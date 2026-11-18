@@ -256,6 +256,11 @@ impl<P: RecoveryPolicy> Endpoint<P> {
                 endpoint.send_rolling_scope,
                 plan.now,
             ));
+            if endpoint.ingress.is_some()
+                && let Some(snapshot) = endpoint.waits.first_mut()
+            {
+                snapshot.ingress_admission = Some(waits::ingress::Snapshot::default());
+            }
         }
         let packing = endpoint
             .packing

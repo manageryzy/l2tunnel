@@ -256,6 +256,7 @@ impl Bank {
         let plan = if rolling_wait_diagnostics {
             plan.with_rolling_wait_diagnostics()
                 .and_then(|plan| plan.with_reliable_output_diagnostics())
+                .and_then(|plan| plan.with_receiver_handoff_diagnostics())
                 .map_err(io::Error::other)?
         } else {
             plan
@@ -422,6 +423,7 @@ impl Backend<C> for Bank {
         let plan = if self.rolling_wait_diagnostics {
             plan.with_rolling_wait_diagnostics()
                 .and_then(|plan| plan.with_reliable_output_diagnostics())
+                .and_then(|plan| plan.with_receiver_handoff_diagnostics())
                 .map_err(io::Error::other)?
         } else {
             plan

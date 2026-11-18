@@ -371,6 +371,17 @@ impl Endpoint {
         )
         .map(Self)
     }
+    /// Construct the exact Compact Packed plan, including prepaid endpoint diagnostics.
+    pub fn new_compact_reserved_with_plan(
+        plan: super::compact_storage::Plan,
+        context: RecoveryContext,
+        limits: storage::Limits,
+    ) -> Result<Self, storage::Error> {
+        if plan.send_packed().is_none() || plan.receive_packed().is_none() {
+            return Err(storage::Error::Endpoint(Error::Configuration));
+        }
+        super::Endpoint::assemble_compact(plan, context, limits).map(Self)
+    }
     /// Complete actual retained heap; allocating construction reports None.
     pub fn storage_usage(&self) -> Option<storage::Usage> {
         self.0.storage_usage()
@@ -636,6 +647,13 @@ impl Endpoint {
         self.0.compact_retry_failure_snapshot()
     }
     /// Read the actual inner staged-source wait owner without protocol mutation.
+    pub fn receiver_handoff_snapshot(
+        &self,
+        observed: Duration,
+    ) -> Option<super::receiver_handoff::Snapshot> {
+        self.0.receiver_handoff_snapshot(observed)
+    }
+    /// Actual retained sender-source admission observations.
     pub fn staged_admission_snapshot(&self, observed: Duration) -> super::staged_wait::Snapshot {
         self.0.staged_admission_snapshot(observed)
     }

@@ -188,6 +188,14 @@ def protocol_provider(value):
                 validate_reliable(epoch['reliable_output'], epoch['epoch'],
                                   path + '.reliable_output', issues, gaps,
                                   {'Client': 0, 'Server': 1}.get(value.get('local_role')))
+            if 'receiver_handoff' in epoch:
+                try:
+                    from .buffer_metrics_handoff import validate as validate_handoff
+                except ImportError:
+                    from buffer_metrics_handoff import validate as validate_handoff
+                validate_handoff(epoch['receiver_handoff'], epoch['epoch'], value.get('local_role'),
+                                 number(epoch, 'last_sample_us', path),
+                                 path + '.receiver_handoff', issues, gaps)
             seen = set()
             for oi, owner in enumerate(owners):
                 prefix = path + '.owners[' + str(oi) + ']'
@@ -759,6 +767,16 @@ def markdown(report):
             from buffer_metrics_reliable import render as render_reliable
         if protocol['status'] == 'validated_known_fields_partial':
             render_reliable(lines, owner['provider_metadata'], table, cell)
+            try:
+                from .buffer_metrics_rolling_ingress import render as render_rolling_ingress
+            except ImportError:
+                from buffer_metrics_rolling_ingress import render as render_rolling_ingress
+            render_rolling_ingress(lines, owner['provider_metadata'], table, cell)
+            try:
+                from .buffer_metrics_handoff import render as render_handoff
+            except ImportError:
+                from buffer_metrics_handoff import render as render_handoff
+            render_handoff(lines, owner['provider_metadata'], table, cell)
         management = owner['management_provider_validation']
         lines.extend(['', 'Management provider: ' + cell(management['status']) + '. ' +
                       management['definition']])

@@ -732,6 +732,7 @@ impl Driver {
             initial_plan
                 .with_rolling_wait_diagnostics()
                 .and_then(|plan| plan.with_reliable_output_diagnostics())
+                .and_then(|plan| plan.with_receiver_handoff_diagnostics())
                 .map_err(invalid)?
         } else {
             initial_plan
@@ -816,6 +817,20 @@ impl Driver {
                     .protocol_buffers()
                     .ok_or_else(|| invalid("reliable buffer observer"))?
                     .configure_reliable_output()?;
+            }
+            if contract.catalog().descriptors().iter().any(|descriptor| {
+                matches!(
+                    descriptor.profile(),
+                    l2tunnel::record_configuration::Profile::Aligned { .. }
+                        | l2tunnel::record_configuration::Profile::Packed { .. }
+                        | l2tunnel::record_configuration::Profile::AlignedCompact { .. }
+                        | l2tunnel::record_configuration::Profile::PackedCompact { .. }
+                )
+            }) {
+                metrics
+                    .protocol_buffers()
+                    .ok_or_else(|| invalid("receiver handoff observer"))?
+                    .configure_receiver_handoff()?;
             }
             metrics.configure_management_buffers()?;
         }

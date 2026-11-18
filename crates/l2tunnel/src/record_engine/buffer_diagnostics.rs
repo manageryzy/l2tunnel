@@ -231,3 +231,18 @@ impl Engine {
         }
     }
 }
+
+impl Engine {
+    /// Actual shared ordered recovery-to-codec handoff timing, absent when not prepaid.
+    /// Preview and independent connection owners are not covered by this single-slot observer.
+    pub fn receiver_handoff_wait(
+        &self,
+        now: std::time::Duration,
+    ) -> Option<l2tunnel_aligned::receiver_handoff::Snapshot> {
+        match &self.owner {
+            Owner::Aligned(owner) => owner.receiver_handoff_snapshot(now),
+            Owner::Packed(owner) => owner.receiver_handoff_snapshot(now),
+            _ => None,
+        }
+    }
+}

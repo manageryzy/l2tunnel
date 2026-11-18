@@ -15,6 +15,7 @@ pub struct Plan {
     pub(super) reliable: l2tunnel_reliable::storage::CompactPlan,
     pub(super) wrapper: usize,
     bytes: usize,
+    pub(super) receiver_handoff_diagnostics: bool,
 }
 impl Plan {
     /// Plan actual ordinary owners; unsupported physical copies fail before allocation.
@@ -106,7 +107,20 @@ impl Plan {
             reliable,
             wrapper,
             bytes,
+            receiver_handoff_diagnostics: false,
         })
+    }
+    /// Prepay one exact ordered receiver-handoff observation, without changing recovery bounds.
+    pub fn with_receiver_handoff_diagnostics(mut self) -> Result<Self, storage::Error> {
+        if !self.receiver_handoff_diagnostics {
+            let extra = Layout::array::<receiver_handoff::State>(1)
+                .map_err(|_| storage::Error::Layout)?
+                .size();
+            self.wrapper = storage::sum(&[self.wrapper, extra])?;
+            self.bytes = storage::sum(&[self.bytes, extra])?;
+            self.receiver_handoff_diagnostics = true;
+        }
+        Ok(self)
     }
     /// Exact original sending policy.
     pub const fn send_config(&self) -> CompactConfig {
@@ -151,6 +165,17 @@ impl Endpoint {
         limits: storage::Limits,
     ) -> Result<Self, storage::Error> {
         Self::assemble_compact(Plan::for_duplex(send, receive)?, context, limits)
+    }
+    /// Construct the exact ordinary Compact plan including its prepaid diagnostic sidecar.
+    pub fn new_compact_reserved_with_plan(
+        plan: Plan,
+        context: RecoveryContext,
+        limits: storage::Limits,
+    ) -> Result<Self, storage::Error> {
+        if plan.send_packed.is_some() || plan.receive_packed.is_some() {
+            return Err(storage::Error::Endpoint(Error::Configuration));
+        }
+        Self::assemble_compact(plan, context, limits)
     }
     pub(super) fn assemble_compact(
         plan: Plan,
@@ -290,6 +315,13 @@ impl Endpoint {
             .as_ref()
             .and_then(receiver::Receiver::storage_usage)
             .ok_or(storage::Error::Invariant)?;
+        guard.receiver_handoff = allocation.vec(usize::from(plan.receiver_handoff_diagnostics))?;
+        if plan.receiver_handoff_diagnostics {
+            guard.receiver_handoff.push(receiver_handoff::State::new(
+                receive_scope,
+                receive_packing.is_some(),
+            ));
+        }
         let (wrapper, wrapper_allocations) = allocation.actual();
         let bytes = storage::sum(&[
             wrapper,
@@ -317,6 +349,7 @@ impl Endpoint {
         let packed_symbols = std::mem::take(&mut guard.packed_symbols);
         let send_buffer = std::mem::take(&mut guard.send_buffer);
         let receive_buffer = std::mem::take(&mut guard.receive_buffer);
+        let receiver_handoff = std::mem::take(&mut guard.receiver_handoff);
         guard.transferred(bytes);
         Ok(Self {
             config: send.body(),
@@ -338,6 +371,7 @@ impl Endpoint {
             compact_wire: false,
             compact_data_overhead: 0,
             staged_wait: staged_wait::State::default(),
+            receiver_handoff,
             usage: Some(storage::Usage {
                 limit_bytes: limits.capacity_bytes,
                 capacity_bytes: bytes,

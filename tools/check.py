@@ -38,7 +38,7 @@ def main() -> None:
         run(sys.executable, 'tools/check_simulator.py', '--check-dependencies')
         run(sys.executable, '-m', 'unittest', 'tools.test_generic_cli_native', 'tools.test_common_carrier_cli_native', 'tools.test_common_native_matrix', 'tools.test_common_matrix_report', '-v')
     run(sys.executable, 'tools/check_checklists.py')
-    run(sys.executable, '-m', 'unittest', 'tools.test_record_check', 'tools.test_buffer_metrics_report', 'tools.test_buffer_metrics_raw_custody', 'tools.test_buffer_metrics_rolling', 'tools.test_buffer_metrics_pipeline', 'tools.test_buffer_metrics_reliable', '-v')
+    run(sys.executable, '-m', 'unittest', 'tools.test_record_check', 'tools.test_buffer_metrics_report', 'tools.test_buffer_metrics_raw_custody', 'tools.test_buffer_metrics_rolling', 'tools.test_buffer_metrics_pipeline', 'tools.test_buffer_metrics_reliable', 'tools.test_buffer_metrics_handoff', 'tools.test_buffer_metrics_rolling_ingress', '-v')
     run(sys.executable, 'tools/check_smoltcp_source.py')
     run(sys.executable, 'tools/generate_tcp_header_goldens.py', '--check', env={**os.environ, 'PYTHONDONTWRITEBYTECODE': '1'})
     run(sys.executable, 'tools/generate_aligned_body_goldens.py', '--check', env={**os.environ, 'PYTHONDONTWRITEBYTECODE': '1'})

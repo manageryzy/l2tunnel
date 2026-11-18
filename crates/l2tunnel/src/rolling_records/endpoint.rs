@@ -1296,6 +1296,27 @@ impl<P: RecoveryPolicy> Endpoint<P> {
         ) {
             return self.fail(Error::Identity);
         }
+        // The immutable data head cannot rotate while Busy. Only opt-in
+        // observation reads its existing metadata; no bytes are parsed again.
+        let diagnostic_input = if self
+            .waits
+            .first()
+            .is_some_and(|waits| waits.ingress_admission.is_some())
+        {
+            Some(waits::ingress::Input {
+                records_number: input.number,
+                received: input.received,
+                deadline: input.deadline,
+                bytes: front.bytes().len(),
+                kind: if input.kind == EmissionKind::Repair {
+                    waits::ingress::Kind::Repair
+                } else {
+                    waits::ingress::Kind::Source
+                },
+            })
+        } else {
+            None
+        };
         let result = compact_wire::receive::<P>(
             self.compact_feedback_overhead.is_some(),
             self.receive_config.scheduler,
@@ -1310,12 +1331,35 @@ impl<P: RecoveryPolicy> Endpoint<P> {
             rolling_tick(input.original_cap),
         );
         match result {
-            Ok(_) => {
+            Ok(outcome) => {
                 owner.queue.complete_front().map_err(Error::Ingress)?;
+                if let Some(input) = diagnostic_input {
+                    let outcome = match outcome {
+                        rolling::Begin::Staged => waits::ingress::Outcome::Staged,
+                        rolling::Begin::Duplicate => waits::ingress::Outcome::Duplicate,
+                        rolling::Begin::Stale => waits::ingress::Outcome::Stale,
+                    };
+                    let admitted_job = if outcome == waits::ingress::Outcome::Staged {
+                        P::receive_expiry(&self.incoming).decoder_job
+                    } else {
+                        None
+                    };
+                    if let Some(waits) = self.waits.first_mut() {
+                        waits.ingress_completed(input, outcome, admitted_job, now);
+                    }
+                }
                 self.request_preview_scan();
                 Ok(())
             }
-            Err(rolling::Error::Busy) => Ok(()),
+            Err(rolling::Error::Busy) => {
+                if let Some(input) = diagnostic_input {
+                    let blocker = P::receive_expiry(&self.incoming).decoder_job;
+                    if let Some(waits) = self.waits.first_mut() {
+                        waits.ingress_refused(input, blocker, now);
+                    }
+                }
+                Ok(())
+            }
             Err(error) => self.fail(Error::Rolling(error)),
         }
     }

@@ -61,6 +61,7 @@ pub struct Plan {
     pub(super) sender: usize,
     pub(super) receiver: codec::ReceiverPlan,
     reliable: reliable::Plan,
+    pub(super) receiver_handoff_diagnostics: bool,
 }
 impl Plan {
     /// Validate ordinary complete send then receive policy and all actual layouts.
@@ -137,6 +138,7 @@ impl Plan {
             sender,
             receiver,
             reliable,
+            receiver_handoff_diagnostics: false,
         })
     }
     /// Pre-admit the actual nested Reliable output observations into this owner plan.
@@ -150,6 +152,16 @@ impl Plan {
             .bytes
             .checked_add(self.reliable.capacity_bytes() - before)
             .ok_or(Error::Layout)?;
+        Ok(self)
+    }
+    /// Prepay one exact ordered receiver-handoff observation; repeated selection is idempotent.
+    pub fn with_receiver_handoff_diagnostics(mut self) -> Result<Self, Error> {
+        if !self.receiver_handoff_diagnostics {
+            let extra = array_bytes::<super::receiver_handoff::State>(1)?;
+            self.wrapper = sum(&[self.wrapper, extra])?;
+            self.bytes = sum(&[self.bytes, extra])?;
+            self.receiver_handoff_diagnostics = true;
+        }
         Ok(self)
     }
     /// Complete original send direction policy.
@@ -289,6 +301,7 @@ pub(super) struct Construction {
     pub(super) packed_symbols: Vec<u8>,
     pub(super) send_buffer: Vec<u8>,
     pub(super) receive_buffer: Vec<u8>,
+    pub(super) receiver_handoff: Vec<super::receiver_handoff::State>,
     #[cfg(test)]
     pub(super) trace: Option<std::rc::Rc<std::cell::RefCell<Vec<ConstructionEvent>>>>,
 }
@@ -321,6 +334,9 @@ impl Construction {
             self.packed_symbols.capacity(),
             self.send_buffer.capacity(),
             self.receive_buffer.capacity(),
+            self.receiver_handoff
+                .capacity()
+                .checked_mul(std::mem::size_of::<super::receiver_handoff::State>())?,
         ]
         .into_iter()
         .try_fold(0usize, usize::checked_add)
@@ -343,7 +359,8 @@ impl Drop for Construction {
             || self.receiver.is_some()
             || self.packed_symbols.capacity() != 0
             || self.send_buffer.capacity() != 0
-            || self.receive_buffer.capacity() != 0;
+            || self.receive_buffer.capacity() != 0
+            || self.receiver_handoff.capacity() != 0;
         if !occupied {
             return;
         }
@@ -359,6 +376,7 @@ impl Drop for Construction {
         drop(std::mem::take(&mut self.packed_symbols));
         drop(std::mem::take(&mut self.send_buffer));
         drop(std::mem::take(&mut self.receive_buffer));
+        drop(std::mem::take(&mut self.receiver_handoff));
         #[cfg(test)]
         if let Some(trace) = &self.trace {
             trace.borrow_mut().push(ConstructionEvent::AfterDrop);

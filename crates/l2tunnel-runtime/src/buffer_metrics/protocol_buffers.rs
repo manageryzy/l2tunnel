@@ -11,7 +11,10 @@ mod reliable_output_metrics;
 #[path = "rolling_wait_metrics.rs"]
 mod rolling_wait_metrics;
 use l2tunnel::rolling_records::waits::{Snapshot as RollingWait, Terminal as RollingTerminal};
+use l2tunnel_aligned::receiver_handoff::Snapshot as ReceiverHandoff;
 use l2tunnel_reliable::diagnostics::Snapshot as ReliableOutput;
+#[path = "receiver_handoff_metrics.rs"]
+mod receiver_handoff_metrics;
 
 const SAMPLE_INTERVAL_US: u64 = 100_000;
 const MAX_OWNERS: usize = 256;
@@ -362,6 +365,7 @@ struct Epoch {
     rows: Vec<Option<Row>>,
     rolling: Vec<RollingWait>,
     reliable: Vec<ReliableOutput>,
+    receiver_handoff: Vec<ReceiverHandoff>,
 }
 impl Epoch {
     fn new(owners: usize) -> io::Result<Self> {
@@ -377,6 +381,7 @@ impl Epoch {
             rows,
             rolling: Vec::new(),
             reliable: Vec::new(),
+            receiver_handoff: Vec::new(),
         })
     }
 }
@@ -453,6 +458,25 @@ impl ProtocolBuffers {
         }
         Ok(())
     }
+    pub(crate) fn configure_receiver_handoff(&mut self) -> io::Result<()> {
+        for epoch in &mut self.epochs {
+            if epoch.receiver_handoff.capacity() != 0 {
+                return Err(io::Error::other(
+                    "receiver handoff observer already configured",
+                ));
+            }
+            epoch
+                .receiver_handoff
+                .try_reserve_exact(1)
+                .map_err(io::Error::other)?;
+            if epoch.receiver_handoff.capacity() != 1 {
+                return Err(io::Error::other(
+                    "receiver handoff observer capacity differs",
+                ));
+            }
+        }
+        Ok(())
+    }
     pub(crate) fn heap_bytes(&self) -> usize {
         self.epochs.capacity() * std::mem::size_of::<Epoch>()
             + self
@@ -462,6 +486,7 @@ impl ProtocolBuffers {
                     v.rows.capacity() * std::mem::size_of::<Option<Row>>()
                         + v.rolling.capacity() * std::mem::size_of::<RollingWait>()
                         + v.reliable.capacity() * std::mem::size_of::<ReliableOutput>()
+                        + v.receiver_handoff.capacity() * std::mem::size_of::<ReceiverHandoff>()
                 })
                 .sum::<usize>()
     }
@@ -529,6 +554,7 @@ impl ProtocolBuffers {
                 epoch.rows.fill(None);
                 epoch.rolling.clear();
                 epoch.reliable.clear();
+                epoch.receiver_handoff.clear();
             }
             epoch.live = true;
             epoch.last = now;
@@ -579,6 +605,9 @@ impl ProtocolBuffers {
         }
         if let Some(snapshot) = engine.reliable_output_wait(Duration::from_micros(now)) {
             self.sample_reliable_output(identity, snapshot);
+        }
+        if let Some(snapshot) = engine.receiver_handoff_wait(Duration::from_micros(now)) {
+            self.sample_receiver_handoff(identity, snapshot);
         }
         let local = engine.configuration().descriptor().local(self.role);
         // Called only after the periodic/terminal sampling gate. Swift's exact
@@ -748,6 +777,47 @@ impl ProtocolBuffers {
             }
         }
     }
+    fn sample_receiver_handoff(&mut self, identity: Identity, snapshot: ReceiverHandoff) {
+        let receive_direction = match self.role {
+            Role::Client => 1,
+            Role::Server => 0,
+        };
+        if let Some(epoch) = self
+            .epochs
+            .iter_mut()
+            .find(|v| v.live && v.identity == Some(identity))
+            && epoch.receiver_handoff.capacity() == 1
+            && snapshot.epoch == identity.epoch
+            && snapshot.receive_direction == receive_direction
+        {
+            if let Some(slot) = epoch.receiver_handoff.first_mut() {
+                *slot = snapshot;
+            } else {
+                epoch.receiver_handoff.push(snapshot);
+            }
+        } else {
+            increment(&mut self.identity_errors, &mut self.overflow);
+        }
+    }
+    pub(crate) fn finish_receiver_handoff(&mut self, now: u64) {
+        let at = Duration::from_micros(now);
+        for epoch in &mut self.epochs {
+            if !epoch.live {
+                continue;
+            }
+            if let Some(snapshot) = epoch.receiver_handoff.first_mut() {
+                if snapshot.terminal_at.is_some() {
+                    continue;
+                }
+                if epoch.last == now && snapshot.observed_at == at {
+                    *snapshot = snapshot.censor(at);
+                } else {
+                    snapshot.terminal_unavailable = true;
+                    increment(&mut self.staged_terminal_unavailable, &mut self.overflow);
+                }
+            }
+        }
+    }
     pub(crate) fn write(&self, out: &mut impl Write) -> io::Result<()> {
         write!(
             out,
@@ -868,6 +938,11 @@ impl ProtocolBuffers {
             write!(out, ",\"reliable_output\":")?;
             match epoch.reliable.first() {
                 Some(snapshot) => reliable_output_metrics::write(out, snapshot)?,
+                None => write!(out, "null")?,
+            }
+            write!(out, ",\"receiver_handoff\":")?;
+            match epoch.receiver_handoff.first() {
+                Some(snapshot) => receiver_handoff_metrics::write(out, snapshot)?,
                 None => write!(out, "null")?,
             }
             write!(out, "}}")?;

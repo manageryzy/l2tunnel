@@ -287,7 +287,16 @@ fn packed_context_fragments_and_raw_native_pressure_retain_complete_frames() -> 
             cfg.base.receiver.body.predictive = false;
             cfg.base.receiver.body.timestamp_pair_dictionary = false;
         }
-        let (mut left, mut right) = peers(cfg)?;
+        let (mut left, _) = peers(cfg)?;
+        let plan =
+            storage::Plan::for_packed_duplex(cfg, cfg)?.with_receiver_handoff_diagnostics()?;
+        let mut right = packed::Endpoint::new_reserved_with_plan(
+            plan,
+            tests::context(EndpointRole::Responder),
+            storage::Limits {
+                capacity_bytes: plan.capacity_bytes(),
+            },
+        )?;
         let mut input = tests::native_frames()?;
         input.extend((0..12).map(|i| vec![i; 90]));
         input.push(vec![0; 500]);
@@ -332,6 +341,26 @@ fn packed_context_fragments_and_raw_native_pressure_retain_complete_frames() -> 
         assert_eq!(output, input);
         assert!(saw_stage && saw_handoff && held.is_some());
         assert!(left.drained() && right.drained());
+        let observed = right
+            .receiver_handoff_snapshot(ms(2000))
+            .ok_or("Packed handoff observer")?;
+        assert!(observed.packed && observed.refusals.iter().sum::<u64>() > 0);
+        assert!(observed.totals.completed_episodes > 0 && observed.pending.is_none());
+        assert_eq!(
+            observed
+                .maximum_completed
+                .ok_or("Packed completed source")?
+                .release,
+            Some(receiver_handoff::Release::PackedBatch)
+        );
+        assert!(!observed.identity_mismatch && !observed.clock_regression);
+        assert_eq!(
+            right
+                .storage_usage()
+                .ok_or("actual reserved Packed")?
+                .capacity_bytes,
+            plan.capacity_bytes()
+        );
     }
     Ok(())
 }
@@ -339,7 +368,14 @@ fn packed_context_fragments_and_raw_native_pressure_retain_complete_frames() -> 
 #[test]
 fn packed_late_semantic_failure_never_exposes_earlier_frame_or_advances_unit_floor() -> TestResult {
     let cfg = config(128);
-    let (_, mut endpoint) = peers(cfg)?;
+    let plan = storage::Plan::for_packed_duplex(cfg, cfg)?.with_receiver_handoff_diagnostics()?;
+    let mut endpoint = packed::Endpoint::new_reserved_with_plan(
+        plan,
+        tests::context(EndpointRole::Responder),
+        storage::Limits {
+            capacity_bytes: plan.capacity_bytes(),
+        },
+    )?;
     let scope = receiver::Scope {
         session: 0x1234u128.to_be_bytes(),
         epoch: Epoch(7),
@@ -388,6 +424,16 @@ fn packed_late_semantic_failure_never_exposes_earlier_frame_or_advances_unit_flo
     assert!(status.retained_handoff && status.failure.is_some());
     assert!(endpoint.pending().is_none());
     assert!(!endpoint.drained());
+    let observed = endpoint
+        .receiver_handoff_snapshot(ms(5))
+        .ok_or("rollback observation")?;
+    assert_eq!(observed.refusals, [0, 0]);
+    assert_eq!(observed.totals, receiver_handoff::Totals::default());
+    assert!(observed.pending.is_none() && observed.last_resolved.is_none());
+    assert_eq!(
+        observed.terminal,
+        Some(receiver_handoff::Terminal::OwnerFailure)
+    );
     Ok(())
 }
 

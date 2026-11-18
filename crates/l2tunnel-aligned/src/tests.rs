@@ -422,7 +422,15 @@ fn bounded_fragment_and_native_backpressure_retain_exact_frames_until_commit() -
     config.receiver.lookahead_records = 0;
     config.receiver.lookahead_bytes = 0;
     config.receiver.lookahead_fragments = 0;
-    let (mut left, mut right) = peers(config)?;
+    let (mut left, _) = peers(config)?;
+    let plan = storage::Plan::for_duplex(config, config)?.with_receiver_handoff_diagnostics()?;
+    let mut right = Endpoint::new_reserved_with_plan(
+        plan,
+        context(EndpointRole::Responder),
+        storage::Limits {
+            capacity_bytes: plan.capacity_bytes(),
+        },
+    )?;
     let input = [vec![17; 500], vec![29; 90], vec![33; 66]];
     let mut admitted = 0;
     let mut output = Vec::new();
@@ -450,6 +458,20 @@ fn bounded_fragment_and_native_backpressure_retain_exact_frames_until_commit() -
         }
         right.prepare(ChannelId(0), ms(time), 8)?;
         saw_handoff |= right.status().retained_handoff;
+        let observed = right
+            .receiver_handoff_snapshot(ms(time))
+            .ok_or("enabled handoff observer")?;
+        if let Some(pending) = observed.pending {
+            let actual = right.handoff.ok_or("actual retained source")?;
+            assert_eq!(
+                (
+                    pending.identity.source,
+                    pending.identity.bytes,
+                    pending.identity.deadline
+                ),
+                actual
+            );
+        }
         if let Some(pending) = right.pending() {
             if time < 80 {
                 if let Some(previous) = &held {
@@ -471,6 +493,29 @@ fn bounded_fragment_and_native_backpressure_retain_exact_frames_until_commit() -
     assert_eq!(output, input);
     assert!(saw_stage && saw_handoff && held.is_some());
     assert!(left.drained() && right.drained());
+    let observed = right
+        .receiver_handoff_snapshot(right.now)
+        .ok_or("enabled handoff observer")?;
+    assert!(observed.refusals.iter().sum::<u64>() > 0);
+    assert!(observed.totals.completed_episodes > 0 && observed.totals.completed > Duration::ZERO);
+    assert_eq!(observed.totals.censored_episodes, 0);
+    assert!(
+        observed.pending.is_none() && !observed.identity_mismatch && !observed.clock_regression
+    );
+    assert_eq!(
+        observed
+            .maximum_completed
+            .ok_or("completed source identity")?
+            .release,
+        Some(receiver_handoff::Release::Admitted)
+    );
+    assert_eq!(
+        right
+            .storage_usage()
+            .ok_or("reserved accounting")?
+            .capacity_bytes,
+        plan.capacity_bytes()
+    );
     Ok(())
 }
 #[test]

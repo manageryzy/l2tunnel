@@ -47,12 +47,12 @@ validation pass. "Implemented" below describes source, not a passing check.
 | BP-02 | ACK ingress candidates/slab | Common held-input capacity wait implemented; internal deliberate coalescing hold and per-flow replacement age export pending. |
 | BP-03 | Bank epoch slots/native window/output tokens | Existing resource usage retained; typed native-window refusal implemented. Per-generation wait and drain/export pending. |
 | BP-04 | Aligned/Packed sender stage, fragment cursor, assembling/sealed container | Actual codec gauges and typed refusals implemented. Bounded per-epoch/owner sampled export and exact retained-source capacity/window refusal-to-admission timing are implemented; validation is recorded below. Packing hold, fragment cursor and other stage waits remain pending. |
-| BP-05 | Aligned receiver proofs/ordered records/fragments/native output | Head/lookahead/proof/native-output gauges have bounded sampled runtime export. Missing context/source versus consumer intervals remain pending; occupancy does not establish blocking. |
+| BP-05 | Aligned receiver proofs/ordered records/fragments/native output | Head/lookahead/proof/native-output gauges have bounded sampled runtime export. Shared Aligned/Packed, including Compact variants, now have exact ordered recovery-source refusal-to-release intervals with scoped local batch22 validation below. Native qualification, independent owners, preview, missing context/source versus consumer intervals remain pending; occupancy does not establish blocking. |
 | BP-06 | Reliable partial block/outgoing/restored/generations/physical tokens | Typed builder/output/restored/decoder gauges and exact sealed-head refusal intervals implemented with coordinated local batch17 validation below and finite native17 Aligned Cauchy export. Exact per-restored-source ARQ refusal-to-admission timing passes scoped local validation; native21 validates both Cauchy exports with zero actual refusals. Native nonzero-wait qualification and whole-write durations remain open. |
 | BP-07 | Normal/Compact ARQ retention/reorder/transmission history | Reliable ARQ retention has sampled runtime export, and exact staged-source capacity/sequence-window refusal-to-admission timing is implemented. History use and remaining ACK/RTO/physical/output-budget attribution remain pending. Exhaustion remains an error, not an invented wait. |
 | BP-08 | Swift packing/sources/retries/repairs/history/rows/stream | Per-channel read-only gauges, actual packing refusal and bounded runtime export are implemented, including asymmetric channel identities and shared packing scope. Coordinated local validation passes below; native export qualification and independent channel timing remain open. |
 | BP-09 | Block FEC generations/equations/restored output | Live generation/rank/history/reservation gauges and actual capacity-refusal counters implemented with coordinated local batch17 validation below and finite native17 generation-capacity observations. Exact restored-source admission timing passes scoped local validation; native21 validates both Cauchy exports with zero actual refusals. Native nonzero-wait qualification and missing-equation waits remain open. |
-| BP-10 | Rolling/Research vectors/rows/jobs/feedback/ordered handoff | Nested codec gauges and three exact retained-operation intervals are implemented: source admission, decoded handoff and ready-feedback budget. Optional bounded storage and runtime export are charged before I/O. Coordinated local validation passes below; native qualification, work slices, feedback construction, ingress and missing-source dependencies remain open. |
+| BP-10 | Rolling/Research vectors/rows/jobs/feedback/ordered handoff | Nested codec gauges and exact retained-operation intervals are implemented for source admission, decoded handoff, ready-feedback budget and receiving data-head Busy admission. Optional bounded storage and runtime export are charged before I/O. Scoped local batch22 validation passes below; native qualification, work slices, feedback construction, remaining ingress and missing-source dependencies remain open. |
 | BP-11 | Legacy sliding/recursive/parity pending/flight/jobs/batches/receive | Existing source/repair status; complete buffer intervals/export pending. These owners remain in scope. |
 | BP-12 | Rolling/fragment groups/tokens/reassembly/completion | Existing original deadlines and ingress snapshots; explicit blockage attribution/export pending. |
 | BP-13 | Connections owner/incarnation and per-owner recovery/native slots | Actual retirement/source-free refusal and codec identities implemented. Sampled codec/recovery export preserves full independent owner incarnation; exact staged-source admission waits retain the same identity. Remaining lifecycle/source-free/native wait timing is pending. |
@@ -1766,3 +1766,56 @@ emissions. Same-emission IPv4 bytes outside codec body have mean/p99 Cauchy
 for a/b directions. These lifetime populations include retries/warmup/drain,
 not original-native overhead. Full BP-01..BP-24 coverage, all 80 current-build
 combinations across three phases and complete original-native overhead remain open.
+
+### Batch22 exact receiving ownership boundaries
+
+Shared Aligned and Packed endpoints, including their Compact recovery variants,
+now retain one optional prepaid observation for the actual ordered recovery
+source handed to the codec receiver. Only a final outer `Capacity` or
+`RecordWindow` result opens an interval. The same original source ID, body
+extent and immutable handoff deadline identify successful release. Ordinary
+admission, already-observed preview and final Packed batch success are distinct
+release classifications; none means native delivery. Packed speculative inner
+prepare/commit/rollback operations do not publish progress before the outer
+transaction succeeds.
+
+Completed/open/censored populations and exact maximum contexts retain the
+enclosing epoch/configuration and receiving direction. Capacity is a coarse
+returned error, not a continuously measured fullness predicate. Actual owner
+failure stops at the last accepted injected tick. Fresh metric-stop sampling
+may censor a snapshot copy; a stale source reports unavailable rather than
+extending custody. Ordinary and Compact plans prepay the actual cell and
+construction verifies actual usage. Compact facade construction now preserves
+the validated plan instead of rebuilding it from configuration. Runtime reserves
+one snapshot per existing epoch slot before service; disabled endpoints allocate
+no diagnostic cell. Independent connection owners, preview/dependency/native
+consumer waits and Packed inner-unit attribution remain open BP-05 work.
+
+Rolling/Research's existing receiving FIFO now records actual `Busy` returns
+from the data-head call. The original head's Records number when available,
+arrival, retained cap, kind and extent remain immutable, with a local serial
+and full enclosing endpoint identity. First/latest blocking DecoderJob contexts
+remain distinct from the new job admitted after that same head succeeds.
+Only successful queue removal resolves an interval; Staged, Duplicate and Stale
+outcomes have separate populations. Earlier queue residence with no actual Busy
+does not become backpressure. Existing feedback cohort rotations preserve data
+order on success; terminal failure censors the retained original input identity.
+
+The fixed optional summary retains one current head and one last resolved
+episode, with count/sum/max per outcome. It is not an event history or a maximum
+identity trace. Enlarged snapshot storage is charged through the existing
+optional plan and provider allocation. No clock, queue, payload copy, wire
+format, work allowance, retry policy or original deadline changes. Work-budget
+Pending, feedback dependencies, ingress-capacity refusal and remaining BP-10
+coverage are still open.
+
+The [scoped required-check continuation](../../work/aligned-extents-20261117/required-buffer-checks22-continuation1/validation.json)
+passes 569 affected Rust cases, strict workspace Clippy, three affected strict
+rustdoc targets and formatting. All 63 affected report tests and checklist
+validation pass in the preserved first attempt. That attempt found a missing
+type import in a new test; the continuation changes only that import. Independent
+source review also found and corrected a parser role-validation gap before
+execution. Existing real pressure, Packed rollback, original expiry, exact
+Compact accounting and current-wire ingress fixtures pass. Unchanged check21
+stages are reused, not rerun. Native22 and full BP/matrix qualification remain
+pending; these slices do not reduce any parent acceptance definition.

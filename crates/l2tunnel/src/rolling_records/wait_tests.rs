@@ -297,3 +297,6 @@ fn actual_ready_feedback_budget_wait_does_not_include_idle_or_physical_receipt()
     feedback_budget(config)?;
     feedback_budget(research_config(config))
 }
+
+#[path = "ingress_wait_tests.rs"]
+mod ingress_wait_tests;

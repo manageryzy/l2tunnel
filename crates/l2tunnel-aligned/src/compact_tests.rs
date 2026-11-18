@@ -634,3 +634,64 @@ fn known_preview_does_not_bypass_recovery_conflicting_duplicate() -> TestResult 
     assert!(receiver.pending().is_none());
     Ok(())
 }
+
+#[test]
+fn receiver_handoff_compact_plans_are_prepaid_and_preserved_for_both_codecs() -> TestResult {
+    for is_packed in [false, true] {
+        let config = policy(false, is_packed)?;
+        let base = if is_packed {
+            compact_storage::Plan::for_packed_duplex(config, config)?
+        } else {
+            compact_storage::Plan::for_duplex(config.base, config.base)?
+        };
+        let plan = base.with_receiver_handoff_diagnostics()?;
+        assert_eq!(plan.with_receiver_handoff_diagnostics()?, plan);
+        assert_eq!(
+            plan.capacity_bytes() - base.capacity_bytes(),
+            std::mem::size_of::<receiver_handoff::State>()
+        );
+        let context = tests::context(EndpointRole::Responder);
+        let limits = storage::Limits {
+            capacity_bytes: plan.capacity_bytes(),
+        };
+        let (snapshot, usage) = if is_packed {
+            let owner = packed::Endpoint::new_compact_reserved_with_plan(plan, context, limits)?;
+            (
+                owner.receiver_handoff_snapshot(Duration::ZERO),
+                owner.storage_usage(),
+            )
+        } else {
+            let owner = Endpoint::new_compact_reserved_with_plan(plan, context, limits)?;
+            (
+                owner.receiver_handoff_snapshot(Duration::ZERO),
+                owner.storage_usage(),
+            )
+        };
+        let value = snapshot.ok_or("Compact plan must retain enabled observation")?;
+        assert_eq!(
+            (value.epoch, value.receive_direction, value.packed),
+            (7, 0, is_packed)
+        );
+        assert_eq!(value.refusals, [0, 0]);
+        assert!(value.pending.is_none());
+        assert_eq!(
+            usage.ok_or("actual Compact allocation")?.capacity_bytes,
+            plan.capacity_bytes()
+        );
+        let short = storage::Limits {
+            capacity_bytes: plan.capacity_bytes() - 1,
+        };
+        if is_packed {
+            assert!(matches!(
+                packed::Endpoint::new_compact_reserved_with_plan(plan, context, short),
+                Err(storage::Error::Limit { .. })
+            ));
+        } else {
+            assert!(matches!(
+                Endpoint::new_compact_reserved_with_plan(plan, context, short),
+                Err(storage::Error::Limit { .. })
+            ));
+        }
+    }
+    Ok(())
+}

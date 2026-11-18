@@ -1,6 +1,8 @@
 //! Terminal serialization of exact pure Rolling/Research refusal intervals.
 use l2tunnel::rolling_records::waits::{Operation, Snapshot, Terminal, Totals};
 use std::io::{self, Write};
+#[path = "rolling_ingress_metrics.rs"]
+mod ingress;
 fn optional(out: &mut impl Write, value: Option<u64>) -> io::Result<()> {
     match value {
         Some(v) => write!(out, "{v}"),
@@ -35,7 +37,7 @@ fn totals(out: &mut impl Write, t: Totals) -> io::Result<()> {
 pub(super) fn write(out: &mut impl Write, s: &Snapshot) -> io::Result<()> {
     write!(
         out,
-        "{{\"definition\":\"actual refusal to same-operation ownership progress; includes scheduling delay; no durations combined across sites; reason intervals can overlap; sampled occupancy is separate\",\"coverage\":\"sealed source recovery admission, decoded source record handoff and ready feedback output budget only; work, ingress and feedback-build dependency intervals unavailable\",\"instance\":{},\"session_hex\":\"",
+        "{{\"definition\":\"actual refusal to same-operation ownership progress; includes scheduling delay; no durations combined across sites; reason intervals can overlap; sampled occupancy is separate\",\"coverage\":\"sealed source recovery admission, decoded source record handoff, ready feedback output budget and optional actual receive data-head Busy intervals; work Pending and feedback-build dependencies remain unavailable\",\"instance\":{},\"session_hex\":\"",
         s.instance
     )?;
     for byte in s.send_scope.session {
@@ -141,5 +143,12 @@ pub(super) fn write(out: &mut impl Write, s: &Snapshot) -> io::Result<()> {
         }
         write!(out, "}}")?;
     }
-    write!(out, "]}}")
+    write!(out, "],\"ingress_admission\":")?;
+    ingress::write(
+        out,
+        s.ingress_admission.as_ref(),
+        s.send_scope.direction ^ 1,
+        s.observed_at.0,
+    )?;
+    write!(out, "}}")
 }

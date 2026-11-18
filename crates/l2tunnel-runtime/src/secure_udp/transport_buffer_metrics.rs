@@ -256,6 +256,7 @@ impl Driver {
                     protocol.finish_staged_admission(now);
                     protocol.finish_rolling_waits(now, boundary);
                     protocol.finish_reliable_output(now);
+                    protocol.finish_receiver_handoff(now);
                 }
             } else if metrics.protocol_buffers().is_some() {
                 // A previous sample at the same tick is not proof that this

@@ -217,9 +217,8 @@ impl RecordPlan {
             )
             .map(Owner::Packed)
             .map_err(Error::Aligned),
-            Self::AlignedCompact(plan) => aligned::Endpoint::new_compact_duplex_reserved(
-                plan.send_config(),
-                plan.receive_config(),
+            Self::AlignedCompact(plan) => aligned::Endpoint::new_compact_reserved_with_plan(
+                plan,
                 recovery,
                 aligned::storage::Limits {
                     capacity_bytes: plan.capacity_bytes(),
@@ -227,9 +226,8 @@ impl RecordPlan {
             )
             .map(Owner::Aligned)
             .map_err(Error::Aligned),
-            Self::PackedCompact(plan) => aligned::packed::Endpoint::new_compact_duplex_reserved(
-                plan.send_packed().ok_or(Error::Invariant)?,
-                plan.receive_packed().ok_or(Error::Invariant)?,
+            Self::PackedCompact(plan) => aligned::packed::Endpoint::new_compact_reserved_with_plan(
+                plan,
                 recovery,
                 aligned::storage::Limits {
                     capacity_bytes: plan.capacity_bytes(),
@@ -541,6 +539,41 @@ impl Plan {
             ),
             RecordPlan::Packed(plan) => RecordPlan::Packed(
                 plan.with_reliable_output_diagnostics()
+                    .map_err(Error::Aligned)?,
+            ),
+            other => other,
+        };
+        let extra = self
+            .record
+            .heap_bytes()
+            .checked_sub(before)
+            .ok_or(Error::Layout)?;
+        self.heap_bytes = self.heap_bytes.checked_add(extra).ok_or(Error::Layout)?;
+        self.capacity_bytes = self
+            .capacity_bytes
+            .checked_add(extra)
+            .ok_or(Error::Layout)?;
+        Ok(self)
+    }
+    /// Prepay the shared Aligned/Packed ordered receiver handoff sidecar in all recovery variants.
+    /// Independent connection owners remain explicitly outside this timing slice.
+    pub fn with_receiver_handoff_diagnostics(mut self) -> Result<Self, Error> {
+        let before = self.record.heap_bytes();
+        self.record = match self.record {
+            RecordPlan::Aligned(plan) => RecordPlan::Aligned(
+                plan.with_receiver_handoff_diagnostics()
+                    .map_err(Error::Aligned)?,
+            ),
+            RecordPlan::Packed(plan) => RecordPlan::Packed(
+                plan.with_receiver_handoff_diagnostics()
+                    .map_err(Error::Aligned)?,
+            ),
+            RecordPlan::AlignedCompact(plan) => RecordPlan::AlignedCompact(
+                plan.with_receiver_handoff_diagnostics()
+                    .map_err(Error::Aligned)?,
+            ),
+            RecordPlan::PackedCompact(plan) => RecordPlan::PackedCompact(
+                plan.with_receiver_handoff_diagnostics()
                     .map_err(Error::Aligned)?,
             ),
             other => other,

@@ -135,5 +135,11 @@ def validate(value, epoch, path, issues, gaps):
             need(union[int(censored)][0] > 0, 'resolved operation lacks matching population')
         if terminal is not None:
             need(pending is None, 'terminal owner still has an open operation')
-    gaps.append(path + ': work slices, feedback construction and ingress dependencies remain unavailable; '
+    try:
+        from .buffer_metrics_rolling_ingress import validate as validate_ingress
+    except ImportError:
+        from buffer_metrics_rolling_ingress import validate as validate_ingress
+    validate_ingress(value.get('ingress_admission'), observed, terminal, direction,
+                     path + '.ingress_admission', issues, gaps)
+    gaps.append(path + ': work slices, feedback construction and other ingress dependencies remain unavailable; '
                 'site/reason durations are not merged into generic runtime union')

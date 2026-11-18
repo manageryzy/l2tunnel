@@ -217,6 +217,15 @@ expires after 4.962090 seconds before decoder admission. All original quotas,
 deadlines and parent gates remain; these finite results do not close full BP or
 matrix acceptance.
 
+The [batch22 receiving-boundary continuation](modules/buffer-observability.md#batch22-exact-receiving-ownership-boundaries)
+adds actual ordered recovery-source handoff refusal/release for shared
+Aligned/Packed and Compact variants, plus actual Rolling/Research data-head Busy
+timing. Optional state and runtime snapshot copies are prepaid; Compact facade
+construction preserves the exact validated plan. Scoped local validation passes
+569 affected Rust cases, 63 report cases, strict Clippy/rustdoc and formatting.
+Native22 and full BP-05/BP-10 coverage remain pending. No original quota, timer,
+work allowance, recovery behavior or full parent definition changes.
+
 This remains the persistent progress ledger. Unchecked work is required;
 a design, enum, successful build or deleted implementation does not complete a
 runtime deliverable. Preserve stable IDs and distinguish planned, protocol-tested,

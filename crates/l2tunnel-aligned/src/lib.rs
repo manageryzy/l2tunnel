@@ -21,6 +21,9 @@ pub mod compact_storage;
 mod compact_wire;
 /// Explicit timed packed-source composition over the same reliable owner.
 pub mod packed;
+pub mod receiver_handoff;
+#[cfg(test)]
+mod receiver_handoff_tests;
 /// Exact injected-time observations of retained source admission refusal.
 pub mod staged_wait;
 /// Complete fallible backing for actual directional codec/recovery owners.
@@ -301,6 +304,7 @@ pub struct Endpoint {
     compact_wire: bool,
     compact_data_overhead: usize,
     staged_wait: staged_wait::State,
+    receiver_handoff: Vec<receiver_handoff::State>,
 }
 impl Endpoint {
     /// Reserve complete actual same-policy duplex backing without fallback.
@@ -460,6 +464,16 @@ impl Endpoint {
             .as_ref()
             .and_then(receiver::Receiver::storage_usage)
             .ok_or(storage::Error::Invariant)?;
+        construction.receiver_handoff =
+            allocation.vec(usize::from(plan.receiver_handoff_diagnostics))?;
+        if plan.receiver_handoff_diagnostics {
+            construction
+                .receiver_handoff
+                .push(receiver_handoff::State::new(
+                    receive_scope,
+                    receive_packing.is_some(),
+                ));
+        }
         let (wrapper, wrapper_allocations) = allocation.actual();
         let capacity_bytes = storage::sum(&[
             wrapper,
@@ -491,6 +505,7 @@ impl Endpoint {
         let packed_symbols = std::mem::take(&mut construction.packed_symbols);
         let send_buffer = std::mem::take(&mut construction.send_buffer);
         let receive_buffer = std::mem::take(&mut construction.receive_buffer);
+        let receiver_handoff = std::mem::take(&mut construction.receiver_handoff);
         construction.transferred(capacity_bytes);
         Ok(Self {
             config: config.into(),
@@ -512,6 +527,7 @@ impl Endpoint {
             compact_wire: false,
             compact_data_overhead: 0,
             staged_wait: staged_wait::State::default(),
+            receiver_handoff,
             usage: Some(storage::Usage {
                 limit_bytes: limits.capacity_bytes,
                 capacity_bytes,
@@ -620,6 +636,7 @@ impl Endpoint {
             compact_wire: false,
             compact_data_overhead: 0,
             staged_wait: staged_wait::State::default(),
+            receiver_handoff: Vec::new(),
             usage: None,
         })
     }
@@ -1194,6 +1211,54 @@ impl Endpoint {
         );
     }
 
+    /// Actual ordered-source refusal intervals, absent unless prepaid in the endpoint plan.
+    /// Preview, Packed inner units, missing context and native consumer waits are unavailable.
+    pub fn receiver_handoff_snapshot(
+        &self,
+        observed: Duration,
+    ) -> Option<receiver_handoff::Snapshot> {
+        self.receiver_handoff
+            .first()
+            .map(|state| state.snapshot(observed))
+    }
+    fn observe_receiver_refusal(
+        &mut self,
+        id: u64,
+        length: usize,
+        deadline: Duration,
+        reason: receiver_handoff::Reason,
+    ) {
+        if let Some(state) = self.receiver_handoff.first_mut() {
+            state.refused(
+                receiver_handoff::Identity {
+                    source: id,
+                    bytes: length,
+                    deadline,
+                },
+                self.now,
+                reason,
+            );
+        }
+    }
+    fn observe_receiver_release(
+        &mut self,
+        id: u64,
+        length: usize,
+        deadline: Duration,
+        release: receiver_handoff::Release,
+    ) {
+        if let Some(state) = self.receiver_handoff.first_mut() {
+            state.released(
+                receiver_handoff::Identity {
+                    source: id,
+                    bytes: length,
+                    deadline,
+                },
+                self.now,
+                release,
+            );
+        }
+    }
     /// Read the actual codec stage and receiver; recovery buffers remain separate.
     pub fn codec_buffer_snapshot(&self) -> l2tunnel_codec::diagnostics::DuplexBuffers {
         l2tunnel_codec::diagnostics::DuplexBuffers {
@@ -1331,18 +1396,33 @@ impl Endpoint {
                     .ok_or(Error::Time)?;
                 self.handoff = Some((id, length, deadline));
             }
-            let Some((id, length, _)) = self.handoff else {
+            let Some((id, length, deadline)) = self.handoff else {
                 break;
             };
             if let Some(options) = self.receive_packing {
                 match self.admit_packed(options, id, length) {
                     Ok(()) => {
+                        // Observe only the final outer result, after any Packed journal rollback.
+                        self.observe_receiver_release(
+                            id,
+                            length,
+                            deadline,
+                            receiver_handoff::Release::PackedBatch,
+                        );
                         self.handoff = None;
                         continue;
                     }
                     Err(Error::Receiver(
-                        receiver::Error::Capacity | receiver::Error::RecordWindow,
-                    )) => break,
+                        error @ (receiver::Error::Capacity | receiver::Error::RecordWindow),
+                    )) => {
+                        let reason = if error == receiver::Error::Capacity {
+                            receiver_handoff::Reason::Capacity
+                        } else {
+                            receiver_handoff::Reason::RecordWindow
+                        };
+                        self.observe_receiver_refusal(id, length, deadline, reason);
+                        break;
+                    }
                     Err(error) => return self.fail(error),
                 }
             }
@@ -1366,7 +1446,15 @@ impl Endpoint {
                 .receiver
                 .admit_authenticated(view.identity, view.symbol, ticks(self.now)?)
             {
-                Ok(receiver::Admission::Accepted) => self.handoff = None,
+                Ok(receiver::Admission::Accepted) => {
+                    self.observe_receiver_release(
+                        id,
+                        length,
+                        deadline,
+                        receiver_handoff::Release::Admitted,
+                    );
+                    self.handoff = None;
+                }
                 Ok(receiver::Admission::Duplicate | receiver::Admission::StaleSource)
                     if self
                         .receive_config
@@ -1375,13 +1463,27 @@ impl Endpoint {
                         .independent_short_frame_bytes
                         != 0 =>
                 {
+                    self.observe_receiver_release(
+                        id,
+                        length,
+                        deadline,
+                        receiver_handoff::Release::AlreadyObserved,
+                    );
                     // The same real source may already have been observed
                     // before ordered recovery reached it. Receiver tombstones
                     // retain conflict evidence until contiguous retirement.
                     self.handoff = None;
                 }
                 Ok(_) => return self.fail(Error::Identity),
-                Err(receiver::Error::Capacity | receiver::Error::RecordWindow) => break,
+                Err(error @ (receiver::Error::Capacity | receiver::Error::RecordWindow)) => {
+                    let reason = if error == receiver::Error::Capacity {
+                        receiver_handoff::Reason::Capacity
+                    } else {
+                        receiver_handoff::Reason::RecordWindow
+                    };
+                    self.observe_receiver_refusal(id, length, deadline, reason);
+                    break;
+                }
                 Err(error) => return self.fail(Error::Receiver(error)),
             }
         }
@@ -1626,6 +1728,9 @@ impl Endpoint {
     }
     fn fail<T>(&mut self, error: Error) -> Result<T, Error> {
         self.staged_wait.stop_observed();
+        if let Some(state) = self.receiver_handoff.first_mut() {
+            state.stop(self.now);
+        }
         self.failure = Some(error);
         Err(error)
     }

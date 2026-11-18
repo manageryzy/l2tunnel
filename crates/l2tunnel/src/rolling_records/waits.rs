@@ -2,6 +2,9 @@
 //! No occupancy, idle poll, timer hold or physical receipt is treated as admission.
 use super::*;
 
+/// Exact receiving data-head admission observations, separate from sender waits.
+pub mod ingress;
+
 /// Actual operation boundary; each site owns at most one unresolved operation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Site {
@@ -155,6 +158,8 @@ pub struct Snapshot {
     pub terminal: Option<(Tick, Terminal)>,
     /// Source admission, decoded handoff and feedback budget, in that order.
     pub sites: [SiteSnapshot; 3],
+    /// Available only when actual bounded receive ingress was selected.
+    pub ingress_admission: Option<ingress::Snapshot>,
     /// Invalid diagnostic time; protocol time checks remain independent.
     pub clock_regression: bool,
     /// Another operation was named while an earlier one remained unresolved.
@@ -170,6 +175,7 @@ impl Snapshot {
             observed_at: now,
             terminal: None,
             sites: [SiteSnapshot::default(); 3],
+            ingress_admission: None,
             clock_regression: false,
             identity_mismatch: false,
             overflow: false,
@@ -219,6 +225,46 @@ impl Snapshot {
             close(row, now, false, &mut self.overflow);
         }
     }
+    pub(super) fn ingress_refused(
+        &mut self,
+        input: ingress::Input,
+        blocker: Option<rolling::expiry::DecoderJob>,
+        now: Tick,
+    ) {
+        if !self.observe(now) {
+            return;
+        }
+        if let Some(value) = &mut self.ingress_admission {
+            value.refuse(
+                input,
+                blocker,
+                now,
+                &mut self.identity_mismatch,
+                &mut self.overflow,
+            );
+        }
+    }
+    pub(super) fn ingress_completed(
+        &mut self,
+        input: ingress::Input,
+        outcome: ingress::Outcome,
+        admitted_job: Option<rolling::expiry::DecoderJob>,
+        now: Tick,
+    ) {
+        if !self.observe(now) {
+            return;
+        }
+        if let Some(value) = &mut self.ingress_admission {
+            value.complete(
+                input,
+                outcome,
+                admitted_job,
+                now,
+                &mut self.identity_mismatch,
+                &mut self.overflow,
+            );
+        }
+    }
     /// Copy at caller-supplied observation time without advancing any protocol owner.
     pub fn observed(mut self, now: Tick) -> Self {
         self.observe(now);
@@ -231,11 +277,15 @@ impl Snapshot {
         self
     }
     pub(super) fn stop(&mut self, now: Tick, boundary: Terminal) {
+        let fresh = self.observed_at == now;
         if !self.observe(now) {
             return;
         }
         for row in &mut self.sites {
             close(row, now, true, &mut self.overflow);
+        }
+        if let Some(value) = &mut self.ingress_admission {
+            value.stop(now, fresh, &mut self.overflow);
         }
         self.terminal = Some((now, boundary));
     }
