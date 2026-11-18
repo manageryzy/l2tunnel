@@ -67,9 +67,7 @@ impl Receiver {
     /// Observe every actual retained nested capacity, excluding the inline header.
     /// The same observation works with the unchanged compatibility constructor.
     pub fn storage_usage(&self) -> Result<storage::Usage, storage::Error> {
-        self.decoder
-            .storage_usage()?
-            .join(self.gaps.queues.usage()?)
+        self.decoder.storage_usage()?.join(self.gaps.usage()?)
     }
 
     /// Conservative total reservation, excluding caller buffers/allocator overhead.
@@ -78,7 +76,7 @@ impl Receiver {
         add(
             add(
                 Decoder::sliding_memory_bound(policy.recovery)?,
-                targeted::Queues::bytes(policy)?,
+                targeted::GapTracker::bytes(policy)?,
             )?,
             std::mem::size_of::<Self>(),
         )
@@ -135,6 +133,30 @@ impl Receiver {
         }
         self.events = (self.events + 1).min(self.policy.feedback_packets);
         Ok(())
+    }
+    /// Whether this exact original belongs to the current targeted gap window.
+    pub fn tracks_queued_source(&self, id: SourceId) -> bool {
+        let prefix = self.decoder.status().decoded_prefix;
+        self.policy.source_wire.is_targeted()
+            && id.0 != u32::MAX
+            && id
+                .0
+                .checked_sub(prefix)
+                .is_some_and(|offset| (offset as usize) < self.policy.recovery.window)
+    }
+    /// Record one successful authenticated local FIFO acquisition. This grants
+    /// neither cumulative receipt nor decoder publication.
+    pub fn hold_queued_source(&mut self, id: SourceId) -> Result<(), Error> {
+        if !self.tracks_queued_source(id) {
+            return Err(Error::Identity);
+        }
+        self.gaps.hold(id.0)
+    }
+    /// Release exactly one such occurrence after its local ownership ends.
+    pub fn release_queued_source(&mut self, id: SourceId) {
+        if self.policy.source_wire.is_targeted() {
+            self.gaps.release(id.0);
+        }
     }
     /// Stage one complete caller-authenticated source/repair record through the existing codec.
     /// No input queue is hidden: an actual pending decode job returns Busy unchanged.

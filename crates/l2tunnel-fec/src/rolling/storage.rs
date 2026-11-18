@@ -84,6 +84,7 @@ impl Plan {
                     policy.recovery.window,
                     if targeted { 2 } else { 1 },
                 )?)?)?
+                .join(scheduler::Sender::earned_storage_plan(policy)?)?
                 .join(scheduler::fresh::Queue::plan(policy)?)?
                 .join(scheduler::targeted::Queues::plan(policy)?)?,
         })
@@ -101,7 +102,7 @@ impl Plan {
             policy,
             kind: Kind::Receiver,
             usage: Decoder::sliding_requested_storage(policy.recovery)?
-                .join(scheduler::targeted::Queues::plan(policy)?)?,
+                .join(scheduler::targeted::GapTracker::plan(policy)?)?,
         })
     }
 

@@ -182,6 +182,27 @@ impl Budget {
         }
     }
 
+    pub(super) fn price_regular(
+        &mut self,
+        id: rolling::RepairId,
+        support: rolling::Support,
+        compact: bool,
+        header_bytes: usize,
+        framing: Option<codec::FragmentConfig>,
+        overhead: usize,
+    ) -> Result<bool, rolling::Error> {
+        let extent = self.extent(support);
+        let length = if compact {
+            rolling::wire::compact::repair_len(id, support.end, extent)?
+        } else {
+            header_bytes
+                .checked_add(extent)
+                .ok_or(rolling::Error::Length)?
+        };
+        let (_, wire_bytes) =
+            wire_charge(framing, length, overhead).map_err(|_| rolling::Error::Length)?;
+        Ok(self.regular(wire_bytes as u64))
+    }
     fn regular(&mut self, wire_bytes: u64) -> bool {
         let status = &mut self.status;
         status.regular_opportunities = status.regular_opportunities.saturating_add(1);
@@ -215,6 +236,7 @@ impl<P: RecoveryPolicy> Endpoint<P> {
         self.packing
             .enable_fragment_tail_packing()
             .map_err(Error::Sender)?;
+        P::enable_earned_regular(&mut self.sender).map_err(Error::Rolling)?;
         budget.status.cap_half_bytes = 2 * 32 * u64::from(mtu);
         Ok(())
     }
@@ -264,17 +286,7 @@ impl<P: RecoveryPolicy> Endpoint<P> {
         let overhead = self.overhead;
         let framing = self.framing;
         P::send_step_filtered(&mut self.sender, rolling_tick(now), work, |id, support| {
-            let extent = budget.extent(support);
-            let length = if compact {
-                rolling::wire::compact::repair_len(id, support.end, extent)?
-            } else {
-                P::HEADER_BYTES
-                    .checked_add(extent)
-                    .ok_or(rolling::Error::Length)?
-            };
-            let (_, wire_bytes) =
-                wire_charge(framing, length, overhead).map_err(|_| rolling::Error::Length)?;
-            Ok(budget.regular(wire_bytes as u64))
+            budget.price_regular(id, support, compact, P::HEADER_BYTES, framing, overhead)
         })
         .map_err(Error::Rolling)
     }

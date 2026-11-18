@@ -110,6 +110,10 @@ fn targeted_repair_budget_prices_real_retries_and_suppresses_before_encoding() -
     );
     assert_eq!(before.balance_half_bytes, 3 * original.wire_bytes as u64);
     emit_source(&mut owner, 3, 80)?;
+    let at_confirmation = owner
+        .repair_budget_status()
+        .ok_or("missing physical-receipt price")?;
+    assert_eq!(at_confirmation.displaced_repairs, 1);
     let progress = owner.step(Tick(4), work())?;
     assert_eq!((progress.send.field, progress.send.copies), (0, 0));
     assert!(owner.sender.pending_output().is_none());
@@ -247,5 +251,34 @@ fn overlapping_requests_own_their_tier_through_ack_and_physical_backpressure() -
             weight * charges[index]
         );
     }
+    Ok(())
+}
+
+#[test]
+fn one_copy_earning_source_publishes_its_own_larger_extent_before_pricing() -> TestResult {
+    let config = config(true, rolling::wire::SourceWire::TargetedExact);
+    let mut owner = endpoint(config, Role::Client)?;
+    owner.enable_compact_wire(41)?;
+    owner.enable_queue_aware_repair_budget(1500)?;
+    let (_, first) = emit_source(&mut owner, 0, 75)?;
+    let (_, last) = emit_source(&mut owner, 1, 116)?;
+    assert!(last > first);
+    let status = owner.repair_budget_status().ok_or("repair budget")?;
+    let inner = compact::repair_len(rolling::RepairId(1), 2, last + 2)?;
+    assert_eq!(status.opportunity_wire_bytes, (inner + 41) as u64);
+    assert_eq!(status.displaced_repairs, 0);
+    owner.step(Tick(2), work())?;
+    let (ready, bytes) = prepare(&mut owner, Tick(2))?;
+    assert_eq!(ready.wire_bytes as u64, status.opportunity_wire_bytes);
+    let compact::View::Data(rolling::wire::View::Repair(r)) = compact::inspect(
+        config.forward.scheduler.recovery,
+        owner.send_rolling_scope,
+        &bytes,
+    )?
+    else {
+        return Err("expected repair".into());
+    };
+    assert_eq!((r.id.0, r.support.end, r.bytes.len()), (1, 2, last + 2));
+    owner.confirm_output(Tick(2), ready)?;
     Ok(())
 }

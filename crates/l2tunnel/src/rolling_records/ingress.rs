@@ -14,6 +14,7 @@ pub struct IngressLimits {
 #[derive(Clone, Copy)]
 pub(super) struct Input {
     pub(super) kind: record_engine::EmissionKind,
+    pub(super) held_source: Option<rolling::SourceId>,
     pub(super) number: Option<u64>,
     pub(super) received: Tick,
     pub(super) order: Option<codec::CausalTime>,

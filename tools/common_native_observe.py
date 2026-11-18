@@ -81,6 +81,46 @@ def distribution(histogram):
             'histogram_ip_packet_bytes': {str(size): amount for size, amount in sorted(histogram.items())}}
 
 
+def observe_tcp_sack(packet, ihl, counts):
+    """Count visible ACK options on this surface; each ACK contributes at most once."""
+    if int.from_bytes(packet[6:8], 'big') & 0x3fff:
+        counts['unparsed_fragments'] += 1
+        return
+    tcp = packet[ihl:]
+    header = (tcp[12] >> 4) * 4 if len(tcp) >= 20 else 0
+    if not 20 <= header <= len(tcp):
+        counts['malformed_headers'] += 1
+        return
+    if not tcp[13] & 0x10:
+        return
+    counts['ack_packets'] += 1
+    offset, first = 20, None
+    while offset < header:
+        kind = tcp[offset]
+        if kind == 0:
+            break
+        if kind == 1:
+            offset += 1
+            continue
+        size = tcp[offset + 1] if offset + 1 < header else 0
+        if size < 2 or offset + size > header:
+            counts['malformed_options'] += 1
+            return
+        if kind == 5:
+            if first is not None or size < 10 or (size - 2) % 8:
+                counts['malformed_options'] += 1
+                return
+            first = struct.unpack_from('!II', tcp, offset + 2)
+        offset += size
+    if first is not None:
+        counts['acks_with_sack'] += 1
+        extent = (first[1] - first[0]) & 0xffffffff
+        if 1 <= extent <= 64:
+            counts['first_block_1_to_64_bytes'] += 1
+        if extent == 16:
+            counts['first_block_16_bytes'] += 1
+
+
 def capture_summary(path, addresses, sample_wall_ns=None):
     """Count observed IP lengths, never infer plaintext or per-packet encapsulation.
 
@@ -95,6 +135,7 @@ is separate; summing the two would double-count delivery.
              b'\x4d\x3c\xb2\xa1': ('<', 1), b'\xa1\xb2\x3c\x4d': ('>', 1)}
     total = {'a_to_b': Counter(), 'b_to_a': Counter()}
     sample = {'a_to_b': Counter(), 'b_to_a': Counter()}
+    tcp_sample = {'a_to_b': Counter(), 'b_to_a': Counter()}
     protocols, first, last, count, non_ip = Counter(), None, None, 0, 0
     with path.open('rb') as stream:
         header = stream.read(24)
@@ -143,11 +184,14 @@ is separate; summing the two would double-count delivery.
             total[direction][length] += 1
             if sample_wall_ns is not None and sample_wall_ns[0] <= stamp < sample_wall_ns[1]:
                 sample[direction][length] += 1
+                if packet[9] == socket.IPPROTO_TCP:
+                    observe_tcp_sack(packet[:length], ihl, tcp_sample[direction])
     return {'status': 'parsed', 'captured_packets': count, 'non_ipv4_packets': non_ip,
             'first_wall_ns': first, 'last_wall_ns': last, 'ip_protocol_counts': dict(protocols),
             'whole_capture': {key: distribution(value) for key, value in total.items()},
             'sample_window': None if sample_wall_ns is None else {
-                'wall_ns': list(sample_wall_ns), **{key: distribution(value) for key, value in sample.items()}},
+                'wall_ns': list(sample_wall_ns), 'observed_ipv4_tcp_ack_options': tcp_sample,
+                **{key: distribution(value) for key, value in sample.items()}},
             'definition': 'IPv4 total_length at this capture surface; packet-size quantiles are not encapsulation-overhead quantiles'}
 
 

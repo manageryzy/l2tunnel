@@ -337,6 +337,7 @@ impl Receiver {
                 padding: old.padding,
                 deadline: old.deadline,
                 early_delivered: old.early_delivered,
+                independent_short: old.independent_short,
                 defer_early: old.defer_early,
             })
         } else {

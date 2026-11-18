@@ -1113,7 +1113,16 @@ the original 75.78–75.94 Mbit/s Python reference. Interleaving source sends
 with a full global equation passed scalar byte comparison on 69 repairs and
 two clean UDP runs at 52.14 and 53.03 Mbit/s. Charging projected native
 authentication and UDP sizes in the Python model yielded 75.73 and 76.06
-Mbit/s. See the C48 evidence in `docs/modules/frame-channel-experiment.md`.
+Mbit/s. The [global repair and short TCP segment study](modules/frame-channel-experiment.md#global-repair-scheduling-and-small-tcp-segments)
+also records the 54.71/51.56 Mbit/s sender experiment and its grouped local
+supports. The receiver traces match small out-of-order TCP ranges to specific
+SACKs using the native captures from both ends. The
+[repair-selection and socket admission measurements](modules/frame-channel-experiment.md#repair-selection-and-tcp-socket-admission)
+verify all 1,673 source-earned repair equations against an independent oracle.
+The original R19 native pair delivered 42.49/43.00 Mbit/s. Enforcing the
+Python per-stream payload budget in a separate native workload control yielded
+64.09/66.96 Mbit/s and scheduled-to-read P99 of 3.48/2.86 s. Both pairs drained
+every source. TEST-12 remains open for the original throughput and latency targets.
 
 ## Per-mode parity implementation gates
 

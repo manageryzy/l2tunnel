@@ -7,6 +7,7 @@ const REPEAT: u64 = 80_000;
 pub(super) const PROBE: u64 = 140_000;
 const MAX_IDS: usize = 8;
 const NONE: u32 = u32::MAX;
+const PARKED: usize = 3;
 
 /// Local sender counts for authenticated, explicitly named source IDs.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -250,26 +251,101 @@ impl Queues {
     }
 }
 
-pub(super) struct GapTracker {
-    pub(super) queues: Queues,
+#[derive(Clone, Copy, Default)]
+struct Selected {
+    id: u32,
+    list: usize,
+    due: u64,
+}
+#[derive(Clone, Copy, Default)]
+struct Custody {
+    id: u32,
+    copies: u32,
+}
+pub(in crate::rolling) struct GapTracker {
+    queues: Queues,
+    custody: Vec<Custody>,
     seen: u32,
     prefer_old: bool,
     next_batch: Tick,
     prefix: u32,
-    ids: [u32; MAX_IDS],
+    ids: [Selected; MAX_IDS],
     count: usize,
 }
 impl GapTracker {
+    pub(in crate::rolling) fn plan(policy: Policy) -> Result<storage::Usage, storage::Error> {
+        Queues::plan(policy)?.join(storage::requested::<Custody>(Queues::count(policy))?)
+    }
+    pub(super) fn bytes(policy: Policy) -> Result<usize, Error> {
+        add(
+            Queues::bytes(policy)?,
+            mul(Queues::count(policy), std::mem::size_of::<Custody>())?,
+        )
+    }
+    pub(super) fn usage(&self) -> Result<storage::Usage, storage::Error> {
+        self.queues
+            .usage()?
+            .join(storage::Usage::vector(&self.custody)?)
+    }
     pub(super) fn new(policy: Policy) -> Result<Self, Error> {
         Ok(Self {
             queues: Queues::new(policy)?,
+            custody: slots(Queues::count(policy), Custody::default())?,
             seen: 0,
             prefer_old: false,
             next_batch: Tick(0),
             prefix: 0,
-            ids: [0; MAX_IDS],
+            ids: [Selected::default(); MAX_IDS],
             count: 0,
         })
+    }
+    fn park_due(&mut self, candidate: Selected) {
+        let slot = self.queues.slot(candidate.id);
+        self.queues.remove(slot);
+        // 0/1 are active lists, 2 is detached. Parked entries retain their
+        // original list and already-matured eligibility stamp.
+        self.queues.entries[slot].list = PARKED + candidate.list;
+        self.queues.entries[slot].stamp = candidate.due;
+    }
+    pub(super) fn hold(&mut self, id: u32) -> Result<(), Error> {
+        let slot = self.queues.slot(id);
+        let held = &mut self.custody[slot];
+        if held.id != id {
+            *held = Custody { id, copies: 0 };
+        }
+        held.copies = held.copies.checked_add(1).ok_or(Error::Capacity)?;
+        if let Some(i) = self.ids[..self.count].iter().position(|v| v.id == id) {
+            self.park_due(self.ids[i]);
+            self.ids.copy_within(i + 1..self.count, i);
+            self.count -= 1;
+        }
+        Ok(())
+    }
+    pub(super) fn release(&mut self, id: u32) {
+        let slot = self.queues.slot(id);
+        let held = &mut self.custody[slot];
+        if held.id != id || held.copies == 0 {
+            return;
+        }
+        held.copies -= 1;
+        let entry = self.queues.entries[slot];
+        if held.copies != 0 || entry.id != id || entry.list < PARKED {
+            return;
+        }
+        // Only due entries were parked. Put the mature item ahead of any
+        // later timer while preserving its stamp and the shared batch cap.
+        let list = entry.list - PARKED;
+        let after = self.queues.head[list];
+        let item = &mut self.queues.entries[slot];
+        item.list = list;
+        item.before = NONE;
+        item.after = after;
+        if after == NONE {
+            self.queues.tail[list] = slot as u32;
+        } else {
+            self.queues.entries[after as usize].before = slot as u32;
+        }
+        self.queues.head[list] = slot as u32;
     }
     pub(super) fn wake(&self, decoder: &Decoder, now: Tick) -> Option<Tick> {
         if self.queues.entries.is_empty() {
@@ -340,13 +416,23 @@ impl GapTracker {
                 {
                     continue;
                 }
-                self.ids[self.count] = entry.id;
+                let candidate = Selected {
+                    id: entry.id,
+                    list,
+                    due: entry.stamp,
+                };
+                let held = self.custody[slot];
+                if held.id == entry.id && held.copies != 0 {
+                    self.park_due(candidate);
+                    continue;
+                }
+                self.ids[self.count] = candidate;
                 self.count += 1;
                 self.prefer_old = list == 0;
                 self.queues.push(entry.id, 1, again.0);
             }
             if self.count > 0 {
-                self.ids[..self.count].sort_unstable();
+                self.ids[..self.count].sort_unstable_by_key(|v| v.id);
                 self.prefix = status.decoded_prefix;
                 self.next_batch = deadline(now, GAP)?;
             }
@@ -354,9 +440,11 @@ impl GapTracker {
         if self.count == 0 {
             return Ok(None);
         }
-        let start = self.ids[0];
-        let n = self.ids[..self.count].partition_point(|&v| v - start < 32);
-        let mask = self.ids[..n].iter().fold(0, |m, &i| m | (1 << (i - start)));
+        let start = self.ids[0].id;
+        let n = self.ids[..self.count].partition_point(|v| v.id - start < 32);
+        let mask = self.ids[..n]
+            .iter()
+            .fold(0, |m, v| m | (1 << (v.id - start)));
         self.ids.copy_within(n..self.count, 0);
         self.count -= n;
         Ok(Some(GapRequest {

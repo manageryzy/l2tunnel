@@ -43,6 +43,67 @@ fn queued(config: Config, slots: usize) -> TestResult<(Endpoint, storage::Usage)
 }
 
 #[test]
+fn busy_decoder_requests_only_holes_outside_authenticated_fifo_custody() -> TestResult {
+    let mut config = short_config(0, rolling::wire::SourceWire::TargetedExact);
+    config.forward.scheduler.repair_numerator = 0;
+    config.forward.scheduler.feedback_packets = 64;
+    let mut sender = endpoint(config, Role::Client)?;
+    sender.enable_queue_aware_repair_budget(1500)?;
+    let mut serial = 1;
+    let mut packets = Vec::new();
+    for source in 0u32..4 {
+        sender
+            .enqueue_admitted_identified(Tick(0), 0, &packet(true, source as u8, 80))?
+            .ok_or("admitted frame")?;
+        sender.flush(Tick(0))?;
+        sender.step(Tick(0), work())?;
+        let (prepared, data) =
+            emit(&mut sender, Tick(0), &mut serial, true)?.ok_or("systematic source")?;
+        assert_eq!(
+            prepared.id,
+            OutputId::Data(scheduler::OutputId::Source(rolling::SourceId(source)))
+        );
+        packets.push(data);
+    }
+    let (mut receiver, _) = queued(config, 1)?;
+    receiver.accept_authenticated(Tick(0), packets[3].kind, &packets[3].bytes)?;
+    receiver.accept_authenticated(Tick(1), packets[0].kind, &packets[0].bytes)?;
+    assert_eq!(
+        receiver.accept_authenticated(Tick(1), packets[1].kind, &packets[1].bytes),
+        Err(Error::Busy)
+    );
+    let queued = receiver.ingress_status().ok_or("queue")?;
+    assert_eq!(queued.packets, 1);
+    assert_eq!(queued.full_refusals, [1, 0, 0]);
+    // Observe the real receiver between the decoder grant and its next FIFO
+    // handoff. The arrived original cannot advance the authenticated prefix.
+    receiver.incoming.step(rolling::Tick(1), work())?;
+    receiver.incoming.step(rolling::Tick(2_001), work())?;
+    let requested = receiver
+        .incoming
+        .pending_request()
+        .ok_or("actual gap request")?;
+    assert_eq!(
+        (requested.start, requested.mask, requested.prefix),
+        (1, 3, 0)
+    );
+    assert_eq!(
+        receiver.ingress_status().ok_or("held source")?.deadline,
+        queued.deadline
+    );
+    receiver
+        .incoming
+        .confirm_feedback(requested.id, rolling::Tick(2_001))?;
+    receiver.step(Tick(2_002), work())?;
+    assert_eq!(
+        receiver.ingress_status().ok_or("released source")?.packets,
+        0
+    );
+    assert_eq!(receiver.receiver_status().decoder.decoded_prefix, 1);
+    Ok(())
+}
+
+#[test]
 fn actual_queue_retains_busy_input_exact_bytes_and_original_age_until_decoder_ownership()
 -> TestResult {
     let config = short_config(64, rolling::wire::SourceWire::Exact);

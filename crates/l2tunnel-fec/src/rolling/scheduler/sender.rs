@@ -87,7 +87,7 @@ pub struct SenderStatus {
     pub sent_sources: u32,
     /// Residual exact numerator units, always below the denominator.
     pub repair_credit: u32,
-    /// Regular earned repairs waiting for service, at most two for targeted service.
+    /// Earned regular repairs waiting for service, including bounded full-global catch-up.
     pub regular_due: u32,
     /// Unfinished repairs in the current bounded tail burst, including its output.
     pub tail_remaining: u32,
@@ -142,10 +142,14 @@ pub struct Sender {
     // Unexposed full-window equation behind one immutable physical source.
     // Its encoder retains the original cap and all unread columns.
     parked_regular: Option<(RepairId, Tick)>,
+    // Physical copies still available above the usual two-regular-debt gate.
+    global_extra_copies: u8,
     source_copy: Option<SourceCopy>,
     sent: u32,
     credit: u32,
     regular_due: u32,
+    // One prepaid slot only for the targeted policy; enabled before any source.
+    earned: Vec<earned::Queue>,
     tail_remaining: u32,
     tail_due: Option<Tick>,
     feedback: Option<Feedback>,
@@ -175,16 +179,25 @@ impl Sender {
         self.encoder
             .storage_usage()?
             .join(self.retry_queue.usage()?)?
-            .join(self.fresh.usage()?)
+            .join(self.fresh.usage()?)?
+            .join(storage::Usage::vector(&self.earned)?)
     }
 
+    pub(in crate::rolling) fn earned_storage_plan(
+        policy: Policy,
+    ) -> Result<storage::Usage, storage::Error> {
+        storage::requested::<earned::Queue>(usize::from(policy.source_wire.is_targeted()))
+    }
     /// Conservative total retained reservation, excluding caller buffers/allocator overhead.
     pub fn memory_bound(policy: Policy) -> Result<usize, Error> {
         policy.validate()?;
         add(
             add(
                 if policy.source_wire.is_targeted() {
-                    Encoder::targeted_memory_bound(policy.recovery)?
+                    add(
+                        Encoder::targeted_memory_bound(policy.recovery)?,
+                        std::mem::size_of::<earned::Queue>(),
+                    )?
                 } else {
                     Encoder::sliding_memory_bound(policy.recovery)?
                 },
@@ -202,6 +215,10 @@ impl Sender {
             return Err(Error::Capacity);
         }
         deadline(now, policy.tail_ticks)?;
+        let mut earned = Vec::new();
+        if policy.source_wire.is_targeted() {
+            earned.try_reserve_exact(1).map_err(|_| Error::Capacity)?;
+        }
         Ok(Self {
             encoder: if policy.source_wire.is_targeted() {
                 Encoder::new_targeted(policy.recovery, scope, now)?
@@ -225,10 +242,12 @@ impl Sender {
             pending: None,
             output_end: None,
             parked_regular: None,
+            global_extra_copies: 0,
             source_copy: None,
             sent: 0,
             credit: 0,
             regular_due: 0,
+            earned,
             tail_remaining: 0,
             tail_due: None,
             feedback: None,
@@ -236,6 +255,27 @@ impl Sender {
             terminal: None,
             expiry_failure: None,
         })
+    }
+    /// Bind future regular equations to the original which earned them. Configure once
+    /// before source admission; priced copy receipts settle displacement at that boundary.
+    pub fn enable_earned_regular(&mut self) -> Result<(), Error> {
+        if !self.policy.source_wire.is_targeted()
+            || !self.earned.is_empty()
+            || self.status().next_source != 0
+        {
+            return Err(Error::Configuration);
+        }
+        self.earned.push(earned::Queue::new());
+        Ok(())
+    }
+    fn clear_regular(&mut self) {
+        if let Some(queue) = self.earned.first_mut() {
+            queue.clear();
+        }
+        self.regular_due = 0;
+    }
+    fn first_earned(&self) -> Option<earned::Entry> {
+        self.earned.first()?.front()
     }
     fn fail<T>(&mut self, error: Error) -> Result<T, Error> {
         self.terminal = Some(error);
@@ -248,12 +288,16 @@ impl Sender {
         if let Err(error) = check_time(
             self.last,
             now,
-            &[self.output_end, self.fresh.earliest().map(|e| Tick(e.due))],
+            &[
+                self.output_end,
+                self.fresh.earliest().map(|e| Tick(e.due)),
+                self.first_earned().map(|v| v.deadline),
+            ],
         ) {
             if error == Error::Expired {
                 self.expiry_failure = self
                     .expiry_failure
-                    .or_else(|| self.expiry_snapshot().first_expired(now, &[3, 4]));
+                    .or_else(|| self.expiry_snapshot().first_expired(now, &[3, 4, 5]));
             }
             return self.fail(error);
         }
@@ -373,6 +417,16 @@ impl Sender {
         during_global: bool,
         budget: &mut WorkBudget,
     ) -> Result<bool, Error> {
+        if let Some(queue) = self.earned.first()
+            && let Some(old) = self
+                .encoder
+                .status()
+                .next_source
+                .checked_sub(self.policy.recovery.window as u32)
+            && queue.blocks_overwrite(old)
+        {
+            return Ok(false);
+        }
         let (e, original) = self.fresh.front().ok_or(Error::Busy)?;
         let Some(id) = self.encoder.admit_queued_source(
             original,
@@ -399,7 +453,8 @@ impl Sender {
     }
     /// An opt-in targeted sender may displace an earned regular opportunity with
     /// already accepted retry bytes. A displaced opportunity starts no equation
-    /// and consumes no repair serial, output reservation or source custody.
+    /// and consumes no repair serial, output reservation or source custody. A sender
+    /// bound to source-earned repairs has already priced its opportunities at copy receipts.
     pub fn step_with_regular_filter(
         &mut self,
         now: Tick,
@@ -414,7 +469,7 @@ impl Sender {
             let targeted = self.policy.source_wire.is_targeted();
             let outstanding = state.confirmed_prefix != state.next_source;
             if !outstanding {
-                self.regular_due = 0;
+                self.clear_regular();
                 self.tail_remaining = 0;
                 self.tail_due = None;
             }
@@ -460,15 +515,30 @@ impl Sender {
                 let tail = self.regular_due == 0;
                 if !tail || self.tail_remaining != 0 {
                     self.last_named = false;
-                    if !tail && self.policy.source_wire.is_targeted() {
+                    if self.earned.is_empty() && !tail && self.policy.source_wire.is_targeted() {
                         let (id, support) = self.encoder.next_regular()?;
                         if displace(id, support)? {
                             self.regular_due -= 1;
                             return Ok(used(before, budget));
                         }
                     }
-                    let end = self.later(now, self.policy.recovery.job_ticks)?;
-                    let id = self.encoder.begin_repair(tail, now)?;
+                    let (id, end) = if !tail && !self.earned.is_empty() {
+                        let entry = self.first_earned().ok_or(Error::Identity)?;
+                        let id = self.encoder.begin_earned_regular(
+                            entry.id,
+                            entry.support,
+                            entry.deadline,
+                            now,
+                        )?;
+                        self.earned.first_mut().ok_or(Error::Identity)?.pop();
+                        (id, entry.deadline)
+                    } else {
+                        (
+                            self.encoder.begin_repair(tail, now)?,
+                            self.later(now, self.policy.recovery.job_ticks)?,
+                        )
+                    };
+                    self.global_extra_copies = 64;
                     if !tail {
                         self.regular_due -= 1;
                     }
@@ -506,10 +576,22 @@ impl Sender {
         let named = self.retry_queue.has_retries();
         let probe = state.confirmed_prefix < self.sent && self.tail_due.is_some_and(|t| now >= t);
         self.competing = self.fresh.len > 0;
-        let fresh = self.competing && self.regular_due < 2;
-        if fresh && (!(named || probe) || self.balance <= 0) {
+        let copies = self.fresh.front().map_or(0, |(entry, _)| entry.copies);
+        let normal = self.regular_due < 2;
+        // Retain the normal recovery priority when a named or old-gap retry is due.
+        // Each accepted original can earn at most one regular equation.
+        let debt_limit = u32::from(self.policy.recovery.global_every.min(16));
+        let extra = !normal
+            && !named
+            && !probe
+            && copies <= self.global_extra_copies
+            && self.regular_due < debt_limit;
+        if self.competing && ((normal && (!(named || probe) || self.balance <= 0)) || extra) {
             match self.select_fresh(now, true, budget) {
                 Ok(true) => {
+                    if extra {
+                        self.global_extra_copies -= copies;
+                    }
                     self.parked_regular = Some((id, end));
                     return Ok(());
                 }
@@ -586,7 +668,13 @@ impl Sender {
             return self.fail(Error::TimeRegression);
         }
         self.time(observed)?;
-        self.finish_output(OutputId::Source(token.id), observed, accepted, wire_bytes)
+        self.finish_output(
+            OutputId::Source(token.id),
+            observed,
+            accepted,
+            wire_bytes,
+            |_, _| Ok(false),
+        )
     }
     /// Only a named retry earns shared repair credit at complete physical acceptance.
     pub fn pending_requested_retry(&self) -> bool {
@@ -713,7 +801,7 @@ impl Sender {
             return Err(Error::Identity);
         }
         self.time(now)?;
-        self.finish_output(id, now, now, wire_bytes)
+        self.finish_output(id, now, now, wire_bytes, |_, _| Ok(false))
     }
     /// Consume exactly one caller-observed whole systematic-copy acceptance.
     /// A repeated ordinal is rejected before clock, counters or retirement change.
@@ -734,6 +822,18 @@ impl Sender {
         accepted: Tick,
         copy: SourceCopy,
         wire_bytes: usize,
+    ) -> Result<(), Error> {
+        self.confirm_source_copy_priced(observed, accepted, copy, wire_bytes, |_, _| Ok(false))
+    }
+    /// Confirm this actual ordinal, then settle at most one source-earned opportunity
+    /// against previously accepted retry credit before another source can be selected.
+    pub fn confirm_source_copy_priced(
+        &mut self,
+        observed: Tick,
+        accepted: Tick,
+        copy: SourceCopy,
+        wire_bytes: usize,
+        displace: impl FnMut(RepairId, Support) -> Result<bool, Error>,
     ) -> Result<(), Error> {
         if self.source_copy != Some(copy)
             || !matches!(self.pending, Some(Pending::Source(id)) if id == copy.source)
@@ -757,12 +857,14 @@ impl Sender {
             self.charge(true, wire_bytes);
             return Ok(());
         }
-        self.finish_output(
+        let result = self.finish_output(
             OutputId::Source(copy.source),
             observed,
             accepted,
             wire_bytes,
-        )
+            displace,
+        );
+        result.or_else(|error| self.fail(error))
     }
     fn charge(&mut self, fresh: bool, wire_bytes: usize) {
         if !self.competing {
@@ -783,6 +885,7 @@ impl Sender {
         now: Tick,
         accepted: Tick,
         wire_bytes: usize,
+        mut displace: impl FnMut(RepairId, Support) -> Result<bool, Error>,
     ) -> Result<(), Error> {
         let output = self.pending_output().ok_or(Error::Busy)?;
         if output.id() != id {
@@ -795,7 +898,29 @@ impl Sender {
                     deadline(accepted, self.idle_ticks()).or_else(|error| self.fail(error))?;
                 self.sent = source.0.checked_add(1).ok_or(Error::Exhausted)?;
                 let earned = self.credit + self.policy.repair_numerator;
-                self.regular_due += earned / self.policy.repair_denominator;
+                if earned >= self.policy.repair_denominator {
+                    if let Some(queue) = self.earned.first_mut() {
+                        let prefix = self
+                            .requested_prefix
+                            .max(self.feedback.map_or(0, |f| f.prefix));
+                        if prefix < self.sent {
+                            let (id, support) = self
+                                .encoder
+                                .following_regular(self.regular_due, self.sent)?;
+                            if !displace(id, support)? {
+                                let cap = deadline(accepted, self.policy.recovery.job_ticks)?;
+                                queue.push(earned::Entry {
+                                    id,
+                                    support,
+                                    deadline: cap,
+                                })?;
+                                self.regular_due += 1;
+                            }
+                        }
+                    } else {
+                        self.regular_due += 1;
+                    }
+                }
                 self.credit = earned % self.policy.repair_denominator;
                 if self.policy.source_wire.is_targeted() {
                     self.tail_due.get_or_insert(tail_due);
@@ -813,7 +938,7 @@ impl Sender {
                         .max(self.requested_prefix);
                     self.encoder.confirm_prefix(prefix, now)?;
                     if prefix == self.encoder.status().next_source {
-                        self.regular_due = 0;
+                        self.clear_regular();
                         self.tail_remaining = 0;
                         self.tail_due = None;
                     }
@@ -903,7 +1028,7 @@ impl Sender {
         self.observe_prefix_progress(feedback.prefix, now)?;
         self.feedback = Some(feedback);
         if released == self.encoder.status().next_source {
-            self.regular_due = 0;
+            self.clear_regular();
             self.tail_remaining = 0;
             self.tail_due = None;
         }
@@ -1014,6 +1139,16 @@ impl Sender {
                 }),
             )
         });
+        snapshot.candidates[5] = self.first_earned().map(|e| {
+            Deadline::new(
+                Kind::EncoderJob,
+                e.deadline,
+                Some(Identity::Repair {
+                    id: e.id,
+                    support: Some((e.support.start, e.support.end)),
+                }),
+            )
+        });
         snapshot.last_successful = self.last;
         snapshot.terminal = self.terminal.or(snapshot.terminal);
         snapshot.failure = self.expiry_failure.or(snapshot.failure);
@@ -1026,6 +1161,7 @@ impl Sender {
             .into_iter()
             .chain(self.output_end)
             .chain(self.fresh.earliest().map(|e| Tick(e.due)))
+            .chain(self.first_earned().map(|e| e.deadline))
             .min()
     }
     /// Earliest hard expiry or idle-tail trigger. Immediate output/work is visible in status.

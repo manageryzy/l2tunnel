@@ -110,6 +110,10 @@ preserved through cleanup.
   identity. Packet-size summaries include the whole phase and the sample window,
   mapped by a saved wall/monotonic clock anchor. Clock-anchor uncertainty remains
   visible.
+- **Observed TCP ACK options** count IPv4 ACK packets, ACKs carrying SACK,
+  and ACKs whose first SACK block spans 1–64 bytes or exactly 16 bytes, by
+  direction and capture surface during the sample window. Repeated reports of
+  one range each count. Fragments and malformed headers have separate counters.
 - **Runtime record metrics** are opt-in actual accepted-record histograms emitted
   at Runtime Drop using `L2TUNNEL_WIRE_METRICS`. They are cumulative across this
   case's phases and distinct from physical captured transport bytes. Inner record

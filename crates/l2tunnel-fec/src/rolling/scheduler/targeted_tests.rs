@@ -341,6 +341,100 @@ fn targeted_request_strict_bounds_and_direction_precede_custody_changes() -> Res
 }
 
 #[test]
+fn held_original_preserves_mature_gap_and_frozen_feedback_across_duplicate_release()
+-> Result<(), Error> {
+    let (policy, scope, work) = setup();
+    let mut r = Receiver::new(policy, scope, Tick(0))?;
+    inject(&mut r, 2, Tick(0), work)?;
+    r.hold_queued_source(SourceId(0))?;
+    r.hold_queued_source(SourceId(0))?;
+    assert_eq!(
+        r.hold_queued_source(SourceId(policy.recovery.window as u32)),
+        Err(Error::Identity)
+    );
+    r.release_queued_source(SourceId(policy.recovery.window as u32));
+    r.step(Tick(2_000), work)?;
+    let other = r.pending_request().ok_or(Error::Busy)?;
+    assert_eq!((other.start, other.mask), (1, 1));
+    r.release_queued_source(SourceId(0));
+    r.confirm_feedback(other.id, Tick(2_000))?;
+    r.step(Tick(5_000), work)?;
+    assert!(r.pending_request().is_none());
+    if let Some(ordinary) = r.pending_feedback() {
+        r.confirm_feedback(ordinary.id, Tick(5_000))?;
+    }
+    // Drop the second local occurrence without admitting it to the decoder.
+    // Its original 2 ms deadline already matured and no new timer is needed.
+    r.release_queued_source(SourceId(0));
+    r.step(Tick(5_000), work)?;
+    let due = r.pending_request().ok_or(Error::Busy)?;
+    assert_eq!((due.start, due.mask, due.scope), (0, 1, scope));
+    let mut before = [0; wire::compact::MAXIMUM_FEEDBACK_BYTES];
+    let len = r.encode_compact_request(due, &mut before)?;
+    r.hold_queued_source(SourceId(0))?;
+    let mut after = [0; wire::compact::MAXIMUM_FEEDBACK_BYTES];
+    assert_eq!(r.encode_compact_request(due, &mut after)?, len);
+    assert_eq!(after, before);
+    r.confirm_feedback(due.id, Tick(5_000))?;
+    r.release_queued_source(SourceId(0));
+    r.step(Tick(8_000), work)?;
+    assert!(r.pending_request().is_none());
+    assert_eq!(r.status().decoder.decoded_prefix, 0);
+    Ok(())
+}
+
+#[test]
+fn late_fifo_release_after_wrap_never_releases_a_new_generation() -> Result<(), Error> {
+    let (mut policy, scope, w) = setup();
+    policy.recovery.window = 4;
+    policy.recovery.local_window = 2;
+    policy.recovery.handoff_sources = 4;
+    let mut r = Receiver::new(policy, scope, Tick(0))?;
+    r.hold_queued_source(SourceId(0))?;
+    for id in 0..4 {
+        inject(&mut r, id, Tick(0), w)?;
+        r.confirm_handoff(SourceId(id), Tick(0))?;
+    }
+    assert!(!r.tracks_queued_source(SourceId(0)));
+    r.hold_queued_source(SourceId(4))?;
+    r.release_queued_source(SourceId(0));
+    inject(&mut r, 6, Tick(0), w)?;
+    r.step(Tick(2_000), w)?;
+    let request = r.pending_request().ok_or(Error::Busy)?;
+    assert_eq!((request.prefix, request.start, request.mask), (4, 5, 1));
+    r.confirm_feedback(request.id, Tick(2_000))?;
+    r.release_queued_source(SourceId(4));
+    r.step(Tick(4_000), w)?;
+    assert_eq!(r.pending_request().ok_or(Error::Busy)?.start, 4);
+    Ok(())
+}
+
+#[test]
+fn a_queued_original_withdraws_only_the_unsealed_distant_span() -> Result<(), Error> {
+    let (policy, scope, work) = setup();
+    let mut r = Receiver::new(policy, scope, Tick(0))?;
+    for id in (1..=36).filter(|&id| id != 35) {
+        inject(&mut r, id, Tick(0), work)?;
+    }
+    r.step(Tick(2_000), work)?;
+    let frozen = r.pending_request().ok_or(Error::Busy)?;
+    assert_eq!((frozen.start, frozen.mask), (0, 1));
+    r.hold_queued_source(SourceId(35))?;
+    assert_eq!(r.pending_request(), Some(frozen));
+    r.confirm_feedback(frozen.id, Tick(2_000))?;
+    r.step(Tick(2_100), work)?;
+    assert!(r.pending_request().is_none());
+    if let Some(ordinary) = r.pending_feedback() {
+        r.confirm_feedback(ordinary.id, Tick(2_100))?;
+    }
+    r.release_queued_source(SourceId(35));
+    r.step(Tick(4_000), work)?;
+    let next = r.pending_request().ok_or(Error::Busy)?;
+    assert_eq!((next.start, next.mask), (35, 1));
+    Ok(())
+}
+
+#[test]
 fn targeted_fresh_and_old_share_eight_ids_per_interval() -> Result<(), Error> {
     let (p, scope, w) = setup();
     let mut r = Receiver::new(p, scope, Tick(0))?;
@@ -834,5 +928,350 @@ fn targeted_contended_regular_debt_is_bounded_and_all_classes_advance() -> Resul
     assert_eq!((fresh, regular, oldest), (8, 9, 1));
     assert!(named >= 4);
     assert_eq!(s.status().encoder.confirmed_prefix, 0);
+    Ok(())
+}
+
+/// A real missing oldest source remains recoverable after multi-copy fresh
+/// handoffs accumulate repair debt across the global support's ring wrap.
+#[test]
+fn full_global_bounded_debt_keeps_oldest_probe_and_pays_all_earned_equations() -> Result<(), Error>
+{
+    old_hole_bounded_global(false)?;
+    old_hole_bounded_global(true)
+}
+fn old_hole_bounded_global(earned: bool) -> Result<(), Error> {
+    const LOST: u32 = 55;
+    const TOTAL: u32 = 148;
+    let (mut p, scope, full) = setup();
+    p.recovery.window = 64;
+    p.recovery.local_window = 16;
+    p.recovery.handoff_sources = 64;
+    p.repair_numerator = 41;
+    p.repair_denominator = 200;
+    let mut s = Sender::new(p, scope, Tick(0))?;
+    if earned {
+        s.enable_earned_regular()?;
+    }
+    let mut r = Receiver::new(p, scope, Tick(0))?;
+    let tiny = WorkBudget { field: 2, ..full };
+    let mut now = Tick(0);
+    let (mut offered, mut delivered, mut confirmed) = (0u32, 0u32, 0u32);
+    let (mut regular, mut final_originals, mut extra_copies) = (0u32, 0u32, 0u32);
+    let (mut peak_due, mut slow_grants, mut dropped_named, mut restored) = (0, 0, false, false);
+    let mut requested = false;
+    for _ in 0..100_000 {
+        while offered < TOTAL {
+            let data = offered.to_be_bytes();
+            match s.admit_source_with_copies_at(&data, now, now, 4) {
+                Ok(id) => {
+                    assert_eq!(id, SourceId(offered));
+                    offered += 1;
+                }
+                Err(Error::Capacity | Error::Busy) => break,
+                Err(e) => return Err(e),
+            }
+        }
+        if extra_copies >= 32 && !requested {
+            assert_eq!((confirmed, delivered), (LOST, LOST));
+            s.receive_request(
+                GapRequest {
+                    scope,
+                    id: FeedbackId(50_000),
+                    prefix: LOST,
+                    start: LOST,
+                    mask: 1,
+                },
+                now,
+            )?;
+            requested = true;
+        }
+        let before = s.status();
+        let running_global = s.computing_full_global();
+        let budget = if running_global {
+            tiny
+        } else {
+            WorkBudget { field: 32, ..full }
+        };
+        let used = s.step(now, budget)?;
+        let after = s.status();
+        peak_due = peak_due.max(after.regular_due);
+        assert!(after.regular_due <= 16);
+        if running_global
+            && before.regular_due >= 2
+            && after.encoder.next_source > before.encoder.next_source
+        {
+            assert!(used.field > 0 && used.copies > 0 && used.metadata > 0);
+            extra_copies += u32::from(s.pending_source_copy().ok_or(Error::Busy)?.total());
+            assert!(extra_copies <= 64);
+        }
+        if running_global
+            && before.regular_due >= 2
+            && before.queued_fresh > 0
+            && s.pending_output().is_none()
+        {
+            slow_grants += 1;
+        }
+        if let Some(token) = s.pending_retry_token() {
+            let Output::Source { id, original, .. } = s.pending_output().ok_or(Error::Busy)? else {
+                return Err(Error::Identity);
+            };
+            assert_eq!((id.0, original), (LOST, LOST.to_be_bytes().as_slice()));
+            if s.pending_requested_retry() {
+                assert!(requested && !dropped_named);
+                dropped_named = true;
+                s.confirm_retry(token, now, now)?;
+                now = s.status().tail_due.ok_or(Error::Busy)?;
+            } else {
+                assert!(dropped_named && !restored);
+                inject(&mut r, id.0, now, full)?;
+                s.confirm_retry(token, now, now)?;
+                restored = true;
+            }
+        } else if let Some(copy) = s.pending_source_copy() {
+            let id = copy.source().0;
+            if copy.ordinal() == 1 && id != LOST {
+                inject(&mut r, id, now, full)?;
+            }
+            s.confirm_source_copy_charged(now, now, copy, 60)?;
+            if copy.ordinal() == copy.total() {
+                final_originals += 1;
+            }
+        } else if let Some(Output::Repair(row)) = s.pending_output() {
+            // Drop all equations. The only route for LOST is its retained original.
+            regular += 1;
+            assert_eq!(row.id.0, u64::from(regular));
+            if earned {
+                assert_eq!(row.support.end, (regular * 200).div_ceil(41));
+            }
+            s.confirm_output(OutputId::Repair(row.id), now)?;
+        }
+        while let Some((id, bytes)) = r.pending_source() {
+            assert_eq!(
+                (id.0, bytes),
+                (delivered, delivered.to_be_bytes().as_slice())
+            );
+            r.confirm_handoff(id, now)?;
+            delivered += 1;
+        }
+        // Send a delayed complete cumulative ACK, keeping recovery outstanding
+        // until the owed opportunities have seen the normal post-job scheduler.
+        let ack = if final_originals == TOTAL && regular == TOTAL * 41 / 200 {
+            delivered
+        } else {
+            delivered.min(s.status().sent_sources.saturating_sub(8))
+        };
+        if ack > confirmed {
+            s.receive_feedback(
+                Feedback {
+                    scope,
+                    id: FeedbackId(60_000 + u64::from(ack)),
+                    prefix: ack,
+                    observed_end: ack,
+                    deficit: 0,
+                },
+                now,
+            )?;
+            confirmed = ack;
+        }
+        if confirmed == TOTAL {
+            break;
+        }
+    }
+    assert!(requested && dropped_named && restored);
+    assert_eq!(extra_copies, 64);
+    assert!(peak_due > 2 && slow_grants > 0);
+    assert_eq!(
+        (offered, final_originals, delivered, confirmed),
+        (TOTAL, TOTAL, TOTAL, TOTAL)
+    );
+    assert_eq!(
+        (regular, s.status().regular_due, s.status().repair_credit),
+        (TOTAL * 41 / 200, 0, TOTAL * 41 % 200)
+    );
+    assert_eq!(s.status().encoder.confirmed_prefix, TOTAL);
+    assert!(s.pending_output().is_none());
+    Ok(())
+}
+
+#[test]
+fn physical_last_copy_prices_once_and_later_credit_cannot_displace_it() -> Result<(), Error> {
+    let (mut p, scope, work) = setup();
+    p.repair_numerator = 1;
+    let mut s = Sender::new(p, scope, Tick(0))?;
+    s.enable_earned_regular()?;
+    s.admit_source_with_copies(&[1, 2, 3, 4, 0, 0], Tick(1), 3)?;
+    let mut attempts = Vec::new();
+    for ordinal in 1..=3 {
+        let copy = s.pending_source_copy().ok_or(Error::Busy)?;
+        assert_eq!(ordinal, copy.ordinal());
+        assert_eq!(s.pending_source_copy(), Some(copy));
+        let at = Tick(u64::from(ordinal));
+        s.confirm_source_copy_priced(at, at, copy, 64, |id, support| {
+            attempts.push((id, support));
+            Ok(false)
+        })?;
+        assert_eq!(attempts.len(), usize::from(ordinal == 3));
+        assert_eq!(
+            s.confirm_source_copy_priced(at, at, copy, 64, |_, _| Err(Error::Conflict)),
+            Err(Error::Identity)
+        );
+    }
+    assert_eq!(s.deadline(), Some(Tick(3 + p.recovery.job_ticks)));
+    let request = GapRequest {
+        scope,
+        id: FeedbackId(1),
+        prefix: 0,
+        start: 0,
+        mask: 1,
+    };
+    s.receive_request(request, Tick(4))?;
+    s.step(Tick(4), work)?;
+    let token = s.pending_retry_token().ok_or(Error::Busy)?;
+    s.confirm_retry_charged(token, Tick(4), Tick(4), 512)?;
+    s.step_with_regular_filter(Tick(5), work, |_, _| Err(Error::Conflict))?;
+    let Some(Output::Repair(r)) = s.pending_output() else {
+        return Err(Error::Busy);
+    };
+    assert_eq!(attempts, [(r.id, r.support)]);
+    let frozen = r.bytes.to_vec();
+    s.receive_feedback(
+        Feedback {
+            scope,
+            id: FeedbackId(2),
+            prefix: 1,
+            observed_end: 1,
+            deficit: 0,
+        },
+        Tick(6),
+    )?;
+    assert_eq!(s.deadline(), Some(Tick(3 + p.recovery.job_ticks)));
+    let Some(Output::Repair(r)) = s.pending_output() else {
+        return Err(Error::Busy);
+    };
+    assert_eq!(r.bytes, frozen);
+    s.confirm_output(OutputId::Repair(r.id), Tick(6))?;
+    assert_eq!(s.deadline(), None);
+    Ok(())
+}
+
+#[test]
+fn unstarted_earned_job_keeps_original_cap_or_clears_on_full_confirmation() -> Result<(), Error> {
+    let (mut p, scope, work) = setup();
+    p.repair_numerator = 1;
+    for acknowledge in [false, true] {
+        let mut s = Sender::new(p, scope, Tick(0))?;
+        s.enable_earned_regular()?;
+        s.admit_source(&[7], Tick(10))?;
+        s.confirm_output(OutputId::Source(SourceId(0)), Tick(11))?;
+        let cap = Tick(11 + p.recovery.job_ticks);
+        assert_eq!(s.deadline(), Some(cap));
+        if acknowledge {
+            s.receive_feedback(
+                Feedback {
+                    scope,
+                    id: FeedbackId(1),
+                    prefix: 1,
+                    observed_end: 1,
+                    deficit: 0,
+                },
+                Tick(12),
+            )?;
+            assert_eq!(s.status().regular_due, 0);
+            assert_eq!(s.deadline(), None);
+            s.admit_source(&[8], cap)?;
+            s.confirm_output(OutputId::Source(SourceId(1)), cap)?;
+            s.step(cap, work)?;
+            let Some(Output::Repair(r)) = s.pending_output() else {
+                return Err(Error::Busy);
+            };
+            assert_eq!((r.id, r.support.end), (RepairId(1), 2));
+        } else {
+            assert_eq!(s.step(cap, work), Err(Error::Expired));
+            let failed = s.expiry_snapshot().failure.ok_or(Error::Identity)?;
+            assert_eq!(
+                (failed.selected.at, failed.selected.identity),
+                (
+                    cap,
+                    Some(expiry::Identity::Repair {
+                        id: RepairId(1),
+                        support: Some((0, 1))
+                    })
+                )
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn queued_global_keeps_older_columns_than_the_earlier_local_across_repeated_wraps()
+-> Result<(), Error> {
+    let (mut p, scope, full) = setup();
+    p.recovery.window = 8;
+    p.recovery.local_window = 2;
+    p.recovery.global_every = 2;
+    p.recovery.handoff_sources = 8;
+    p.repair_numerator = 1;
+    p.repair_denominator = 1;
+    let at = Tick(0);
+    let mut s = Sender::new(p, scope, at)?;
+    s.enable_earned_regular()?;
+    let (mut offered, mut sent, mut repair_count, mut two_due) = (0u32, 0u32, 0u32, false);
+    fn bytes(i: u32) -> [u8; 4] {
+        (i.wrapping_mul(0x12345) + 7).to_be_bytes()
+    }
+    for _ in 0..16000 {
+        while offered < 96 {
+            match s.admit_source(&bytes(offered), at) {
+                Ok(id) => {
+                    assert_eq!(id.0, offered);
+                    offered += 1;
+                }
+                Err(Error::Busy | Error::Capacity) => break,
+                Err(e) => return Err(e),
+            }
+        }
+        s.step(at, WorkBudget { field: 3, ..full })?;
+        if let Some(c) = s.pending_source_copy() {
+            assert_eq!(c.source().0, sent);
+            s.confirm_source_copy_charged(at, at, c, 56)?;
+            sent += 1;
+            if sent > 2 {
+                s.receive_feedback(
+                    Feedback {
+                        scope,
+                        id: FeedbackId(u64::from(sent)),
+                        prefix: sent - 2,
+                        observed_end: sent - 2,
+                        deficit: 0,
+                    },
+                    at,
+                )?;
+            }
+        } else if let Some(Output::Repair(r)) = s.pending_output() {
+            repair_count += 1;
+            let end = repair_count;
+            let start = end.saturating_sub(if end.is_multiple_of(2) { 8 } else { 2 });
+            assert_eq!(
+                (r.id.0, r.support.start, r.support.end),
+                (u64::from(end), start, end)
+            );
+            let mut expected = [0u8; 6];
+            for id in start..end {
+                let coefficient =
+                    crate::field::compact_coefficient(end.wrapping_mul(2654435761), id);
+                for (out, byte) in expected.iter_mut().zip([0, 4].into_iter().chain(bytes(id))) {
+                    *out ^= crate::field::multiply(byte, coefficient);
+                }
+            }
+            assert_eq!(r.bytes, expected);
+            s.confirm_output(OutputId::Repair(r.id), at)?;
+        }
+        two_due |= s.status().regular_due >= 2;
+        if sent == 96 && repair_count == sent {
+            break;
+        }
+    }
+    assert_eq!((sent, repair_count, two_due), (96, 96, true));
     Ok(())
 }

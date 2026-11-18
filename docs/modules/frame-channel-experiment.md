@@ -1013,3 +1013,172 @@ clears the full slot and charges the actual clear plus the length and payload.
 [Ring-slot replay](../../work/c48-parity-20261119/recovery/source-surplus-summary.json),
 [experiment and tests](../../work/c48-parity-20261119/recovery/source-surplus-with-tests.patch)
 and [bracketing run](../../work/c48-parity-20261119/native/bracket-r13-after-r14/summary.json).
+
+The three clean runs had 180.5–193.2 ms median sender TCP RTT across periodic
+samples of the 16 application sockets. Over the intervals bounded by those
+samples, Linux reported zero peer-receive-window-limited time and
+0.019–0.053% of aggregate busy-sending time limited by the local send
+buffer. These are TCP socket counters. They do not measure the tunnel's
+separate MUX admission delay. [Socket TCP_INFO observations](../../work/c48-parity-20261119/native/tcp-window-limited.json).
+
+One diagnostic followed forward source IDs congruent to 11 modulo 16 from
+gap selection through physical output, authentication and decoder publication.
+Of 345 repeated IDs in receiver-issued requests, 149 had already arrived
+at the receiver with the preceding named retry. For 100, the eventual
+successful decoder input matched that exact arrival. Another 33 retries
+arrived after the repeat. The observation could not match an arrival for
+84 retries and could not match sender receipt of 79 prior requests.
+These counts use receiver-issued requests as the denominator. In the same
+interval the sender saw 239 repeated IDs among 850 eligible IDs.
+Neither auth success nor a possibly dropped wire packet proves that the
+receiver retained a complete source. [Native per-source timeline](../../work/c48-parity-20261119/native/diagnostic-r13-named-trace/named-timeline.json).
+
+### Global repair scheduling and small TCP segments
+
+In a 7.75-second interval, the UDP sender spent 1.66 seconds in turns with
+queued fresh data, enough tokens for a full MTU, and no UDP handoff. Each such
+turn started and ended with the same unfinished global repair and at least two
+earned regular repairs. Socket activity cannot show whether the qdisc was
+still draining earlier packets. Separately, pre-loss socket bytes divided by
+application bytes over matching status intervals were 1.34–1.40 in three
+ordinary R13 runs. Filling a 100 Mbit/s link at those exact byte ratios would
+yield 71.22–74.57 Mbit/s. The ratios can change with delivery and scheduling.
+[Per-turn measurement](../../work/c48-parity-20261119/native/diagnostic-r13-global-turn-v2/global-turn-analysis.json)
+and [matched byte costs](../../work/c48-parity-20261119/native/native-byte-efficiency.json).
+
+Suppressing repeated requests for sources in authenticated local input custody
+reduced the sender's repeated share of named IDs to 8.25% and 10.61% in two
+ordinary R15 runs. Goodput was 49.32 and 49.87 Mbit/s. R16 additionally allowed
+up to 64 extra physical copies of fresh data while making field progress on a
+global equation, up to one cadence of earned regular debt. Neither an outstanding
+named retry nor an oldest-due probe yields to this extra service. The pair
+delivered 54.71 and 51.56 Mbit/s with scheduled-to-read P99 of 4.42 and 4.11 s.
+Both drained every source. In replay all 69 full global equations matched the
+scalar reference. Deferring local work grouped up to five distinct serials on
+the same 128-source support. The Python implementation chooses support when an
+opportunity is earned. Local support timing and performance parity remain open.
+[Native runs](../../work/c48-parity-20261119/native/candidate-r16-lane/summary.json),
+[repeat](../../work/c48-parity-20261119/native/candidate-r16-lane-repeat/summary.json)
+and [support distribution](../../work/c48-parity-20261119/recovery/r16-bounded-lane/public-replay.json).
+
+One discarded approach prepared 128-source partial sums for a predicted global
+repair during otherwise idle turns. Across 292 native global intervals, spare
+time before genuine timer wakes could cover only 19 blocks in total after
+preserving ready traffic and 100 microseconds of deadline slack. The median
+interval had no usable blocks. [Native spare-time measurement](../../work/c48-parity-20261119/native/diagnostic-r13-spare-grants/spare-grant-analysis.json).
+
+The 512-byte application record statistic concealed much smaller TCP data
+segments delivered ahead of their own stream. In two R13 measurement windows,
+800 and 928 segments of at most 64 payload bytes appeared in order at the sender
+TUN and ahead of the contiguous byte frontier at the receiver TUN. Matching
+both endpoints by flow, sequence range and payload hash tied 16,156 of 16,278
+and 17,575 of 17,694 SACK-bearing ACKs to these segments: the first reported
+SACK block exactly equalled one outstanding segment. The P99 time to fill the
+earlier bytes was 189 and 211 ms. Both R16 runs reproduced this effect. The
+matrix's offline capture summary counts SACK-bearing ACKs and short first
+blocks per direction in the original measurement window. The per-flow join
+attributes specific blocks to packet reordering between the two TUN devices.
+[Two-ended reconstruction](../../work/c48-parity-20261119/native/short-sack-order.json).
+
+A receiver experiment tracked the next contiguous TCP byte per directional
+flow at native handoff. Both R18 runs eliminated every observed short-segment
+overtake. Across the two 10-second measurement windows, the receiver generated
+one SACK-bearing ACK (a DSACK) and zero, respectively. The sender's sampled
+TCP retransmission counters advanced by one segment and zero. In R16 the
+corresponding deltas were 156 and 259 segments. Median sampled congestion
+windows grew from 68/97 segments to 131/129. In the first R18 measurement the
+sender TUN carried 98,325 data segments and 9,462 full MSS segments; the first
+R16 measurement carried 54,739 and 43,517. The smaller average native payload
+raised the packet-processing load. R18 delivered 47.15 and 48.36 Mbit/s,
+below both R16 runs. Both completed the stream hash, four-capture and bilateral
+drain checks. An additional invocation missed the shared probe start before
+the transfer. It provides no goodput measurement.
+[First R18 run](../../work/c48-parity-20261119/native/candidate-r18-short-order/summary.json),
+[repeat](../../work/c48-parity-20261119/native/candidate-r18-short-order-repeat2/summary.json)
+and [kernel TCP counter comparison](../../work/c48-parity-20261119/native/inner-tcp-recovery.json).
+
+### Repair selection and TCP socket admission
+
+Python chooses the support and displacement of a regular repair when the
+last copy of a new source earns the opportunity. Deferring that choice to
+the Rust encoder's next service turn changed both the support and the named
+retry credit available for displacing a regular repair. R19 fixes the support
+end, serial and byte price at the final physical source-copy handoff. Field
+work remains bounded and interruptible. An independent byte oracle verified
+all 1,673 selected equations for 24,000 inputs, including 69 mature globals,
+under both full and partial grants. Losing all four copies of an old source
+and its first named retry still allowed 148/148 sources to be confirmed.
+These are component and owner tests. The two real Linux runs gave 42.49 and
+43.00 Mbit/s. Caching early-delivery eligibility in receiver slot metadata
+(R20) reduced the 512-entry scan from 5.47 to 1.13 microseconds in replay.
+Its two Linux runs gave 44.95 and 40.92 Mbit/s. All four runs drained both
+endpoints. Neither change establishes a throughput gain over R13.
+[Repair oracle and old-hole tests](../../work/c48-parity-20261119/recovery/regular-earn-overlay/replay-summary.json),
+[receiver replay](../../work/c48-parity-20261119/recovery/r20-receiver-slot/public-replay.json)
+and [matched native bytes](../../work/c48-parity-20261119/native/matched-byte-cost-r18-r20.json).
+
+Both R19 traces carried 512-byte TCP data segments during the measurement.
+For 103,569 complete ranges in the first run, the mean time from sender TUN
+to receiver TUN was 152.18 ms. The receiver emitted a cumulative ACK
+covering the range after another 0.044 ms on average. The first covering
+ACK reached the sender TUN 40.03 ms later. The repeat gave 149.86, 0.045
+and 40.34 ms respectively. Sequence numbers, payload hashes and cumulative
+ACKs match across both endpoints. A separate socket observation measured
+125 unacknowledged segments per stream at the median. Holding 125 segments
+per stream for 191 ms would sustain about 42.9 Mbit/s across 16 streams.
+[First cumulative ACK trace](../../work/c48-parity-20261119/native/candidate-r19-earn/cumulative-ack.json)
+and [repeat](../../work/c48-parity-20261119/native/candidate-r19-earn-repeat/cumulative-ack.json).
+
+The native probe requested 128 KiB of Linux send and receive buffer space
+per socket and read back 256 KiB. The measured Linux sender accounted 1,408
+bytes per 512-byte segment in the original geometry. Across 160 flow-seconds,
+the original socket diagnostic found 147.97 flow-seconds with an overdue
+offer and no write readiness. In 97.1% of that time, queued socket memory
+exceeded the Linux stream writeability threshold. The median was 176,000
+socket-memory bytes, 64,000 queued payload bytes and zero unsent bytes.
+The kernel TCP transmission counter for send-buffer-limited time measures a
+different event from application write readiness. The Python producer counts
+512 outstanding *payload records* per flow at this setting, or 262,144 bytes.
+[Socket and readiness evidence](../../work/c48-parity-20261119/native/diagnostic-r19-socket-memory/send-readiness.json).
+
+| Forward experiment | Goodput (Mbit/s) | Issue or first write to read P99 (ms) | Scheduled to read P99 (ms) | Unsubmitted |
+| --- | ---: | ---: | ---: | ---: |
+| Python original, two seeds | 75.94 / 75.78 | 179 / 194 | 471 / 555 | 5,375 / 6,599 |
+| Python authenticated UDP prices, same seeds | 75.73 / 76.06 | 265 / 269 | 634 / 609 | 6,767 / 6,232 |
+| Python same prices, observed 125-record admission cap | 50.01 / 49.31 | 179 / 183 | 4,241 / 4,304 | 77,954 / 78,584 |
+| Linux R19, original sockets | 42.49 / 43.00 | 273 / 264 | 5,302 / 5,197 | 95,930 / 94,053 |
+| Linux R19, strict payload credit and timed recheck | 64.09 / 66.96 | 898 / 757 | 3,477 / 2,860 | 34,236 / 25,458 |
+
+Increasing only the native sender socket budget raised goodput to 62.18
+Mbit/s in a single diagnostic but let outstanding payload exceed 262,144
+bytes per stream for 149.18 out of 160 flow-seconds. For the strict-credit
+pair, the producer instead checked actual queued payload including unsent
+bytes before every write, enforced the 262,144-byte limit, and rechecked
+only the affected flow on a timer. The unchanged ten-second goodput window,
+completed-record latency cohort, stream hashes and final bilateral drain
+apply to both runs. The original C48 acceptance comparison remains open.
+[Python admission sensitivity](../../work/c48-parity-20261119/python/native-admission-sensitivity/comparison.json),
+[native socket-only control](../../work/c48-parity-20261119/native/diagnostic-r19-socket-544k/send-readiness.json),
+[strict-credit measurement](../../work/c48-parity-20261119/native/diagnostic-r19-credit-wait/summary.json)
+and [repeat](../../work/c48-parity-20261119/native/diagnostic-r19-credit-wait-repeat/summary.json).
+
+The strict-credit experiments also distinguished TCP receive-window pressure
+from tunnel efficiency. Increasing only the receiving TCP sockets' buffer
+made the advertised window cover 262,144 bytes throughout both samples.
+Throughput fell to 61.55 and 58.91 Mbit/s. CUBIC reached its congestion
+window for 77.5% and 76.4% of flow-time, and first-write P99 was 775 and
+890 ms. Receivers refused more authenticated inputs at their bounded decoder
+queue. In the original strict-credit pair, the pre-loss forward IP cost was
+1.387 and 1.372 bytes per delivered payload byte over matching eight-second
+intervals. At those byte ratios, fully using 100 Mbit/s would yield 72.1
+and 72.9 Mbit/s. Reaching 75.78 Mbit/s requires lowering that ratio to
+about 1.320 as well as keeping the forward link busy.
+[Window and kernel evidence](../../work/c48-parity-20261119/native/peer-window-semantics-r19.json)
+and [pre-loss byte counters](../../work/c48-parity-20261119/native/peer-window-wire-matched-r19.json).
+
+An isolated single-thread encoder reused GF products across consecutive global
+repairs. All 1,673 tested equations remained byte-exact. The median time per
+pair fell from 1,272 to 1,066 microseconds, but the first equation required
+90 service grants instead of 85 and its median rose from 631 to 958 microseconds.
+The original encoder remains in the runtime while the cost of delaying that
+first repair is unresolved. [Paired encoder replay](../../work/c48-parity-20261119/recovery/r21-paired/summary.json).

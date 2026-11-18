@@ -163,3 +163,189 @@ fn overflow_keeps_live_fences_and_allows_other_buckets() -> TestResult {
     assert!(guard.may_deliver_early(policy, &tcp(true, 1016, 40, 123, 4, 0)));
     Ok(())
 }
+
+#[test]
+fn short_payload_waits_for_physical_predecessor_while_another_flow_and_sacks_pass() -> TestResult {
+    let mut config = short_config(64, rolling::wire::SourceWire::TargetedExact);
+    config.forward.scheduler.repair_numerator = 0;
+    config.forward.receiver.lookahead_records = 16;
+    let mut sender = endpoint(config, Role::Client)?;
+    let mut receiver = make_receiver(config, true)?;
+    for end in [&mut sender, &mut receiver] {
+        end.enable_queue_aware_repair_budget(1500)?;
+    }
+    let mut sack = tcp(true, 1000, 52, 1077, 600, 0x10);
+    sack[32] = 0x80;
+    sack[40..52].copy_from_slice(&[1, 1, 5, 10, 0, 0, 3, 0, 0, 0, 3, 16]);
+    sack[36..38].copy_from_slice(&0xb88bu16.to_be_bytes());
+    let frames = [
+        tcp(true, 1000, 40, 1000, 0, 2),
+        tcp(true, 1001, 40, 2000, 0, 2),
+        tcp(true, 1000, 100, 1001, 0, 0x10),
+        tcp(true, 1002, 100, 8000, 0, 0x10),
+        tcp(true, 1000, 56, 1061, 0, 0x10),
+        tcp(true, 1001, 56, 2001, 0, 0x10),
+        sack.clone(),
+        sack,
+    ];
+    let mut rows = Vec::new();
+    let mut number = 1;
+    for frame in &frames {
+        let id = sender
+            .enqueue_admitted_identified(Tick(0), 0, frame)?
+            .ok_or("admission")?;
+        sender.flush(Tick(0))?;
+        sender.step(Tick(0), work())?;
+        let (_, data) = emit(&mut sender, Tick(0), &mut number, true)?.ok_or("source")?;
+        rows.push((id, data));
+    }
+    let accept = |receiver: &mut Endpoint, i: usize, now: Tick| -> TestResult {
+        let (_, data) = &rows[i];
+        receiver.accept_authenticated(now, data.kind, &data.bytes)?;
+        service_until(receiver, now, |owner| !owner.work_pending())
+    };
+    let mut buf = [0; 1024];
+    for i in [0, 1] {
+        accept(&mut receiver, i, Tick(1))?;
+        let n = ready(&mut receiver, Tick(1), &mut buf)?;
+        assert_eq!(n.identity(), rows[i].0);
+        receiver.commit_native(Tick(1), n.token())?;
+    }
+    for i in 4..8 {
+        accept(&mut receiver, i, Tick(2))?;
+    }
+    for i in 5..8 {
+        let n = ready(&mut receiver, Tick(2), &mut buf)?;
+        assert_eq!(n.identity(), rows[i].0);
+        assert!(n.early());
+        assert_eq!(&buf[..n.bytes()], frames[i]);
+        receiver.commit_native(Tick(2), n.token())?;
+    }
+    for _ in 0..config.forward.receiver.channels {
+        assert_eq!(
+            receiver.prepare_native(Tick(3), 8, Tick(8_000_000), &mut buf)?,
+            NativePreparation::Idle
+        );
+    }
+    accept(&mut receiver, 2, Tick(4))?;
+    let older = ready(&mut receiver, Tick(4), &mut buf)?;
+    assert_eq!(older.identity(), rows[2].0);
+    assert_eq!(&buf[..older.bytes()], frames[2]);
+    assert!(matches!(
+        receiver
+            .fin_order
+            .decision(NativePolicy::RawIp, &frames[4], 5),
+        receiver::EarlyDecision::Wait(_)
+    ));
+    assert_eq!(
+        receiver.prepare_native(Tick(5), 8, Tick(8_000_000), &mut buf)?,
+        NativePreparation::AlreadyPending(older)
+    );
+    receiver.commit_native(Tick(5), older.token())?;
+    let tail = ready(&mut receiver, Tick(6), &mut buf)?;
+    assert!(
+        tail.early(),
+        "a different missing record still holds the channel head"
+    );
+    assert_eq!(tail.identity(), rows[4].0);
+    assert_eq!(&buf[..tail.bytes()], frames[4]);
+    assert_eq!(tail.deadline(), Tick(5_000_002));
+    receiver.commit_native(Tick(6), tail.token())?;
+    accept(&mut receiver, 4, Tick(7))?;
+    accept(&mut receiver, 3, Tick(8))?;
+    let last = ready(&mut receiver, Tick(8), &mut buf)?;
+    assert_eq!(last.identity(), rows[3].0);
+    receiver.commit_native(Tick(8), last.token())?;
+    for _ in 0..16 {
+        assert!(matches!(
+            receiver.prepare_native(Tick(8), 16, Tick(8_000_000), &mut buf)?,
+            NativePreparation::Idle | NativePreparation::Progress
+        ));
+    }
+    assert_eq!(receiver.statistics().committed, frames.len() as u64);
+    assert_eq!(receiver.record_status().early_tombstones, 0);
+    Ok(())
+}
+
+#[test]
+fn payload_edge_wraps_and_requires_live_ordered_evidence_after_tuple_reuse() -> TestResult {
+    use crate::rolling_records::fin_order::Guard;
+    use receiver::EarlyDecision::{Allow, Ordered, Wait};
+    let cfg = short_config(64, rolling::wire::SourceWire::TargetedExact);
+    let mut guard = Guard::new(cfg.forward)?;
+    let policy = NativePolicy::RawIp;
+    let start = u32::MAX - 4;
+    let syn = tcp(true, 1000, 40, start, 0, 2);
+    let first = tcp(true, 1000, 48, start + 1, 0, 0x10);
+    let second = tcp(true, 1000, 56, 4, 0, 0x10);
+    let Wait(unknown) = guard.decision(policy, &first, 0) else {
+        return Err("unknown edge should wait".into());
+    };
+    guard.native_commit(policy, &first, true, 0);
+    assert!(!guard.changed(unknown));
+    guard.native_commit(policy, &syn, false, 1);
+    assert!(guard.changed(unknown));
+    let Wait(gap) = guard.decision(policy, &second, 1) else {
+        return Err("eight missing bytes across wrap should hold the tail".into());
+    };
+    assert!(matches!(guard.decision(policy, &first, 1), Allow));
+    guard.native_commit(policy, &first, true, 2);
+    assert!(guard.changed(gap));
+    assert!(matches!(guard.decision(policy, &first, 2), Allow));
+    assert!(matches!(guard.decision(policy, &second, 2), Allow));
+    let ambiguous = tcp(true, 1000, 48, 4 + (1 << 31), 0, 0x10);
+    assert!(matches!(guard.decision(policy, &ambiguous, 2), Wait(_)));
+    assert!(matches!(
+        guard.decision(policy, &second, 5_000_002),
+        Wait(_)
+    ));
+    let new_syn = tcp(true, 1000, 44, 8000, 0, 2);
+    assert!(matches!(
+        guard.decision(policy, &new_syn, 5_000_003),
+        Ordered
+    ));
+    guard.native_commit(policy, &new_syn, false, 5_000_003);
+    let fresh = tcp(true, 1000, 56, 8005, 0, 0x10);
+    assert!(matches!(guard.decision(policy, &fresh, 5_000_003), Allow));
+    let new_future = tcp(true, 1000, 56, 8021, 0, 0x10);
+    assert!(matches!(
+        guard.decision(policy, &new_future, 5_000_003),
+        Wait(_)
+    ));
+    Ok(())
+}
+
+#[test]
+fn unknown_midstream_flow_learns_from_contiguous_ordered_commits_and_preserves_live_storage()
+-> TestResult {
+    use crate::rolling_records::fin_order::Guard;
+    use receiver::EarlyDecision::{Allow, Wait};
+    let cfg = short_config(64, rolling::wire::SourceWire::TargetedExact);
+    let policy = NativePolicy::RawIp;
+    let mut guard = Guard::new(cfg.forward)?;
+    let capacity = guard.capacity_bytes();
+    let first = tcp(true, 1000, 48, 100, 0, 0x10);
+    let missing = tcp(true, 1000, 48, 108, 0, 0x10);
+    let far = tcp(true, 1000, 48, 116, 0, 0x10);
+    let tail = tcp(true, 1000, 56, 124, 0, 0x10);
+    guard.native_commit(policy, &first, false, 0);
+    assert!(matches!(guard.decision(policy, &missing, 1), Wait(_)));
+    guard.native_commit(policy, &far, false, 1);
+    assert!(matches!(guard.decision(policy, &tail, 2), Wait(_)));
+    guard.native_commit(policy, &missing, false, 2);
+    assert!(matches!(guard.decision(policy, &tail, 3), Allow));
+    let mut overflow = 0;
+    for port in 2000..2128 {
+        guard.native_commit(policy, &tcp(true, port, 40, 100, 0, 2), false, 4);
+        if matches!(
+            guard.decision(policy, &tcp(true, port, 48, 101, 0, 0x10), 4),
+            Wait(_)
+        ) {
+            overflow += 1;
+        }
+    }
+    assert!(overflow > 0);
+    assert!(matches!(guard.decision(policy, &tail, 5), Allow));
+    assert_eq!(guard.capacity_bytes(), capacity);
+    Ok(())
+}

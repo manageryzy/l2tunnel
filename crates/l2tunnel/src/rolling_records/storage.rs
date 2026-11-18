@@ -325,7 +325,7 @@ impl<P: RecoveryPolicy> Endpoint<P> {
             incoming.allocations,
             usize::from(endpoint.source.capacity() != 0),
             usize::from(endpoint.symbols.capacity() != 0),
-            usize::from(endpoint.fin_order.capacity_bytes() != 0),
+            endpoint.fin_order.allocations(),
             usize::from(endpoint.previewed.capacity_bytes() != 0),
             usize::from(endpoint.repair_budget.is_some()),
             usize::from(endpoint.waits.capacity() != 0),

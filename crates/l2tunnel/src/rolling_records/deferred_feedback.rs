@@ -60,6 +60,7 @@ impl Endpoint<crate::fec::research::Config> {
         let owner = self.ingress.as_mut().ok_or(Error::Identity)?;
         owner.push(
             ingress::Input {
+                held_source: None,
                 kind: record_engine::EmissionKind::Feedback,
                 number: Some(number),
                 received,

@@ -4,6 +4,7 @@
 //! native delivery. Neither data nor feedback codecs authenticate their bytes.
 use super::*;
 
+mod earned;
 mod feedback;
 pub(in crate::rolling) mod fresh;
 mod receiver;

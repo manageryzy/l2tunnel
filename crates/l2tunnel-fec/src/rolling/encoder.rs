@@ -377,6 +377,46 @@ impl Encoder {
         let id = RepairId(self.next_repair);
         Ok((id, self.config.support(self.next, id, false)?))
     }
+    // An already frozen equation keeps the current serial until its physical receipt.
+    pub(super) fn following_regular(
+        &self,
+        queued: u32,
+        end: u32,
+    ) -> Result<(RepairId, Support), Error> {
+        let serial = self
+            .next_repair
+            .checked_add(u64::from(self.job.is_some()))
+            .and_then(|v| v.checked_add(u64::from(queued)))
+            .filter(|v| *v < u64::MAX)
+            .ok_or(Error::Exhausted)?;
+        let id = RepairId(serial);
+        Ok((id, self.config.support(end, id, false)?))
+    }
+    pub(super) fn begin_earned_regular(
+        &mut self,
+        id: RepairId,
+        support: Support,
+        cap: Tick,
+        now: Tick,
+    ) -> Result<RepairId, Error> {
+        self.time(now)?;
+        if self.job.is_some() {
+            return Err(Error::Busy);
+        }
+        if self.explicit.is_some()
+            || id.0 != self.next_repair
+            || self.confirmed == self.next
+            || support.end > self.next
+            || support.start < self.next.saturating_sub(self.config.window as u32)
+            || support != self.config.support(support.end, id, false)?
+        {
+            return Err(Error::Identity);
+        }
+        if now >= cap {
+            return Err(Error::Expired);
+        }
+        self.install_repair(id, support, None, cap)
+    }
     /// Begin the next owned regular/tail equation. A failed call consumes no ID.
     pub fn begin_repair(&mut self, tail: bool, now: Tick) -> Result<RepairId, Error> {
         if self.explicit.is_some() {

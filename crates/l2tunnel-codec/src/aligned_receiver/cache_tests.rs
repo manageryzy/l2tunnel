@@ -73,6 +73,15 @@ fn fragment(body: &[u8], offset: usize) -> Vec<u8> {
 // Independent pre-cache behavior, exercised against actual live and rollback
 // transitions. The diagnostic buffer snapshot retains its separate scan API.
 pub(super) fn assert_matches(r: &Receiver) {
+    for record in r.records.iter().flatten() {
+        assert_eq!(
+            record.independent_short,
+            record.pieces.is_empty()
+                && r.limits.body.independent_short_frame_bytes != 0
+                && independent_length(&record.bytes)
+                    .is_some_and(|length| length <= r.limits.body.independent_short_frame_bytes)
+        );
+    }
     for start in 0..r.limits.channels {
         let expected = (0..r.limits.channels)
             .map(|offset| ChannelId(((start + offset) % r.limits.channels) as u8))

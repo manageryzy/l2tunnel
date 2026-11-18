@@ -1302,7 +1302,42 @@ impl<P: RecoveryPolicy> Endpoint<P> {
         } else {
             None
         };
+        // Install this witnessed source extent before pricing a one-copy source's
+        // earned repair. A final ordinal of a copied source already has its first extent.
+        if let (Some(budget), Some((id, length))) = (&mut self.repair_budget, extent) {
+            budget.record_source(id, length)?;
+        }
         let result = match pending.id {
+            OutputId::Data(scheduler::OutputId::Source(id))
+                if pending.source_copy.is_some()
+                    && self
+                        .repair_budget
+                        .as_ref()
+                        .is_some_and(repair_budget::Budget::configured) =>
+            {
+                let copy = pending.source_copy.ok_or(Error::Identity)?;
+                if copy.source() != id {
+                    return self.fail(Error::Identity);
+                }
+                let budget = self.repair_budget.as_mut().ok_or(Error::Identity)?;
+                P::confirm_priced_copy(
+                    &mut self.sender,
+                    copy,
+                    rolling_tick(accepted),
+                    rolling_tick(now),
+                    pending.wire_bytes,
+                    |id, support| {
+                        budget.price_regular(
+                            id,
+                            support,
+                            self.compact_feedback_overhead.is_some(),
+                            P::HEADER_BYTES,
+                            self.framing,
+                            self.overhead,
+                        )
+                    },
+                )
+            }
             OutputId::Data(id) => P::confirm_data(
                 &mut self.sender,
                 id,
@@ -1321,9 +1356,6 @@ impl<P: RecoveryPolicy> Endpoint<P> {
             return self.fail(error);
         }
         if let Some(budget) = &mut self.repair_budget {
-            if let Some((id, length)) = extent {
-                budget.record_source(id, length)?;
-            }
             budget.accepted(pending);
         }
         self.expire_confirmed_credit();
@@ -1475,9 +1507,13 @@ impl<P: RecoveryPolicy> Endpoint<P> {
                             Err(error) => return self.fail(Error::Rolling(error)),
                         }
                     }
+                    let held_source = source
+                        .map(|(id, _)| id)
+                        .filter(|&id| P::tracks_queued_source(&self.incoming, id));
                     owner.push(
                         ingress::Input {
                             kind,
+                            held_source,
                             number: security_number,
                             received,
                             order: None,
@@ -1486,6 +1522,11 @@ impl<P: RecoveryPolicy> Endpoint<P> {
                         },
                         bytes,
                     )?;
+                    if let Some(id) = held_source
+                        && let Err(error) = P::hold_queued_source(&mut self.incoming, id)
+                    {
+                        return self.fail(Error::Rolling(error));
+                    }
                 } else {
                     compact_wire::receive::<P>(
                         self.compact_feedback_overhead.is_some(),
@@ -1598,6 +1639,9 @@ impl<P: RecoveryPolicy> Endpoint<P> {
         match result {
             Ok(outcome) => {
                 owner.complete_front()?;
+                if let Some(id) = input.held_source {
+                    P::release_queued_source(&mut self.incoming, id);
+                }
                 if let Some(input) = diagnostic_input {
                     let outcome = match outcome {
                         rolling::Begin::Staged => waits::ingress::Outcome::Staged,
@@ -1628,7 +1672,12 @@ impl<P: RecoveryPolicy> Endpoint<P> {
                 }
                 Ok(())
             }
-            Err(error) => self.fail(Error::Rolling(error)),
+            Err(error) => {
+                if let Some(id) = input.held_source {
+                    P::release_queued_source(&mut self.incoming, id);
+                }
+                self.fail(Error::Rolling(error))
+            }
         }
     }
     /// Actual per-generation input custody, independent of decoded/native receipt.

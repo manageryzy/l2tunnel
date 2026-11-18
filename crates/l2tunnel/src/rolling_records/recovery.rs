@@ -126,6 +126,19 @@ pub trait RecoveryPolicy: sealed::Sealed + Copy + Eq {
     ) -> Result<rolling::WorkUsed, rolling::Error> {
         Self::send_step(sender, now, work)
     }
+    fn enable_earned_regular(_: &mut Self::Sender) -> Result<(), rolling::Error> {
+        Err(rolling::Error::Configuration)
+    }
+    fn confirm_priced_copy(
+        _: &mut Self::Sender,
+        _: scheduler::SourceCopy,
+        _: rolling::Tick,
+        _: rolling::Tick,
+        _: usize,
+        _: impl FnMut(rolling::RepairId, rolling::Support) -> Result<bool, rolling::Error>,
+    ) -> Result<(), rolling::Error> {
+        Err(rolling::Error::Configuration)
+    }
     fn requested_credit(_sender: &Self::Sender) -> Option<bool> {
         None
     }
@@ -176,6 +189,16 @@ pub trait RecoveryPolicy: sealed::Sealed + Copy + Eq {
         id: rolling::SourceId,
         now: rolling::Tick,
     ) -> Result<(), rolling::Error>;
+    fn tracks_queued_source(_receiver: &Self::Receiver, _id: rolling::SourceId) -> bool {
+        false
+    }
+    fn hold_queued_source(
+        _receiver: &mut Self::Receiver,
+        _id: rolling::SourceId,
+    ) -> Result<(), rolling::Error> {
+        Err(rolling::Error::Configuration)
+    }
+    fn release_queued_source(_receiver: &mut Self::Receiver, _id: rolling::SourceId) {}
     fn receive_committed_source(
         _receiver: &mut Self::Receiver,
         _id: rolling::SourceId,
@@ -382,6 +405,19 @@ impl RecoveryPolicy for scheduler::Policy {
     ) -> Result<rolling::WorkUsed, rolling::Error> {
         s.step_with_regular_filter(n, w, filter)
     }
+    fn enable_earned_regular(s: &mut Self::Sender) -> Result<(), rolling::Error> {
+        s.enable_earned_regular()
+    }
+    fn confirm_priced_copy(
+        s: &mut Self::Sender,
+        c: scheduler::SourceCopy,
+        a: rolling::Tick,
+        n: rolling::Tick,
+        bytes: usize,
+        price: impl FnMut(rolling::RepairId, rolling::Support) -> Result<bool, rolling::Error>,
+    ) -> Result<(), rolling::Error> {
+        s.confirm_source_copy_priced(n, a, c, bytes, price)
+    }
     fn requested_credit(s: &Self::Sender) -> Option<bool> {
         s.pending_requested_credit()
     }
@@ -491,6 +527,18 @@ impl RecoveryPolicy for scheduler::Policy {
         n: rolling::Tick,
     ) -> Result<(), rolling::Error> {
         r.confirm_handoff(i, n)
+    }
+    fn tracks_queued_source(r: &Self::Receiver, id: rolling::SourceId) -> bool {
+        r.tracks_queued_source(id)
+    }
+    fn hold_queued_source(
+        r: &mut Self::Receiver,
+        id: rolling::SourceId,
+    ) -> Result<(), rolling::Error> {
+        r.hold_queued_source(id)
+    }
+    fn release_queued_source(r: &mut Self::Receiver, id: rolling::SourceId) {
+        r.release_queued_source(id);
     }
     fn receive_committed_source(
         receiver: &mut Self::Receiver,

@@ -296,8 +296,12 @@ struct Record {
     padding: Padding,
     deadline: Tick,
     early_delivered: bool,
+    // Immutable classification of the original unfragmented body. Lookahead
+    // can skip ordinary records without following each body slab pointer.
+    independent_short: bool,
     // Filtered delivery rejected this complete short frame until its ordinary turn.
-    defer_early: bool,
+    // Zero is eligible, MAX waits for channel order, other values are owner recheck tokens.
+    defer_early: u64,
 }
 impl Record {
     fn complete(&self) -> bool {
@@ -328,6 +332,16 @@ enum EarlySelection<'a> {
     Any,
     Ordered,
     Filtered(&'a mut dyn FnMut(&[u8]) -> bool),
+    Reevaluated(&'a dyn Fn(u64) -> bool, &'a dyn Fn(&[u8]) -> EarlyDecision),
+}
+/// Local eligibility of an independently decoded complete native frame.
+pub enum EarlyDecision {
+    /// Expose this frame now.
+    Allow,
+    /// Retain this record until channel order catches up.
+    Ordered,
+    /// Reconsider after an owner's dependency changes. Zero and MAX are reserved.
+    Wait(u64),
 }
 struct Parsed<'a> {
     channel: ChannelId,
@@ -337,6 +351,13 @@ struct Parsed<'a> {
     fragments: usize,
     capacity: usize,
     padding: Padding,
+}
+impl Parsed<'_> {
+    fn independent_short(&self, limit: usize) -> bool {
+        limit > 0
+            && self.fragments == 0
+            && independent_length(self.body).is_some_and(|length| length <= limit)
+    }
 }
 
 /// Finite receiver state with separate admission, preparation and actual delivery commit.
@@ -607,10 +628,7 @@ impl Receiver {
             return Err(Error::Scope);
         }
         let parsed = self.parse_unit(symbol, identity.record)?;
-        Ok(self.limits.body.independent_short_frame_bytes != 0
-            && parsed.fragments == 0
-            && independent_length(parsed.body)
-                .is_some_and(|length| length <= self.limits.body.independent_short_frame_bytes))
+        Ok(parsed.independent_short(self.limits.body.independent_short_frame_bytes))
     }
     /// Inspect this scope's source ledger in constant time without admitting bytes.
     ///
@@ -783,7 +801,9 @@ impl Receiver {
                         padding: parsed.padding,
                         deadline,
                         early_delivered: false,
-                        defer_early: false,
+                        independent_short: parsed
+                            .independent_short(self.limits.body.independent_short_frame_bytes),
+                        defer_early: 0,
                     };
                     self.retention.add_record(&record);
                     self.deadlines.insert(record.deadline);
@@ -834,6 +854,23 @@ impl Receiver {
             now,
             max_records,
             EarlySelection::Filtered(&mut allow),
+        )
+    }
+    /// Reconsider deferred complete records when their local dependency changes.
+    /// A negative decision keeps the retained bytes and original deadline.
+    pub fn prepare_with_early_dependencies(
+        &mut self,
+        channel: ChannelId,
+        now: Tick,
+        max_records: usize,
+        changed: impl Fn(u64) -> bool,
+        decide: impl Fn(&[u8]) -> EarlyDecision,
+    ) -> Result<Prepared, Error> {
+        self.prepare_selected(
+            channel,
+            now,
+            max_records,
+            EarlySelection::Reevaluated(&changed, &decide),
         )
     }
     /// Preserve channel FIFO even when independent short bodies are enabled.
@@ -891,11 +928,18 @@ impl Receiver {
                     break;
                 }
                 if record.id > expected
-                    && record.pieces.is_empty()
+                    && record.independent_short
                     && !record.early_delivered
-                    && (matches!(selection, EarlySelection::Any) || !record.defer_early)
-                    && independent_length(&record.bytes)
-                        .is_some_and(|n| n <= self.limits.body.independent_short_frame_bytes)
+                    && (record.defer_early == 0
+                        || match &selection {
+                            EarlySelection::Any => true,
+                            EarlySelection::Reevaluated(changed, _)
+                                if record.defer_early != u64::MAX =>
+                            {
+                                changed(record.defer_early)
+                            }
+                            _ => false,
+                        })
                 {
                     selected = Some(slot);
                     break;
@@ -932,15 +976,39 @@ impl Receiver {
                     self.retire(slot)?;
                 }
                 aligned_body::Decoded::Frame { written, .. } => {
-                    if early
-                        && let EarlySelection::Filtered(allow) = &mut selection
-                        && !allow(&self.native[..written])
-                    {
+                    let hold = if early {
+                        match &mut selection {
+                            EarlySelection::Filtered(allow) => {
+                                if allow(&self.native[..written]) {
+                                    0
+                                } else {
+                                    u64::MAX
+                                }
+                            }
+                            EarlySelection::Reevaluated(_, decide) => {
+                                match decide(&self.native[..written]) {
+                                    EarlyDecision::Allow => 0,
+                                    EarlyDecision::Ordered => u64::MAX,
+                                    EarlyDecision::Wait(token) => {
+                                        if token == 0 {
+                                            u64::MAX
+                                        } else {
+                                            token
+                                        }
+                                    }
+                                }
+                            }
+                            _ => 0,
+                        }
+                    } else {
+                        0
+                    };
+                    if hold != 0 {
                         self.touch_record(slot, true)?;
                         self.records[slot]
                             .as_mut()
                             .ok_or(Error::Malformed)?
-                            .defer_early = true;
+                            .defer_early = hold;
                         continue;
                     }
                     self.pending = Some(Pending {

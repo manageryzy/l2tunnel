@@ -370,6 +370,24 @@ class MatrixTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'truncated pcap bytes'):
                 observe.capture_summary(path, addresses)
 
+    def test_sampled_tcp_sack_matches_direction_extent_and_wrapped_sequence(self):
+        addresses = list(matrix.NATIVE.values())
+        packet = bytearray(ipv4(*reversed(addresses), 60))
+        packet[32:34] = bytes((10 << 4, 0x10))
+        packet[40:] = bytes((1, 1, 5, 18)) + struct.pack('!IIII', 0xfffffff8, 8, 100, 180)
+        invalid = bytearray(packet)
+        invalid[43] = 19
+        fragment = bytearray(packet)
+        fragment[6] = 0x20
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'acks.pcap'
+            path.write_bytes(pcap([(1, packet), (2, packet), (2, invalid), (2, fragment)]))
+            sample = observe.capture_summary(path, addresses, (2_000_000_000, 3_000_000_000))['sample_window']
+        self.assertEqual(sample['observed_ipv4_tcp_ack_options']['a_to_b'], {})
+        self.assertEqual(sample['observed_ipv4_tcp_ack_options']['b_to_a'], {
+            'ack_packets': 2, 'acks_with_sack': 1, 'first_block_1_to_64_bytes': 1,
+            'first_block_16_bytes': 1, 'malformed_options': 1, 'unparsed_fragments': 1})
+
     def test_capture_missing_or_dropped_counts_never_pass(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / 'capture.log'
