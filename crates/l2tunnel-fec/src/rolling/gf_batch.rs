@@ -45,6 +45,13 @@ pub(super) fn xor_scaled<const COUNT: bool>(
     if factor == 0 {
         return (0, 0);
     }
+    let count = destination.len().min(input.len());
+    if !COUNT && count >= 32 {
+        // The backend dispatches at runtime with a scalar fallback. Both
+        // operands have exactly the length already granted by the caller.
+        tape_reed_solomon::gf::mul_slice_xor(&mut destination[..count], &input[..count], factor);
+        return (0, 0);
+    }
     let table = &MULTIPLICATION_ROWS[usize::from(factor)];
     let (mut removed, mut added) = (0, 0);
     let mut destinations = destination.chunks_exact_mut(8);
@@ -73,8 +80,6 @@ pub(super) fn xor_scaled<const COUNT: bool>(
             removed += nonzero_bytes(old);
             added += nonzero_bytes(new);
         } else if factor == 1 {
-            // Retain the existing payload kernel: the measured word-table
-            // change benefits coefficient counting, not sparse payload blocks.
             let mut old_bytes = [0; 8];
             old_bytes.copy_from_slice(destination);
             let old = u64::from_ne_bytes(old_bytes);

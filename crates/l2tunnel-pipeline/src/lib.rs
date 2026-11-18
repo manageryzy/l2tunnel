@@ -576,11 +576,11 @@ impl Pipeline {
             Ok(value) => value,
             Err(kind) => return Err((kind, input)),
         };
-        let new = !self.states.contains_key(&key);
         let transaction = match self.flows.prepare_assign(key, now) {
             Ok(value) => value,
             Err(error) => return Err((PipelineError::Flow(error), input)),
         };
+        let new = transaction.is_new();
         if !self.metadata_pool.has_room()
             || new && (!self.states.has_room() || !self.by_id.has_room())
         {
@@ -706,11 +706,11 @@ impl Pipeline {
         now: Duration,
     ) -> Result<Binding, PipelineError> {
         self.validate_weight(key, weight)?;
-        let new = !self.states.contains_key(&key);
         let transaction = self
             .flows
             .prepare_learn(key, channel, now)
             .map_err(PipelineError::Flow)?;
+        let new = transaction.is_new();
         let binding = transaction.binding();
         if new && (!self.states.has_room() || !self.by_id.has_room()) {
             return Err(PipelineError::Invariant);
@@ -733,13 +733,14 @@ impl Pipeline {
                     metadata: MetadataQueue::new(self.metadata_pool.is_reserved()),
                 },
             )?;
+            self.by_id.insert(binding.id, key)?;
+        } else {
+            self.states
+                .get_mut(&key)
+                .ok_or(PipelineError::Invariant)?
+                .snapshot
+                .last_activity = now;
         }
-        self.states
-            .get_mut(&key)
-            .ok_or(PipelineError::Invariant)?
-            .snapshot
-            .last_activity = now;
-        self.by_id.insert(binding.id, key)?;
         Ok(binding)
     }
 
@@ -828,8 +829,11 @@ impl Pipeline {
         offer: impl FnOnce(PacketMetadata, &[u8]) -> Result<Option<T>, E>,
         owned: bool,
     ) -> Result<Option<Handoff<T>>, DequeueError<E>> {
-        if self.qos.is_some() {
-            return self.offer_with_inner(|_| true, offer, owned);
+        if let Some(qos) = &mut self.qos {
+            let head = qos
+                .peek_unrestricted()
+                .map_err(|source| DequeueError::Pipeline(PipelineError::Schedule(source)))?;
+            return self.offer_tun_head(head, offer, owned);
         }
         let states = &mut self.states;
         let by_id = &self.by_id;
@@ -954,9 +958,23 @@ impl Pipeline {
         if inconsistent {
             return Err(error(PipelineError::Invariant));
         }
+        self.offer_tun_head(selected, offer, owned)
+    }
+
+    fn offer_tun_head<T, E>(
+        &mut self,
+        selected: Option<l2tunnel_qos::PacketHead>,
+        offer: impl FnOnce(PacketMetadata, &[u8]) -> Result<Option<T>, E>,
+        owned: bool,
+    ) -> Result<Option<Handoff<T>>, DequeueError<E>> {
+        let error = DequeueError::Pipeline;
         let Some(head) = selected else {
             return Ok(None);
         };
+        let qos = self
+            .qos
+            .as_mut()
+            .ok_or_else(|| error(PipelineError::TunOnly))?;
         let key = *self
             .by_id
             .get(&FlowId(head.flow.value()))

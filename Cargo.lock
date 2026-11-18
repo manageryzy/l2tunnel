@@ -737,6 +737,7 @@ dependencies = [
 name = "l2tunnel"
 version = "0.1.0"
 dependencies = [
+ "arrayvec",
  "l2tunnel-active",
  "l2tunnel-aligned",
  "l2tunnel-codec",
@@ -890,6 +891,7 @@ name = "l2tunnel-fec"
 version = "0.1.0"
 dependencies = [
  "sha2",
+ "tape-reed-solomon",
 ]
 
 [[package]]
@@ -1882,6 +1884,12 @@ dependencies = [
  "quote",
  "syn 2.0.119",
 ]
+
+[[package]]
+name = "tape-reed-solomon"
+version = "0.2.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "00345f09c4aaac65268873f11706ff1e7f7cfe974bdbdef0341253f4182ecb93"
 
 [[package]]
 name = "thiserror"

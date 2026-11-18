@@ -329,6 +329,8 @@ pub struct Scheduler {
     flows: BTreeMap<FlowId, Flow>,
     active: VecDeque<FlowId>,
     in_visit: bool,
+    // Set only while a caller-supplied eligibility snapshot excludes a flow.
+    has_ineligible_heads: bool,
     queued_bytes: usize,
     queued_packets: usize,
     selected: Option<PacketHead>,
@@ -351,6 +353,7 @@ impl Scheduler {
             flows: BTreeMap::new(),
             active: VecDeque::new(),
             in_visit: false,
+            has_ineligible_heads: false,
             queued_bytes: 0,
             queued_packets: 0,
             selected: None,
@@ -373,6 +376,7 @@ impl Scheduler {
             flows: BTreeMap::new(),
             active: VecDeque::new(),
             in_visit: false,
+            has_ineligible_heads: false,
             queued_bytes: 0,
             queued_packets: 0,
             selected: None,
@@ -515,7 +519,8 @@ impl Scheduler {
     /// Call only when downstream can retain one maximum-sized packet: receiver
     /// credit, MUX admission, path congestion allowance and pacing are external.
     pub fn dequeue(&mut self) -> Result<Option<ScheduledPacket>, ScheduleError> {
-        self.dequeue_eligible(|_, _| true)
+        self.peek_unrestricted()?;
+        self.dequeue_peeked()
     }
 
     /// Select and remove an eligible head; the callback must only inspect credit.
@@ -548,6 +553,8 @@ impl Scheduler {
     {
         self.selected = None;
         let mut any = false;
+        let mut excluded = false;
+        self.has_ineligible_heads = true;
         for index in 0..self.active_flows() {
             let id = self.active_id(index).ok_or(ScheduleError::Invariant)?;
             let length = self.front_length(id).ok_or(ScheduleError::Invariant)?;
@@ -557,8 +564,25 @@ impl Scheduler {
                 any = true;
             } else {
                 flow.deficit = 0;
+                excluded = true;
             }
         }
+        self.has_ineligible_heads = excluded;
+        self.select_head(any)
+    }
+
+    /// Select by weighted DRR when the caller permits every active FIFO head.
+    /// Switching from filtered service restores eligibility once. Its previous
+    /// deficit resets and the current round-robin position still apply.
+    pub fn peek_unrestricted(&mut self) -> Result<Option<PacketHead>, ScheduleError> {
+        if self.has_ineligible_heads {
+            return self.peek_eligible(|_, _| true);
+        }
+        self.selected = None;
+        self.select_head(self.active_flows() != 0)
+    }
+
+    fn select_head(&mut self, any: bool) -> Result<Option<PacketHead>, ScheduleError> {
         if !any {
             self.in_visit = false;
             return if self.active_flows() == 0

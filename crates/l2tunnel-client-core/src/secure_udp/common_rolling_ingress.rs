@@ -92,6 +92,9 @@ pub struct RollingIngressObservation {
     pub oldest_received_micros: Option<u64>,
     /// Observation metadata only; this is no second replay authority.
     pub oldest_records_number: Option<u64>,
+    /// Full queue refusals by source, repair and deferred feedback since this generation started.
+    #[serde(default)]
+    pub full_refusals: [u64; 3],
     /// Earliest original queued job/operation/session cap.
     pub deadline_micros: Option<u64>,
 }
@@ -127,6 +130,7 @@ impl RollingIngressStatus {
                     bytes: u64::try_from(value.bytes).map_err(invalid)?,
                     oldest_received_micros: value.oldest_received.map(|tick| tick.0),
                     oldest_records_number: value.oldest_records_number,
+                    full_refusals: value.full_refusals,
                     deadline_micros: value.deadline.map(|tick| tick.0),
                 })
             })

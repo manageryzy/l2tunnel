@@ -346,6 +346,9 @@ pub struct Receiver {
     compact_units: bool,
     channels: Vec<Channel>,
     records: Vec<Option<Record>>,
+    // Only occupied slots, in (channel, absolute record) order. Valid limits
+    // allow at most 4,352 slots. The payload owners never move with this index.
+    ordered_slots: Vec<u16>,
     proofs: Vec<Option<Proof>>,
     retention: Retention,
     deadlines: DeadlineCache,
@@ -416,6 +419,7 @@ impl Receiver {
             limits,
             compact_units: false,
             channels,
+            ordered_slots: Vec::with_capacity(records.len()),
             records,
             proofs,
             retention: Retention::default(),
@@ -493,6 +497,7 @@ impl Receiver {
         self.limits.batch_memory_bound_bytes()?;
         self.check_time(now)?;
         let records = self.records.clone();
+        let ordered_slots = self.ordered_slots.clone();
         let proofs = self.proofs.clone();
         let floor = self.floor;
         let last_time = self.last_time;
@@ -504,6 +509,7 @@ impl Receiver {
                 Ok(outcome) => outcomes.push(outcome),
                 Err(error) => {
                     self.records = records;
+                    self.ordered_slots.clone_from(&ordered_slots);
                     self.proofs = proofs;
                     self.floor = floor;
                     self.last_time = last_time;
@@ -576,6 +582,7 @@ impl Receiver {
             target.decoder.copy_context_from(&source.decoder);
         }
         shadow.records.clone_from(&self.records);
+        shadow.ordered_slots.extend_from_slice(&self.ordered_slots);
         shadow.proofs.clone_from(&self.proofs);
         shadow.floor = self.floor;
         shadow.staged.copy_context_from(&self.staged);
@@ -628,6 +635,40 @@ impl Receiver {
             .as_ref()
             .is_some_and(|proof| proof.source == source))
     }
+    /// Validate an authenticated preview unit and identify a missing current channel head.
+    /// A retained proof must match exactly, even for units outside the selected heads.
+    pub fn needs_channel_head(
+        &self,
+        identity: SymbolIdentity,
+        symbol: &[u8],
+    ) -> Result<bool, Error> {
+        if identity.scope != self.scope {
+            return Err(Error::Scope);
+        }
+        if let Some(error) = self.failure {
+            return Err(error);
+        }
+        let parsed = self.parse_unit(symbol, identity.record)?;
+        let floor = self.floor.ok_or(Error::Exhausted)?;
+        if identity.source.0 < floor.0 {
+            return Ok(false);
+        }
+        if identity.source.0 - floor.0 >= self.limits.source_window as u64 {
+            // The floor can move after earlier units in the retained source drain.
+            return Ok(false);
+        }
+        let slot = (identity.source.0 % self.limits.source_window as u64) as usize;
+        if let Some(proof) = &self.proofs[slot] {
+            if proof.source != identity.source
+                || proof.record != identity.record
+                || proof.bytes != symbol
+            {
+                return Err(Error::Conflict);
+            }
+            return Ok(false);
+        }
+        Ok(self.expected(parsed.channel)? == Some(identity.record))
+    }
     /// Admit one authenticated complete protected symbol; errors consume no source ID.
     pub fn admit_authenticated(
         &mut self,
@@ -671,80 +712,85 @@ impl Receiver {
             if identity.record.0 - expected.0 > u64::from(self.limits.record_window) {
                 return Err(Error::RecordWindow);
             }
-            if let Some(slot) = self.find(parsed.channel, identity.record) {
-                let existing = self.records[slot].as_ref().ok_or(Error::Malformed)?;
-                if existing.bytes.len() != parsed.total
-                    || existing.fragment_capacity != parsed.capacity
-                    || existing.padding != parsed.padding
-                {
-                    return Err(Error::Conflict);
-                }
-                if parsed.fragments == 0 {
-                    if existing.bytes != parsed.body {
+            match self.record_position(parsed.channel, identity.record) {
+                Ok(position) => {
+                    let slot = usize::from(self.ordered_slots[position]);
+                    let existing = self.records[slot].as_ref().ok_or(Error::Malformed)?;
+                    if existing.bytes.len() != parsed.total
+                        || existing.fragment_capacity != parsed.capacity
+                        || existing.padding != parsed.padding
+                    {
                         return Err(Error::Conflict);
                     }
-                    Admission::Duplicate
-                } else {
-                    let index = parsed.offset / parsed.capacity;
-                    let end = parsed.offset + parsed.body.len();
-                    if existing.pieces[index] != 0 {
-                        if existing.bytes[parsed.offset..end] != *parsed.body {
+                    if parsed.fragments == 0 {
+                        if existing.bytes != parsed.body {
                             return Err(Error::Conflict);
                         }
                         Admission::Duplicate
                     } else {
-                        // The final fragment is validated in a bounded temporary copy
-                        // before changing the admitted record or replay ledger.
-                        if existing.count + 1 == parsed.fragments {
-                            self.validate_completion(slot, parsed.offset, parsed.body)?;
+                        let index = parsed.offset / parsed.capacity;
+                        let end = parsed.offset + parsed.body.len();
+                        if existing.pieces[index] != 0 {
+                            if existing.bytes[parsed.offset..end] != *parsed.body {
+                                return Err(Error::Conflict);
+                            }
+                            Admission::Duplicate
+                        } else {
+                            // The final fragment is validated in a bounded temporary copy
+                            // before changing the admitted record or replay ledger.
+                            if existing.count + 1 == parsed.fragments {
+                                self.validate_completion(slot, parsed.offset, parsed.body)?;
+                            }
+                            self.touch_record(slot, true)?;
+                            let entry = self.records[slot].as_mut().ok_or(Error::Malformed)?;
+                            let was_native = entry.native_pending();
+                            entry.bytes[parsed.offset..end].copy_from_slice(parsed.body);
+                            entry.pieces[index] = 1;
+                            entry.count += 1;
+                            self.retention.native_records -= usize::from(was_native);
+                            self.retention.native_records += usize::from(entry.native_pending());
+                            Admission::Accepted
                         }
-                        self.touch_record(slot, true)?;
-                        let entry = self.records[slot].as_mut().ok_or(Error::Malformed)?;
-                        let was_native = entry.native_pending();
-                        entry.bytes[parsed.offset..end].copy_from_slice(parsed.body);
-                        entry.pieces[index] = 1;
-                        entry.count += 1;
-                        self.retention.native_records -= usize::from(was_native);
-                        self.retention.native_records += usize::from(entry.native_pending());
-                        Admission::Accepted
                     }
                 }
-            } else {
-                self.reserve(
-                    parsed.channel,
-                    identity.record,
-                    parsed.total,
-                    parsed.fragments,
-                )?;
-                let slot = self
-                    .records
-                    .iter()
-                    .position(Option::is_none)
-                    .ok_or(Error::Capacity)?;
-                self.touch_record(slot, false)?;
-                let (mut bytes, mut pieces) =
-                    self.record_buffers(parsed.total, parsed.fragments)?;
-                bytes[parsed.offset..parsed.offset + parsed.body.len()]
-                    .copy_from_slice(parsed.body);
-                if parsed.fragments != 0 {
-                    pieces[parsed.offset / parsed.capacity] = 1;
+                Err(position) => {
+                    self.reserve(
+                        parsed.channel,
+                        identity.record,
+                        parsed.total,
+                        parsed.fragments,
+                    )?;
+                    let slot = self
+                        .records
+                        .iter()
+                        .position(Option::is_none)
+                        .ok_or(Error::Capacity)?;
+                    self.touch_record(slot, false)?;
+                    let (mut bytes, mut pieces) =
+                        self.record_buffers(parsed.total, parsed.fragments)?;
+                    bytes[parsed.offset..parsed.offset + parsed.body.len()]
+                        .copy_from_slice(parsed.body);
+                    if parsed.fragments != 0 {
+                        pieces[parsed.offset / parsed.capacity] = 1;
+                    }
+                    let record = Record {
+                        channel: parsed.channel,
+                        id: identity.record,
+                        bytes,
+                        pieces,
+                        count: usize::from(parsed.fragments != 0),
+                        fragment_capacity: parsed.capacity,
+                        padding: parsed.padding,
+                        deadline,
+                        early_delivered: false,
+                        defer_early: false,
+                    };
+                    self.retention.add_record(&record);
+                    self.deadlines.insert(record.deadline);
+                    self.records[slot] = Some(record);
+                    self.ordered_slots.insert(position, slot as u16);
+                    Admission::Accepted
                 }
-                let record = Record {
-                    channel: parsed.channel,
-                    id: identity.record,
-                    bytes,
-                    pieces,
-                    count: usize::from(parsed.fragments != 0),
-                    fragment_capacity: parsed.capacity,
-                    padding: parsed.padding,
-                    deadline,
-                    early_delivered: false,
-                    defer_early: false,
-                };
-                self.retention.add_record(&record);
-                self.deadlines.insert(record.deadline);
-                self.records[slot] = Some(record);
-                Admission::Accepted
             }
         };
         self.touch_proof(proof_slot)?;
@@ -821,35 +867,41 @@ impl Receiver {
                 Some(id) => id,
                 None => return Ok(Prepared::Idle),
             };
-            let head = self
-                .find(channel, expected)
-                .filter(|slot| self.records[*slot].as_ref().is_some_and(Record::complete));
-            let slot = head.or_else(|| {
+            // Each channel retains only records at or beyond its expected
+            // watermark. A binary search skips every other channel and every
+            // unused payload reservation. The first eligible short is oldest.
+            let position = self
+                .record_position(channel, expected)
+                .unwrap_or_else(|i| i);
+            let slots = &self.ordered_slots[position..];
+            let mut selected = None;
+            for &indexed in slots {
+                let slot = usize::from(indexed);
+                let record = self.records[slot].as_ref().ok_or(Error::Malformed)?;
+                if record.channel != channel {
+                    break;
+                }
+                if record.id == expected && record.complete() {
+                    selected = Some(slot);
+                    break;
+                }
                 if matches!(selection, EarlySelection::Ordered)
                     || self.limits.body.independent_short_frame_bytes == 0
                 {
-                    return None;
+                    break;
                 }
-                self.records
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(i, entry)| {
-                        let entry = entry.as_ref()?;
-                        (entry.channel == channel
-                            && entry.id > expected
-                            && entry.complete()
-                            && entry.pieces.is_empty()
-                            && !entry.early_delivered
-                            && (matches!(selection, EarlySelection::Any) || !entry.defer_early)
-                            && independent_length(&entry.bytes).is_some_and(|length| {
-                                length <= self.limits.body.independent_short_frame_bytes
-                            }))
-                        .then_some((entry.id, i))
-                    })
-                    .min_by_key(|(id, _)| *id)
-                    .map(|(_, i)| i)
-            });
-            let Some(slot) = slot else {
+                if record.id > expected
+                    && record.pieces.is_empty()
+                    && !record.early_delivered
+                    && (matches!(selection, EarlySelection::Any) || !record.defer_early)
+                    && independent_length(&record.bytes)
+                        .is_some_and(|n| n <= self.limits.body.independent_short_frame_bytes)
+                {
+                    selected = Some(slot);
+                    break;
+                }
+            }
+            let Some(slot) = selected else {
                 return Ok(Prepared::Idle);
             };
             let entry = self.records[slot].as_ref().ok_or(Error::Malformed)?;
@@ -1036,12 +1088,32 @@ impl Receiver {
         }
         result
     }
+    /// First channel with retained records in round-robin order from `start`.
+    /// Incomplete records, contexts and early-delivery tombstones all participate.
+    pub fn next_retained_channel(&self, start: ChannelId) -> Option<ChannelId> {
+        let position = match self.record_position(start, RecordId(0)) {
+            Ok(index) | Err(index) => index,
+        };
+        let slot = self
+            .ordered_slots
+            .get(position)
+            .or_else(|| self.ordered_slots.first())?;
+        self.records[usize::from(*slot)].as_ref().map(|r| r.channel)
+    }
+
+    fn record_position(&self, channel: ChannelId, record: RecordId) -> Result<usize, usize> {
+        self.ordered_slots
+            .binary_search_by_key(&Some((channel.0, record)), |slot| {
+                self.records[usize::from(*slot)]
+                    .as_ref()
+                    .map(|r| (r.channel.0, r.id))
+            })
+    }
+    #[cfg(test)]
     fn find(&self, channel: ChannelId, record: RecordId) -> Option<usize> {
-        self.records.iter().position(|entry| {
-            entry
-                .as_ref()
-                .is_some_and(|e| e.channel == channel && e.id == record)
-        })
+        self.record_position(channel, record)
+            .ok()
+            .map(|i| usize::from(self.ordered_slots[i]))
     }
     fn check_time(&mut self, now: Tick) -> Result<(), Error> {
         if let Some(error) = self.failure {
@@ -1097,8 +1169,12 @@ impl Receiver {
         if self.channels[index].expected != Some(id) {
             return Err(Error::Malformed);
         }
+        let position = self
+            .record_position(entry.channel, id)
+            .map_err(|_| Error::Malformed)?;
         self.touch_channel(index)?;
         self.touch_record(slot, false)?;
+        self.ordered_slots.remove(position);
         self.channels[index].expected = id.0.checked_add(1).map(RecordId);
         if let Some(record) = self.records[slot].take() {
             self.retention.remove_record(&record);

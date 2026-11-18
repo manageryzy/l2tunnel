@@ -294,12 +294,15 @@ where
                     .terminal
                     .ok_or_else(|| protocol("terminal expiry missing"))?);
             }
-            execution.measure_result(TimingStage::CommonProtocolProgress, || {
-                driver.service_common_ingress(now, &mut inputs.native)?;
-                driver.collect_native(now)?;
-                driver.progress(now)?;
-                driver.service_common_rolling(now)
-            })?;
+            now = driver.service_common_protocol_stages(
+                now,
+                &mut inputs.native,
+                execution,
+                || {
+                    instant = sample();
+                    clock(origin, instant)
+                },
+            )?;
             let completed = driver.report_transaction_completion(
                 || clock(origin, sample()),
                 |driver, at| {

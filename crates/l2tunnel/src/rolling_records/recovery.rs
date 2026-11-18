@@ -129,6 +129,9 @@ pub trait RecoveryPolicy: sealed::Sealed + Copy + Eq {
     fn requested_credit(_sender: &Self::Sender) -> Option<bool> {
         None
     }
+    fn request_counts(_sender: &Self::Sender) -> scheduler::RequestCounts {
+        scheduler::RequestCounts::default()
+    }
     fn observe_mux_wait(_sender: &mut Self::Sender, _age: u64) {}
     fn receive_step(
         receiver: &mut Self::Receiver,
@@ -173,6 +176,16 @@ pub trait RecoveryPolicy: sealed::Sealed + Copy + Eq {
         id: rolling::SourceId,
         now: rolling::Tick,
     ) -> Result<(), rolling::Error>;
+    fn receive_committed_source(
+        _receiver: &mut Self::Receiver,
+        _id: rolling::SourceId,
+        _original: &[u8],
+        _received: rolling::Tick,
+        _now: rolling::Tick,
+        _cap: rolling::Tick,
+    ) -> Result<Option<rolling::Begin>, rolling::Error> {
+        Ok(None)
+    }
     fn receive(
         receiver: &mut Self::Receiver,
         bytes: &[u8],
@@ -369,6 +382,9 @@ impl RecoveryPolicy for scheduler::Policy {
     fn requested_credit(s: &Self::Sender) -> Option<bool> {
         s.pending_requested_credit()
     }
+    fn request_counts(s: &Self::Sender) -> scheduler::RequestCounts {
+        s.request_counts()
+    }
     fn observe_mux_wait(s: &mut Self::Sender, age: u64) {
         s.observe_mux_wait_micros(age);
     }
@@ -472,6 +488,16 @@ impl RecoveryPolicy for scheduler::Policy {
         n: rolling::Tick,
     ) -> Result<(), rolling::Error> {
         r.confirm_handoff(i, n)
+    }
+    fn receive_committed_source(
+        receiver: &mut Self::Receiver,
+        id: rolling::SourceId,
+        original: &[u8],
+        received: rolling::Tick,
+        now: rolling::Tick,
+        cap: rolling::Tick,
+    ) -> Result<Option<rolling::Begin>, rolling::Error> {
+        receiver.receive_committed_source_until(id, original, received, now, cap)
     }
     fn receive(
         r: &mut Self::Receiver,

@@ -178,13 +178,15 @@ fn protected_udp_targeted_gap_retries_retained_original_and_charges_local_mux_pr
             let plain = &sender.driver.buffers.frame[..token.emission().bytes];
             assert_eq!(plain.first(), Some(&1));
             assert_eq!(plain.get(1), Some(&0));
+            let mut requested = before;
+            requested.named_requests.first += 1;
             assert_eq!(
                 sender
                     .driver
                     .common_state()?
                     .engine(epoch)?
                     .rolling_repair_budget(),
-                Some(before)
+                Some(requested)
             );
             sender
                 .driver

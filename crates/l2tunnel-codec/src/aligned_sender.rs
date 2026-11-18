@@ -461,6 +461,11 @@ impl Sender {
             completes_frame: complete && !pending.context,
         })
     }
+    // The packed sender can retain an already rendered full-width first
+    // fragment until commit. The owning frame remains staged throughout.
+    pub(crate) fn rendered_symbol(&self) -> &[u8] {
+        &self.symbol
+    }
     /// Classify the actual next meaningful unit without advancing ownership.
     /// The caller must authenticate this explicit policy before installation;
     /// returning a count does not perform or acknowledge physical packet writes.

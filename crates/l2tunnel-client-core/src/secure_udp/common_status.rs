@@ -23,6 +23,8 @@ pub use rolling_ingress::{
 /// Physical retransmission credits and regular FEC spending in the active local sender.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct RollingRepairBudget {
+    /// Named source requests observed by the sender, when reported by this service.
+    pub named_requests: Option<RollingNamedRequests>,
     /// Remaining and maximum credit, expressed in half-bytes.
     pub balance_half_bytes: u64,
     /// Selected 32-MTU credit ceiling, in half-bytes.
@@ -69,9 +71,34 @@ pub struct RollingRepairBudget {
     /// Current hysteresis state of this local sender.
     pub full_credit: bool,
 }
+
+/// Distinct source request identities and their disposition under local backpressure.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RollingNamedRequests {
+    /// First request for a source still retained.
+    pub first: u64,
+    /// Newer request serials for a previously requested source.
+    pub repeated: u64,
+    /// Repeated requests coalesced before their retry was selected.
+    pub coalesced_queued: u64,
+    /// Repeated requests coalesced after preparation and before physical handoff.
+    pub coalesced_prepared: u64,
+    /// Previously observed or older request serials for the same source.
+    pub duplicate_or_older: u64,
+    /// Named sources already cumulatively confirmed.
+    pub confirmed: u64,
+}
 impl From<l2tunnel::rolling_records::RepairBudgetStatus> for RollingRepairBudget {
     fn from(s: l2tunnel::rolling_records::RepairBudgetStatus) -> Self {
         Self {
+            named_requests: Some(RollingNamedRequests {
+                first: s.named_requests.first,
+                repeated: s.named_requests.repeated,
+                coalesced_queued: s.named_requests.coalesced_queued,
+                coalesced_prepared: s.named_requests.coalesced_prepared,
+                duplicate_or_older: s.named_requests.duplicate_or_older,
+                confirmed: s.named_requests.confirmed,
+            }),
             balance_half_bytes: s.balance_half_bytes,
             cap_half_bytes: s.cap_half_bytes,
             half_weight_retries: s.half_weight_retries,

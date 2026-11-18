@@ -22,9 +22,7 @@ impl Driver {
         let Some(reader) = state.peer().reader(core::Epoch(opened.scope.epoch.0)) else {
             return Ok(false);
         };
-        if common_actions::common_scope(core::Epoch(opened.scope.epoch.0), reader.config)?
-            != opened.scope
-        {
+        if common_actions::record_scope(reader.scope) != opened.scope {
             return Ok(false);
         }
         let body = &self.buffers.plain[..opened.bytes];
@@ -112,15 +110,11 @@ impl Driver {
                 None
             };
             if let Some(step) = step {
-                let width = usize::from(
-                    self.common_state()?
-                        .engine(epoch)?
-                        .configuration()
-                        .descriptor()
-                        .local(common_contract::mg_role(self.info.role))
-                        .receive()
-                        .channels(),
-                );
+                let visits = if step.source_handed || step.native_progress {
+                    Some(self.common_state()?.engine(epoch)?.native_scan_visits())
+                } else {
+                    None
+                };
                 let runtime = self
                     .common
                     .as_deref_mut()
@@ -135,8 +129,8 @@ impl Driver {
                         .saturating_add(sent as u64)
                         .saturating_add(received as u64);
                 }
-                if step.source_handed || step.native_progress {
-                    runtime.native_work[(epoch.0 % 2) as usize] = width;
+                if let Some(visits) = visits {
+                    runtime.native_work[(epoch.0 % 2) as usize] = visits;
                 }
             }
         }
@@ -355,7 +349,7 @@ impl Driver {
                 if reader.disposition == transaction::ReadDisposition::Staged {
                     continue;
                 }
-                common_actions::common_scope(epoch, reader.config)?
+                common_actions::record_scope(reader.scope)
             };
             if self
                 .common_state()?
@@ -447,19 +441,11 @@ impl Driver {
                     ));
                 }
                 record_bank::NativePreparation::Progress => {
-                    let width = usize::from(
-                        state
-                            .engine(epoch)?
-                            .configuration()
-                            .descriptor()
-                            .local(common_contract::mg_role(self.info.role))
-                            .receive()
-                            .channels(),
-                    );
+                    let visits = state.engine(epoch)?.native_scan_visits();
                     self.common
                         .as_deref_mut()
                         .ok_or_else(|| protocol("common scan contract"))?
-                        .native_work[index] = width;
+                        .native_work[index] = visits;
                 }
                 record_bank::NativePreparation::Idle => {}
             }
@@ -525,19 +511,11 @@ impl Driver {
                 .native_write_batch_packets
                 .saturating_add(1);
             committed?;
-            let width = usize::from(
-                self.common_state()?
-                    .engine(epoch)?
-                    .configuration()
-                    .descriptor()
-                    .local(common_contract::mg_role(self.info.role))
-                    .receive()
-                    .channels(),
-            );
+            let visits = self.common_state()?.engine(epoch)?.native_scan_visits();
             self.common
                 .as_deref_mut()
                 .ok_or_else(|| protocol("common scan contract"))?
-                .native_work[(epoch.0 % 2) as usize] = width;
+                .native_work[(epoch.0 % 2) as usize] = visits;
         } else if matches!(&result, Ok(false)) {
             self.performance.counters.native_write_would_block = self
                 .performance
@@ -602,6 +580,7 @@ impl Driver {
         now: u64,
         raw: Option<&mut R>,
     ) -> io::Result<bool> {
+        self.service_due_acks(now)?;
         if self
             .common
             .as_deref()
@@ -634,7 +613,7 @@ impl Driver {
                     .reader(epoch)
                     .ok_or_else(|| protocol("common scheduler reader"))?;
                 (
-                    common_actions::common_scope(epoch, reader.config)?,
+                    common_actions::record_scope(reader.scope),
                     epoch.0 == self.source_scope.epoch.0
                         && reader.disposition != transaction::ReadDisposition::Staged,
                 )
@@ -1463,7 +1442,7 @@ impl Driver {
             self.counters.rejected_packets = self.counters.rejected_packets.saturating_add(1);
             return Ok(());
         };
-        if common_actions::common_scope(epoch, reader.config)? != opened.scope
+        if common_actions::record_scope(reader.scope) != opened.scope
             || !self.scope_registered(opened.scope)
         {
             return Err(protocol("common authenticated reader scope differs"));
@@ -1475,12 +1454,13 @@ impl Driver {
         let body = &self.buffers.plain[..opened.bytes];
         let kind = state.engine(epoch)?.inspect_peer(body).map_err(protocol)?;
         let staged_reader = reader.disposition == transaction::ReadDisposition::Staged;
+        let deferred_decode = matches!(
+            local.receive().profile(),
+            configuration::DirectionProfile::Rolling { .. }
+                | configuration::DirectionProfile::Research { .. }
+        );
         let queued_rolling_input = self.config.rolling_ingress.is_some()
-            && matches!(
-                local.receive().profile(),
-                configuration::DirectionProfile::Rolling { .. }
-                    | configuration::DirectionProfile::Research { .. }
-            )
+            && deferred_decode
             && kind != engine::EmissionKind::Feedback;
         let width = usize::from(local.receive().channels());
         if kind == engine::EmissionKind::Feedback
@@ -1519,10 +1499,14 @@ impl Driver {
                 "staged common generation cannot admit native-producing data",
             ));
         }
-        self.common
-            .as_deref_mut()
-            .ok_or_else(|| protocol("common scan contract"))?
-            .native_work[(epoch.0 % 2) as usize] = width;
+        // Rolling inputs only stage decoder work. Its later receive step arms
+        // native scans after admitting records or advancing their ordered head.
+        if !deferred_decode {
+            self.common
+                .as_deref_mut()
+                .ok_or_else(|| protocol("common scan contract"))?
+                .native_work[(epoch.0 % 2) as usize] = width;
+        }
         let raw_connection = kind == engine::EmissionKind::UnreliableNative;
         let mut original_deadline = if raw_connection {
             self.raw_connection_deadline(opened.scope, received)?
@@ -2008,7 +1992,7 @@ impl Driver {
             .peer()
             .reader(epoch)
             .ok_or_else(|| protocol("retained feedback reader missing"))?;
-        if common_actions::common_scope(epoch, reader.config)? != pending.scope {
+        if common_actions::record_scope(reader.scope) != pending.scope {
             return Err(protocol("retained feedback reader changed"));
         }
         let order = pending

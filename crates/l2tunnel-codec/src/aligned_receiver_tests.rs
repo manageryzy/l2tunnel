@@ -695,6 +695,14 @@ fn source_observation_keeps_full_scope_identity_conflicts_and_original_expiry() 
     config.lifetime_ticks = 10;
     let mut receiver = Receiver::new(scope(), config)?;
     let bytes = raw(1460, 0, 1, b"retained with a source gap");
+    let head = raw(1460, 0, 0, b"unadmitted head");
+    assert!(receiver.needs_channel_head(identity(0, 0), &head)?);
+    assert!(!receiver.needs_channel_head(identity(1, 1), &bytes)?);
+    assert!(!receiver.needs_channel_head(identity(4, 0), &head)?);
+    assert_eq!(
+        receiver.needs_channel_head(identity(0, 1), &head),
+        Err(Error::Malformed)
+    );
     assert!(!receiver.source_observed(scope(), SourceId(1))?);
     receiver.admit_authenticated(identity(1, 1), &bytes, Tick(1))?;
     assert!(receiver.source_observed(scope(), SourceId(1))?);
@@ -714,12 +722,21 @@ fn source_observation_keeps_full_scope_identity_conflicts_and_original_expiry() 
     assert_eq!(receiver.status(), before);
     assert_eq!(receiver.deadline(), deadline);
     let changed = raw(1460, 0, 1, b"different retained bytes");
+    assert!(!receiver.needs_channel_head(identity(1, 1), &bytes)?);
+    assert_eq!(
+        receiver.needs_channel_head(identity(1, 1), &changed),
+        Err(Error::Conflict)
+    );
     assert_eq!(
         receiver.admit_authenticated(identity(1, 1), &changed, Tick(2)),
         Err(Error::Conflict)
     );
     receiver.tick(Tick(10))?;
     assert_eq!(receiver.tick(Tick(11)), Err(Error::Expired));
+    assert_eq!(
+        receiver.needs_channel_head(identity(0, 0), &head),
+        Err(Error::Expired)
+    );
     assert_eq!(
         receiver.source_observed(scope(), SourceId(1)),
         Err(Error::Expired)

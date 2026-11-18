@@ -1,6 +1,7 @@
 //! One actual bounded queue for already authenticated, replay-checked wire inputs.
 use super::*;
 use crate::native_storage as queue;
+use record_engine::EmissionKind;
 
 /// Explicit receive input custody, independent of coding window and carrier lanes.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -36,6 +37,8 @@ pub struct IngressStatus {
     pub oldest_received: Option<Tick>,
     /// Records number already authenticated by the caller; not replay authority.
     pub oldest_records_number: Option<u64>,
+    /// Full-slot refusals for systematic sources, repairs and deferred feedback, respectively.
+    pub full_refusals: [u64; 3],
     /// Earliest original queued job/operation/session cap.
     pub deadline: Option<Tick>,
 }
@@ -66,6 +69,7 @@ pub(super) struct Ingress {
     limits: IngressLimits,
     minimum: Option<Tick>,
     feedback: usize,
+    full_refusals: [u64; 3],
     pub(super) waiting_on_decoder: bool,
     pub(super) queue: queue::Queue<Input>,
 }
@@ -84,6 +88,7 @@ impl Ingress {
             queue,
             minimum: None,
             feedback: 0,
+            full_refusals: [0; 3],
             waiting_on_decoder: false,
         })
     }
@@ -100,16 +105,24 @@ impl Ingress {
                 .front()
                 .and_then(|packet| packet.metadata().number),
             deadline: self.deadline(),
+            full_refusals: self.full_refusals,
         }
     }
     pub(super) fn deadline(&self) -> Option<Tick> {
         self.minimum
     }
     pub(super) fn push(&mut self, input: Input, bytes: &[u8]) -> Result<(), Error> {
-        self.queue
-            .acquire()
-            .ok_or(Error::Busy)?
-            .copy(input, input.received.0, bytes)
+        let Some(slot) = self.queue.acquire() else {
+            let index = match input.kind {
+                EmissionKind::Source(_) => 0,
+                EmissionKind::Repair => 1,
+                EmissionKind::Feedback => 2,
+                _ => return Err(Error::Identity),
+            };
+            self.full_refusals[index] = self.full_refusals[index].saturating_add(1);
+            return Err(Error::Busy);
+        };
+        slot.copy(input, input.received.0, bytes)
             .map_err(Error::Ingress)?;
         self.minimum = Some(
             self.minimum

@@ -946,7 +946,10 @@ impl Engine {
     ) -> Result<Option<rolling_records::Step>, Error> {
         self.advance(now)?;
         let result = match &mut self.owner {
-            Owner::Rolling(endpoint) => endpoint.step(now, work).map(Some).map_err(Error::Rolling),
+            Owner::Rolling(endpoint) => endpoint
+                .step_queued(now, work)
+                .map(Some)
+                .map_err(Error::Rolling),
             Owner::Research(endpoint) => endpoint.step(now, work).map(Some).map_err(Error::Rolling),
             owner => owner.tick(now).map(|()| None),
         };

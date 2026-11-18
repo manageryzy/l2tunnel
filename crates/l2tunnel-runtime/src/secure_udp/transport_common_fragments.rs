@@ -158,7 +158,7 @@ impl Driver {
         if state.engine(epoch)?.fragment_policy().is_none() {
             return Ok(false);
         }
-        if common_actions::common_scope(epoch, reader.config)? != opened.scope
+        if common_actions::record_scope(reader.scope) != opened.scope
             || !self.scope_registered(opened.scope)
         {
             return Err(protocol("fragment authenticated reader scope differs"));

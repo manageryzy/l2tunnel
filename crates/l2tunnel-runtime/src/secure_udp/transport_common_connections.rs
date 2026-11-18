@@ -294,7 +294,7 @@ impl Driver {
                 .peer()
                 .reader(epoch)
                 .ok_or_else(|| protocol("raw ACK retained Reader missing"))?;
-            if common_actions::common_scope(epoch, reader.config)? != pending.scope {
+            if common_actions::record_scope(reader.scope) != pending.scope {
                 return Err(protocol("raw ACK retained Reader changed"));
             }
             let width = usize::from(

@@ -1022,6 +1022,11 @@ impl Owner {
     }
     fn work(&mut self, now: Duration) -> Result<(), Error> {
         for _ in 0..self.settings.work_per_call {
+            // A source ACK can release a fragment while its whole-message
+            // confirmation is still outstanding. Keep checking such entries.
+            if self.outbound.is_empty() && self.idle_actions >= self.idle_limit() {
+                break;
+            }
             let phase = self.phase;
             self.phase = (self.phase + 1) % 3;
             let progressed = match phase {

@@ -225,6 +225,8 @@ pub enum ReadDisposition {
 pub struct Reader<'a, C: Configuration = ModeConfig> {
     /// Exact configuration for the requested epoch, never the other epoch's profile.
     pub config: &'a C,
+    /// Canonical digest and epoch of this reader, retained from validated negotiation.
+    pub scope: crate::session_control::Scope,
     /// Delivery restriction for this reader.
     pub disposition: ReadDisposition,
 }
@@ -249,7 +251,7 @@ struct Incoming {
 }
 struct Pending<C: Configuration> {
     ticket: Ticket,
-    source: Epoch,
+    origin: crate::session_control::Scope,
     old: C,
     next: C,
     local: Option<Fence>,
@@ -456,6 +458,7 @@ impl<C: Configuration> Peer<C> {
         if epoch == self.active_epoch() {
             return Some(Reader {
                 config: &self.active,
+                scope: self.current_origin(),
                 disposition: if self.guard.phase() == GuardPhase::CommitSent {
                     ReadDisposition::DrainOnly
                 } else {
@@ -464,14 +467,19 @@ impl<C: Configuration> Peer<C> {
             });
         }
         let pending = self.pending.as_ref()?;
-        if epoch == pending.source && self.active_epoch() == pending.ticket.epoch {
+        if epoch == pending.origin.epoch && self.active_epoch() == pending.ticket.epoch {
             Some(Reader {
                 config: &pending.old,
+                scope: pending.origin,
                 disposition: ReadDisposition::DrainOnly,
             })
         } else if epoch == pending.ticket.epoch && self.guard.phase() == GuardPhase::CommitSent {
             Some(Reader {
                 config: &pending.next,
+                scope: crate::session_control::Scope {
+                    epoch: pending.ticket.epoch,
+                    digest: pending.ticket.digest,
+                },
                 disposition: ReadDisposition::Staged,
             })
         } else {
@@ -516,7 +524,7 @@ impl<C: Configuration> Peer<C> {
         self.last_attempt = ticket.attempt;
         self.pending = Some(Pending {
             ticket,
-            source: self.active_epoch(),
+            origin: self.current_origin(),
             old: self.active.clone(),
             next: config.clone(),
             local: None,
@@ -543,7 +551,7 @@ impl<C: Configuration> Peer<C> {
         let pending = self.pending.as_mut().ok_or(Error::Unexpected)?;
         pending.local = Some(local.clone());
         let ticket = pending.ticket;
-        let source = pending.source;
+        let source = pending.origin.epoch;
         if self.identity.role == Role::Client {
             let mut body = encode_configuration(&pending.next)?;
             body.extend_from_slice(&local.encode());
@@ -582,7 +590,7 @@ impl<C: Configuration> Peer<C> {
         }
         pending.local_drained = true;
         let ticket = pending.ticket;
-        let source = pending.source;
+        let source = pending.origin.epoch;
         if self.identity.role == Role::Client {
             self.set_phase(Phase::AwaitBarrier)?;
             self.command(MessageKind::Barrier, source, ticket, &[])
@@ -681,7 +689,7 @@ impl<C: Configuration> Peer<C> {
             {
                 let pending = self.pending.as_ref().ok_or(Error::Unexpected)?;
                 let ticket = pending.ticket;
-                let source = pending.source;
+                let source = pending.origin.epoch;
                 let not_sent = self.phase == Phase::Staging;
                 self.guard.abort(ticket).map_err(Error::Guard)?;
                 self.outstanding = None;
@@ -755,7 +763,7 @@ impl<C: Configuration> Peer<C> {
     }
     fn matches_pending(&self, header: Header) -> Result<(), Error> {
         let pending = self.pending.as_ref().ok_or(Error::Unexpected)?;
-        if pending.ticket != header.ticket || pending.source != header.source_epoch {
+        if pending.ticket != header.ticket || pending.origin.epoch != header.source_epoch {
             return Err(Error::Unexpected);
         }
         Ok(())
@@ -808,7 +816,7 @@ impl<C: Configuration> Peer<C> {
                 self.last_attempt = h.ticket.attempt;
                 self.pending = Some(Pending {
                     ticket: h.ticket,
-                    source: h.source_epoch,
+                    origin: self.current_origin(),
                     old: self.active.clone(),
                     next: next.clone(),
                     local: None,

@@ -102,8 +102,14 @@ impl Entries {
                 .map(|index| &entries[index].1),
         }
     }
-    fn contains_key(&self, key: &FlowKey) -> bool {
-        self.get(key).is_some()
+    fn locate(&self, key: &FlowKey) -> (Option<Binding>, usize) {
+        match self {
+            Self::Legacy(entries) => (entries.get(key).map(|entry| entry.binding), 0),
+            Self::Reserved(entries) => match entries.binary_search_by_key(key, |(key, _)| *key) {
+                Ok(index) => (Some(entries[index].1.binding), index),
+                Err(index) => (None, index),
+            },
+        }
     }
     fn len(&self) -> usize {
         match self {
@@ -114,16 +120,15 @@ impl Entries {
     fn is_empty(&self) -> bool {
         self.len() == 0
     }
-    fn insert(&mut self, key: FlowKey, entry: Entry) {
+    fn insert(&mut self, key: FlowKey, entry: Entry, index: usize, existed: bool) {
         match self {
             Self::Legacy(entries) => {
                 entries.insert(key, entry);
             }
-            Self::Reserved(entries) => match entries.binary_search_by_key(&key, |(key, _)| *key) {
-                Ok(index) => entries[index].1 = entry,
-                // The exclusive PreparedAssignment preview proved room before commit.
-                Err(index) => entries.insert(index, (key, entry)),
-            },
+            // The exclusive assignment keeps this exact sorted position and
+            // the preflighted capacity valid until commit or cancellation.
+            Self::Reserved(entries) if existed => entries[index].1 = entry,
+            Self::Reserved(entries) => entries.insert(index, (key, entry)),
         }
     }
     fn remove(&mut self, key: &FlowKey) -> Option<Entry> {
@@ -182,6 +187,7 @@ pub struct PreparedAssignment<'a> {
     binding: Binding,
     now: Duration,
     existed: bool,
+    reserved_index: usize,
     learned: bool,
 }
 
@@ -189,6 +195,11 @@ impl PreparedAssignment<'_> {
     /// Exact binding that commit will install or refresh.
     pub fn binding(&self) -> Binding {
         self.binding
+    }
+
+    /// Whether commit will create a new local identity.
+    pub fn is_new(&self) -> bool {
+        !self.existed
     }
 
     /// Commit after other component admission, without another fallible check.
@@ -199,6 +210,8 @@ impl PreparedAssignment<'_> {
                 binding: self.binding,
                 last_seen: self.now,
             },
+            self.reserved_index,
+            self.existed,
         );
         if !self.existed {
             self.table.next_id = self.binding.id.0.checked_add(1);
@@ -280,17 +293,8 @@ impl FlowTable {
     /// A subsequent `assign` returns this binding if no mutation intervenes.
     /// This preview is not a reservation or permission for concurrent mutation.
     pub fn preview_assign(&self, key: FlowKey, now: Duration) -> Result<Binding, FlowError> {
-        self.check_time(now)?;
-        if let Some(entry) = self.entries.get(&key) {
-            return Ok(entry.binding);
-        }
-        let channel = match self.config.mapping {
-            Mapping::Crc32 => self.crc_channel(key),
-            Mapping::ConnectionRoundRobin | Mapping::ConnectionRoundRobinLearned => {
-                self.next_channel
-            }
-        };
-        self.preview_insert(channel)
+        self.assignment(key, None, now)
+            .map(|(binding, _, _)| binding)
     }
 
     /// Predict authenticated learned affinity without changing any table state.
@@ -302,16 +306,25 @@ impl FlowTable {
         channel: u16,
         now: Duration,
     ) -> Result<Binding, FlowError> {
+        self.assignment(key, Some(channel), now)
+            .map(|(binding, _, _)| binding)
+    }
+
+    fn assignment(
+        &self,
+        key: FlowKey,
+        learned: Option<u16>,
+        now: Duration,
+    ) -> Result<(Binding, bool, usize), FlowError> {
         self.check_time(now)?;
-        if channel >= self.config.channels {
+        if learned.is_some_and(|channel| channel >= self.config.channels) {
             return Err(FlowError::InvalidChannel);
         }
-        let expected = self
-            .entries
-            .get(&key)
-            .map(|entry| entry.binding.channel)
+        let (existing, index) = self.entries.locate(&key);
+        let expected = existing
+            .map(|binding| binding.channel)
             .or_else(|| (self.config.mapping == Mapping::Crc32).then(|| self.crc_channel(key)));
-        if let Some(expected) = expected
+        if let (Some(channel), Some(expected)) = (learned, expected)
             && channel != expected
         {
             return Err(FlowError::BindingConflict {
@@ -319,9 +332,13 @@ impl FlowTable {
                 received: channel,
             });
         }
-        match self.entries.get(&key) {
-            Some(entry) => Ok(entry.binding),
-            None => self.preview_insert(channel),
+        match existing {
+            Some(binding) => Ok((binding, true, index)),
+            None => Ok((
+                self.preview_insert(learned.or(expected).unwrap_or(self.next_channel))?,
+                false,
+                index,
+            )),
         }
     }
 
@@ -331,14 +348,14 @@ impl FlowTable {
         key: FlowKey,
         now: Duration,
     ) -> Result<PreparedAssignment<'_>, FlowError> {
-        let binding = self.preview_assign(key, now)?;
-        let existed = self.entries.contains_key(&key);
+        let (binding, existed, reserved_index) = self.assignment(key, None, now)?;
         Ok(PreparedAssignment {
             table: self,
             key,
             binding,
             now,
             existed,
+            reserved_index,
             learned: false,
         })
     }
@@ -350,14 +367,14 @@ impl FlowTable {
         channel: u16,
         now: Duration,
     ) -> Result<PreparedAssignment<'_>, FlowError> {
-        let binding = self.preview_learn(key, channel, now)?;
-        let existed = self.entries.contains_key(&key);
+        let (binding, existed, reserved_index) = self.assignment(key, Some(channel), now)?;
         Ok(PreparedAssignment {
             table: self,
             key,
             binding,
             now,
             existed,
+            reserved_index,
             learned: true,
         })
     }

@@ -13,6 +13,8 @@ struct Header {
     prefix: u32,
     observed: u32,
     rank: usize,
+    // Exclusive upper bound for occupied row slots in this transaction.
+    row_end: usize,
     known_count: usize,
     evicted_before: u32,
 }
@@ -699,6 +701,23 @@ impl Decoder {
         now: Tick,
         original_deadline: Tick,
     ) -> Result<Begin, Error> {
+        self.source_input(scope, id, original, received, now, original_deadline, true)?
+            .ok_or(Error::Busy)
+    }
+
+    /// Classify committed sources before optionally staging fresh decoder work.
+    /// The candidate store can write only outside the committed retention horizon.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn source_input(
+        &mut self,
+        scope: Scope,
+        id: SourceId,
+        original: &[u8],
+        received: Tick,
+        now: Tick,
+        original_deadline: Tick,
+        stage_new: bool,
+    ) -> Result<Option<Begin>, Error> {
         if scope != self.scope {
             return Err(Error::Scope);
         }
@@ -726,35 +745,44 @@ impl Decoder {
             });
             return self.fail(Error::Expired);
         }
-        if self.job.is_some() {
+        if stage_new && self.job.is_some() {
             return Err(Error::Busy);
         }
         let floor = self.live.prefix.saturating_sub(self.config.window as u32);
         if id.0 < floor {
-            return Ok(Begin::Stale);
+            return Ok(Some(Begin::Stale));
         }
         if u64::from(id.0) >= u64::from(self.live.prefix) + self.config.window as u64 {
-            return Err(Error::Identity);
+            // An earlier queued source can advance the window before a new
+            // input takes its ordinary FIFO turn.
+            return if stage_new {
+                Err(Error::Identity)
+            } else {
+                Ok(None)
+            };
         }
         let slot = id.0 as usize % (2 * self.config.window);
         if self.known[slot].get(&self.decisions, None)? == Some(id.0) {
             let data = &self.known_data[slot * self.width..(slot + 1) * self.width];
             let len = usize::from(u16::from_be_bytes([data[0], data[1]]));
             return if len == original.len() && data[2..2 + len] == *original {
-                Ok(Begin::Duplicate)
+                Ok(Some(Begin::Duplicate))
             } else {
                 self.fail(Error::Conflict)
             };
+        }
+        if !stage_new {
+            return Ok(None);
         }
         if id.0 < self.live.prefix {
             return self.fail(Error::Identity);
         }
         let input = Input::Source(id.0);
         let (job_end, debt) = self.input_deadlines(input, received, now, original_deadline)?;
-        self.input.fill(0);
         self.input[..2].copy_from_slice(&(original.len() as u16).to_be_bytes());
         self.input[2..2 + original.len()].copy_from_slice(original);
-        self.stage(input, job_end, debt, received, now)
+        self.input[2 + original.len()..].fill(0);
+        self.stage(input, job_end, debt, received, now).map(Some)
     }
     /// Stage a complete authenticated equation; useful end<=prefix+W is checked first.
     pub fn begin_repair(&mut self, repair: Repair<'_>, now: Tick) -> Result<Begin, Error> {
@@ -936,8 +964,8 @@ impl Decoder {
         let (job_end, debt) = self.input_deadlines(input, received, now, original_deadline)?;
         // One bounded clear and prefix copy restore the same logical equation
         // used by the solver and duplicate history, without another allocation.
-        self.input.fill(0);
         self.input[..repair.bytes.len()].copy_from_slice(repair.bytes);
+        self.input[repair.bytes.len()..].fill(0);
         self.stage(input, job_end, debt, received, now)
     }
     fn row_start(&self, row: usize) -> usize {
@@ -967,7 +995,15 @@ impl Decoder {
             &mut self.decisions,
             self.active.ok_or(Error::Identity)?,
             value,
-        )
+        )?;
+        if value.is_some() {
+            self.shadow.row_end = self.shadow.row_end.max(row + 1);
+        } else if row + 1 == self.shadow.row_end {
+            // Earlier vacant slots can remain in the bound until the last
+            // live pivot clears. No occupied row may be skipped.
+            self.shadow.row_end = row;
+        }
+        Ok(())
     }
     fn set_map(&mut self, column: usize, value: Option<usize>) -> Result<(), Error> {
         self.map[column].set(
@@ -991,8 +1027,11 @@ impl Decoder {
     }
     fn zero_coefficient_run(&self, id: u32, budget: &WorkBudget) -> Result<usize, Error> {
         let w = self.config.window;
-        let limit = (u64::from(self.live.prefix) + w as u64).min(u64::from(u32::MAX));
-        let remaining = limit.checked_sub(u64::from(id)).ok_or(Error::Identity)?;
+        let remaining = self
+            .shadow
+            .observed
+            .checked_sub(id)
+            .ok_or(Error::Identity)?;
         let remaining = usize::try_from(remaining).map_err(|_| Error::Exhausted)?;
         let column = id as usize % w;
         // Do not cross the circular-column boundary, source-ID limit, first
@@ -1028,17 +1067,23 @@ impl Decoder {
         }
         Ok(())
     }
-    fn payload_byte(
-        &self,
+    // The working row bank cannot change within one bounded phase visit.
+    // Known-data writes stay private until the transaction publishes their ID.
+    fn payload_storage(
+        &mut self,
         row: Option<usize>,
-        index: usize,
         systematic: bool,
-    ) -> Result<u8, Error> {
-        match row {
-            Some(row) => self.row_byte(row, self.config.window + index),
-            None if systematic => Ok(self.input[index]),
-            None => Ok(self.candidate[self.config.window + index]),
-        }
+    ) -> Result<(&[u8], &mut [u8]), Error> {
+        let payload = match row {
+            Some(row) => {
+                let bank = self.row_bank(row, self.active)?;
+                let start = self.row_start(row) + self.config.window;
+                &self.data[bank][start..start + self.width]
+            }
+            None if systematic => &self.input,
+            None => &self.candidate[self.config.window..],
+        };
+        Ok((payload, &mut self.known_data))
     }
     fn advance(
         &mut self,
@@ -1129,7 +1174,7 @@ impl Decoder {
             }
             Phase::Support(id) => {
                 if id == job.input.end() {
-                    job.phase = Phase::Reduce(self.live.prefix);
+                    job.phase = Phase::Reduce(job.input.start().max(self.live.prefix));
                 } else {
                     // A research metadata visit includes at most sixteen
                     // single-block SHA-256 evaluations, bounded by Profile.
@@ -1206,8 +1251,10 @@ impl Decoder {
                 }
             }
             Phase::Reduce(id) => {
-                if u64::from(id) >= u64::from(self.live.prefix) + w as u64 || id == u32::MAX {
-                    job.phase = Phase::Pivot(self.live.prefix);
+                // A retained row has no term below its pivot. Elimination can
+                // introduce later terms only inside the observed source horizon.
+                if id >= self.shadow.observed {
+                    job.phase = Phase::Pivot(job.input.start().max(self.live.prefix));
                 } else {
                     let factor = self.candidate[id as usize % w];
                     if factor == 0 {
@@ -1268,7 +1315,7 @@ impl Decoder {
                 }
             }
             Phase::Pivot(id) => {
-                if u64::from(id) >= u64::from(self.live.prefix) + w as u64 || id == u32::MAX {
+                if id >= self.shadow.observed {
                     job.phase = Phase::Zero(0);
                 } else {
                     let value = self.candidate[id as usize % w];
@@ -1339,10 +1386,14 @@ impl Decoder {
                     if !spend(&mut budget.copies) {
                         return Ok(Action::Paused);
                     }
-                    if self.candidate[w + i] != 0 {
+                    let count = metadata_chunk(width - i, budget)?.min(1 + budget.copies);
+                    let end = i + count;
+                    if self.candidate[w + i..w + end].iter().any(|&byte| byte != 0) {
                         return Err(Error::Inconsistent);
                     }
-                    job.phase = Phase::Zero(i + 1);
+                    budget.copies -= count - 1;
+                    budget.metadata -= count - 1;
+                    job.phase = Phase::Zero(end);
                 }
             }
             Phase::Normalize {
@@ -1360,8 +1411,11 @@ impl Decoder {
                     let count = field_chunk(remaining, budget)?;
                     let end = add(index, count)?;
                     let candidate = self.candidate.get_mut(index..end).ok_or(Error::Identity)?;
-                    for value in candidate {
-                        *value = field::multiply(factor, *value);
+                    if factor != 1 {
+                        let products = &gf_batch::MULTIPLICATION_ROWS[usize::from(factor)];
+                        for value in candidate {
+                            *value = products[usize::from(*value)];
+                        }
                     }
                     charge_field_chunk(count, budget);
                     job.phase = Phase::Normalize {
@@ -1372,7 +1426,7 @@ impl Decoder {
                 }
             }
             Phase::Others { pivot, row } => {
-                if row == self.config.max_rows {
+                if row >= self.shadow.row_end {
                     job.phase = Phase::CandidateCount {
                         pivot,
                         index: 0,
@@ -1548,7 +1602,7 @@ impl Decoder {
                 }
             }
             Phase::Scan { row } => {
-                if row == self.config.max_rows {
+                if row >= self.shadow.row_end {
                     job.phase = Phase::Advance;
                 } else if let Some(pivot) = self.pivot_at(row)? {
                     // Insert publishes the complete count; CopyRow transfers it
@@ -1582,17 +1636,17 @@ impl Decoder {
                 length,
             } => {
                 if index == 0 {
-                    let length = usize::from(u16::from_be_bytes([
-                        self.payload_byte(row, 0, job.systematic)?,
-                        self.payload_byte(row, 1, job.systematic)?,
-                    ]));
+                    let (payload, _) = self.payload_storage(row, job.systematic)?;
+                    let length = usize::from(u16::from_be_bytes([payload[0], payload[1]]));
                     if length == 0 || length > self.config.max_payload {
                         return Err(Error::Length);
                     }
                     job.phase = Phase::Validate {
                         row,
                         id,
-                        index: 2,
+                        // Only the padding has a required value. Store charges
+                        // the complete vector when it copies the original.
+                        index: length + 2,
                         length,
                     };
                 } else if index == width {
@@ -1617,22 +1671,14 @@ impl Decoder {
                     if !spend(&mut budget.copies) {
                         return Ok(Action::Paused);
                     }
-                    let count = if job.systematic {
-                        let count = metadata_chunk(width - index, budget)?.min(1 + budget.copies);
-                        let end = index + count;
-                        let padding = (length + 2).max(index).min(end);
-                        if self.input[padding..end].iter().any(|byte| *byte != 0) {
-                            return Err(Error::Length);
-                        }
-                        budget.copies -= count - 1;
-                        budget.metadata -= count - 1;
-                        count
-                    } else {
-                        if index >= length + 2 && self.payload_byte(row, index, false)? != 0 {
-                            return Err(Error::Length);
-                        }
-                        1
-                    };
+                    let count = metadata_chunk(width - index, budget)?.min(1 + budget.copies);
+                    let end = index + count;
+                    let (payload, _) = self.payload_storage(row, job.systematic)?;
+                    if payload[index..end].iter().any(|byte| *byte != 0) {
+                        return Err(Error::Length);
+                    }
+                    budget.copies -= count - 1;
+                    budget.metadata -= count - 1;
                     job.phase = Phase::Validate {
                         row,
                         id,
@@ -1653,6 +1699,9 @@ impl Decoder {
                         self.set_pivot(row, None)?;
                         self.set_map(id as usize % w, None)?;
                         self.shadow.rank -= 1;
+                        if self.shadow.rank == 0 {
+                            self.shadow.row_end = 0;
+                        }
                         job.phase = Phase::Scan { row: row + 1 };
                     } else if job.systematic {
                         // No committed row depends on this original. Shared
@@ -1667,17 +1716,11 @@ impl Decoder {
                     }
                     // The slot remains invisible until its staged identity commits.
                     let target = slot * width + index;
-                    let count = if job.systematic {
-                        let count = metadata_chunk(width - index, budget)?.min(1 + budget.copies);
-                        self.known_data[target..target + count]
-                            .copy_from_slice(&self.input[index..index + count]);
-                        budget.copies -= count - 1;
-                        budget.metadata -= count - 1;
-                        count
-                    } else {
-                        self.known_data[target] = self.payload_byte(row, index, false)?;
-                        1
-                    };
+                    let count = metadata_chunk(width - index, budget)?.min(1 + budget.copies);
+                    let (payload, known) = self.payload_storage(row, job.systematic)?;
+                    known[target..target + count].copy_from_slice(&payload[index..index + count]);
+                    budget.copies -= count - 1;
+                    budget.metadata -= count - 1;
                     job.phase = Phase::Store {
                         row,
                         id,
@@ -1720,11 +1763,17 @@ impl Decoder {
                         }
                         let slot = (d.id.0 % self.config.repair_history as u64) as usize;
                         if i < width {
-                            self.history[slot * width + i] = self.input[i];
+                            let count = metadata_chunk(width - i, budget)?.min(1 + budget.copies);
+                            let start = slot * width + i;
+                            self.history[start..start + count]
+                                .copy_from_slice(&self.input[i..i + count]);
+                            budget.copies -= count - 1;
+                            budget.metadata -= count - 1;
+                            job.phase = Phase::History(i + count);
                         } else if let Some(state) = &mut self.explicit {
                             state.copy_history_byte(slot, i - width);
+                            job.phase = Phase::History(i + 1);
                         }
-                        job.phase = Phase::History(i + 1);
                     }
                 } else {
                     job.phase = Phase::Commit;

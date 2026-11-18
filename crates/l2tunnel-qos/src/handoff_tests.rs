@@ -101,12 +101,16 @@ fn actual_blocked_heads_and_weighted_order_match_legacy_after_refused_offers() -
         }
     }
     for step in 0..12 {
+        let filtered = step % 4 == 0;
         let expected = legacy
-            .dequeue_eligible(|id, _| step != 0 || id != FlowId::new(1))?
+            .dequeue_eligible(|id, _| !filtered || id != FlowId::new(1))?
             .ok_or("packet")?;
-        let head = offered
-            .peek_eligible(|id, _| step != 0 || id != FlowId::new(1))?
-            .ok_or("head")?;
+        let head = if filtered {
+            offered.peek_eligible(|id, _| id != FlowId::new(1))?
+        } else {
+            offered.peek_unrestricted()?
+        }
+        .ok_or("head")?;
         assert_eq!(head.flow, expected.flow);
         let deficit = offered.flows[&head.flow].deficit;
         assert_eq!(

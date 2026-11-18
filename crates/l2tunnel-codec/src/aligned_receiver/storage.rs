@@ -33,7 +33,7 @@ struct Journal {
     records: Vec<Undo<Record>>,
     proofs: Vec<Undo<Proof>>,
     channels: Vec<Option<ChannelCheckpoint>>,
-    record_order: Vec<usize>,
+    record_order: Vec<u16>,
     proof_order: Vec<usize>,
     channel_order: Vec<usize>,
     globals: Option<Globals>,
@@ -44,7 +44,7 @@ impl Journal {
             heap::array_bytes::<Undo<Record>>(r)?,
             heap::array_bytes::<Undo<Proof>>(s)?,
             heap::array_bytes::<Option<ChannelCheckpoint>>(c)?,
-            heap::array_bytes::<usize>(r)?,
+            heap::array_bytes::<u16>(r)?,
             heap::array_bytes::<usize>(s)?,
             heap::array_bytes::<usize>(c)?,
         ])
@@ -89,6 +89,7 @@ impl Receiver {
         heap::sum(&[
             heap::array_bytes::<Channel>(c)?,
             heap::array_bytes::<Option<Record>>(r)?,
+            heap::array_bytes::<u16>(r)?,
             heap::array_bytes::<Option<Proof>>(s)?,
             heap::product(c + 1, Decoder::reserved_bytes(l.body)?)?,
             heap::array_bytes::<u8>(l.body.max_frame_bytes)?,
@@ -202,6 +203,7 @@ impl Receiver {
             compact_units: false,
             channels,
             records,
+            ordered_slots: a.vec(r)?,
             proofs,
             retention: Retention::default(),
             deadlines: DeadlineCache::default(),
@@ -349,7 +351,7 @@ impl Receiver {
                 .remove(record.deadline, self.retention.is_empty());
         }
         r.journals[active].records[slot] = old.map_or(Undo::Empty, Undo::Value);
-        r.journals[active].record_order.push(slot);
+        r.journals[active].record_order.push(slot as u16);
         self.records[slot] = replacement;
         Ok(())
     }
@@ -426,7 +428,8 @@ impl Receiver {
         loop {
             let next = self.reserved.as_mut().ok_or(Error::Storage)?.journals[index]
                 .record_order
-                .pop();
+                .pop()
+                .map(usize::from);
             let Some(slot) = next else {
                 break;
             };
@@ -439,6 +442,12 @@ impl Receiver {
                     self.recycle_record(record)?;
                 }
             } else {
+                if let Some(record) = self.records[slot].as_ref() {
+                    let position = self
+                        .record_position(record.channel, record.id)
+                        .map_err(|_| Error::Storage)?;
+                    self.ordered_slots.remove(position);
+                }
                 if let Some(record) = self.records[slot].take() {
                     self.retention.remove_record(&record);
                     self.deadlines
@@ -451,6 +460,11 @@ impl Receiver {
                     Undo::Untouched => return Err(Error::Storage),
                 };
                 if let Some(record) = &restored {
+                    let position = self
+                        .record_position(record.channel, record.id)
+                        .err()
+                        .ok_or(Error::Storage)?;
+                    self.ordered_slots.insert(position, slot as u16);
                     self.retention.add_record(record);
                     self.deadlines.insert(record.deadline);
                 }

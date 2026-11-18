@@ -24,9 +24,6 @@ impl States {
     pub(crate) fn is_empty(&self) -> bool {
         self.len() == 0
     }
-    pub(crate) fn contains_key(&self, key: &FlowKey) -> bool {
-        self.get(key).is_some()
-    }
     pub(crate) fn get(&self, key: &FlowKey) -> Option<&FlowState> {
         match self {
             Self::Legacy(values) => values.get(key),

@@ -615,6 +615,24 @@ class SelectionExecutionProviderTests(unittest.TestCase):
             pending_planned_wake_us=None)
         return value
 
+    def test_split_protocol_timing_requires_all_four_observed_stages(self):
+        from tools.buffer_metrics_execution import STAGES_V3
+        value = self.observed_selection()
+        timing = value['timing']
+        timing['schema'] = 3
+        self.assertTrue(self.normalized(value)['issues'])
+        old = {row['stage']: row for row in timing['stages']}
+        timing['stages'] = [old.get(name, dict(old['CommonProtocolProgress'], stage=name))
+                            for name in STAGES_V3]
+        owner = self.normalized(value)
+        self.assertFalse(owner['issues'])
+        rows = owner['execution_provider_validation']['stages']
+        self.assertEqual([row['stage'] for row in rows][3:7],
+                         ['CommonHeldIngress', 'CommonNativeCollection',
+                          'CommonTransactionProgress', 'CommonRollingComputation'])
+        timing['stages'].pop(3)
+        self.assertTrue(self.normalized(value)['issues'])
+
     def test_historical_and_actual_selected_observations_keep_wait_union_separate(self):
         historical = self.normalized(self.observation())
         self.assertEqual(historical['execution_provider_validation']['selection']['status'],

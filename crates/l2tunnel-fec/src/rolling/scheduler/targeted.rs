@@ -8,6 +8,23 @@ pub(super) const PROBE: u64 = 140_000;
 const MAX_IDS: usize = 8;
 const NONE: u32 = u32::MAX;
 
+/// Local sender counts for authenticated, explicitly named source IDs.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RequestCounts {
+    /// First request for a source still in sender custody.
+    pub first: u64,
+    /// A newer request serial for the same retained source.
+    pub repeated: u64,
+    /// Repeated IDs coalesced while the original retry remained in the FIFO.
+    pub coalesced_queued: u64,
+    /// Repeated IDs coalesced while a prepared retry awaited physical ownership.
+    pub coalesced_prepared: u64,
+    /// IDs seen again at or below their last accepted request serial.
+    pub duplicate_or_older: u64,
+    /// IDs already retired by authenticated cumulative confirmation.
+    pub confirmed: u64,
+}
+
 /// One authenticated request. The receipt prefix is independent of the named span.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct GapRequest {
@@ -178,17 +195,33 @@ impl Queues {
     pub(super) fn has_retries(&self) -> bool {
         self.head[0] != NONE
     }
-    pub(super) fn enqueue_retry(&mut self, id: u32, serial: u64, full_credit: bool) -> bool {
+    pub(super) fn enqueue_retry(
+        &mut self,
+        id: u32,
+        serial: u64,
+        full_credit: bool,
+        prepared: bool,
+        counts: &mut RequestCounts,
+    ) -> bool {
         let slot = self.slot(id);
         let entry = &mut self.entries[slot];
         if entry.id == id {
             if entry.stamp >= serial {
+                counts.duplicate_or_older = counts.duplicate_or_older.saturating_add(1);
                 return false;
             }
+            counts.repeated = counts.repeated.saturating_add(1);
             entry.stamp = serial;
             if entry.list == 0 {
+                counts.coalesced_queued = counts.coalesced_queued.saturating_add(1);
                 return false;
             }
+            if prepared {
+                counts.coalesced_prepared = counts.coalesced_prepared.saturating_add(1);
+                return false;
+            }
+        } else {
+            counts.first = counts.first.saturating_add(1);
         }
         self.push(id, 0, serial);
         self.entries[slot].full_credit = full_credit;

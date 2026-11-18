@@ -5,6 +5,8 @@ use super::*;
 /// regular-repair charges. Half-byte units retain odd-sized half credits.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct RepairBudgetStatus {
+    /// Named request identities independent of ordinary cumulative feedback.
+    pub named_requests: scheduler::RequestCounts,
     /// Admitted originals beyond authenticated cumulative confirmation, including queued originals.
     pub unconfirmed_sources: u32,
     /// Fresh originals waiting for their first encoder service turn.
@@ -210,6 +212,9 @@ impl<P: RecoveryPolicy> Endpoint<P> {
         if mtu == 0 || budget.configured() || self.statistics != Statistics::default() {
             return Err(Error::Configuration);
         }
+        self.packing
+            .enable_fragment_tail_packing()
+            .map_err(Error::Sender)?;
         budget.status.cap_half_bytes = 2 * 32 * u64::from(mtu);
         Ok(())
     }
@@ -226,6 +231,7 @@ impl<P: RecoveryPolicy> Endpoint<P> {
         self.repair_budget.as_ref().map(|b| {
             let state = P::send_state(&self.sender);
             RepairBudgetStatus {
+                named_requests: P::request_counts(&self.sender),
                 unconfirmed_sources: state.next_source - state.encoder.confirmed_prefix,
                 queued_fresh: state.queued_fresh,
                 peak_queued_fresh: state.peak_queued_fresh,

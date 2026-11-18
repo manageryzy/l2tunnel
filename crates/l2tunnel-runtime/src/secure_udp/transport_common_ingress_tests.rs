@@ -122,6 +122,98 @@ async fn turn(fixture: &mut Fixture, inputs: &mut [buffers::Inputs; 2]) -> Resul
     fixture.turn().await
 }
 #[test]
+fn protocol_stage_boundaries_service_original_ack_or_expire_it() -> Result {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?
+        .block_on(async {
+            for expire in [false, true] {
+                let kind = cover::Appearance::QuicLike;
+                let mut fixture = Fixture::from_contracts(kind, selected_contracts(kind)?).await?;
+                let mut input = fixture.endpoints[0].driver.take_inputs()?;
+                assert!(read(&mut fixture, &mut input, &packet(100)).await?);
+                for _ in 0..8 {
+                    fixture.turn().await?;
+                }
+                assert!(read(&mut fixture, &mut input, &packet(101)).await?);
+                let driver = &mut fixture.endpoints[0].driver;
+                let epoch = driver.common_state()?.epoch();
+                let start = fixture.now;
+                let due = start + u64::try_from(policy().interval.as_micros())?;
+                let limit = start + u64::try_from(policy().max_hold.as_micros())?;
+                let mut timing = crate::initialization_timing::Timing::disabled();
+                // The clock crosses the deadline after native collection. No further
+                // read is allowed after a successful transfer to the record owner.
+                let mut ticks = [start, due - 1, if expire { limit } else { due }].into_iter();
+                let result = driver.service_common_protocol_stages(
+                    start,
+                    &mut input.native,
+                    &mut timing,
+                    || {
+                        ticks
+                            .next()
+                            .ok_or_else(|| io::Error::other("clock read with no held ACK"))
+                    },
+                );
+                assert_eq!(ticks.next(), None);
+                if expire {
+                    let error = result.err().ok_or("missed original ACK expiry")?;
+                    assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+                    assert_eq!(error.to_string(), "original held ACK ingress deadline");
+                    assert!(!driver.common_state()?.engine(epoch)?.ingress_empty());
+                } else {
+                    assert_eq!(result?, due);
+                    assert!(driver.common_state()?.engine(epoch)?.ingress_empty());
+                    assert_eq!(
+                        driver.service_common_protocol_stages(
+                            due,
+                            &mut input.native,
+                            &mut timing,
+                            || { Err(io::Error::other("idle path sampled the held ACK clock")) }
+                        )?,
+                        due
+                    );
+                }
+            }
+            Ok(())
+        })
+}
+
+#[test]
+fn busy_carrier_progress_flushes_due_ack_before_next_outer_turn() -> Result {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?
+        .block_on(async {
+            let kind = cover::Appearance::QuicLike;
+            let mut fixture = Fixture::from_contracts(kind, selected_contracts(kind)?).await?;
+            let mut input = fixture.endpoints[0].driver.take_inputs()?;
+            assert!(read(&mut fixture, &mut input, &packet(100)).await?);
+            // Free the single downstream slot before holding a later cumulative ACK.
+            for _ in 0..8 {
+                fixture.turn().await?;
+            }
+            assert!(read(&mut fixture, &mut input, &packet(101)).await?);
+            let driver = &mut fixture.endpoints[0].driver;
+            let epoch = driver.common_state()?.epoch();
+            let due = fixture.now + u64::try_from(policy().interval.as_micros())?;
+            assert_eq!(
+                driver.common.as_ref().and_then(|r| r.next_ack_service),
+                Some(due)
+            );
+            driver.progress_common(due - 1)?;
+            assert!(!driver.common_state()?.engine(epoch)?.ingress_empty());
+            driver.progress_common(due)?;
+            assert!(driver.common_state()?.engine(epoch)?.ingress_empty());
+            assert_eq!(
+                driver.common.as_ref().and_then(|r| r.next_ack_service),
+                None
+            );
+            Ok(())
+        })
+}
+
+#[test]
 fn real_benchmark_ingress_retains_refused_duplicate_and_drains_before_negotiated_switch() -> Result
 {
     tokio::runtime::Builder::new_current_thread()

@@ -20,13 +20,11 @@ impl Driver {
         let Some(reader) = state.peer().reader(core::Epoch(scope.epoch.0)) else {
             return Ok(false);
         };
-        Ok(
-            common_actions::common_scope(core::Epoch(scope.epoch.0), reader.config)? == scope
-                && matches!(
-                    reader.config.descriptor().profile(),
-                    configuration::Profile::Research { .. }
-                ),
-        )
+        Ok(common_actions::record_scope(reader.scope) == scope
+            && matches!(
+                reader.config.descriptor().profile(),
+                configuration::Profile::Research { .. }
+            ))
     }
     pub(super) fn retain_research_feedback(
         &mut self,

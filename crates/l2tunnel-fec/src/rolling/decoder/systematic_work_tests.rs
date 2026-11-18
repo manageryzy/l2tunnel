@@ -87,8 +87,10 @@ fn systematic_original_work_is_independent_of_window_and_row_capacity() -> Resul
             work.field, 0,
             "rank-zero original must not do GF normalization"
         );
-        assert!(work.copies <= 2 * 66);
-        assert!(work.metadata <= 2 * 66 + 32);
+        // The full-width original has no padding to validate. Only Store
+        // visits its bytes, irrespective of the recovery window or rank cap.
+        assert_eq!(work.copies, 66);
+        assert!(work.metadata <= 66 + 32);
     }
     assert_eq!(results[0], results[1]);
     assert_eq!(results[1], results[2]);

@@ -1,5 +1,6 @@
 use super::*;
 use crate::{management::Role, pipeline};
+use arrayvec::ArrayVec;
 use record_engine::{EmissionKind, SourceForm};
 
 /// Exact actual owner output namespace; source, repair and feedback never alias.
@@ -69,7 +70,7 @@ struct PreviewUnit {
     identity: receiver::SymbolIdentity,
     offset: usize,
     length: usize,
-    cleared: usize,
+    clear_cursor: usize,
     copied: usize,
 }
 #[derive(Clone, Copy)]
@@ -556,7 +557,7 @@ impl<P: RecoveryPolicy> Endpoint<P> {
         Ok(())
     }
     fn pump_send(&mut self, now: Tick) -> Result<(), Error> {
-        if !self.packing.status().packing.sealed {
+        if !self.packing.has_pending_source() {
             return Ok(());
         }
         let expected = rolling::SourceId(P::send_state(&self.sender).next_source);
@@ -618,12 +619,12 @@ impl<P: RecoveryPolicy> Endpoint<P> {
             Err(error) => self.fail(Error::Rolling(error)),
         }
     }
-    fn pump_receive(&mut self, now: Tick) -> Result<bool, Error> {
+    fn pump_receive(&mut self, now: Tick) -> Result<(bool, bool), Error> {
         if P::receive_state(&self.incoming, rolling_tick(now)).feedback_building {
-            return Ok(false);
+            return Ok((false, false));
         }
         let Some((id, bytes)) = P::source(&self.incoming) else {
-            return Ok(false);
+            return Ok((false, false));
         };
         let operation = waits::Operation {
             id: u64::from(id.0),
@@ -647,8 +648,8 @@ impl<P: RecoveryPolicy> Endpoint<P> {
             now,
             self.compact_feedback_overhead.is_some(),
         );
-        match result {
-            Ok(()) => {
+        let (blocked, heads_accepted) = match result {
+            Ok(PackedAdmission::Complete) => {
                 let result =
                     P::handoff(&mut self.incoming, id, rolling_tick(now)).map_err(Error::Rolling);
                 if let Err(error) = result {
@@ -657,18 +658,18 @@ impl<P: RecoveryPolicy> Endpoint<P> {
                 if let Some(waits) = self.waits.first_mut() {
                     waits.progress(waits::Site::DecodedHandoff, operation, now);
                 }
-                Ok(true)
+                return Ok((true, false));
             }
-            Err(error) if error.is_backpressure() => {
-                if let Some(reason) = waits::Reason::from_error(error)
-                    && let Some(waits) = self.waits.first_mut()
-                {
-                    waits.refuse(waits::Site::DecodedHandoff, operation, reason, now);
-                }
-                Ok(false)
-            }
-            Err(error) => self.fail(error),
+            Ok(PackedAdmission::HeadsOnly(blocked)) => (Error::Receiver(blocked), true),
+            Err(error) if error.is_backpressure() => (error, false),
+            Err(error) => return self.fail(error),
+        };
+        if let Some(reason) = waits::Reason::from_error(blocked)
+            && let Some(waits) = self.waits.first_mut()
+        {
+            waits.refuse(waits::Site::DecodedHandoff, operation, reason, now);
         }
+        Ok((false, heads_accepted))
     }
     fn previews_sources(&self) -> bool {
         self.receive_config.scheduler.targeted()
@@ -755,24 +756,25 @@ impl<P: RecoveryPolicy> Endpoint<P> {
                     bytes,
                     self.compact_feedback_overhead.is_some(),
                 )?;
-                let mut inputs = empty_inputs(self.receive_scope);
-                let mut count = 0;
+                let mut inputs = ArrayVec::<_, 255>::new();
                 let floor = self.records.status().source_floor;
                 for (index, unit) in view.units().map_err(Error::Envelope)?.enumerate() {
                     if preview.selected[index / 64] & (1 << (index % 64)) != 0
                         && floor.is_some_and(|floor| unit.identity.source.0 > floor.0)
                     {
-                        inputs[count] = receiver::AuthenticatedSymbol {
-                            identity: unit.identity,
-                            bytes: &self.symbols[index * width..(index + 1) * width],
-                        };
-                        count += 1;
+                        inputs
+                            .try_push(receiver::AuthenticatedSymbol {
+                                identity: unit.identity,
+                                bytes: &self.symbols[index * width..(index + 1) * width],
+                            })
+                            .map_err(|_| Error::Identity)?;
                     }
                 }
+                let count = inputs.len();
                 if count != 0 {
                     let mut outcomes = [receiver::Admission::Accepted; 255];
                     match self.records.admit_batch_authenticated_into(
-                        &inputs[..count],
+                        &inputs,
                         receiver_tick(now),
                         &mut outcomes[..count],
                     ) {
@@ -795,8 +797,22 @@ impl<P: RecoveryPolicy> Endpoint<P> {
                             | receiver::Error::RecordWindow
                             | receiver::Error::SourceWindow,
                         ) if config.scheduler.targeted() => {
-                            // Another solved source can belong to a ready channel.
-                            // Native commits and ordered handoff re-arm this scan.
+                            // A mixed source can hold a ready channel head alongside
+                            // a future record that cannot use the full lookahead pool.
+                            match admit_channel_heads(
+                                &mut self.records,
+                                &mut inputs,
+                                &mut outcomes[..count],
+                                now,
+                            ) {
+                                Ok(progress) => native_progress |= progress,
+                                Err(Error::Receiver(
+                                    receiver::Error::Capacity
+                                    | receiver::Error::RecordWindow
+                                    | receiver::Error::SourceWindow,
+                                )) => {}
+                                Err(error) => return Err(error),
+                            }
                             continue;
                         }
                         Err(receiver::Error::Capacity | receiver::Error::RecordWindow) => {
@@ -854,7 +870,8 @@ impl<P: RecoveryPolicy> Endpoint<P> {
                     identity: unit.identity,
                     offset,
                     length: unit.bytes.len(),
-                    cleared: 0,
+                    // The payload is completely overwritten by the bounded copy.
+                    clear_cursor: unit.bytes.len(),
                     copied: 0,
                 });
                 self.preview = Some(preview);
@@ -862,12 +879,12 @@ impl<P: RecoveryPolicy> Endpoint<P> {
             }
             let current = preview.current.as_mut().ok_or(Error::Identity)?;
             let symbol = &mut self.symbols[preview.unit * width..(preview.unit + 1) * width];
-            if current.cleared < width {
-                let count = budget.copies.min(width - current.cleared);
-                symbol[current.cleared..current.cleared + count].fill(0);
-                current.cleared += count;
+            if current.clear_cursor < width {
+                let count = budget.copies.min(width - current.clear_cursor);
+                symbol[current.clear_cursor..current.clear_cursor + count].fill(0);
+                current.clear_cursor += count;
                 budget.copies -= count;
-                if current.cleared < width {
+                if current.clear_cursor < width {
                     self.preview = Some(preview);
                     break;
                 }
@@ -920,6 +937,73 @@ impl<P: RecoveryPolicy> Endpoint<P> {
         self.pump_send(now)?;
         self.service_ingress(now)?;
         let send = self.step_sender(now, work)?;
+        let (receive, source_handed, native_progress) = self.receive_turn(now, work)?;
+        Ok(Step {
+            send,
+            receive,
+            source_handed,
+            native_progress,
+        })
+    }
+
+    /// Consume queued targeted inputs with this turn's remaining receive grant.
+    /// Yield at the first native opportunity or newly prepared feedback. The
+    /// sole sender step and all physical output remain owned by the outer turn.
+    pub(crate) fn step_queued(
+        &mut self,
+        now: Tick,
+        work: rolling::WorkBudget,
+    ) -> Result<Step, Error> {
+        let feedback = P::feedback(&self.incoming);
+        let mut step = self.step(now, work)?;
+        if !self.receive_config.scheduler.targeted() {
+            return Ok(step);
+        }
+        // Each additional admission and atomic packed-source inspection also
+        // has a count bound, even when a duplicate needs no GF work.
+        let limit = self.receive_config.packing.work_limit.min(8);
+        for _ in 1..limit {
+            if step.source_handed
+                || step.native_progress
+                || P::feedback(&self.incoming) != feedback
+                || matches!(
+                    step.receive.decode,
+                    rolling::DecodeStep::Pending(_) | rolling::DecodeStep::Capacity(_)
+                )
+                || !self.ingress.as_ref().is_some_and(|owner| {
+                    owner
+                        .queue
+                        .front()
+                        .is_some_and(|front| front.metadata().kind != EmissionKind::Feedback)
+                })
+            {
+                break;
+            }
+            let Some(metadata) = (work.metadata - step.receive.work.metadata).checked_sub(1) else {
+                break;
+            };
+            let remaining = rolling::WorkBudget {
+                field: work.field - step.receive.work.field,
+                copies: work.copies - step.receive.work.copies,
+                metadata,
+            };
+            self.service_ingress(now)?;
+            let (mut receive, handed, native) = self.receive_turn(now, remaining)?;
+            receive.work.field += step.receive.work.field;
+            receive.work.copies += step.receive.work.copies;
+            receive.work.metadata += step.receive.work.metadata + 1;
+            step.receive = receive;
+            step.source_handed = handed;
+            step.native_progress = native;
+        }
+        Ok(step)
+    }
+
+    fn receive_turn(
+        &mut self,
+        now: Tick,
+        work: rolling::WorkBudget,
+    ) -> Result<(scheduler::ReceiverStep, bool, bool), Error> {
         if self.receive_progress {
             self.request_preview_scan();
         }
@@ -937,8 +1021,7 @@ impl<P: RecoveryPolicy> Endpoint<P> {
         if matches!(receive.decode, rolling::DecodeStep::Accepted { .. }) {
             self.request_preview_scan();
         }
-        let source_handed = self.pump_receive(now)?;
-        let mut native_progress = false;
+        let (source_handed, mut native_progress) = self.pump_receive(now)?;
         if !source_handed {
             let mut remaining = rolling::WorkBudget {
                 field: work.field - receive.work.field,
@@ -946,7 +1029,7 @@ impl<P: RecoveryPolicy> Endpoint<P> {
                 metadata: work.metadata - receive.work.metadata,
             };
             let before = remaining;
-            native_progress = match self.preview_receive(now, &mut remaining) {
+            native_progress |= match self.preview_receive(now, &mut remaining) {
                 Ok(progress) => progress,
                 Err(error) => return self.fail(error),
             };
@@ -954,12 +1037,7 @@ impl<P: RecoveryPolicy> Endpoint<P> {
             receive.work.metadata += before.metadata - remaining.metadata;
         }
         self.receive_progress = source_handed;
-        Ok(Step {
-            send,
-            receive,
-            source_handed,
-            native_progress,
-        })
+        Ok((receive, source_handed, native_progress))
     }
     /// Prepare one actual immutable output and reserve its exact wire debit once.
     /// Retain caller output/witnesses until confirm; AlreadyPending is returned as
@@ -1252,12 +1330,18 @@ impl<P: RecoveryPolicy> Endpoint<P> {
                 self.expire_confirmed_credit();
             }
             EmissionKind::Source(SourceForm::SystematicFec) | EmissionKind::Repair => {
-                let (observed, scope) =
+                let (observed, scope, source) =
                     match self.inspect_data(bytes, false).map_err(Error::Rolling)? {
-                        recovery::View::Source { scope, .. } => {
-                            (EmissionKind::Source(SourceForm::SystematicFec), scope)
-                        }
-                        recovery::View::Repair { scope } => (EmissionKind::Repair, scope),
+                        recovery::View::Source {
+                            scope,
+                            id,
+                            original,
+                        } => (
+                            EmissionKind::Source(SourceForm::SystematicFec),
+                            scope,
+                            Some((id, original)),
+                        ),
+                        recovery::View::Repair { scope } => (EmissionKind::Repair, scope, None),
                     };
                 let expected = rolling::Scope {
                     direction: self.send_rolling_scope.direction ^ 1,
@@ -1308,6 +1392,27 @@ impl<P: RecoveryPolicy> Endpoint<P> {
                                 return Ok(());
                             }
                             Err(rolling::Error::Busy) => {}
+                            Err(error) => return self.fail(Error::Rolling(error)),
+                        }
+                    }
+                    // Only committed evidence may cross the FIFO. Preserve the
+                    // ordinary source conflict check and duplicate feedback notice.
+                    if self.receive_config.scheduler.targeted()
+                        && let Some((id, original)) = source
+                    {
+                        match P::receive_committed_source(
+                            &mut self.incoming,
+                            id,
+                            original,
+                            rolling_tick(received),
+                            rolling_tick(now),
+                            rolling_tick(original_deadline),
+                        ) {
+                            Ok(Some(outcome)) => {
+                                self.note_direct_ingress_admission(received, now, outcome);
+                                return Ok(());
+                            }
+                            Ok(None) => {}
                             Err(error) => return self.fail(Error::Rolling(error)),
                         }
                     }
@@ -1641,6 +1746,47 @@ impl<P: RecoveryPolicy> Endpoint<P> {
     }
 }
 
+enum PackedAdmission {
+    Complete,
+    HeadsOnly(receiver::Error),
+}
+
+// Only called after the full transaction rolled back. Validate all input units
+// before committing the eligible head subset together. Original source custody
+// and the ordered unit cursor remain available for a complete later admission.
+fn admit_channel_heads(
+    records: &mut receiver::Receiver,
+    inputs: &mut [receiver::AuthenticatedSymbol<'_>],
+    outcomes: &mut [receiver::Admission],
+    now: Tick,
+) -> Result<bool, Error> {
+    let mut heads = 0;
+    for index in 0..inputs.len() {
+        let unit = &inputs[index];
+        if records
+            .needs_channel_head(unit.identity, unit.bytes)
+            .map_err(Error::Receiver)?
+        {
+            inputs.swap(heads, index);
+            heads += 1;
+        }
+    }
+    if heads == 0 {
+        return Ok(false);
+    }
+    let n = records
+        .admit_batch_authenticated_into(
+            &inputs[..heads],
+            receiver_tick(now),
+            &mut outcomes[..heads],
+        )
+        .map_err(Error::Receiver)?;
+    if n != heads {
+        return Err(Error::Identity);
+    }
+    Ok(outcomes[..heads].contains(&receiver::Admission::Accepted))
+}
+
 // The exact ordered unit cursor is separate from the previewable record ledger.
 #[allow(clippy::too_many_arguments)]
 fn admit_packed<P: RecoveryPolicy>(
@@ -1653,7 +1799,7 @@ fn admit_packed<P: RecoveryPolicy>(
     symbols: &mut [u8],
     now: Tick,
     compact: bool,
-) -> Result<(), Error> {
+) -> Result<PackedAdmission, Error> {
     let view = packed_view(config, scope, id, bytes, compact)?;
     if Some(view.identity().first_unit) != *ordered_unit {
         return Err(Error::Identity);
@@ -1667,33 +1813,35 @@ fn admit_packed<P: RecoveryPolicy>(
     let targeted = config.scheduler.targeted();
     let preview = targeted || config.receiver.body.independent_short_frame_bytes != 0;
     let floor = records.status().source_floor;
-    let mut inputs = empty_inputs(scope);
-    let mut count = 0;
+    let mut inputs = ArrayVec::<_, 255>::new();
     let mut units = 0;
     for (unit, symbol) in view
         .units()
         .map_err(Error::Envelope)?
         .zip(symbols.chunks_exact_mut(config.receiver.body.symbol_bytes))
     {
-        symbol.fill(0);
-        symbol[..unit.bytes.len()].copy_from_slice(unit.bytes);
+        let (payload, padding) = symbol.split_at_mut(unit.bytes.len());
+        payload.copy_from_slice(unit.bytes);
+        padding.fill(0);
         check_policy(config, symbol)?;
         units += 1;
         if preview && floor.is_none_or(|floor| unit.identity.source.0 < floor.0) {
             continue;
         }
-        inputs[count] = receiver::AuthenticatedSymbol {
-            identity: unit.identity,
-            bytes: symbol,
-        };
-        count += 1;
+        inputs
+            .try_push(receiver::AuthenticatedSymbol {
+                identity: unit.identity,
+                bytes: symbol,
+            })
+            .map_err(|_| Error::Identity)?;
     }
+    let count = inputs.len();
     if units != view.len() {
         return Err(Error::Identity);
     }
     if count == 0 {
         *ordered_unit = next;
-        return Ok(());
+        return Ok(PackedAdmission::Complete);
     }
     let mut outcomes = [receiver::Admission::Accepted; 255];
     // Other channels may legitimately retain complete context-dependent records
@@ -1703,13 +1851,17 @@ fn admit_packed<P: RecoveryPolicy>(
     } else {
         receiver::Receiver::admit_validated_batch_authenticated_into
     };
-    let admitted = admit(
-        records,
-        &inputs[..count],
-        receiver_tick(now),
-        &mut outcomes[..count],
-    )
-    .map_err(Error::Receiver)?;
+    let admission = admit(records, &inputs, receiver_tick(now), &mut outcomes[..count]);
+    let admitted = match admission {
+        Err(blocked @ (receiver::Error::Capacity | receiver::Error::RecordWindow)) if targeted => {
+            return if admit_channel_heads(records, &mut inputs, &mut outcomes, now)? {
+                Ok(PackedAdmission::HeadsOnly(blocked))
+            } else {
+                Err(Error::Receiver(blocked))
+            };
+        }
+        value => value.map_err(Error::Receiver)?,
+    };
     if admitted != count
         || outcomes[..count].iter().any(|a| {
             !(matches!(a, receiver::Admission::Accepted)
@@ -1723,18 +1875,7 @@ fn admit_packed<P: RecoveryPolicy>(
         return Err(Error::Identity);
     }
     *ordered_unit = next;
-    Ok(())
-}
-
-fn empty_inputs<'a>(scope: receiver::Scope) -> [receiver::AuthenticatedSymbol<'a>; 255] {
-    std::array::from_fn(|_| receiver::AuthenticatedSymbol {
-        identity: receiver::SymbolIdentity {
-            scope,
-            source: receiver::SourceId(0),
-            record: receiver::RecordId(0),
-        },
-        bytes: &[],
-    })
+    Ok(PackedAdmission::Complete)
 }
 
 fn packed_view<P: RecoveryPolicy>(

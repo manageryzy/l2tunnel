@@ -124,6 +124,13 @@ fn finish(
     assert!(matches!(ack.event, Some(Event::Committed(_))));
     assert_eq!(server.active_epoch(), target);
     assert_eq!(client.active_epoch(), old);
+    for peer in [&*server, &*client] {
+        for epoch in [old, target] {
+            let reader = peer.reader(epoch).ok_or(Error::Unexpected)?;
+            assert_eq!(reader.scope.epoch, epoch);
+            assert_eq!(reader.scope.digest, configuration_digest(reader.config)?);
+        }
+    }
     assert_eq!(
         server.reader(old).ok_or(Error::Unexpected)?.disposition,
         ReadDisposition::DrainOnly

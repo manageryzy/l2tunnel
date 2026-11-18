@@ -83,7 +83,9 @@ fn measured_gf_rows_match_all_factors_and_byte_products() {
 
 #[test]
 fn measured_gf_chunks_preserve_zero_mixed_dense_boundaries_and_counts() {
-    for length in [0, 1, 7, 8, 9, 15, 16, 17, 64, 257, 1290, 8192] {
+    for length in [
+        0, 1, 7, 8, 9, 15, 16, 17, 31, 32, 33, 63, 64, 65, 257, 1290, 8192,
+    ] {
         for factor in [0, 1, 2, 129, 255] {
             for offset in [0, 1, 7] {
                 let before: Vec<_> = (0..length + offset)
@@ -132,8 +134,8 @@ fn bytewise_advance(
     let width = d.width;
     match job.phase {
         Phase::Reduce(id) => {
-            if u64::from(id) >= u64::from(d.live.prefix) + w as u64 || id == u32::MAX {
-                job.phase = Phase::Pivot(d.live.prefix);
+            if id >= d.shadow.observed {
+                job.phase = Phase::Pivot(job.input.start().max(d.live.prefix));
             } else {
                 let factor = d.candidate[id as usize % w];
                 if factor != 0
@@ -154,7 +156,7 @@ fn bytewise_advance(
             }
         }
         Phase::Pivot(id) => {
-            if u64::from(id) >= u64::from(d.live.prefix) + w as u64 || id == u32::MAX {
+            if id >= d.shadow.observed {
                 job.phase = Phase::Zero(0);
             } else {
                 let value = d.candidate[id as usize % w];
@@ -321,7 +323,7 @@ fn bytewise_advance(
             }
         }
         Phase::Scan { row } => {
-            if row == d.config.max_rows {
+            if row >= d.shadow.row_end {
                 job.phase = Phase::Advance;
             } else if let Some(pivot) = d.pivot_at(row)? {
                 let mut count = 0;

@@ -6,6 +6,104 @@ use l2tunnel_core::Epoch;
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
 #[test]
+fn full_fragment_passes_short_tails_without_renewing_the_old_hold_or_creating_unit_gaps()
+-> TestResult {
+    let cfg = config(96);
+    for delay_full in [false, true] {
+        let mut tx = Sender::new_reserved(
+            scope(),
+            cfg,
+            crate::aligned_storage::Limits {
+                capacity_bytes: usize::MAX,
+            },
+        )?;
+        let initial = tx.storage_usage();
+        tx.enable_fragment_tail_packing()?;
+        let mut output = vec![0; cfg.envelope().max_source_bytes()?];
+        let first = vec![0x11; 108];
+        let second = vec![0x22; 110];
+        tx.stage_raw(ChannelId(0), &first, 10)?;
+        assert!(tx.has_pending_source());
+        let n = tx.write_pending_compact(&mut output)?;
+        let view = envelope::decode_compact(cfg.envelope(), scope(), SourceId(0), &output[..n])?;
+        let head = view.units()?.next().ok_or("first head")?;
+        assert_eq!((head.identity.source, head.bytes.len()), (SourceId(0), 96));
+        tx.commit_source()?;
+        tx.poll(11)?;
+        assert!(!tx.has_pending_source());
+        let old_deadline = tx.deadline_micros().ok_or("old tail deadline")?;
+        tx.stage_raw(ChannelId(0), &second, 13)?;
+        assert!(tx.has_pending_source());
+        assert_eq!(tx.pending_admission_micros()?, 13);
+        assert_eq!(tx.oldest_admission_micros(), Some(10));
+        assert_eq!(tx.deadline_micros(), Some(old_deadline));
+        let n = tx.write_pending_compact(&mut output)?;
+        let frozen = output[..n].to_vec();
+        let view = envelope::decode_compact(cfg.envelope(), scope(), SourceId(1), &frozen)?;
+        let head = view.units()?.next().ok_or("second head")?;
+        assert_eq!((head.identity.source, head.bytes.len()), (SourceId(1), 96));
+        let now = if delay_full { old_deadline } else { 14 };
+        tx.poll(now)?;
+        assert_eq!(
+            tx.stage_raw(ChannelId(1), b"blocked", now),
+            Err(Error::Busy)
+        );
+        assert_eq!(tx.write_pending_compact(&mut output)?, frozen.len());
+        assert_eq!(&output[..n], &frozen);
+        tx.commit_source()?;
+        tx.poll(now)?;
+        if !delay_full {
+            tx.poll(old_deadline)?;
+        }
+        assert_eq!(tx.pending_admission_micros()?, 10);
+        let n = tx.write_pending_compact(&mut output)?;
+        let tails = envelope::decode_compact(cfg.envelope(), scope(), SourceId(2), &output[..n])?;
+        assert_eq!(tails.len(), if delay_full { 1 } else { 2 });
+        for (index, unit) in tails.units()?.enumerate() {
+            assert_eq!(unit.identity.source, SourceId(2 + index as u64));
+            assert_eq!(unit.bytes[3], 4);
+            assert_eq!(&unit.bytes[6..8], &88u16.to_be_bytes());
+        }
+        tx.commit_source()?;
+        if delay_full {
+            tx.flush(now)?;
+            assert_eq!(tx.pending_admission_micros()?, 13);
+            let n = tx.write_pending_compact(&mut output)?;
+            let last =
+                envelope::decode_compact(cfg.envelope(), scope(), SourceId(3), &output[..n])?;
+            assert_eq!(last.identity().first_unit, SourceId(3));
+            tx.commit_source()?;
+        }
+        assert!(tx.is_idle());
+        assert_eq!(tx.storage_usage(), initial);
+        assert_eq!(tx.status().next_unit, Some(SourceId(4)));
+    }
+    Ok(())
+}
+
+#[test]
+fn last_available_unit_cannot_displace_a_retained_fragment_tail() -> TestResult {
+    let mut cfg = config(96);
+    cfg.first_unit = SourceId(u64::MAX - 2);
+    let mut tx = Sender::new(scope(), cfg)?;
+    tx.enable_fragment_tail_packing()?;
+    tx.stage_raw(ChannelId(0), &[0x11; 108], 10)?;
+    tx.commit_source()?;
+    tx.poll(11)?;
+    tx.stage_raw(ChannelId(1), &[0x22; 108], 12)?;
+    assert_eq!(tx.pending_admission_micros()?, 10);
+    let mut output = [0; 1024];
+    let n = tx.write_pending(SourceId(1), &mut output)?;
+    let src = envelope::decode(cfg.envelope(), scope(), &output[..n])?;
+    assert_eq!(src.identity().first_unit, SourceId(u64::MAX - 1));
+    assert_eq!(src.units()?.next().ok_or("old tail")?.bytes[7], 88);
+    tx.commit_source()?;
+    tx.poll(13)?;
+    assert_eq!(tx.pending_admission_micros()?, 12);
+    Ok(())
+}
+
+#[test]
 fn buffer_snapshot_distinguishes_timer_hold_sealed_source_and_staged_frame() -> TestResult {
     let mut sender = Sender::new(scope(), config(64))?;
     sender.stage_raw(ChannelId(0), b"first", 0)?;

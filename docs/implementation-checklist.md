@@ -1098,6 +1098,11 @@ The study distinguishes the two changes, application latency, cumulative ACK
 latency and bilateral recovery drain. Broader carrier and performance gates
 remain open.
 
+TEST-12 and PBA-03/06 track the
+[matched C48 measurements and sender MUX residence](modules/frame-channel-experiment.md#sender-mux-residence-and-the-c48-throughput-gap).
+The four-flow Linux trace joins original TCP byte ranges to native reads, MUX
+admission, recovery and application completion. Performance parity remains open.
+
 ## Per-mode parity implementation gates
 
 Each P-* gate means the named algorithm/codec/workload adapter is implemented and

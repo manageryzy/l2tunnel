@@ -196,6 +196,25 @@ impl Receiver {
         }
         Ok(result)
     }
+    /// Consume an exact committed duplicate or stale source across a busy ingress FIFO.
+    /// Fresh data stays unconsumed. Duplicate recognition still requests feedback.
+    pub fn receive_committed_source_until(
+        &mut self,
+        id: SourceId,
+        original: &[u8],
+        received: Tick,
+        now: Tick,
+        cap: Tick,
+    ) -> Result<Option<Begin>, Error> {
+        self.time(now)?;
+        let outcome = self
+            .decoder
+            .source_input(self.scope, id, original, received, now, cap, false)?;
+        if outcome.is_some() {
+            self.notice(now)?;
+        }
+        Ok(outcome)
+    }
     /// Advance actual decode and feedback work under shared per-component caps.
     /// All-zero work validates original time bounds but starts/advances no job.
     pub fn step(&mut self, now: Tick, mut budget: WorkBudget) -> Result<ReceiverStep, Error> {

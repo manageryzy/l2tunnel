@@ -67,8 +67,14 @@ pub enum Stage {
     CommonReceiptProgress,
     /// Actual FIFO admission to current record owners.
     CommonAdmission,
-    /// Ingress, native extraction, protocol progress and Rolling service work.
-    CommonProtocolProgress,
+    /// Service of held ACKs and retry of retained native ingress.
+    CommonHeldIngress,
+    /// Extraction of native output from the active record owners.
+    CommonNativeCollection,
+    /// Common control, transaction and retained feedback progress.
+    CommonTransactionProgress,
+    /// Bounded Rolling sender and receiver computation.
+    CommonRollingComputation,
     /// Actual management service and submission.
     CommonManagement,
     /// Actual selected send preparation and submission.
@@ -103,7 +109,7 @@ pub enum Stage {
     CliFileWrite,
 }
 
-const STAGES: [Stage; 32] = [
+const STAGES: [Stage; 35] = [
     Stage::ContractAndRecords,
     Stage::ControlAndExternalPlanning,
     Stage::EngineAndBankPlanning,
@@ -119,7 +125,10 @@ const STAGES: [Stage; 32] = [
     Stage::CommonTurnSpacing,
     Stage::CommonReceiptProgress,
     Stage::CommonAdmission,
-    Stage::CommonProtocolProgress,
+    Stage::CommonHeldIngress,
+    Stage::CommonNativeCollection,
+    Stage::CommonTransactionProgress,
+    Stage::CommonRollingComputation,
     Stage::CommonManagement,
     Stage::CommonSend,
     Stage::CommonReceive,
@@ -642,7 +651,7 @@ impl State {
             } else {
                 "initialization_timing"
             },
-            if execution_owner(self.owner) { 2 } else { 1 },
+            if execution_owner(self.owner) { 3 } else { 1 },
             self.owner,
             self.id,
             std::process::id(),

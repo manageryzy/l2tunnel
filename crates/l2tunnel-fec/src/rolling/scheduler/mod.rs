@@ -14,7 +14,7 @@ pub use receiver::{Receiver, ReceiverStatus, ReceiverStep};
 pub use sender::{
     FeedbackDisposition, Output, OutputId, RetryToken, Sender, SenderStatus, SourceCopy,
 };
-pub use targeted::GapRequest;
+pub use targeted::{GapRequest, RequestCounts};
 
 /// Explicit scheduling and total owner reservation, with no inferred link properties.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

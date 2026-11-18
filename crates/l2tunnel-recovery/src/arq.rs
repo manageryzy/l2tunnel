@@ -1422,6 +1422,11 @@ impl Engine {
 
     fn poll_delivered(&mut self, output: &mut [u8]) -> Result<Option<(u64, usize)>, RecoveryError> {
         self.running()?;
+        // Receipt advances this prefix only over contiguous retained payloads.
+        // At the first missing ID even a nonempty out-of-order buffer cannot deliver.
+        if self.deliver_next == self.receive_prefix {
+            return Ok(None);
+        }
         let source = SourceId(self.deliver_next);
         let Some(payload) = self.received.get(&source) else {
             return Ok(None);

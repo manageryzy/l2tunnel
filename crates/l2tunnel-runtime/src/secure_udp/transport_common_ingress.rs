@@ -1,9 +1,61 @@
 //! Optional Benchmark ingress on the existing sole Driver and its actual read slab.
 use super::*;
+use crate::initialization_timing::{Stage, Timing};
 use l2tunnel::{record_bank, record_engine as engine};
 use l2tunnel_pipeline::ack_coalescing as ack;
 
 impl Driver {
+    pub(super) fn service_common_protocol_stages(
+        &mut self,
+        mut now: u64,
+        input: &mut [u8],
+        timing: &mut Timing,
+        mut sample: impl FnMut() -> io::Result<u64>,
+    ) -> io::Result<u64> {
+        if self.next_held_ack_service().is_some() {
+            now = sample()?;
+        }
+        timing.measure_result(Stage::CommonHeldIngress, || {
+            self.service_common_ingress(now, input)
+        })?;
+        let mut run = |stage, operation: fn(&mut Self, u64) -> io::Result<()>| -> io::Result<()> {
+            self.refresh_held_acks(&mut now, timing, &mut sample)?;
+            if self.terminal.is_none() {
+                timing.measure_result(stage, || operation(self, now))?;
+            }
+            Ok(())
+        };
+        run(Stage::CommonNativeCollection, Self::collect_native)?;
+        run(Stage::CommonTransactionProgress, Self::progress)?;
+        run(
+            Stage::CommonRollingComputation,
+            Self::service_common_rolling,
+        )?;
+        self.refresh_held_acks(&mut now, timing, &mut sample)?;
+        Ok(now)
+    }
+
+    fn next_held_ack_service(&self) -> Option<u64> {
+        self.common.as_deref()?.next_ack_service
+    }
+
+    fn refresh_held_acks(
+        &mut self,
+        now: &mut u64,
+        timing: &mut Timing,
+        sample: &mut impl FnMut() -> io::Result<u64>,
+    ) -> io::Result<()> {
+        if self.terminal.is_none()
+            && let Some(due) = self.next_held_ack_service()
+        {
+            *now = sample()?;
+            if *now >= due {
+                timing.measure_result(Stage::CommonHeldIngress, || self.service_due_acks(*now))?;
+            }
+        }
+        Ok(())
+    }
+
     /// One bounded pass per live generation per loop turn; never a second actor.
     pub(super) fn service_common_ingress(&mut self, now: u64, input: &mut [u8]) -> io::Result<()> {
         if self.common.is_none() || self.config.ack_coalescing.is_none() {
@@ -12,6 +64,18 @@ impl Driver {
         if !self.check_expiry(now)? {
             return Ok(());
         }
+        self.service_held_acks(now)?;
+        self.retry_common_ingress(now, input)?;
+        Ok(())
+    }
+    /// Honor the ACK hold interval even while carrier or native I/O is draining a batch.
+    pub(super) fn service_due_acks(&mut self, now: u64) -> io::Result<()> {
+        if self.next_held_ack_service().is_some_and(|at| now >= at) && self.check_expiry(now)? {
+            self.service_held_acks(now)?;
+        }
+        Ok(())
+    }
+    fn service_held_acks(&mut self, now: u64) -> io::Result<()> {
         let draining = !self.common_state()?.can_admit_data()
             || self
                 .common
@@ -19,6 +83,8 @@ impl Driver {
                 .and_then(|r| r.reuse_controller())
                 .is_some_and(super::common_reuse::Controller::active);
         let work = self.config.work.native_read_batch;
+        let mut next = None;
+        let cadence = self.config.work.receive_interval;
         for epoch in self.common_epochs().into_iter().flatten() {
             match self.common_state_mut()?.entry(epoch)?.service_ingress(
                 engine::Tick(now),
@@ -35,8 +101,18 @@ impl Driver {
                 }
                 Err(error) => return Err(protocol(error)),
             }
+            if let Some(at) = self
+                .common_state()?
+                .engine(epoch)?
+                .ingress_wake_at(engine::Tick(now), cadence)
+                .map_err(protocol)?
+            {
+                next = Some(next.map_or(at.0, |other: u64| other.min(at.0)));
+            }
         }
-        self.retry_common_ingress(now, input)?;
+        if let Some(runtime) = self.common.as_deref_mut() {
+            runtime.next_ack_service = next;
+        }
         Ok(())
     }
     /// Do not read a second packet until the issuing generation consumes this one.
@@ -142,11 +218,20 @@ impl Driver {
             bytes,
             engine::Tick(pending.deadline),
         ) {
-            Ok(
-                engine::IngressAdmission::Forwarded(_)
-                | engine::IngressAdmission::Held
-                | engine::IngressAdmission::Superseded,
-            ) => {
+            Ok(admission) => {
+                if !matches!(admission, engine::IngressAdmission::Forwarded(_)) {
+                    let policy = self
+                        .config
+                        .ack_coalescing
+                        .ok_or_else(|| protocol("missing ACK policy"))?;
+                    let at = add(pending.received, policy.interval)?.min(pending.deadline);
+                    let runtime = self
+                        .common
+                        .as_deref_mut()
+                        .ok_or_else(|| protocol("Common ingress owner missing"))?;
+                    runtime.next_ack_service =
+                        Some(runtime.next_ack_service.map_or(at, |old| old.min(at)));
+                }
                 self.common
                     .as_deref_mut()
                     .ok_or_else(|| protocol("Common ingress owner missing"))?

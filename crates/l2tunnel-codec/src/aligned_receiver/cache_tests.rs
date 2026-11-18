@@ -73,6 +73,17 @@ fn fragment(body: &[u8], offset: usize) -> Vec<u8> {
 // Independent pre-cache behavior, exercised against actual live and rollback
 // transitions. The diagnostic buffer snapshot retains its separate scan API.
 pub(super) fn assert_matches(r: &Receiver) {
+    for start in 0..r.limits.channels {
+        let expected = (0..r.limits.channels)
+            .map(|offset| ChannelId(((start + offset) % r.limits.channels) as u8))
+            .find(|ch| {
+                r.records
+                    .iter()
+                    .flatten()
+                    .any(|record| record.channel == *ch)
+            });
+        assert_eq!(r.next_retained_channel(ChannelId(start as u8)), expected);
+    }
     let mut status = Status {
         source_floor: r.floor,
         retained_sources: r.proofs.iter().flatten().count(),
@@ -106,6 +117,24 @@ pub(super) fn assert_matches(r: &Receiver) {
             .chain(r.proofs.iter().flatten().map(|proof| proof.deadline))
             .min()
     };
+    let mut ordered: Vec<_> = r
+        .records
+        .iter()
+        .enumerate()
+        .filter_map(|(slot, entry)| {
+            entry
+                .as_ref()
+                .map(|record| (record.channel.0, record.id, slot as u16))
+        })
+        .collect();
+    ordered.sort_unstable();
+    assert_eq!(
+        r.ordered_slots,
+        ordered
+            .into_iter()
+            .map(|(_, _, slot)| slot)
+            .collect::<Vec<_>>()
+    );
     assert_eq!(r.status(), status);
     assert_eq!(r.deadline(), deadline);
 }
@@ -243,5 +272,43 @@ fn cached_receiver_fragment_and_nested_validation_rollback_restore_exact_state()
         assert_matches(&r);
         assert!(matches!(r.deadlines.checkpoint(), Some(None)));
     }
+    Ok(())
+}
+
+#[test]
+fn sparse_channels_choose_first_permitted_short_in_record_order() -> Result {
+    let mut l = limits();
+    l.channels = 256;
+    l.lookahead_records = 1024;
+    l.body.independent_short_frame_bytes = 32;
+    let mut rx = Receiver::new(scope(), l)?;
+    // Arrival order and physical slot reuse need not follow either ordering.
+    for (source, channel, id) in [(0, 255, 5), (1, 3, 2), (2, 255, 1), (3, 3, 3), (4, 255, 3)] {
+        rx.admit_authenticated(identity(source, id), &raw(channel, id), Tick(1))?;
+    }
+    for channel in [0, 2, 4, 254] {
+        assert_eq!(rx.prepare(ChannelId(channel), Tick(2), 1)?, Prepared::Idle);
+    }
+    let mut visits = 0;
+    assert_eq!(
+        rx.prepare_with_early_filter(ChannelId(255), Tick(2), 3, |_| {
+            visits += 1;
+            visits == 2
+        })?,
+        Prepared::Ready
+    );
+    assert_eq!(visits, 2);
+    assert_eq!(
+        rx.pending().ok_or("missing early packet")?.record,
+        RecordId(3)
+    );
+    rx.commit_delivery(Tick(2))?;
+    assert_eq!(rx.prepare(ChannelId(3), Tick(2), 1)?, Prepared::Ready);
+    assert_eq!(
+        rx.pending().ok_or("missing unrelated packet")?.record,
+        RecordId(2)
+    );
+    rx.commit_delivery(Tick(2))?;
+    assert_matches(&rx);
     Ok(())
 }

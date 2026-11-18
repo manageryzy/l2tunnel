@@ -9,6 +9,10 @@ STAGES = (
     'CliProjection', 'CliEncoding', 'CliFlush', 'CliFileWrite',
 )
 STAGES_V2 = STAGES[:13] + ('CommonWakePlanning', 'CommonSelectPoll', 'CommonSelectPending') + STAGES[13:]
+STAGES_V3 = STAGES_V2[:3] + (
+    'CommonHeldIngress', 'CommonNativeCollection', 'CommonTransactionProgress', 'CommonRollingComputation',
+) + STAGES_V2[4:]
+STAGES_BY_SCHEMA = {1: STAGES, 2: STAGES_V2, 3: STAGES_V3}
 WINNERS = ('Shutdown', 'Request', 'Carrier', 'Native', 'Timer', 'IoError')
 BOUNDARIES = {'loop_stop_before_settlement': 'loop_stop',
               'driver_future_drop': 'driver_future_drop'}
@@ -42,7 +46,7 @@ def validate(value, owner):
         require(isinstance(boundary, str) and boundary in BOUNDARIES,
                 'common_execution: unknown boundary')
         timing = object_value(value.get('timing'), 'common_execution.timing')
-        require(type(timing.get('schema')) is int and timing['schema'] in (1, 2) and
+        require(type(timing.get('schema')) is int and timing['schema'] in STAGES_BY_SCHEMA and
                 timing.get('event') == 'execution_timing' and timing.get('owner') == 'CommonExecution',
                 'common_execution: unknown timing schema/owner/event')
         require(timing.get('checkpoint') == BOUNDARIES[boundary],
@@ -53,7 +57,7 @@ def validate(value, owner):
             issues.append('common_execution: producer invalid flag')
         for name in ('id', 'pid', 'inline_bytes', 'diagnostic_heap_bytes'):
             uint(timing.get(name), 'common_execution.' + name)
-        expected = STAGES if timing['schema'] == 1 else STAGES_V2
+        expected = STAGES_BY_SCHEMA[timing['schema']]
         stages = timing.get('stages')
         require(isinstance(stages, list) and len(stages) == len(expected),
                 'common_execution: incomplete or oversized stage array')

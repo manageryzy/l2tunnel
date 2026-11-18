@@ -95,7 +95,7 @@ pub struct Status {
     pub packing: packed::Status,
     /// Next unused absolute unit; None denotes exhaustion.
     pub next_unit: Option<SourceId>,
-    /// First unit in the currently retained packed source, if any.
+    /// First unit of the next source to hand off, if any.
     pub first_unit: Option<SourceId>,
     /// Sticky ownership/exhaustion failure, requiring session termination.
     pub failure: Option<Error>,
@@ -116,6 +116,11 @@ pub struct Sender {
     // never renews its original admission time.
     staged_at: Option<u64>,
     source_started_at: Option<u64>,
+    // A ready full first fragment can remain in the aligned scratch while
+    // same-policy short final fragments share the original packing buffer.
+    group_fragment_tails: bool,
+    tail_copies: Option<u8>,
+    leading_fragment: Option<RecordId>,
 }
 #[allow(dead_code)]
 pub(crate) struct LegacyLayout {
@@ -236,6 +241,9 @@ impl Sender {
             copy_policy: crate::source_copy::Policy::ONE,
             staged_at: None,
             source_started_at: None,
+            group_fragment_tails: false,
+            tail_copies: None,
+            leading_fragment: None,
         })
     }
     /// Validate all products before allocating packet/metadata storage.
@@ -266,6 +274,9 @@ impl Sender {
             copy_policy: crate::source_copy::Policy::ONE,
             staged_at: None,
             source_started_at: None,
+            group_fragment_tails: false,
+            tail_copies: None,
+            leading_fragment: None,
         })
     }
     /// Select an explicit immutable policy while keeping existing constructors
@@ -427,12 +438,26 @@ impl Sender {
         self.poll(now)?;
         Ok(identity)
     }
+    /// Allow full first fragments to pass a same-copy batch of short final
+    /// fragments. This sender-local selection requires a fresh owner.
+    pub fn enable_fragment_tail_packing(&mut self) -> Result<(), Error> {
+        self.live()?;
+        if !self.is_idle() || self.next_unit != Some(self.config.first_unit) {
+            return Err(Error::Configuration);
+        }
+        self.group_fragment_tails = true;
+        Ok(())
+    }
+    /// A complete immutable source is ready, in either existing storage owner.
+    pub fn has_pending_source(&self) -> bool {
+        self.leading_fragment.is_some() || self.packing.pending().is_some()
+    }
     /// Attempt at most the configured unit work; sealed sources remain immutable.
     pub fn poll(&mut self, now: u64) -> Result<(), Error> {
         self.live()?;
         self.packing.tick(now).map_err(Error::Packing)?;
         for _ in 0..self.config.work_limit {
-            if self.packing.pending().is_some() || !self.aligned.is_pending() {
+            if self.has_pending_source() || !self.aligned.is_pending() {
                 break;
             }
             if self.records.len() >= usize::from(self.config.max_units) {
@@ -448,6 +473,24 @@ impl Sender {
                 .copy_policy
                 .copies_for_unit(unit.bytes, self.config.packing.symbol_bytes)
                 .map_err(Error::Copies)?;
+            let offset = unit.bytes.get(3..8).and_then(|header| {
+                (header[0] == 4).then(|| u16::from_be_bytes([header[3], header[4]]))
+            });
+            if self.group_fragment_tails
+                && self.tail_copies == Some(copies)
+                && offset == Some(0)
+                && unit.bytes.len() == self.config.packing.symbol_bytes
+                && id.0 != u64::MAX
+            {
+                // Reserve one more identity. The full fragment takes the first
+                // uncommitted unit ID; the held batch follows without a gap.
+                self.next_unit = id.0.checked_add(1).map(SourceId);
+                self.leading_fragment = Some(record);
+                break;
+            }
+            let tail = self.group_fragment_tails
+                && offset.is_some_and(|offset| offset != 0)
+                && unit.completes_record;
             let pushed = match self.packing.push(unit.bytes, copies, now) {
                 Err(packed::Error::ClockExhausted) => {
                     return self.fail(Error::Packing(packed::Error::ClockExhausted));
@@ -456,6 +499,11 @@ impl Sender {
             };
             match pushed {
                 packed::Push::Accepted => {
+                    if self.records.is_empty() {
+                        self.tail_copies = tail.then_some(copies);
+                    } else if !tail {
+                        self.tail_copies = None;
+                    }
                     let admitted = self.staged_at.ok_or(Error::Ownership)?;
                     self.source_started_at = Some(
                         self.source_started_at
@@ -501,14 +549,20 @@ impl Sender {
         compact: bool,
     ) -> Result<usize, Error> {
         self.live()?;
-        let packed = self.packing.pending().ok_or(Error::NoPending)?;
-        if usize::from(packed.units) != self.records.len() || !(1..=4).contains(&packed.copies) {
-            return Err(Error::Ownership);
-        }
         let encode = if compact {
             envelope::encode_compact
         } else {
             envelope::encode
+        };
+        let (records, bytes) = if let Some(record) = &self.leading_fragment {
+            (std::slice::from_ref(record), self.aligned.rendered_symbol())
+        } else {
+            let packed = self.packing.pending().ok_or(Error::NoPending)?;
+            if usize::from(packed.units) != self.records.len() || !(1..=4).contains(&packed.copies)
+            {
+                return Err(Error::Ownership);
+            }
+            (self.records.as_slice(), packed.payload)
         };
         encode(
             self.config.envelope(),
@@ -517,8 +571,8 @@ impl Sender {
                 source,
                 first_unit: self.first_unit.ok_or(Error::Ownership)?,
             },
-            &self.records,
-            packed.payload,
+            records,
+            bytes,
             output,
         )
         .map_err(Error::Envelope)
@@ -527,12 +581,23 @@ impl Sender {
     /// This neither emits copies nor acknowledges any physical/recovery handoff.
     pub fn pending_copies(&self) -> Result<u8, Error> {
         self.live()?;
+        if self.leading_fragment.is_some() {
+            return self.tail_copies.ok_or(Error::Ownership);
+        }
         Ok(self.packing.pending().ok_or(Error::NoPending)?.copies)
     }
     /// Release only after actual recovery copied the complete envelope with the same ID.
     /// This is neither a source-prefix receipt nor native-delivery confirmation.
     pub fn commit_source(&mut self) -> Result<(), Error> {
         self.live()?;
+        if self.leading_fragment.is_some() {
+            let first = self.first_unit.ok_or(Error::Ownership)?;
+            let next = first.0.checked_add(1).ok_or(Error::Exhausted)?;
+            self.aligned.commit_unit().map_err(Error::Aligned)?;
+            self.first_unit = Some(SourceId(next));
+            self.leading_fragment = None;
+            return Ok(());
+        }
         if self.packing.pending().is_none() {
             return Err(Error::NoPending);
         }
@@ -540,6 +605,7 @@ impl Sender {
         self.records.clear();
         self.first_unit = None;
         self.source_started_at = None;
+        self.tail_copies = None;
         Ok(())
     }
     /// Original native admission of the oldest bytes still owned by this codec.
@@ -555,6 +621,9 @@ impl Sender {
     /// Newer input behind that source cannot change this ownership timestamp.
     pub fn pending_admission_micros(&self) -> Result<u64, Error> {
         self.live()?;
+        if self.leading_fragment.is_some() {
+            return self.staged_at.ok_or(Error::Ownership);
+        }
         self.packing.pending().ok_or(Error::NoPending)?;
         self.source_started_at.ok_or(Error::Ownership)
     }

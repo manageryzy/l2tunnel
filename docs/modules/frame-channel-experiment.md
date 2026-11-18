@@ -763,3 +763,95 @@ first-attempt failures remain visible in the logs.
 and [remaining checks](../../work/receiver-gap-20261118/verification/check-remaining.log).
 [Pressure-probe retry](../../work/receiver-gap-20261118/verification/pressure-retry.log)
 and [simulator suite](../../work/receiver-gap-20261118/verification/simulator.log).
+
+### Sender MUX residence and the C48 throughput gap
+
+The matched Python run offers 512-byte records across 16 streams at 76 Mbit/s.
+Both implementations use the same two-second warmup, ten-second measurement,
+100/10 Mbit/s link, 35 ms one-way delay, and independent 15% loss in each
+direction. The selected regular repair rate is 41/200 in both frozen plans.
+Python issues one TCP segment per record. Linux CUBIC can combine writes into
+MSS-sized segments, which can require two protected source fragments. Linux
+also executes both codecs, real authentication, packet I/O and TCP ACKs.
+The model's segment-issue clock starts after TCP has a congestion-window slot.
+The native first-write clock starts at the application's first attempted write.
+The scheduled clock additionally includes backlog at the producer in both tests.
+[Matched Python manifests and definitions](../../work/c48-parity-20261119/python/comparison.json).
+
+| Forward experiment | Application Mbit/s | Issue or first-write P99 (ms) | Scheduled P99 (ms) | Unsubmitted records |
+| --- | ---: | ---: | ---: | ---: |
+| Python seed 1 | 75.94 | 179.44 | 470.52 | 5,375 |
+| Python seed 2 | 75.78 | 193.74 | 554.67 | 6,599 |
+| Linux after TCP half-close fix | 28.50 | 1,148.46 | 8,602.5 | 138,411 |
+| Linux R4 | 40.97 | 561.44 | 5,922.31 | 102,957 |
+| Linux R5 | 38.14 | 784.85 | 7,035.74 | 109,381 |
+| Linux R6, independent repeat | 48.27 | 543.27 | 5,121.91 | 81,915 |
+| Linux R6, profiler enabled at cutoff | 48.81 | 468.82 | 5,855.54 | 81,134 |
+
+R4 and R5 each passed stream hashes, the four captures, and two successive
+observations of zero unconfirmed sources at both peers. Other qualified draws
+recorded 35.28, 37.25 and 28.65 Mbit/s. The last included a 2.82-second
+receiver traffic pause. Its cause remains undetermined. R4 with the same
+workload and lighter observation delivered 44.25 Mbit/s. A separate R4
+zero-loss control delivered 36.33 Mbit/s. Each control has one draw.
+[R4](../../work/c48-parity-20261119/native/candidate-r4/summary.json),
+[R5](../../work/c48-parity-20261119/native/candidate-r5/summary.json),
+[pause](../../work/c48-parity-20261119/native/candidate-r3/pause.json)
+and [zero-loss control](../../work/c48-parity-20261119/native/diagnostic-r4-loss0/summary.json).
+
+R4 removed repeated negotiated-configuration hashing, reduced finite-field
+work and empty channel scans, serviced due held ACKs during I/O batches,
+and shared the original receive work grant across queued inputs. Under full
+lookahead, the receiver now admits units needed by a channel head from a
+mixed packed source while retaining the source until all units are accepted.
+With MSS explicitly constrained in a diagnostic, the former receiver rejected
+the same already-decoded source 70,949 times and exhausted the original debt
+deadline. The same 15%-loss diagnostic with R4 delivered 36.91 Mbit/s and
+drained both peers. An isolated fragment-packing candidate still encountered
+the receiver's original held-ACK deadline in another run.
+[Old-gap evidence](../../work/c48-parity-20261119/native/diagnostic-r2-mss512/old-gap-status.json),
+[MSS repeat](../../work/c48-parity-20261119/native/diagnostic-r4-mss512/summary.json)
+and [ACK failure](../../work/c48-parity-20261119/native/candidate-r4-fragment/diagnostic-failure.json).
+
+Process-scoped markers on channels 0, 4, 8 and 12 distinguish a kernel TUN
+capture from a successful device read, MUX enqueue, first codec offer, admission,
+and receiver handoff. In the R5 marker run all 47,385 sender TUN packets matched
+device reads. The device read P99 was 1.455 ms. On 9,584 measured data packets,
+MUX enqueue to first codec offer averaged 131.48 ms with P99 388.10 ms.
+The first offer to acceptance averaged 0.294 ms with P99 1.880 ms.
+For the 309 traced records in the application tail, MUX residence averaged
+148.72 ms. For the 225 records in the tunnel-only tail it averaged 394.61 ms.
+No marker events were lost. The markers add overhead, so these values apply
+to their own run. R4's lighter application trace measured 0.052 ms average
+in-order receiver TUN to read for its slowest one percent.
+[Packet and record join](../../work/c48-parity-20261119/native/trace-run-r5-sender/cohort.json),
+[queue depth](../../work/c48-parity-20261119/native/trace-run-r5-sender/depth.json),
+[per-flow service](../../work/c48-parity-20261119/native/trace-run-r5-sender/mux-service.json)
+and [R4 stages](../../work/c48-parity-20261119/native/candidate-r4/stages.json).
+
+R6 groups compatible short fragment tails while full first fragments continue
+in their existing scratch space. Replaying 48,043 actual native packets through
+the two Rust packers changed the protected source count from 75,400 to 52,283.
+Both retained all 82,392 units, consecutive wire unit IDs and the same 1,824
+additional physical copies. R6 also reduces flow lookup and unfiltered
+weighted-DRR selection work. Both completed Linux runs passed hashes, four
+captures and bilateral drain. For the independent repeat, the physical
+recovery shares were 21.39% forward and 11.54% reverse. Lifetime sender IP
+bytes per application byte were 1.401, versus 1.318 in the two Python runs.
+The sender accepted 66.15 Mbit/s in the synchronized 8.06-second status
+interval inside the measurement window. The complete trial still left
+81,915 of 222,657 scheduled producer opportunities unsubmitted.
+[Packing replay](../../work/c48-parity-20261119/recovery/packing-comparison.json),
+[R6 repeat](../../work/c48-parity-20261119/native/candidate-r6-repeat/summary.json),
+[synchronized wire counters](../../work/c48-parity-20261119/native/candidate-r6-repeat/sample-counters.json)
+and [late-profiled repeat](../../work/c48-parity-20261119/native/candidate-r6-late-perf/summary.json).
+
+The first R6 trial failed authenticated liveness during drain. All 139,878
+submitted records reached the server, but nine returning TCP FINs had yet to
+reach the client TUN. The sender WAN was silent for 5.049 s. An independent
+probe's half-second timer also stalled, and 15 server-side Linux FIN timers
+then fired within 0.2 ms of one another. Guest scheduling counters showed a
+concurrent tick deficit across 28 vCPUs. The guest evidence cannot isolate a
+hypervisor cause. Both original five-second challenge caps remained active.
+This run does not qualify as a successful performance sample.
+[Failed-run timeline](../../work/c48-parity-20261119/native/candidate-r6/terminal-timeline.json).

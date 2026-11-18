@@ -172,19 +172,8 @@ fn actual_common_silent_tail_rearms_native_after_bounded_short_preview() -> Resu
                 before.native_backpressure_drops
             );
             let epoch = endpoint.driver.common_state()?.epoch();
-            let width = endpoint
-                .driver
-                .common_state()?
-                .current()
-                .descriptor()
-                .local(common_contract::mg_role(endpoint.driver.info.role))
-                .receive()
-                .channels();
-            // Exhaust the packet-arrival scan before the one-byte GF/preview work
-            // can finish. Only an actual later preview admission can rearm it.
-            for _ in 0..width {
-                endpoint.driver.collect_native(now)?;
-            }
+            // Arrival only stages decoding. The one-byte GF/preview turns must
+            // rearm native delivery even if the socket remains silent.
             assert_eq!(
                 endpoint
                     .driver

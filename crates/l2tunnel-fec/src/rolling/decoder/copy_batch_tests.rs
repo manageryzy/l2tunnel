@@ -31,8 +31,8 @@ fn budget(n: usize) -> WorkBudget {
     }
 }
 
-// The oracle is intentionally limited to the three changed phases. Every other
-// phase, including GF operations and atomic publication, uses the actual owner.
+// Use individual byte visits for copy, check and publication staging. All
+// control transitions, algebra and transaction publication use the real owner.
 fn bytewise_advance(
     d: &mut Decoder,
     job: &mut Job,
@@ -87,13 +87,77 @@ fn bytewise_advance(
                 job.phase = Phase::Load(i + 1);
             }
         }
+        Phase::Zero(i) if i < width => {
+            if !spend(&mut budget.copies) {
+                return Ok(Action::Paused);
+            }
+            if d.candidate[w + i] != 0 {
+                return Err(Error::Inconsistent);
+            }
+            job.phase = Phase::Zero(i + 1);
+        }
+        Phase::Validate {
+            row,
+            id,
+            index,
+            length,
+        } if (2..width).contains(&index) => {
+            if !spend(&mut budget.copies) {
+                return Ok(Action::Paused);
+            }
+            if index >= length + 2 && scalar_payload(d, row, job.systematic, index)? != 0 {
+                return Err(Error::Length);
+            }
+            job.phase = Phase::Validate {
+                row,
+                id,
+                index: index + 1,
+                length,
+            };
+        }
+        Phase::Store { row, id, index } if index < width => {
+            if !spend(&mut budget.copies) {
+                return Ok(Action::Paused);
+            }
+            let target = (id as usize % (2 * w)) * width + index;
+            d.known_data[target] = scalar_payload(d, row, job.systematic, index)?;
+            job.phase = Phase::Store {
+                row,
+                id,
+                index: index + 1,
+            };
+        }
+        Phase::History(i) if i < width && matches!(job.input, Input::Repair(_)) => {
+            if !spend(&mut budget.copies) {
+                return Ok(Action::Paused);
+            }
+            let Input::Repair(descriptor) = job.input else {
+                return Err(Error::Identity);
+            };
+            let slot = (descriptor.id.0 % d.config.repair_history as u64) as usize;
+            d.history[slot * width + i] = d.input[i];
+            job.phase = Phase::History(i + 1);
+        }
         _ => return d.advance(job, budget, now),
     }
     Ok(Action::Continue)
 }
 
+fn scalar_payload(
+    d: &Decoder,
+    row: Option<usize>,
+    systematic: bool,
+    index: usize,
+) -> Result<u8, Error> {
+    match row {
+        Some(row) => d.row_byte(row, d.config.window + index),
+        None if systematic => Ok(d.input[index]),
+        None => Ok(d.candidate[d.config.window + index]),
+    }
+}
+
 // Reuse the current owner for idle work. The staged-job loop differs from step()
-// only at the three-phase oracle call, retaining its exact metadata visit order.
+// only at the bytewise oracle call, retaining its exact metadata visit order.
 fn bytewise_step(d: &mut Decoder, now: Tick, mut budget: WorkBudget) -> Result<DecodeStep, Error> {
     if d.job.is_none() {
         return d.step(now, budget);

@@ -1,6 +1,17 @@
 use super::*;
 
 impl Engine {
+    /// Visits sufficient to cover all channels that can currently make native progress.
+    /// Rolling preparation skips empty channels and includes retained context and tombstone work.
+    pub fn native_scan_visits(&self) -> usize {
+        let channels = usize::from(self.receive_channels);
+        match &self.owner {
+            Owner::Rolling(endpoint) => channels.min(endpoint.record_status().retained_records),
+            Owner::Research(endpoint) => channels.min(endpoint.record_status().retained_records),
+            _ => channels,
+        }
+    }
+
     /// Prepare into the caller's actual free output slot under an original cap.
     ///
     /// The caller retains that slot until complete native acceptance. Repeated

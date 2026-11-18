@@ -267,6 +267,7 @@ impl Driver {
         if !self.check_expiry(now)? {
             return Ok(());
         }
+        self.service_due_acks(now)?;
         self.retry_common_feedback(now)?;
         self.retry_common_connection_input(now)?;
         let mut runtime = self
@@ -748,9 +749,12 @@ impl Driver {
     }
 }
 fn original_scope(operation: transaction::Operation) -> Scope {
+    record_scope(operation.origin())
+}
+pub(super) fn record_scope(origin: control::Scope) -> Scope {
     Scope {
-        epoch: security::Epoch(operation.origin().epoch.0),
-        configuration: security::ConfigDigest(operation.origin().digest.0),
+        epoch: security::Epoch(origin.epoch.0),
+        configuration: security::ConfigDigest(origin.digest.0),
     }
 }
 pub(super) fn common_scope(epoch: core::Epoch, value: &C) -> io::Result<Scope> {

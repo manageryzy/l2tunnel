@@ -83,7 +83,13 @@ fn actual_queue_retains_busy_input_exact_bytes_and_original_age_until_decoder_ow
         ),
         Err(Error::Busy)
     );
-    assert_eq!(receiver.ingress_status(), Some(full));
+    assert_eq!(
+        receiver.ingress_status(),
+        Some(IngressStatus {
+            full_refusals: [1, 0, 0],
+            ..full
+        })
+    );
     let one = receiver.step(
         Tick(9),
         rolling::WorkBudget {
@@ -125,6 +131,113 @@ fn actual_queue_retains_busy_input_exact_bytes_and_original_age_until_decoder_ow
             .bytes,
         0
     );
+    Ok(())
+}
+
+#[test]
+fn targeted_committed_copy_crosses_full_input_queue_without_displacing_fresh_work() -> TestResult {
+    let mut config = short_config(0, rolling::wire::SourceWire::TargetedExact);
+    config.forward.scheduler.repair_numerator = 0;
+    let (old_wire, short_wire, old_id, short_id, old, short) = originals(config)?;
+    for conflict in [false, true] {
+        let (mut receiver, _) = queued(config, 1)?;
+        receiver.accept_authenticated(Tick(1), old_wire.kind, &old_wire.bytes)?;
+        service_until(&mut receiver, Tick(1), |owner| {
+            owner.receiver_status().decoder.handoff_prefix == 1
+        })?;
+        receiver.accept_authenticated(Tick(2), short_wire.kind, &short_wire.bytes)?;
+        receiver.accept_authenticated(Tick(2), short_wire.kind, &short_wire.bytes)?;
+        let full = receiver.ingress_status().ok_or("actual queue")?;
+        assert_eq!(full.packets, 1);
+        assert!(receiver.receiver_status().decoder.pending_job);
+        let events = receiver.receiver_status().feedback_events;
+        let mut bytes = old_wire.bytes.clone();
+        if conflict {
+            *bytes.last_mut().ok_or("nonempty original")? ^= 1;
+            assert_eq!(
+                receiver.accept_authenticated(Tick(2), old_wire.kind, &bytes),
+                Err(Error::Rolling(rolling::Error::Conflict))
+            );
+            assert!(receiver.failure().is_some());
+            continue;
+        }
+        receiver.accept_authenticated(Tick(2), old_wire.kind, &bytes)?;
+        assert_eq!(receiver.ingress_status(), Some(full));
+        assert_eq!(receiver.receiver_status().feedback_events, events + 1);
+        service_until(&mut receiver, Tick(2), |owner| {
+            owner
+                .ingress_status()
+                .is_some_and(|queue| queue.packets == 0)
+                && owner.receiver_status().decoder.handoff_prefix == 2
+        })?;
+        let mut output = [0; 1024];
+        for (identity, expected) in [(old_id, &old), (short_id, &short)] {
+            let native = ready(&mut receiver, Tick(2), &mut output)?;
+            assert_eq!(native.identity(), identity);
+            assert_eq!(&output[..native.bytes()], expected.as_slice());
+            receiver.commit_native(Tick(2), native.token())?;
+        }
+        assert_eq!(receiver.statistics().committed, 2);
+    }
+    Ok(())
+}
+
+#[test]
+fn queued_targeted_burst_shares_one_grant_and_yields_for_feedback_and_native() -> TestResult {
+    for feedback_packets in [2, 64] {
+        let mut config = short_config(0, rolling::wire::SourceWire::TargetedExact);
+        config.forward.scheduler.repair_numerator = 0;
+        config.forward.scheduler.feedback_packets = feedback_packets;
+        let (old, later, _, _, _, _) = originals(config)?;
+        let (mut receiver, _) = queued(config, 12)?;
+        // The entire out-of-order train arrives before its first copy commits.
+        for _ in 0..10 {
+            receiver.accept_authenticated(Tick(1), later.kind, &later.bytes)?;
+        }
+        receiver.step(Tick(1), work())?;
+        let before = receiver.ingress_status().ok_or("actual queue")?.packets;
+        let step = receiver.step_queued(Tick(1), work())?;
+        let after = receiver.ingress_status().ok_or("actual queue")?.packets;
+        assert!(step.receive.work.field <= work().field);
+        assert!(step.receive.work.copies <= work().copies);
+        assert!(step.receive.work.metadata <= work().metadata);
+        if feedback_packets == 2 {
+            assert!(step.receive.feedback_ready);
+            assert_eq!(before - after, 1);
+        } else {
+            assert!(!step.receive.feedback_ready);
+            assert!(step.native_progress);
+            assert_eq!(before - after, 1);
+            let next = receiver.step_queued(Tick(1), work())?;
+            assert!(!next.native_progress && !next.source_handed && !next.receive.feedback_ready);
+            assert_eq!(
+                after - receiver.ingress_status().ok_or("actual queue")?.packets,
+                config.forward.packing.work_limit
+            );
+            let unit = rolling::WorkBudget {
+                field: 0,
+                copies: 0,
+                metadata: 1,
+            };
+            let constrained = receiver.step_queued(Tick(1), unit)?;
+            assert_eq!(constrained.receive.work.field, 0);
+            assert_eq!(constrained.receive.work.copies, 0);
+            assert!(constrained.receive.work.metadata <= 1);
+        }
+        receiver.accept_authenticated(Tick(1), old.kind, &old.bytes)?;
+        let mut handed = 0;
+        for _ in 0..20 {
+            let prior = receiver.receiver_status().decoder.handoff_prefix;
+            let step = receiver.step_queued(Tick(1), work())?;
+            let new = receiver.receiver_status().decoder.handoff_prefix;
+            assert_eq!(new - prior, u32::from(step.source_handed));
+            handed += u32::from(step.source_handed);
+            if new == 2 {
+                break;
+            }
+        }
+        assert_eq!(handed, 2);
+    }
     Ok(())
 }
 

@@ -125,6 +125,7 @@ pub struct Sender {
     scope: Scope,
     encoder: Encoder,
     retry_queue: targeted::Queues,
+    request_counts: RequestCounts,
     fresh: fresh::Queue,
     // Fresh wire bytes minus twice recovery wire bytes under contention.
     balance: i64,
@@ -205,6 +206,7 @@ impl Sender {
                 Encoder::new_sliding(policy.recovery, scope, now)?
             },
             retry_queue: targeted::Queues::new(policy)?,
+            request_counts: RequestCounts::default(),
             fresh: fresh::Queue::new(policy)?,
             balance: 0,
             competing: false,
@@ -532,6 +534,10 @@ impl Sender {
     /// At least one received request awaits inspection under the next work budget.
     pub fn requested_retry_waiting(&self) -> bool {
         self.retry_queue.has_retries()
+    }
+    /// Count named requests independently of cumulative feedback and physical wire bytes.
+    pub fn request_counts(&self) -> RequestCounts {
+        self.request_counts
     }
     fn idle_ticks(&self) -> u64 {
         if self.policy.source_wire.is_targeted() {
@@ -875,12 +881,23 @@ impl Sender {
                     15_000.. => true,
                     _ => self.full_credit,
                 };
-                if self
-                    .retry_queue
-                    .enqueue_retry(id, request.id.0, full_credit)
-                {
+                // A prepared named original still awaits its physical handoff.
+                // Record this newer request but let the existing output serve it.
+                let prepared = matches!(
+                    self.pending,
+                    Some(Pending::Retry { id: source, full_credit: Some(_) }) if source.0 == id
+                );
+                if self.retry_queue.enqueue_retry(
+                    id,
+                    request.id.0,
+                    full_credit,
+                    prepared,
+                    &mut self.request_counts,
+                ) {
                     self.full_credit = full_credit;
                 }
+            } else {
+                self.request_counts.confirmed = self.request_counts.confirmed.saturating_add(1);
             }
             mask &= mask - 1;
         }

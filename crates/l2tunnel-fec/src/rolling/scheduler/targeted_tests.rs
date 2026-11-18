@@ -209,6 +209,71 @@ fn targeted_retries_only_named_old_and_distant_sources_without_prefix_jump()
 }
 
 #[test]
+fn repeated_requests_share_a_blocked_native_output_and_retry_after_an_actual_loss()
+-> Result<(), Error> {
+    let (policy, scope, work) = setup();
+    let mut s = Sender::new(policy, scope, Tick(0))?;
+    admit_source(&mut s, 0, Tick(0))?;
+    let request = |serial| GapRequest {
+        scope,
+        id: FeedbackId(serial),
+        prefix: 0,
+        start: 0,
+        mask: 1,
+    };
+    let mut now = Tick(100);
+    let receipt = Feedback {
+        scope,
+        id: FeedbackId(1),
+        prefix: 0,
+        observed_end: 1,
+        deficit: 1,
+    };
+    s.receive_feedback(receipt, now)?;
+    assert!(!s.requested_retry_waiting());
+    s.receive_request(request(2), now)?;
+    s.receive_request(request(3), now)?;
+    s.step(now, work)?;
+    let original = s.pending_retry_token().ok_or(Error::Busy)?;
+    s.receive_request(request(4), now)?;
+    s.receive_request(request(3), now)?;
+    assert_eq!(s.pending_retry_token(), Some(original));
+    assert!(!s.requested_retry_waiting());
+    s.confirm_retry(original, now, now)?;
+    // The carrier drops that physically handed copy. A newer request must
+    // still select exactly the same source under a fresh physical witness.
+    now = Tick(80_100);
+    s.receive_request(request(5), now)?;
+    s.step(now, work)?;
+    let retry = s.pending_retry_token().ok_or(Error::Busy)?;
+    assert_ne!(original, retry);
+    s.confirm_retry(retry, now, now)?;
+    s.receive_feedback(
+        Feedback {
+            id: FeedbackId(6),
+            prefix: 1,
+            deficit: 0,
+            ..receipt
+        },
+        now,
+    )?;
+    s.receive_request(request(7), now)?;
+    assert_eq!(s.status().encoder.confirmed_prefix, 1);
+    assert_eq!(
+        s.request_counts(),
+        RequestCounts {
+            first: 1,
+            repeated: 3,
+            coalesced_queued: 1,
+            coalesced_prepared: 1,
+            duplicate_or_older: 1,
+            confirmed: 1,
+        }
+    );
+    Ok(())
+}
+
+#[test]
 fn targeted_request_strict_bounds_and_direction_precede_custody_changes() -> Result<(), Error> {
     let (p, scope, _) = setup();
     let mut s = Sender::new(p, scope, Tick(0))?;

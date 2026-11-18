@@ -98,8 +98,9 @@ impl<P: RecoveryPolicy> Endpoint<P> {
             .committed
             .checked_add(1)
             .ok_or(Error::Arithmetic)?;
-        let channel =
+        let cursor =
             receiver::ChannelId(u8::try_from(self.next_channel).map_err(|_| Error::Identity)?);
+        let channel = self.records.next_retained_channel(cursor).unwrap_or(cursor);
         let result = if self.fin_order.active() {
             self.records
                 .prepare_with_early_filter(channel, receiver_tick(now), work, |frame| {
@@ -113,10 +114,10 @@ impl<P: RecoveryPolicy> Endpoint<P> {
             Ok(prepared) => prepared,
             Err(error) => return self.fail(Error::Receiver(error)),
         };
-        self.next_channel = if self.next_channel + 1 == self.receive_config.receiver.channels {
+        self.next_channel = if u16::from(channel.0) + 1 == self.receive_config.receiver.channels {
             0
         } else {
-            self.next_channel + 1
+            u16::from(channel.0) + 1
         };
         match prepared {
             receiver::Prepared::Idle => Ok(NativePreparation::Idle),

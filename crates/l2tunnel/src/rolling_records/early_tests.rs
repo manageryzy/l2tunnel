@@ -21,6 +21,9 @@ type Originals = (
 
 fn originals(config: Config) -> TestResult<Originals> {
     let mut sender = endpoint(config, Role::Client)?;
+    if config.forward.scheduler.source_wire.is_targeted() {
+        sender.enable_queue_aware_repair_budget(1500)?;
+    }
     let old = packet(true, 0x39, 80);
     let short = packet(true, 0x71, 48);
     let old_id = sender

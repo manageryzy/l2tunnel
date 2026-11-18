@@ -148,3 +148,60 @@ fn sparse_large_rank_one_original_copies_only_touched_rows() -> Result<(), Error
     );
     Ok(())
 }
+
+#[test]
+fn local_repair_with_an_older_equation_costs_the_same_in_a_larger_row_bank() -> Result<(), Error> {
+    fn trial(rows: usize) -> Result<WorkUsed, Error> {
+        let c = Config {
+            max_rows: rows,
+            max_payload: 16,
+            ..large()
+        };
+        let mut e = Encoder::new(c, scope(), Tick(0))?;
+        let mut d = Decoder::new(c, scope(), Tick(0))?;
+        let original = |id: u32| [id as u8, 0x42, 0];
+        let budget = WorkBudget {
+            field: MAX_STEP_WORK,
+            copies: MAX_STEP_WORK,
+            metadata: MAX_STEP_WORK,
+        };
+        let mut work = WorkUsed::default();
+        for id in 0..130 {
+            e.admit_source(&original(id), Tick(0))?;
+            if ![0, 1, 120].contains(&id) {
+                d.begin_source(scope(), SourceId(id), &original(id), Tick(0))?;
+                finish(&mut d)?;
+            }
+            if matches!(id, 1 | 129) {
+                e.begin_repair(false, Tick(0))?;
+                while e.pending_repair().is_none() {
+                    e.step(Tick(0), budget)?;
+                }
+                let equation = e.pending_repair().ok_or(Error::Identity)?;
+                let repair_id = equation.id;
+                d.begin_repair(equation, Tick(0))?;
+                work = finish(&mut d)?;
+                e.confirm_repair(repair_id, Tick(0))?;
+                assert_eq!(d.status().rank, 1);
+                assert_eq!(d.status().decoded_prefix, 0);
+            }
+        }
+        assert_eq!(
+            d.decoded_source(SourceId(120))?,
+            Some(original(120).as_slice())
+        );
+        d.begin_source(scope(), SourceId(0), &original(0), Tick(0))?;
+        finish(&mut d)?;
+        for id in 0..130 {
+            assert_eq!(
+                d.pending_source(),
+                Some((SourceId(id), original(id).as_slice()))
+            );
+            d.confirm_handoff(SourceId(id), Tick(0))?;
+        }
+        assert_eq!(d.status().rank, 0);
+        Ok(work)
+    }
+    assert_eq!(trial(2)?, trial(2048)?);
+    Ok(())
+}

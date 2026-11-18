@@ -370,7 +370,13 @@ fn selected_ingress_retains_two_real_feedbacks_across_one_physical_receipt() -> 
         ),
         Err(Error::Rolling(rolling_records::Error::Busy))
     );
-    assert_eq!(sender.rolling_ingress_status(), Some(queued));
+    assert_eq!(
+        sender.rolling_ingress_status(),
+        Some(rolling_records::IngressStatus {
+            full_refusals: [0, 0, 1],
+            ..queued
+        })
+    );
     sender.confirm_carrier_output_ordered_at(observed, received, order(500), token)?;
     let actual = sender.research_status().ok_or("completed actual sender")?.0;
     assert_eq!(
