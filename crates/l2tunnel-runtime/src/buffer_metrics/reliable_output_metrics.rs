@@ -2,6 +2,8 @@
 use l2tunnel_reliable::diagnostics::{Operation, Snapshot, Totals};
 use std::io::{self, Write};
 use std::time::Duration;
+#[path = "reliable_restored_metrics.rs"]
+mod restored;
 #[path = "reliable_staged_metrics.rs"]
 mod staged;
 fn optional(out: &mut impl Write, value: Option<Duration>) -> io::Result<()> {
@@ -32,7 +34,7 @@ fn totals(out: &mut impl Write, value: Totals) -> io::Result<()> {
 pub(super) fn write(out: &mut impl Write, value: &Snapshot) -> io::Result<()> {
     write!(
         out,
-        "{{\"definition\":\"actual sealed queue-head budget refusal to emission; includes scheduling delay; does not mean physical acceptance; per-reason durations overlap and must not be summed; capacity refusals are counts only\",\"coverage\":\"shared Aligned/Packed Block output only; Direct ARQ has capacity counts but no sealed-output wait; builder hold, restored-source waits, missing-equation dependencies and physical receipt latency unavailable\",\"scope\":\"endpoint-shared\",\"epoch\":{},\"send_direction\":{},\"sealed_output_present\":{},\"observed_at_us\":{},\"terminal_at_us\":",
+        "{{\"definition\":\"actual sealed queue-head budget refusal to emission; includes scheduling delay; does not mean physical acceptance; per-reason durations overlap and must not be summed; capacity refusals are counts only\",\"coverage\":\"shared Aligned/Packed Block output only; Direct ARQ has capacity counts but no sealed-output wait; builder hold, missing-equation dependencies and physical receipt latency unavailable; exact restored-source admission is separate\",\"scope\":\"endpoint-shared\",\"epoch\":{},\"send_direction\":{},\"sealed_output_present\":{},\"observed_at_us\":{},\"terminal_at_us\":",
         value.epoch,
         value.send_direction,
         value.sealed_output_present,
@@ -114,5 +116,7 @@ pub(super) fn write(out: &mut impl Write, value: &Snapshot) -> io::Result<()> {
     }
     write!(out, "],\"staged_source\":")?;
     staged::write(out, &value.staged)?;
+    write!(out, ",\"restored_admission\":")?;
+    restored::write(out, &value.restored, 1 - value.send_direction)?;
     write!(out, "}}")
 }

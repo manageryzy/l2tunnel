@@ -274,3 +274,90 @@ pub(super) fn ticket_event(
         event(state, now, converted);
     }
 }
+
+/// Capture public context only at first actual Pending or the existing sample cadence.
+/// Separate provider locks make begin/end a bracket, never an atomic denial reason.
+pub(super) fn ticket_pending(
+    metrics: &mut Option<Observer>,
+    carrier: &l2tunnel_quic::common::Carrier,
+    id: tickets::Identity,
+    physical_lane: usize,
+    required_payload_bytes: Option<usize>,
+) {
+    let Some(metrics) = metrics
+        .as_mut()
+        .filter(|metrics| metrics.has_quic_tickets())
+    else {
+        return;
+    };
+    let now = metrics.now();
+    let first = metrics
+        .quic_tickets()
+        .is_some_and(|state| state.pending(id, required_payload_bytes, now));
+    let cadence_due = metrics.quic_transport_due(physical_lane, now);
+    if !first && !cadence_due {
+        return;
+    }
+    pending_provider_sample(metrics, carrier, physical_lane, cadence_due.then_some(now));
+}
+
+/// Reuse one existing per-lane sample for all still-unresolved local tickets.
+/// A shared sample neither starts another wait nor reports a new failed enqueue.
+pub(super) fn pending_provider_sample(
+    metrics: &mut Observer,
+    carrier: &l2tunnel_quic::common::Carrier,
+    physical_lane: usize,
+    cadence_at: Option<u64>,
+) {
+    let begin_us = metrics.now();
+    let buffers = carrier.buffer_snapshot();
+    let stats = carrier.transport_statistics();
+    let end_us = metrics.now();
+    let micros = stats.path.rtt.as_micros();
+    let rtt_us = micros.min(u128::from(u64::MAX)) as u64;
+    let rtt_conversion_overflow = micros > u128::from(u64::MAX);
+    // Share the existing per-lane cadence so observe_buffers cannot duplicate
+    // this provider query in the same turn. This does not arm a timer or wake.
+    if let Some(cadence_at) = cadence_at {
+        metrics.sample_quic_transport(
+            physical_lane,
+            cadence_at,
+            TransportSample {
+                rtt_us,
+                rtt_conversion_overflow,
+                cwnd_bytes: stats.path.cwnd,
+                congestion_events: stats.path.congestion_events,
+                lost_quic_packets: stats.path.lost_packets,
+                lost_quic_bytes: stats.path.lost_bytes,
+                sent_quic_packets: stats.path.sent_packets,
+                udp_tx_datagrams: stats.udp_tx.datagrams,
+                udp_rx_datagrams: stats.udp_rx.datagrams,
+                udp_tx_payload_bytes: stats.udp_tx.bytes,
+                udp_rx_payload_bytes: stats.udp_rx.bytes,
+            },
+        );
+    }
+    if let Some(state) = metrics.quic_tickets() {
+        state.pending_lane_sample(
+            physical_lane,
+            tickets::PendingSample {
+                begin_us,
+                end_us,
+                required_payload_bytes: None,
+                available_payload_bytes: buffers.available_payload_bytes,
+                configured_send_buffer_bytes: buffers.outgoing_send_buffer_capacity,
+                rtt_us,
+                cwnd_bytes: stats.path.cwnd,
+                current_mtu_bytes: stats.path.current_mtu,
+                congestion_events: stats.path.congestion_events,
+                lost_quic_packets: stats.path.lost_packets,
+                lost_quic_bytes: stats.path.lost_bytes,
+                sent_quic_packets: stats.path.sent_packets,
+                udp_tx_datagrams: stats.udp_tx.datagrams,
+                udp_tx_payload_bytes: stats.udp_tx.bytes,
+                datagram_frames_tx: stats.frame_tx.datagram,
+                invalid: rtt_conversion_overflow || buffers.invalid_slot_observation,
+            },
+        );
+    }
+}

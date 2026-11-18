@@ -751,7 +751,7 @@ impl ProtocolBuffers {
     pub(crate) fn write(&self, out: &mut impl Write) -> io::Result<()> {
         write!(
             out,
-            "{{\"definition\":\"sampled occupancy, not blocked time; high water is observed samples only; endpoint pools are shared across channels; independent owners preserve incarnation; Swift shared packing overlaps per-channel packing and is not additive; Swift source positions include gaps; equation payload bytes exclude coefficient metadata; repairs_due is work debt without allocated payload; absent fields are unavailable; no owner durations are combined\",\"sample_interval_us\":{SAMPLE_INTERVAL_US},\"local_role\":\"{:?}\",\"coverage\":\"codec Aligned/Packed/Rolling/Research and per-connection owners; Reliable ARQ retention and Swift shared packing/per-channel source/retry/equation/stream snapshots; Swift feedback/history/control and all Swift dependency waits, restored-source handoff waits, builder packing hold, FEC missing-equation dependencies, other recovery internals, history use, per-channel non-Swift receiver gauges and waits outside explicitly emitted interval sections remain unavailable\",\"retired_epochs_omitted\":{},\"retired_owner_generations_omitted\":{},\"identity_errors\":{},\"clock_regressions\":{},\"unsupported_codec_samples\":{},\"staged_terminal_unavailable\":{},\"counter_overflow\":{},\"epochs\":[",
+            "{{\"definition\":\"sampled occupancy, not blocked time; high water is observed samples only; endpoint pools are shared across channels; independent owners preserve incarnation; Swift shared packing overlaps per-channel packing and is not additive; Swift source positions include gaps; equation payload bytes exclude coefficient metadata; repairs_due is work debt without allocated payload; absent fields are unavailable; no owner durations are combined\",\"sample_interval_us\":{SAMPLE_INTERVAL_US},\"local_role\":\"{:?}\",\"coverage\":\"codec Aligned/Packed/Rolling/Research and per-connection owners; Reliable ARQ retention and Swift shared packing/per-channel source/retry/equation/stream snapshots; Swift feedback/history/control and all Swift dependency waits, restored-source waits outside the explicitly emitted same-source ARQ-admission section, builder packing hold, FEC missing-equation dependencies, other recovery internals, history use, per-channel non-Swift receiver gauges and waits outside explicitly emitted interval sections remain unavailable\",\"retired_epochs_omitted\":{},\"retired_owner_generations_omitted\":{},\"identity_errors\":{},\"clock_regressions\":{},\"unsupported_codec_samples\":{},\"staged_terminal_unavailable\":{},\"counter_overflow\":{},\"epochs\":[",
             self.role,
             self.omitted_epochs,
             self.omitted_owners,
@@ -1360,6 +1360,15 @@ mod tests {
         let wait = &json["epochs"][0]["reliable_output"];
         assert_eq!(wait["epoch"], 7);
         assert_eq!(wait["union"]["censored_episodes"], 1);
+        assert_eq!(wait["restored_admission"]["schema"], 1);
+        assert_eq!(wait["restored_admission"]["receive_direction"], 1);
+        assert_eq!(
+            wait["restored_admission"]["cells"],
+            config.max_restored_packets
+        );
+        assert_eq!(wait["restored_admission"]["terminal_at_us"], 6_000);
+        assert_eq!(wait["restored_admission"]["open"]["episodes"], 0);
+        assert!(wait["restored_admission"]["maximum_censored"].is_null());
         assert_eq!(wait["union"]["censored_us"], 1_000);
         assert_eq!(wait["last_resolved"]["operation"]["generation"], 0);
         assert!(wait["pending"].is_null());

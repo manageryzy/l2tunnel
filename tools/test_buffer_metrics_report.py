@@ -694,7 +694,7 @@ class QuicTicketProviderTests(unittest.TestCase):
         for mutation in ('schema', 'class', 'cutoff', 'maximum', 'identity', 'phase', 'count', 'stop'):
             with self.subTest(mutation=mutation):
                 value = self.observation(); row = value['rows'][0]
-                if mutation == 'schema': value['schema'] = 2
+                if mutation == 'schema': value['schema'] = 3
                 elif mutation == 'class': row['class'] = 'Unknown'
                 elif mutation == 'cutoff': value['cutoff'] = 'physical_send'
                 elif mutation == 'maximum': row['stages'][0]['maximum_us'] = None
@@ -722,6 +722,113 @@ class QuicTicketProviderTests(unittest.TestCase):
         self.assertEqual(owner['quic_ticket_provider_validation']['status'],
                          'validated_ticket_latencies')
         self.assertIsNone(owner['quic_ticket_provider_validation']['rows'][0]['stages'][1]['maximum_us'])
+
+
+class QuicPendingProviderTests(unittest.TestCase):
+    normalized = QuicTicketProviderTests.normalized
+
+    @staticmethod
+    def observation():
+        value = QuicTicketProviderTests.observation()
+        value['schema'] = 2
+        row = value['rows'][0]
+        sample = dict(begin_us=4, end_us=5, required_payload_bytes=9,
+                      available_payload_bytes=0, configured_send_buffer_bytes=2208,
+                      rtt_us=70_000, cwnd_bytes=2944, current_mtu_bytes=1472,
+                      congestion_events=1, lost_quic_packets=1, lost_quic_bytes=100,
+                      sent_quic_packets=10, udp_tx_datagrams=10,
+                      udp_tx_payload_bytes=1000, datagram_frames_tx=10,
+                      bytes_in_flight=None, pacing_deadline_us=None, invalid=False)
+        row['last'].update(poll_count=1, latest_poll_us=3, maximum_poll_gap_us=None,
+                           pending_observation=dict(polls=1, first_us=4, latest_us=4,
+                                                    first_sample=sample,
+                                                    latest_sample=copy.deepcopy(sample)))
+        row['maximum_pending'] = copy.deepcopy(row['last'])
+        return value
+
+    def test_schema_two_keeps_exact_maximum_identity_and_unknown_provider_causes(self):
+        value = self.observation()
+        # Another valid last ticket need not be the one retained as maximum.
+        row = value['rows'][0]
+        row['created'] = row['completed'] = 2
+        row['last']['identity']['serial'] = 8
+        for stage in row['stages']:
+            stage['completed'] = 2
+            stage['completed_us'] *= 2
+        owner = self.normalized(value)
+        result = owner['quic_ticket_provider_validation']
+        self.assertEqual(result['status'], 'validated_ticket_latencies')
+        self.assertEqual(result['pending_context'], 'sampled_public_context')
+        self.assertEqual(result['rows'][0]['maximum_pending']['identity']['serial'], 7)
+        sample = result['rows'][0]['maximum_pending']['pending_observation']['first_sample']
+        self.assertIsNone(sample['bytes_in_flight'])
+        baseline = report.normalize(fixture(), 'baseline.bmetrics', 'digest')
+        self.assertEqual(owner['blocked_union'], baseline['blocked_union'])
+
+    def test_historical_schema_one_remains_unavailable_without_zero_fill(self):
+        result = self.normalized(QuicTicketProviderTests.observation())['quic_ticket_provider_validation']
+        self.assertEqual(result['status'], 'validated_ticket_latencies')
+        self.assertEqual(result['pending_context'], 'unavailable_historical_schema')
+        self.assertNotIn('maximum_pending', result['rows'][0])
+
+    def test_pending_clock_identity_counter_and_fabricated_cause_are_rejected(self):
+        for mutation in ('required', 'sample_end', 'counter', 'owner', 'lane', 'missing_max',
+                         'pending_polls', 'gap', 'in_flight', 'pacing', 'cap', 'sample_flag'):
+            with self.subTest(mutation=mutation):
+                value = self.observation(); row = value['rows'][0]
+                record = row['maximum_pending']; pending = record['pending_observation']
+                first = pending['first_sample']; last = pending['latest_sample']
+                if mutation == 'required': first['required_payload_bytes'] = 10
+                elif mutation == 'sample_end': last['end_us'] = 7
+                elif mutation == 'counter': last['lost_quic_packets'] = 0
+                elif mutation == 'owner': record['identity']['owner'] = 4
+                elif mutation == 'lane': record['lane'] = 0
+                elif mutation == 'missing_max': row['maximum_pending'] = None
+                elif mutation == 'pending_polls': pending['polls'] = 2
+                elif mutation == 'gap': record['maximum_poll_gap_us'] = 1
+                elif mutation == 'in_flight': first['bytes_in_flight'] = 0
+                elif mutation == 'pacing': first['pacing_deadline_us'] = 4
+                elif mutation == 'cap': first['available_payload_bytes'] = 2209
+                else: first['invalid'] = True
+                owner = self.normalized(value)
+                self.assertTrue(owner['issues'])
+                self.assertIsNone(owner['owner_union_percent_of_observed_span'])
+
+    def test_late_error_and_cancel_keep_acceptance_vs_censor_distinct(self):
+        for accepted in (True, False):
+            with self.subTest(accepted=accepted):
+                value = self.observation(); row = value['rows'][0]
+                row.update(completed=0, failed=int(accepted), censored=int(not accepted))
+                if accepted:
+                    row['last']['failed'] = True
+                    row['last']['deadline_us'] = 5
+                else:
+                    row['last'].update(accepted_us=None, result_us=None,
+                                       observed_us=None, taken_us=None)
+                    for stage in row['stages'][1:]:
+                        stage.update(completed=0, completed_us=0,
+                                     maximum_us=None, maximum_identity=None)
+                    row['stages'][1].update(censored=1, censored_us=12, maximum_us=12,
+                                            maximum_identity=row['last']['identity'])
+                row['maximum_pending'] = copy.deepcopy(row['last'])
+                owner = self.normalized(value)
+                result = owner['quic_ticket_provider_validation']
+                self.assertEqual(result['status'], 'validated_ticket_latencies')
+                maximum = result['rows'][0]['maximum_pending']
+                self.assertEqual(maximum['accepted_us'], 6 if accepted else None)
+                self.assertEqual(maximum['stopped_us'], 15)
+
+    def test_render_exposes_context_without_adding_it_to_blocked_union(self):
+        try:
+            from . import buffer_metrics_quic_pending as pending
+        except ImportError:
+            import buffer_metrics_quic_pending as pending
+        tables = []
+        lines = []
+        pending.render(lines, self.observation()['rows'], lambda output, headings, rows: tables.append((headings, rows)))
+        self.assertIn('not a causal split', ' '.join(lines))
+        self.assertIn('First cwnd B', tables[0][0])
+        self.assertEqual(tables[0][1][0][3:7], [7, 'accepted', 2, 1])
 
 
 if __name__ == '__main__':

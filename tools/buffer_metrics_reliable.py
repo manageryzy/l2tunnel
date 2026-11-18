@@ -1,4 +1,9 @@
 """Validate exact Block FEC head observations without deriving carrier waits."""
+try:
+    from . import buffer_metrics_restored as restored
+except ImportError:
+    import buffer_metrics_restored as restored
+
 REASONS = ('packet_budget', 'wire_byte_budget')
 CAPACITY_REASONS = ('fec_symbol_slots', 'fec_generation_slots', 'fec_logical_reservation',
                     'restored_packet_slots', 'restored_byte_budget')
@@ -116,8 +121,10 @@ def validate(value, epoch, path, issues, gaps, expected_direction=None):
         validate_staged(value['staged_source'], observed, terminal, path + '.staged_source', issues, gaps)
     else:
         gaps.append(path + ': exact staged source maximum/native identity unavailable in this receipt')
+    restored.validate(value.get('restored_admission'), observed, terminal, direction,
+                      path + '.restored_admission', issues, gaps)
     gaps.append(path + ': head interval includes scheduling until emission; reason intervals overlap; '
-                'capacity gates are count-only; restored-source/builder/dependency/physical waits unavailable')
+                'capacity gates are count-only; builder/dependency/physical waits unavailable')
 
 
 def render(lines, metadata, table, cell):
@@ -146,6 +153,7 @@ def render(lines, metadata, table, cell):
                       'physical acceptance. Reasons overlap and are not added. Capacity counts do '
                       'not establish wait duration. Full configuration identity is retained in JSON.'])
         render_staged(lines, value.get('staged_source'), table, cell)
+        restored.render(lines, value.get('restored_admission'), table, cell)
         if not value['sealed_output_present']:
             lines.append('No sealed FEC output queue is present; output wait duration is unavailable.')
             table(lines, ['Capacity gate', 'Actual count-only refusals'],
@@ -164,7 +172,7 @@ def render(lines, metadata, table, cell):
                for row in value['reasons'] if row['refusals']])
         table(lines, ['Capacity gate', 'Actual count-only refusals'],
               [[row['reason'], row['refusals']] for row in value['capacity_refusals'] if row['refusals']])
-        lines.append('Restored-source waits, deliberate builder hold, missing equations and physical '
+        lines.append('Restored waits beyond the emitted exact ARQ-admission section, deliberate builder hold, missing equations and physical '
                      'receipt latency are unavailable in this provider.')
 
 

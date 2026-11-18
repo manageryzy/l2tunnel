@@ -48,10 +48,10 @@ validation pass. "Implemented" below describes source, not a passing check.
 | BP-03 | Bank epoch slots/native window/output tokens | Existing resource usage retained; typed native-window refusal implemented. Per-generation wait and drain/export pending. |
 | BP-04 | Aligned/Packed sender stage, fragment cursor, assembling/sealed container | Actual codec gauges and typed refusals implemented. Bounded per-epoch/owner sampled export and exact retained-source capacity/window refusal-to-admission timing are implemented; validation is recorded below. Packing hold, fragment cursor and other stage waits remain pending. |
 | BP-05 | Aligned receiver proofs/ordered records/fragments/native output | Head/lookahead/proof/native-output gauges have bounded sampled runtime export. Missing context/source versus consumer intervals remain pending; occupancy does not establish blocking. |
-| BP-06 | Reliable partial block/outgoing/restored/generations/physical tokens | Typed builder/output/restored/decoder gauges and exact sealed-head refusal intervals implemented with coordinated local batch17 validation below and finite native17 Aligned Cauchy export. Restored-source and whole-write durations remain open. |
+| BP-06 | Reliable partial block/outgoing/restored/generations/physical tokens | Typed builder/output/restored/decoder gauges and exact sealed-head refusal intervals implemented with coordinated local batch17 validation below and finite native17 Aligned Cauchy export. Exact per-restored-source ARQ refusal-to-admission timing passes scoped local validation below; native qualification and whole-write durations remain open. |
 | BP-07 | Normal/Compact ARQ retention/reorder/transmission history | Reliable ARQ retention has sampled runtime export, and exact staged-source capacity/sequence-window refusal-to-admission timing is implemented. History use and remaining ACK/RTO/physical/output-budget attribution remain pending. Exhaustion remains an error, not an invented wait. |
 | BP-08 | Swift packing/sources/retries/repairs/history/rows/stream | Per-channel read-only gauges, actual packing refusal and bounded runtime export are implemented, including asymmetric channel identities and shared packing scope. Coordinated local validation passes below; native export qualification and independent channel timing remain open. |
-| BP-09 | Block FEC generations/equations/restored output | Live generation/rank/history/reservation gauges and actual capacity-refusal counters implemented with coordinated local batch17 validation below and finite native17 generation-capacity observations. Missing-equation and restored-source wait duration remain open. |
+| BP-09 | Block FEC generations/equations/restored output | Live generation/rank/history/reservation gauges and actual capacity-refusal counters implemented with coordinated local batch17 validation below and finite native17 generation-capacity observations. Exact restored-source admission timing passes scoped local validation below; native qualification and missing-equation waits remain open. |
 | BP-10 | Rolling/Research vectors/rows/jobs/feedback/ordered handoff | Nested codec gauges and three exact retained-operation intervals are implemented: source admission, decoded handoff and ready-feedback budget. Optional bounded storage and runtime export are charged before I/O. Coordinated local validation passes below; native qualification, work slices, feedback construction, ingress and missing-source dependencies remain open. |
 | BP-11 | Legacy sliding/recursive/parity pending/flight/jobs/batches/receive | Existing source/repair status; complete buffer intervals/export pending. These owners remain in scope. |
 | BP-12 | Rolling/fragment groups/tokens/reassembly/completion | Existing original deadlines and ingress snapshots; explicit blockage attribution/export pending. |
@@ -1621,3 +1621,90 @@ remains 21 bytes mean/p99; systematic source fill remains zero for Cauchy
 codec body have mean/p99 of 69.440988/73 and 67.858402/72 B for Cauchy, and
 60.201444/68 and 69.794118/105 B for Rolling. These lifetime emission populations
 are not full original-native overhead. No full BP, matrix or parity gate closes.
+
+### Batch21 scanning and actual Pending context
+
+Implementation passes the coordinated local continuation below; renewed native
+qualification is pending. No complete BP or performance gate closes.
+
+Rolling `Scan` and `CandidateCount` now inspect contiguous coefficient slices
+within the original metadata allowance. Each coefficient retains its original
+debit, including the first charge made by the outer step. A slice never crosses
+a row or phase transition; pivot selection, transaction-bank selection and
+failure ordering remain explicit. No new allocation, row mutation, decoder work
+allowance or deadline is introduced. Independent source review finds no blocker;
+the original scalar arms remain the independent test oracle. Native20 identifies
+the failing Scan cursor, but does not measure Scan-exclusive CPU time or establish
+that dispatch batching alone resolves the earlier ingress residence.
+
+Genuine QUIC diagnostics now sample public provider context after an actual lower
+send future returns Pending. First-Pending sampling is immediate; subsequent
+samples reuse the existing per-lane cadence. Two live tickets and eight fixed
+lane/class/consumer summaries retain first/latest context and one whole maximum
+Pending ticket, without an event history. The existing optional diagnostic heap
+charge includes the larger inline snapshots. Disabled instrumentation adds no
+clock or provider query at the new hook.
+
+The snapshot brackets separate provider queries and exports available DATAGRAM
+payload capacity, configured buffer bound, RTT, congestion window, MTU and
+cumulative transmission/loss/congestion counters. Poll counts and maximum poll
+gaps distinguish observed refusal from scheduling intervals. In-flight bytes and
+pacing deadlines remain unavailable. Queue acceptance is the success boundary;
+failed or cancelled tickets preserve their own terminal boundary. These public
+samples provide context, not an atomic or exclusive congestion attribution.
+Ticket schema2 carries the new fields; historical schema1 explicitly lacks them.
+
+### Exact restored-source admission observations (batch21)
+
+The opt-in Reliable observer prepays one diagnostic cell for each configured
+`max_restored_packets` slot through the existing complete construction plan. The
+original slot index and complete source ID are retained through the existing
+minimum-source selection; a newly inserted lower source does not replace another
+source's outstanding episode. Disabled owners allocate no cells. This changes no
+protocol allowance, queue, wire byte, timer, retry policy, or error precedence.
+
+An episode starts only after the actual ARQ receive call refuses a retained source
+with `Capacity` or `SequenceWindow`. Successful admission of that same original
+source closes it; admission is neither native delivery nor physical transmission.
+Repeated refusals keep the first boundary. Per-source durations and the two
+first-reason-to-progress durations can overlap, including while a different
+lower source is serviced. They must not be added to an owner blocked-time union
+or presented as continuously true causes. The source body extent includes
+recovery fields; the recovered flag is the original retained record's provenance.
+
+The bounded snapshot retains count/sum/max populations and exact last-completed,
+maximum-completed, maximum-open and maximum-censored source contexts. It contains
+no payload or event history. Every live tracked source has its own cell; the
+report deliberately exports extrema, not every live source. Snapshot scans occur
+only on the existing opt-in observation path. Fresh epoch/provider termination
+censors the genuine sampled population; a stale snapshot cannot invent a later
+terminal boundary. Omitted observations and identity, clock and arithmetic
+invalidity remain explicit. Receive direction is opposite the local sender role
+and retains the enclosing full epoch/configuration identity.
+
+This adds only the restored-source-to-ARQ ownership boundary. Missing source or
+receive-prefix dependencies, eligible feedback delay/budget waits, missing FEC
+equations, builder packing hold and other BP-06/BP-09 definitions remain open.
+The source fixtures cover lower-source insertion, actual byte-capacity refusal,
+real FEC recovery provenance, same-source completion and fresh/stale terminal
+semantics. Local validation passes below; renewed native observations are pending.
+No broader coverage or performance gate closes through this implementation.
+
+### Batch21 coordinated local validation
+
+The [final scoped continuation](../../work/aligned-extents-20261117/required-buffer-checks21-continuation6/validation.json)
+closes the affected check sequence, preserving every failed attempt and source
+hash. The five affected Rust suites have passing coverage through the aggregate
+and fixture-only continuations (823 cases including doctests); all 54 affected
+Python report cases pass. Strict workspace Clippy, affected strict rustdoc,
+formatting and checklist validation pass. Unchanged passing check20/check19
+stages are reused, not claimed as newly executed tests.
+
+Initial failures exposed a new test callback signature, a missing token extent
+accessor, strict-lint/return handling, and two invalid test-window configurations.
+The latter fixtures now use valid original composition constraints and real
+second-generation FEC recovery. The final assertion distinguishes a retained
+source never attempted from one actually refused: only the latter starts a wait.
+No protocol limit, deadline, queue or benchmark quota was changed to pass these
+checks. Independent Scan, Pending-context and restored-source reviews are retained
+with their isolated drafts. Native qualification and full BP coverage remain open.

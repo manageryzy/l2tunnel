@@ -107,6 +107,7 @@ fn block_output_diagnostics_are_prepaid_and_terminal_censor_is_read_only() -> Te
     assert_eq!(
         enabled.capacity_bytes() - plain.capacity_bytes(),
         std::mem::size_of::<diagnostics::Snapshot>()
+            + config().max_restored_packets * std::mem::size_of::<diagnostics::restored::Cell>()
     );
     assert!(matches!(
         Reliable::new_reserved_with_plan(
@@ -530,3 +531,6 @@ fn selected_ack_diagnostics_keep_stale_valid_and_reject_invalid_feedback() -> Te
     }
     Ok(())
 }
+
+#[path = "restored_diagnostics_tests.rs"]
+mod restored;

@@ -70,13 +70,22 @@ def validate(quic, owner):
                     'quic effective deadline exceeds original user deadline')
         else:
             require(user is None, 'quic unexpected User identity')
+        if schema == 2:
+            pending_parser.validate_record(value, stopped, require, uint, object_value)
         return key, (lane, key[2], consumer)
 
     try:
         value = object_value(quic['tickets'], 'quic tickets')
         require(owner == 'maintained_quic', 'quic tickets: wrong outer owner')
-        require(type(value.get('schema')) is int and value['schema'] == 1,
+        require(type(value.get('schema')) is int and value['schema'] in (1, 2),
                 'quic tickets: unknown schema')
+        schema = value['schema']
+        try:
+            from . import buffer_metrics_quic_pending as pending_parser
+        except ImportError:
+            import buffer_metrics_quic_pending as pending_parser
+        result['pending_context'] = ('sampled_public_context' if schema == 2
+                                     else 'unavailable_historical_schema')
         require(value.get('cutoff') == 'carrier_drop', 'quic tickets: unknown cutoff')
         require(type(value.get('invalid')) is bool, 'quic tickets: missing invalid flag')
         if value['invalid']:
@@ -142,6 +151,27 @@ def validate(quic, owner):
                 else:
                     require(maximum is None and span.get('maximum_identity') is None,
                             'quic tickets absent phase fabricated as zero')
+            if schema == 2:
+                require('maximum_pending' in row, 'quic missing Pending maximum')
+                maximum = row['maximum_pending']
+                if maximum is not None:
+                    max_id, max_key = record(maximum, True, stopped)
+                    require(max_key == key, 'quic Pending maximum row identity')
+                    owners.add(max_id[0])
+                    elapsed = pending_parser.validate_record(
+                        maximum, stopped, require, uint, object_value)
+                    require(elapsed is not None, 'quic Pending maximum has no observed interval')
+                    total_max = next(s['maximum_us'] for s in stages if s['stage'] == STAGES[1])
+                    require(total_max is not None and elapsed <= total_max,
+                            'quic Pending maximum exceeds full acceptance stage')
+                    if last is not None:
+                        last_elapsed = pending_parser.validate_record(
+                            last, stopped, require, uint, object_value)
+                        require(last_elapsed is None or last_elapsed <= elapsed,
+                                'quic Pending maximum smaller than last interval')
+                elif last is not None:
+                    require(last['pending_observation']['polls'] == 0,
+                            'quic missing observed Pending maximum')
             result['rows'].append(row)
         require(set(pending_rows) <= seen, 'quic tickets live cell without summary')
         require(len(owners) <= 1, 'quic tickets mixed actual owners')
@@ -166,3 +196,12 @@ def render(lines, observation, table, cell):
             stage['censored'], stage['censored_us'], stage['maximum_us']]
            for row in observation['rows'] for stage in row['stages']
            if stage['completed'] + stage['failed'] + stage['censored']])
+
+    if observation.get('pending_context') == 'sampled_public_context':
+        try:
+            from . import buffer_metrics_quic_pending as pending_parser
+        except ImportError:
+            import buffer_metrics_quic_pending as pending_parser
+        pending_parser.render(lines, observation['rows'], table)
+    else:
+        lines.extend(['', 'QUIC Pending context: unavailable in historical ticket schema 1.'])

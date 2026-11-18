@@ -360,27 +360,9 @@ impl Carrier {
                 if let Some(metrics) = self.buffer_metrics.as_mut() {
                     let now = metrics.now();
                     if metrics.quic_transport_due(index, now) {
-                        // Public provider facts sampled at a diagnostic cadence only.
-                        // No timer, driver wake, queue allowance or admission is changed.
-                        let stats = value.transport_statistics();
-                        let micros = stats.path.rtt.as_micros();
-                        metrics.sample_quic_transport(
-                            index,
-                            now,
-                            quic_metrics::TransportSample {
-                                rtt_us: micros.min(u128::from(u64::MAX)) as u64,
-                                rtt_conversion_overflow: micros > u128::from(u64::MAX),
-                                cwnd_bytes: stats.path.cwnd,
-                                congestion_events: stats.path.congestion_events,
-                                lost_quic_packets: stats.path.lost_packets,
-                                lost_quic_bytes: stats.path.lost_bytes,
-                                sent_quic_packets: stats.path.sent_packets,
-                                udp_tx_datagrams: stats.udp_tx.datagrams,
-                                udp_rx_datagrams: stats.udp_rx.datagrams,
-                                udp_tx_payload_bytes: stats.udp_tx.bytes,
-                                udp_rx_payload_bytes: stats.udp_rx.bytes,
-                            },
-                        );
+                        // One existing cadence sample also supplies adjacent public
+                        // context to still-pending tickets on this same actual lane.
+                        quic_metrics::pending_provider_sample(metrics, value, index, Some(now));
                     }
                 }
                 quic_metrics::input(
@@ -809,39 +791,48 @@ impl Carrier {
                         }
                     }
                 }
-                (Backend::Quic(_), Pending::Quic(token)) => match Pin::new(token).poll(cx) {
-                    Poll::Pending => {
-                        // Observe this existing await without inferring provider
-                        // queue fullness or changing its original receipt clock.
-                        quic_metrics::event(
-                            &mut self.buffer_metrics,
-                            BufferSite::QuicSend,
-                            Some(output.lane),
-                            class,
-                            BufferReason::CarrierAdmission,
-                            true,
-                        );
-                        None
-                    }
-                    Poll::Ready(value) => {
-                        let value = map_quic_send(value, output.lane);
-                        if matches!(
-                            &value,
-                            Ok(_) | Err(SendFailure::Expired { accepted: Some(_) })
-                        ) {
+                (Backend::Quic(values), Pending::Quic(token)) => {
+                    match Pin::new(&mut *token).poll(cx) {
+                        Poll::Pending => {
+                            quic_metrics::ticket_pending(
+                                &mut self.buffer_metrics,
+                                &values[output.lane],
+                                identity,
+                                output.lane,
+                                (output.framing == Framing::Final).then_some(token.record_bytes()),
+                            );
+                            // Observe this existing await without inferring provider
+                            // queue fullness or changing its original receipt clock.
                             quic_metrics::event(
                                 &mut self.buffer_metrics,
                                 BufferSite::QuicSend,
                                 Some(output.lane),
                                 class,
                                 BufferReason::CarrierAdmission,
-                                false,
+                                true,
                             );
+                            None
                         }
-                        metric_terminal |= value.is_err();
-                        Some(value)
+                        Poll::Ready(value) => {
+                            let value = map_quic_send(value, output.lane);
+                            if matches!(
+                                &value,
+                                Ok(_) | Err(SendFailure::Expired { accepted: Some(_) })
+                            ) {
+                                quic_metrics::event(
+                                    &mut self.buffer_metrics,
+                                    BufferSite::QuicSend,
+                                    Some(output.lane),
+                                    class,
+                                    BufferReason::CarrierAdmission,
+                                    false,
+                                );
+                            }
+                            metric_terminal |= value.is_err();
+                            Some(value)
+                        }
                     }
-                },
+                }
                 _ => Some(Err(SendFailure::Ticket)),
             };
             if let Some(result) = ready {
@@ -1494,6 +1485,12 @@ mod tests {
         let cap = a.setup_deadline().min(b.setup_deadline());
         a.select_final_records(cap)?;
         b.select_final_records(cap)?;
+        let metric_path = std::env::temp_dir().join(format!(
+            "l2tunnel-quic-pending-{}-{}.bmetrics",
+            std::process::id(),
+            a.owner
+        ));
+        a.test_ticket_metrics(metric_path.clone())?;
         let user = [0x80; 1072];
         // A Ping/Pong uses 88 envelope bytes, 41 fragment bytes, 44 ARQ
         // bytes, 8 stream bytes and 21 protected Records bytes. Its actual
@@ -1516,6 +1513,21 @@ mod tests {
         let mut control_token = a.try_send(Class::Control, &management, cap, Framing::Final)?;
         assert!(a.poll_send(&mut cx, &mut user_token).is_pending());
         assert!(a.poll_send(&mut cx, &mut control_token).is_pending());
+        let pending_report = a.test_ticket_report()?;
+        assert_eq!(pending_report["schema"], 2);
+        for ticket in pending_report["pending"].as_array().ok_or("ticket array")? {
+            let observed = &ticket["pending_observation"];
+            assert!(observed["polls"].as_u64().is_some_and(|count| count > 0));
+            assert_eq!(
+                observed["first_sample"]["required_payload_bytes"],
+                ticket["bytes"]
+            );
+            assert!(observed["first_sample"]["begin_us"].as_u64().is_some());
+            assert_eq!(
+                observed["first_sample"]["bytes_in_flight"],
+                serde_json::Value::Null
+            );
+        }
         assert_eq!(user_token.deadline(), cap);
         assert_eq!(control_token.deadline(), cap);
         // Pending polling leaves both immutable tickets owned. Give the actual
@@ -1558,6 +1570,16 @@ mod tests {
             a.poll_send(&mut cx, &mut user_token),
             Poll::Ready(Err(SendFailure::Ticket))
         ));
+        let report = a.test_ticket_report()?;
+        assert_eq!(report["invalid"], false);
+        for row in report["rows"].as_array().ok_or("ticket rows")? {
+            let maximum = &row["maximum_pending"];
+            assert_eq!(maximum["identity"]["class"], row["class"]);
+            assert!(maximum["accepted_us"].as_u64().is_some());
+            assert!(maximum["pending_observation"]["first_sample"].is_object());
+        }
+        drop(a);
+        std::fs::remove_file(metric_path)?;
         Ok(())
     }
     #[tokio::test(start_paused = true)]

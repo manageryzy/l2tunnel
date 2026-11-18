@@ -115,11 +115,18 @@ impl Plan {
             diagnostics: false,
         })
     }
-    /// Reserve one optional scalar observation sidecar before owner construction.
+    /// Reserve the optional scalar summary and one cell per existing restored slot.
+    /// Cells track actual refused sources; no new protocol queue is created.
     /// This changes no protocol allowance; the existing complete byte limit still applies.
     pub fn with_output_diagnostics(mut self) -> Result<Self, Error> {
         if !self.diagnostics {
             self.bytes = add(self.bytes, array_bytes::<crate::diagnostics::Snapshot>(1)?)?;
+            self.bytes = add(
+                self.bytes,
+                array_bytes::<crate::diagnostics::restored::Cell>(
+                    self.receive.max_restored_packets,
+                )?,
+            )?;
             self.diagnostics = true;
         }
         Ok(self)

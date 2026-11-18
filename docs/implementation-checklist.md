@@ -204,6 +204,13 @@ spent 4.947542 seconds before decoder admission and 53.286 ms in decoder custody
 All original caps and open parent gates remain, including the documented
 Cauchy/Python recovery-policy differences.
 
+The [batch21 continuation](modules/buffer-observability.md#batch21-scanning-and-actual-pending-context)
+integrates same-budget Rolling coefficient scans and bounded genuine QUIC
+DATAGRAM Pending context, plus exact restored-source ARQ refusal-to-admission
+intervals with prepaid per-slot identities. Scoped local validation passes all affected
+suites, strict Clippy/rustdoc, formatting and report validation; renewed native
+qualification is pending. All original quotas, deadlines and parent gates remain.
+
 This remains the persistent progress ledger. Unchecked work is required;
 a design, enum, successful build or deleted implementation does not complete a
 runtime deliverable. Preserve stable IDs and distinguish planned, protocol-tested,

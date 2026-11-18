@@ -1,6 +1,9 @@
 //! Exact local ticket custody latencies; none is physical IP transmission time.
 use super::super::Class;
 use std::io::{self, Write};
+#[path = "maintained_quic_pending_metrics.rs"]
+mod pending;
+pub(crate) use pending::Sample as PendingSample;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct Identity {
@@ -24,6 +27,10 @@ struct Record {
     deadline_us: u64,
     created_us: u64,
     first_poll_us: Option<u64>,
+    poll_count: u64,
+    latest_poll_us: Option<u64>,
+    maximum_poll_gap_us: Option<u64>,
+    pending: pending::Pending,
     accepted_us: Option<u64>,
     result_us: Option<u64>,
     observed_us: Option<u64>,
@@ -58,6 +65,7 @@ struct Row {
     censored: u64,
     spans: [Span; 5],
     last: Option<Record>,
+    maximum_pending: Option<Record>,
 }
 /// Exactly two live cells and eight fixed lane/class/consumer summaries, in prepaid storage.
 #[derive(Clone, Copy, Default)]
@@ -130,6 +138,10 @@ impl Snapshot {
             deadline_us,
             created_us: now,
             first_poll_us: None,
+            poll_count: 0,
+            latest_poll_us: None,
+            maximum_poll_gap_us: None,
+            pending: pending::Pending::default(),
             accepted_us: None,
             result_us: None,
             observed_us: None,
@@ -177,12 +189,49 @@ impl Snapshot {
         let Some(mut record) = self.pending[index] else {
             return;
         };
-        if record.first_poll_us.is_some() {
+        if record.result_us.is_some() {
+            self.invalid = true;
             return;
         }
-        record.first_poll_us = Some(now);
+        if let Some(previous) = record.latest_poll_us {
+            if let Some(gap) = now.checked_sub(previous) {
+                record.maximum_poll_gap_us = Some(record.maximum_poll_gap_us.unwrap_or(0).max(gap));
+            } else {
+                self.invalid = true;
+            }
+        }
+        add(&mut record.poll_count, 1, &mut self.invalid);
+        record.latest_poll_us = Some(record.latest_poll_us.map_or(now, |old| old.max(now)));
+        let first = record.first_poll_us.is_none();
+        record.first_poll_us.get_or_insert(now);
         self.pending[index] = Some(record);
-        self.span(record, 0, record.created_us, now, Outcome::Completed);
+        if first {
+            self.span(record, 0, record.created_us, now, Outcome::Completed);
+        }
+    }
+    /// This records an actual lower Pending result, not an inferred occupancy wait.
+    pub(crate) fn pending(&mut self, id: Identity, required: Option<usize>, now: u64) -> bool {
+        let Some(index) = self.cell(id) else {
+            return false;
+        };
+        let Some(record) = self.pending[index].as_mut() else {
+            return false;
+        };
+        if record.first_poll_us.is_none() || record.result_us.is_some() {
+            self.invalid = true;
+            return false;
+        }
+        record.pending.observe(now, required, &mut self.invalid);
+        record.pending.needs_first_sample()
+    }
+    /// A single lane query supplies adjacent context to its still-pending cells.
+    /// It does not create another refusal or claim either future was polled again.
+    pub(crate) fn pending_lane_sample(&mut self, lane: usize, sample: PendingSample) {
+        for record in self.pending.iter_mut().flatten() {
+            if record.lane == lane && record.result_us.is_none() && record.pending.observed() {
+                record.pending.sample(sample, &mut self.invalid);
+            }
+        }
     }
     pub(crate) fn result(&mut self, id: Identity, accepted: Option<u64>, failed: bool, now: u64) {
         let Some(index) = self.cell(id) else {
@@ -276,6 +325,12 @@ impl Snapshot {
             Outcome::Censored => &mut row.censored,
         };
         add(count, 1, &mut self.invalid);
+        if let Some(elapsed) = pending_elapsed(record) {
+            let previous = row.maximum_pending.and_then(pending_elapsed);
+            if previous.is_none_or(|old| elapsed > old) {
+                row.maximum_pending = Some(record);
+            }
+        }
         row.last = Some(record);
     }
     pub(crate) fn finish(&mut self, now: u64) {
@@ -314,7 +369,7 @@ impl Snapshot {
     pub(crate) fn write(&self, out: &mut impl Write) -> io::Result<()> {
         write!(
             out,
-            "{{\"schema\":1,\"definition\":\"local ticket custody latencies, not physical IP send or continuous blockage; stages overlap generic waits and must not join their union; failed operation can retain completed acceptance stages\",\"cutoff\":\"carrier_drop\",\"invalid\":{},\"first_us\":",
+            "{{\"schema\":2,\"definition\":\"local ticket custody latencies, not physical IP send or continuous blockage; stages overlap generic waits and must not join their union; failed operation can retain completed acceptance stages; Pending snapshots are sequential public observations, not atomic congestion or pacing causes; pending poll gaps include scheduling\",\"cutoff\":\"carrier_drop\",\"invalid\":{},\"first_us\":",
             self.invalid
         )?;
         optional(out, self.first_us)?;
@@ -361,6 +416,12 @@ impl Snapshot {
             } else {
                 write!(out, "null")?;
             }
+            write!(out, ",\"maximum_pending\":")?;
+            if let Some(record) = row.maximum_pending {
+                write_record(out, record)?;
+            } else {
+                write!(out, "null")?;
+            }
             write!(out, ",\"stages\":[")?;
             for (index, span) in row.spans.iter().enumerate() {
                 if index != 0 {
@@ -390,6 +451,14 @@ impl Snapshot {
         }
         write!(out, "]}}")
     }
+}
+fn pending_elapsed(record: Record) -> Option<u64> {
+    record.pending.elapsed(
+        record
+            .accepted_us
+            .or(record.result_us)
+            .or(record.stopped_us)?,
+    )
 }
 fn row_index(record: Record) -> usize {
     record.lane * 4
@@ -446,6 +515,16 @@ fn write_record(out: &mut impl Write, record: Record) -> io::Result<()> {
         write!(out, ",\"{name}\":")?;
         optional(out, value)?;
     }
+    write!(
+        out,
+        ",\"poll_count\":{},\"latest_poll_us\":",
+        record.poll_count
+    )?;
+    optional(out, record.latest_poll_us)?;
+    write!(out, ",\"maximum_poll_gap_us\":")?;
+    optional(out, record.maximum_poll_gap_us)?;
+    write!(out, ",\"pending_observation\":")?;
+    record.pending.write(out)?;
     write!(out, "}}")
 }
 
@@ -502,5 +581,136 @@ mod tests {
         assert_eq!(state.rows[2].spans[2].maximum_us, None);
         assert_eq!(state.rows[2].failed, 1);
         assert!(!state.invalid);
+    }
+    fn sample(begin_us: u64, end_us: u64, lost: u64) -> PendingSample {
+        PendingSample {
+            begin_us,
+            end_us,
+            required_payload_bytes: None,
+            available_payload_bytes: 0,
+            configured_send_buffer_bytes: 2208,
+            rtt_us: 70_000,
+            cwnd_bytes: 2944,
+            current_mtu_bytes: 1472,
+            congestion_events: lost,
+            lost_quic_packets: lost,
+            lost_quic_bytes: lost * 100,
+            sent_quic_packets: lost + 10,
+            udp_tx_datagrams: lost + 10,
+            udp_tx_payload_bytes: (lost + 10) * 100,
+            datagram_frames_tx: lost + 10,
+            invalid: false,
+        }
+    }
+    fn json(state: &Snapshot) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+        let mut output = Vec::new();
+        state.write(&mut output)?;
+        Ok(serde_json::from_slice(&output)?)
+    }
+    #[test]
+    fn pending_context_keeps_lane_identity_without_inventing_another_refusal()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let user = Identity {
+            owner: 9,
+            serial: 1,
+            class: Class::User,
+        };
+        let control = Identity {
+            serial: 2,
+            class: Class::Control,
+            ..user
+        };
+        let mut state = Snapshot::default();
+        state.create(user, 0, 1000, 100, 1);
+        state.create(control, 1, 202, 100, 2);
+        state.first_poll(user, 3);
+        assert!(state.pending(user, Some(1000), 4));
+        state.first_poll(control, 5);
+        assert!(state.pending(control, Some(202), 6));
+        assert!(!state.pending(Identity { owner: 10, ..user }, Some(1000), 7));
+        state.pending_lane_sample(0, sample(8, 9, 1));
+        let first = json(&state)?;
+        assert_eq!(
+            first["pending"][0]["pending_observation"]["first_sample"]["required_payload_bytes"],
+            1000
+        );
+        assert_eq!(
+            first["pending"][1]["pending_observation"]["first_sample"],
+            serde_json::Value::Null
+        );
+        state.pending_lane_sample(1, sample(10, 11, 1));
+        // A cadence sample refreshes adjacent provider context without another
+        // lower poll or a claim that a second enqueue was refused.
+        state.pending_lane_sample(0, sample(12, 13, 2));
+        let refreshed = json(&state)?;
+        let pending = &refreshed["pending"][0]["pending_observation"];
+        assert_eq!(pending["polls"], 1);
+        assert_eq!(pending["first_sample"]["begin_us"], 8);
+        assert_eq!(pending["latest_sample"]["begin_us"], 12);
+        assert_eq!(refreshed["pending"][0]["poll_count"], 1);
+        assert!(!state.invalid);
+        state.pending_lane_sample(0, sample(14, 15, 1));
+        assert!(
+            state.invalid,
+            "regressed public counter must remain visible"
+        );
+        Ok(())
+    }
+    #[test]
+    fn pending_maximum_preserves_late_acceptance_and_censored_ticket_boundaries()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let id = Identity {
+            owner: 4,
+            serial: 1,
+            class: Class::User,
+        };
+        let mut state = Snapshot::default();
+        state.create(id, 0, 99, 10, 1);
+        state.first_poll(id, 2);
+        state.pending(id, Some(99), 3);
+        state.pending_lane_sample(0, sample(4, 5, 1));
+        state.first_poll(id, 12);
+        state.result(id, Some(13), true, 17);
+        state.direct_take(id, 20);
+        assert_eq!(
+            pending_elapsed(
+                state.rows[0]
+                    .maximum_pending
+                    .ok_or("missing maximum Pending ticket")?
+            ),
+            Some(10)
+        );
+        // A newer shorter ticket must not overwrite the maximum's full identity.
+        let next = Identity { serial: 2, ..id };
+        state.create(next, 0, 99, 100, 21);
+        state.first_poll(next, 22);
+        state.pending(next, Some(99), 23);
+        state.result(next, Some(24), false, 25);
+        state.direct_take(next, 26);
+        let report = json(&state)?;
+        assert_eq!(report["rows"][0]["last"]["identity"]["serial"], 2);
+        assert_eq!(
+            report["rows"][0]["maximum_pending"]["identity"]["serial"],
+            1
+        );
+        assert_eq!(
+            report["rows"][0]["maximum_pending"]["maximum_poll_gap_us"],
+            10
+        );
+        assert_eq!(report["rows"][0]["maximum_pending"]["accepted_us"], 13);
+        let final_id = Identity { serial: 3, ..id };
+        state.create(final_id, 0, 99, 100, 27);
+        state.first_poll(final_id, 28);
+        state.pending(final_id, Some(99), 29);
+        state.finish(50);
+        let maximum = state.rows[0]
+            .maximum_pending
+            .ok_or("missing maximum Pending ticket")?;
+        assert_eq!(maximum.id, final_id);
+        assert_eq!(maximum.accepted_us, None);
+        assert_eq!(pending_elapsed(maximum), Some(21));
+        assert_eq!(state.rows[0].censored, 1);
+        assert!(!state.invalid);
+        Ok(())
     }
 }

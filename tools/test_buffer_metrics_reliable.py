@@ -255,3 +255,127 @@ def ack_staged_fixture():
 
 if __name__ == '__main__':
     unittest.main()
+
+
+def restored_fixture():
+    zero = {'completed_episodes': 0, 'completed_us': 0, 'maximum_completed_us': 0,
+            'censored_episodes': 0, 'censored_us': 0, 'maximum_censored_us': 0}
+    # Two different actual sources can overlap; their sum (110) exceeds owner age (100).
+    value = {'schema': 1, 'scope': 'endpoint-shared-receive', 'receive_direction': 1,
+             'cells': 16, 'restored_bytes_capacity': 4096, 'observed_at_us': 100,
+             'terminal_at_us': None, 'omitted_refusals': 0, 'identity_mismatch': False,
+             'clock_regression': False, 'counter_overflow': False, 'terminal_unavailable': False,
+             'sources': dict(zero), 'open': {'episodes': 2, 'sum_us': 110, 'maximum_us': 60},
+             'maximum_open': {'source': 9, 'bytes': 64, 'recovered': True, 'since_us': 40,
+                              'last_refusal_us': 95, 'reasons_since_us': [None, 40]},
+             'last_completed': None, 'maximum_completed': None, 'maximum_censored': None}
+    value['reasons'] = [{'reason': name, 'refusals': count, 'totals': dict(zero),
+                        'open': {'episodes': count, 'sum_us': elapsed, 'maximum_us': elapsed}}
+                       for name, count, elapsed in [('arq_capacity', 1, 50), ('arq_sequence_window', 1, 60)]]
+    return value
+
+
+class RestoredAdmissionProviderTests(unittest.TestCase):
+    def check(self, restored):
+        value = fixture()
+        value['restored_admission'] = restored
+        provider = protocol_fixture()
+        provider['epochs'][0]['reliable_output'] = value
+        return report.protocol_provider(provider), provider
+
+    def test_actual_sources_overlap_and_keep_full_identity_without_owner_percentage(self):
+        result, provider = self.check(restored_fixture())
+        self.assertEqual(result['status'], 'validated_known_fields_partial')
+        lines = []
+        reliable.render(lines, {'protocol_buffers': provider}, report.table, report.cell)
+        text = '\n'.join(lines)
+        self.assertIn('Restored-source ARQ admission', text)
+        self.assertIn('arq_sequence_window', text)
+        self.assertIn('not owner blocked', text)
+        self.assertIn('110', text)
+        self.assertIn('maximum_open', text)
+        self.assertTrue(any('missing receive-prefix/source dependency' in g for g in result['coverage_gaps']))
+
+    def test_impossible_source_population_identity_or_availability_is_rejected(self):
+        mutations = [lambda v: v.update(schema=99), lambda v: v.update(schema=True),
+                     lambda v: v.update(receive_direction=0),
+                     lambda v: v.update(cells=1), lambda v: v.update(maximum_open=None),
+                     lambda v: v['maximum_open'].update(source=1 << 64),
+                     lambda v: v['maximum_open'].update(bytes=4097),
+                     lambda v: v['maximum_open'].update(since_us=42),
+                     lambda v: v['reasons'][0]['open'].update(maximum_us=1),
+                     lambda v: v['open'].update(sum_us=122),
+                     lambda v: v['maximum_open'].update(reasons_since_us=[None, None]),
+                     lambda v: v['maximum_open'].update(last_refusal_us=101),
+                     lambda v: v.update(terminal_at_us=100),
+                     lambda v: v['reasons'][1].update(reason='arq_capacity'),
+                     lambda v: v['sources'].update(completed_episodes=1),
+                     lambda v: v.update(clock_regression=True)]
+        for mutate in mutations:
+            with self.subTest(mutate=mutate):
+                value = restored_fixture()
+                mutate(value)
+                result, provider = self.check(value)
+                self.assertTrue(result['status'].startswith('invalid'))
+                lines = []
+                reliable.render(lines, {'protocol_buffers': provider}, report.table, report.cell)
+                self.assertNotIn('Restored-source ARQ admission', '\n'.join(lines))
+
+    def test_exact_fresh_terminal_censor_does_not_claim_admission_or_erase_missing_data(self):
+        v = restored_fixture()
+        v['terminal_at_us'] = 100
+        v['sources'].update(censored_episodes=2, censored_us=110, maximum_censored_us=60)
+        v['open'] = {'episodes': 0, 'sum_us': 0, 'maximum_us': 0}
+        v['maximum_censored'] = {'pending': v['maximum_open'], 'at_us': 100, 'censored': True}
+        v['maximum_open'] = None
+        for row in v['reasons']:
+            row['totals'].update(censored_episodes=row['open']['episodes'],
+                                 censored_us=row['open']['sum_us'], maximum_censored_us=row['open']['maximum_us'])
+            row['open'] = {'episodes': 0, 'sum_us': 0, 'maximum_us': 0}
+        owner = fixture()
+        owner.update(terminal_at_us=100, pending=None,
+                     last_resolved={'operation': {'generation': 4, 'symbol': 3, 'bytes': 127},
+                                    'since_us': 90, 'at_us': 100, 'censored': True})
+        for population in [owner['union'], *(row['totals'] for row in owner['reasons'])]:
+            population.update(censored_episodes=1, censored_us=10, maximum_censored_us=10)
+        for row in owner['reasons']:
+            row['pending_since_us'] = None
+        owner['restored_admission'] = v
+        provider = protocol_fixture()
+        provider['epochs'][0]['reliable_output'] = owner
+        self.assertEqual(report.protocol_provider(provider)['status'], 'validated_known_fields_partial')
+        result, _ = self.check(None)
+        self.assertTrue(any('restored-source ARQ-admission timing unavailable' in g for g in result['coverage_gaps']))
+        omitted = restored_fixture()
+        omitted['omitted_refusals'] = 1
+        result, _ = self.check(omitted)
+        self.assertEqual(result['status'], 'validated_known_fields_partial')
+        self.assertTrue(any('1 actual refusals omitted' in g for g in result['coverage_gaps']))
+
+    def test_resolved_sources_cannot_lose_their_actual_refusal_reason_population(self):
+        for kind in ('completed', 'censored'):
+            with self.subTest(kind=kind):
+                v = restored_fixture()
+                v['open'] = {'episodes': 0, 'sum_us': 0, 'maximum_us': 0}
+                v['maximum_open'] = None
+                for row in v['reasons']:
+                    row['open'] = {'episodes': 0, 'sum_us': 0, 'maximum_us': 0}
+                    row['refusals'] = int(row['reason'] == 'arq_capacity')
+                v['sources'].update({kind + '_episodes': 1, kind + '_us': 10,
+                                     'maximum_' + kind + '_us': 10})
+                resolved = {'pending': {'source': 3, 'bytes': 64, 'recovered': False,
+                                        'since_us': 90, 'last_refusal_us': 95,
+                                        'reasons_since_us': [90, None]},
+                            'at_us': 100, 'censored': kind == 'censored'}
+                v['maximum_' + kind] = copy.deepcopy(resolved)
+                if kind == 'completed':
+                    v['last_completed'] = copy.deepcopy(resolved)
+                else:
+                    v['terminal_at_us'] = 100
+                with self.assertRaisesRegex(ValueError, 'resolved source population lacks actual refusal reason'):
+                    reliable.restored.validate(v, 100, v['terminal_at_us'], 0, 'restored', [], [])
+                v['reasons'][0]['totals'].update({kind + '_episodes': 1, kind + '_us': 10,
+                                                  'maximum_' + kind + '_us': 10})
+                issues, gaps = [], []
+                reliable.restored.validate(v, 100, v['terminal_at_us'], 0, 'restored', issues, gaps)
+                self.assertEqual(issues, [])

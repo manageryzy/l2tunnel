@@ -305,6 +305,12 @@ pub struct Decoder {
     expiry_failure: Option<expiry::Failure>,
     explicit: Option<explicit::DecoderState>,
 }
+// The outer step already paid the first metadata visit. A coefficient chunk
+// stops before the row end; the following transition keeps its separate visit.
+fn metadata_chunk(remaining: usize, budget: &WorkBudget) -> Result<usize, Error> {
+    Ok(remaining.min(add(budget.metadata, 1)?))
+}
+
 // step() already charged the first metadata visit. Each copied/cleared byte
 // still consumes one copy and one metadata unit; batching removes dispatch only.
 // The end-of-phase transition remains a separate, unchanged metadata visit.
@@ -1337,10 +1343,19 @@ impl Decoder {
                         job.phase = Phase::FindSlot { pivot, row: 0 };
                     }
                 } else {
+                    let remaining = w.checked_sub(index).ok_or(Error::Identity)?;
+                    let bytes = metadata_chunk(remaining, budget)?;
+                    let end = add(index, bytes)?;
+                    let coefficients = self.candidate.get(index..end).ok_or(Error::Identity)?;
+                    let count = add(
+                        count,
+                        coefficients.iter().filter(|value| **value != 0).count(),
+                    )?;
+                    budget.metadata -= bytes - 1;
                     job.phase = Phase::CandidateCount {
                         pivot,
-                        index: index + 1,
-                        count: count + usize::from(self.candidate[index] != 0),
+                        index: end,
+                        count,
                     };
                 }
             }
@@ -1413,11 +1428,25 @@ impl Decoder {
                         };
                     }
                 } else {
-                    let byte = self.row_byte(row, index)?;
+                    // Preserve the first pivot/bank validation before any chunk
+                    // arithmetic. No decision or bank can change while counting.
+                    let bank = self.row_bank(row, self.active)?;
+                    let remaining = w.checked_sub(index).ok_or(Error::Identity)?;
+                    let bytes = metadata_chunk(remaining, budget)?;
+                    let end = add(index, bytes)?;
+                    let start = mul(row, add(w, width)?)?;
+                    let from = add(start, index)?;
+                    let to = add(start, end)?;
+                    let coefficients = self.data[bank].get(from..to).ok_or(Error::Identity)?;
+                    let count = add(
+                        count,
+                        coefficients.iter().filter(|value| **value != 0).count(),
+                    )?;
+                    budget.metadata -= bytes - 1;
                     job.phase = Phase::Scan {
                         row,
-                        index: index + 1,
-                        count: count + usize::from(byte != 0),
+                        index: end,
+                        count,
                     };
                 }
             }

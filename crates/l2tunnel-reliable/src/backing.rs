@@ -203,13 +203,14 @@ impl RestoredMap {
     pub fn contains_key(&self, id: &u64) -> bool {
         self.get(id).is_some()
     }
-    pub fn first_key_value(&self) -> Option<(&u64, &Restored)> {
+    pub fn first_key_value(&self) -> Option<(Option<usize>, &u64, &Restored)> {
         match self {
-            Self::Legacy(m) => m.first_key_value(),
+            Self::Legacy(m) => m.first_key_value().map(|(id, value)| (None, id, value)),
             Self::Reserved(v) => v
                 .iter()
-                .filter_map(|s| s.id.as_ref().map(|id| (id, &s.value)))
-                .min_by_key(|(id, _)| **id),
+                .enumerate()
+                .filter_map(|(index, s)| s.id.as_ref().map(|id| (Some(index), id, &s.value)))
+                .min_by_key(|(_, id, _)| **id),
         }
     }
     pub fn insert(&mut self, id: u64, bytes: &[u8], recovered: bool) -> Result<(), Error> {

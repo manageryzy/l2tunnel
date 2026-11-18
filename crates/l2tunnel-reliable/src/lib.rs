@@ -358,6 +358,8 @@ pub struct Reliable {
     compact_wire: Option<CompactOverheads>,
     // Opt-in fixed sidecar, reserved in the original construction plan.
     diagnostics: Vec<diagnostics::Snapshot>,
+    // One diagnostic cell per actual reserved restored slot, empty when disabled.
+    restored_waits: Vec<diagnostics::restored::Cell>,
 }
 
 impl ReliableConfig {
@@ -514,6 +516,7 @@ impl Reliable {
             independent_feedback: None,
             compact_wire: None,
             diagnostics: Vec::new(),
+            restored_waits: Vec::new(),
         })
     }
 
@@ -640,6 +643,23 @@ impl Reliable {
         if plan.diagnostics {
             diagnostics.push(diagnostics::Snapshot::new(context, encoder.is_some()));
         }
+        let mut restored_waits = a.vec::<diagnostics::restored::Cell>(if plan.diagnostics {
+            receive_config.max_restored_packets
+        } else {
+            0
+        })?;
+        let restored_cells = if plan.diagnostics {
+            receive_config.max_restored_packets
+        } else {
+            0
+        };
+        restored_waits.resize(restored_cells, None);
+        if let Some(state) = diagnostics.first_mut() {
+            state.restored = diagnostics::restored::Snapshot::new(
+                receive_config.max_restored_packets,
+                receive_config.max_restored_bytes,
+            );
+        }
         let wrapper = a.usage();
         let bytes = storage::add(
             wrapper.capacity_bytes,
@@ -703,6 +723,7 @@ impl Reliable {
             independent_feedback: None,
             compact_wire: None,
             diagnostics,
+            restored_waits,
         })
     }
     /// Select physical-attempt timing before any local/peer traffic is used.
@@ -1468,7 +1489,11 @@ impl Reliable {
     }
     /// Read-only exact output-budget observations; None means diagnostics were not selected.
     pub fn output_wait_snapshot(&self, now: Duration) -> Option<diagnostics::Snapshot> {
-        self.diagnostics.first().copied().map(|v| v.observed(now))
+        self.diagnostics.first().copied().map(|v| {
+            let mut snapshot = v.observed(now);
+            snapshot.restored = v.restored.sampled(&self.restored_waits, now);
+            snapshot
+        })
     }
     fn block_buffers(&self) -> Option<diagnostics::Buffers> {
         let compact::Policies::Legacy { send, receive } = self.policies else {
@@ -1991,8 +2016,17 @@ impl Reliable {
             return Ok(());
         }
         for _ in 0..self.legacy_receive()?.max_restored_packets {
-            let Some((&identity, record)) = self.restored.first_key_value() else {
+            let Some((slot, &identity, record)) = self.restored.first_key_value() else {
                 break;
+            };
+            let operation = if self.diagnostics.is_empty() {
+                None
+            } else {
+                Some(diagnostics::restored::Operation {
+                    source: identity,
+                    bytes: record.bytes.len(),
+                    recovered: record.recovered,
+                })
             };
             let previous = self.arq.statistics().received_unique;
             let received = if self.compact_wire.is_some() {
@@ -2008,8 +2042,30 @@ impl Reliable {
                     }
                     self.restored_bytes -= record.bytes.len();
                     self.restored.remove(&identity);
+                    if let (Some(state), Some(operation)) =
+                        (self.diagnostics.first_mut(), operation)
+                    {
+                        state.restored.admitted(
+                            slot.and_then(|index| self.restored_waits.get_mut(index)),
+                            operation,
+                            self.now,
+                        );
+                    }
                 }
-                Err(RecoveryError::Capacity(_) | RecoveryError::SequenceWindow) => break,
+                Err(error @ (RecoveryError::Capacity(_) | RecoveryError::SequenceWindow)) => {
+                    if let (Some(state), Some(operation)) =
+                        (self.diagnostics.first_mut(), operation)
+                    {
+                        let reason = usize::from(matches!(error, RecoveryError::SequenceWindow));
+                        state.restored.refused(
+                            slot.and_then(|index| self.restored_waits.get_mut(index)),
+                            operation,
+                            self.now,
+                            reason,
+                        );
+                    }
+                    break;
+                }
                 Err(error) => return self.fail(error.into()),
             }
         }

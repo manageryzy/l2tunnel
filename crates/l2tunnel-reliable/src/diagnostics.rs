@@ -2,6 +2,8 @@
 //! Packing delay, missing equations and physical custody are not inferred waits.
 use super::{EndpointRole, RecoveryContext};
 use std::time::Duration;
+#[path = "restored_diagnostics.rs"]
+pub mod restored;
 #[path = "staged_diagnostics.rs"]
 pub mod staged;
 
@@ -113,6 +115,8 @@ pub struct Snapshot {
     pub capacity_refusals: [u64; 5],
     /// Opt-in same-source identity and actual gate/retirement observations.
     pub staged: staged::Snapshot,
+    /// Exact retained receive-source refusal to the same ARQ admission.
+    pub restored: restored::Snapshot,
     /// Diagnostic time regressed; no protocol clock is changed.
     pub clock_regression: bool,
     /// Actual head identity differed before corresponding progress.
@@ -138,6 +142,7 @@ impl Snapshot {
             last_resolved: None,
             capacity_refusals: [0; 5],
             staged: staged::Snapshot::default(),
+            restored: restored::Snapshot::default(),
             clock_regression: false,
             identity_mismatch: false,
             overflow: false,
@@ -207,6 +212,7 @@ impl Snapshot {
     pub fn censor(mut self, now: Duration) -> Self {
         if self.observe(now) {
             self.staged.censor(now);
+            self.restored.censor(now);
             self.close(now, true);
             self.terminal_at = Some(now);
         }

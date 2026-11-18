@@ -208,6 +208,7 @@ impl Reliable {
             independent_feedback: None,
             compact_wire: None,
             diagnostics: Vec::new(),
+            restored_waits: Vec::new(),
         })
     }
     /// Admit using original authenticated arrival and monotonic observation.
