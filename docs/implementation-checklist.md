@@ -1124,6 +1124,11 @@ Python per-stream payload budget in a separate native workload control yielded
 64.09/66.96 Mbit/s and scheduled-to-read P99 of 3.48/2.86 s. Both pairs drained
 every source. TEST-12 remains open for the original throughput and latency targets.
 
+The [sender global-repair replay and four native trials](modules/frame-channel-experiment.md#sending-originals-during-a-mature-global-repair)
+preserved the original equations and old-hole recovery. The original-socket
+pair delivered 42.85/47.96 Mbit/s and the strict payload-credit pair delivered
+63.86/65.44 Mbit/s. All four drained. These trials leave TEST-12 open.
+
 ## Per-mode parity implementation gates
 
 Each P-* gate means the named algorithm/codec/workload adapter is implemented and

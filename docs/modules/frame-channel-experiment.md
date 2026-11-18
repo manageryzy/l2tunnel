@@ -1257,6 +1257,33 @@ contiguous receiver bytes arrived, the read took 0.05 and 0.06 ms on average.
 [Completed-record reconstruction](../../work/c48-parity-20261119/native/diagnostic-r19-credit-wait/stages.json)
 and [repeat](../../work/c48-parity-20261119/native/diagnostic-r19-credit-wait-repeat/stages.json).
 
+In the original-socket marker run, four missing sources (58820, 58825,
+58827 and 58840) were already due for a request before repair 7024 entered
+a 19.17 ms receiver job. A separate receiver candidate spent a bounded part
+of the original work grant on an already discovered gap before servicing a
+wide repair. It retained the existing timers, authentication, repeat limits
+and decoder budget. A replay used the captured identifiers and 8,019
+measured source lengths, assigning the observed median length to the other
+173 sources. The authenticated request was available in grant one instead
+of grant 130, 15.85 ms earlier on the replay clock. Both variants completed
+the same equation in grant 130. The historical capture did not record
+each service grant or the exact contents of the encrypted response.
+[Reproduction and reviewed patch](../../work/c48-parity-20261119/recovery/r22-gap/receipt.json).
+
+The native evidence does not qualify this candidate. Its first build twice
+entered the original-socket lab. One trial stopped at the held TCP ACK
+deadline. The other completed at 36.08 Mbit/s with a first-write P99 of
+2,498 ms and a final bilateral 0/0. The slowest 990 records in that run
+all originated between 2.072 and 2.540 seconds after workload start, during
+a period of major page faults and reduced CPU service at both endpoints.
+In a subsequent adjacent pair the original R19 passed at 44.84 Mbit/s.
+The reviewed build missed the same 20 ms hard ACK deadline while the
+server was servicing Rolling work. Its four captures passed; the workload
+did not reach completion. The original deadline remains in force.
+[Initial trials and fault evidence](../../work/c48-parity-20261119/native/r22-offline/outcomes.json),
+[adjacent control](../../work/c48-parity-20261119/native/control-r19-before-reviewed/summary.json)
+and [reviewed trial](../../work/c48-parity-20261119/native/candidate-r22-reviewed/summary.json).
+
 The native C48 planner also reserves 200 bytes of the MTU for worst-case
 framing. Replaying the two strict-credit captures with the actual Rust
 codec at the current planner's 1,313-byte safe symbol limit instead of
@@ -1278,7 +1305,61 @@ fragment and unit framing, packed identities and length tables together
 cost about 0.030 in Linux and 0.016 in Python. An optimistic packing bound
 retaining the current symbol size, unit cap, flush deadline and copy classes
 could save at most 0.46 and 0.49 Mbit/s of fresh wire traffic in those
-windows. [Capture byte accounting and packing bound](../../work/c48-parity-20261119/native/fresh-attribution/breakdown.json).
+windows. Keeping source order and allowing the existing 500-microsecond
+flush allowance merged just three adjacent pairs in each replay and saved
+156 bytes each. The real inner TCP/IP headers averaged 52 bytes. After
+the current body codec their incremental cost averaged 11.94 and 12.11
+bytes. [Capture byte accounting and packing bound](../../work/c48-parity-20261119/native/fresh-attribution/breakdown.json)
+and [source-order replay](../../work/c48-parity-20261119/native/fresh-attribution/adjacent.json).
+
+### Sending originals during a mature global repair
+
+The strict-credit trace established a lower bound of 0.713 s in the ten-second
+sample with queued MUX traffic and unused sender service at the configured
+100 Mbit/s rate while the same global equation was running. This calculation
+charges the MTU for unidentified data lengths and subtracts all feedback and
+management bytes for the entire process. For at least 0.462 s fresh sources
+were continuously available. For at least 0.112 s the existing allowance of
+64 extra physical copies had also been exhausted. The calculation uses the
+sender's actual UDP handoffs. It cannot timestamp physical NIC departures.
+
+The R23 sender let progress on the active global earn an extra physical copy
+per 65,536 actual GF byte operations. It preserved earned repair identities,
+support, byte credit, the cap of 16 owed equations and the original deadlines.
+In a 24,000-source replay, 1,673 equations matched a separate scalar oracle
+and both senders consumed 33,836,413 simulated IP bytes. The longest period
+with no output fell from 5.28 to 0.48 ms. The first mature global was emitted
+in grant 7,318 for both, and completion moved from 3.464 to 3.331 seconds.
+A separate real sender/receiver test lost all four original copies and the
+first named retry of one source. The oldest-source probe recovered it, and
+all 9,000 sources were delivered and confirmed. [Replay, bounds and byte
+accounting](../../work/c48-parity-20261119/recovery/r19-strict-sender/r23-receipt.json)
+and [focused Rust regression](../../work/c48-parity-20261119/recovery/r19-strict-sender/r23-focus.log).
+
+The frozen R23 release differed from R19 only in the sender scheduler.
+All four native runs verified the 16 payload hashes, both endpoint and WAN
+captures, and two consecutive bilateral zero confirmations. Goodput uses
+the ten-second measurement. Latency uses all completed application records.
+Recovery counts named retries, regular equations and oldest-source probes
+as a share of lifetime pre-loss IP bytes, excluding extra short copies.
+
+| R23 socket setting | Forward Mbit/s | First write to read P99 (ms) | Scheduled to read P99 (ms) | Unsubmitted | Forward / reverse recovery (%) |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Original, first draw | 42.85 | 332 | 5,328 | 94,784 | 22.31 / 12.24 |
+| Original, repeat | 47.96 | 478 | 4,538 | 81,632 | 21.75 / 12.61 |
+| Strict payload credit, first draw | 63.86 | 798 | 3,543 | 31,816 | 19.39 / 12.47 |
+| Strict payload credit, repeat | 65.44 | 782 | 3,126 | 32,370 | 19.46 / 12.58 |
+
+With strict credit, R19 delivered 64.09 and 66.96 Mbit/s. The offline
+reduction in sender silence did not produce a repeatable throughput or
+latency improvement in the four native draws. The two strict-credit runs
+also recorded wall/monotonic clock calibration brackets of 0.601 and
+0.676 ms. Matching packet and probe timestamps produced 366 and 3,000
+negative first-write-to-TUN intervals below the 20-microsecond join
+tolerance. The most negative intervals (0.297 and 0.333 ms in magnitude)
+were within half the respective bracket. The latency figures in the table
+use only the common monotonic application clock. [Four-cell native evidence
+and timing precision](../../work/c48-parity-20261119/native/r23-four-cell.json).
 
 ### An eight-source repair at two TCP flight limits
 
