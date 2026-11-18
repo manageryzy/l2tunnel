@@ -820,6 +820,27 @@ fn pending_job_handoff_does_not_renew_already_recovered_batch_deadline() -> Test
 }
 
 #[test]
+fn sliding_debt_follows_the_original_oldest_source_across_window_reuse() -> TestResult {
+    let mut encoder = Encoder::new_sliding(config(), scope(), Tick(0))?;
+    encoder.admit_source(ORIGINALS[0], Tick(1))?;
+    for id in 1..10 {
+        let admitted = Tick(id * 500);
+        encoder.admit_source(ORIGINALS[1], admitted)?;
+        encoder.confirm_prefix(id as u32, Tick(admitted.0 + 50))?;
+        assert_eq!(encoder.deadline(), Some(Tick(admitted.0 + 1000)));
+    }
+    encoder.confirm_prefix(8, Tick(5400))?;
+    assert_eq!(encoder.deadline(), Some(Tick(5500)));
+    assert_eq!(encoder.step(Tick(5500), budget(1)), Err(Error::Expired));
+    let failure = encoder.expiry_snapshot().failure.ok_or("missing failure")?;
+    assert_eq!(
+        failure.selected.identity,
+        Some(expiry::Identity::Sources { first: 9, end: 10 })
+    );
+    Ok(())
+}
+
+#[test]
 fn expiry_snapshot_keeps_original_cohort_cap_after_partial_confirmation() -> TestResult {
     let mut encoder = Encoder::new(config(), scope(), Tick(0))?;
     encoder.admit_source(ORIGINALS[0], Tick(1))?;

@@ -1035,6 +1035,14 @@ impl Engine {
         }
     }
     fn retry_fragment_lane(&mut self, now: Tick, index: usize) -> Result<bool, Error> {
+        if index == 2
+            && self
+                .fragments
+                .as_ref()
+                .is_some_and(|f| f.lanes[index].held.is_some())
+        {
+            self.observe_recovery_queue(now)?;
+        }
         // Research support is frozen at actual complete send acceptance. Its
         // already complete feedback body must wait until that receipt orders it.
         if index == 2

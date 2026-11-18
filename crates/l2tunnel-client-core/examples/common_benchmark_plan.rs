@@ -82,6 +82,9 @@ enum Algorithm {
     Rolling {
         copies: bool,
     },
+    PackedC48 {
+        targeted: bool,
+    },
     Research(fec::research::Profile),
 }
 struct Row {
@@ -533,8 +536,22 @@ fn profile(algorithm: Algorithm, carrier: Carrier) -> Result<c::Profile> {
                 reverse: selected,
             }
         }
-        Algorithm::Rolling { copies } => {
-            let selected = rolling_direction(carrier)?;
+        Algorithm::Rolling { .. } | Algorithm::PackedC48 { .. } => {
+            let mut selected = rolling_direction(carrier)?;
+            let copies = match algorithm {
+                Algorithm::PackedC48 { targeted } => {
+                    selected.scheduler.repair_numerator = 41;
+                    selected.scheduler.repair_denominator = 200;
+                    selected.scheduler.feedback_packets = 64;
+                    if targeted {
+                        selected.scheduler.source_wire =
+                            fec::rolling::wire::SourceWire::TargetedExact;
+                    }
+                    true
+                }
+                Algorithm::Rolling { copies } => copies,
+                _ => return Err("invalid rolling selection".into()),
+            };
             let config = rolling_records::Config {
                 forward: selected,
                 reverse: selected,
@@ -746,7 +763,16 @@ fn export_row(directory: &Path, row: &Row, carrier: Carrier) -> Result<Value> {
     let configuration = c::Configuration::new(c::EnvelopeDigest::new([0x42; 32]), descriptor)?;
     let coded = matches!(
         row.algorithm,
-        Algorithm::Rolling { .. } | Algorithm::Research(_)
+        Algorithm::Rolling { .. } | Algorithm::PackedC48 { .. } | Algorithm::Research(_)
+    );
+    let ack = matches!(row.algorithm, Algorithm::PackedC48 { .. }).then_some(
+        pipeline::ack_coalescing::Policy {
+            selection: pipeline::ack_coalescing::Selection::Benchmark,
+            interval: Duration::from_millis(5),
+            max_hold: Duration::from_millis(20),
+            max_flows: 64,
+            max_ack_bytes: 128,
+        },
     );
     let ingress = coded.then_some(rolling_records::IngressLimits {
         slots: 256,
@@ -765,7 +791,7 @@ fn export_row(directory: &Path, row: &Row, carrier: Carrier) -> Result<Value> {
             engine::NativeLimits {
                 stall_micros: NATIVE_STALL_US,
             },
-            None,
+            ack,
             ingress,
             carrier.overhead(),
         )?;
@@ -780,6 +806,11 @@ fn export_row(directory: &Path, row: &Row, carrier: Carrier) -> Result<Value> {
         .ok_or("runtime reserve overflow")?;
     let mut document = runtime_document(retained);
     document["catalog"] = json!([encoded]);
+    if let Some(ack) = ack {
+        let role = json!({"selection":"benchmark","interval_micros":ack.interval.as_micros(),
+            "max_hold_micros":ack.max_hold.as_micros(),"max_flows":ack.max_flows,"max_ack_bytes":ack.max_ack_bytes});
+        document["ack_coalescing"] = json!({"initiator":role,"responder":role});
+    }
     if coded {
         document["rolling_work"] = json!({"field":65536,"copies":65536,"metadata":65536});
         document["rolling_ingress"] = json!({"initiator":{"slots":256,"capacity_bytes":1048576},"responder":{"slots":256,"capacity_bytes":1048576}});
@@ -824,13 +855,35 @@ fn export_row(directory: &Path, row: &Row, carrier: Carrier) -> Result<Value> {
 }
 fn run() -> Result<()> {
     let arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
-    if arguments.len() != 2 || arguments[0] != "--output-dir" {
-        return Err("usage: common_benchmark_plan --output-dir NEW_DIRECTORY".into());
+    let c48_pair = arguments.len() == 3 && arguments[2] == "--packed-c48-pair";
+    if (arguments.len() != 2 && !c48_pair) || arguments[0] != "--output-dir" {
+        return Err(
+            "usage: common_benchmark_plan --output-dir NEW_DIRECTORY [--packed-c48-pair]".into(),
+        );
     }
+    let selected_rows = if c48_pair {
+        vec![
+            Row {
+                id: "packed-c48-control",
+                family: "rolling_copies",
+                variant: "exact-regular-fec",
+                algorithm: Algorithm::PackedC48 { targeted: false },
+            },
+            Row {
+                id: "packed-c48-queue-aware",
+                family: "rolling_copies",
+                variant: "targeted-queue-aware-fec",
+                algorithm: Algorithm::PackedC48 { targeted: true },
+            },
+        ]
+    } else {
+        rows()
+    };
+    let all_rows = selected_rows.len() * 4;
     let directory = Path::new(&arguments[1]);
     std::fs::create_dir(directory)?;
     let mut exported = Vec::new();
-    for row in rows() {
+    for row in selected_rows {
         for carrier in [Carrier::Udp, Carrier::Raw, Carrier::Tls, Carrier::Quic] {
             match export_row(directory, &row, carrier) {
                 Ok(value) => exported.push(value),
@@ -843,11 +896,11 @@ fn run() -> Result<()> {
         .iter()
         .filter(|value| value["status"] == "ready")
         .count();
-    let manifest = json!({"version":1,"kind":"current-common-native-matrix","baseline":{"ip_family":4,"duplex":"full","layer":"tun","tcp_flows":16,"forward_mbit_s":100,"reverse_mbit_s":10,"nominal_rtt_ms":70,"one_way_delay_ms":35,"loss_percent_each_way":15,"warmup_seconds":2,"sample_seconds":10,"directions":["forward","reverse","simultaneous"],"mtu":1500},"rows":exported,"ready_rows":ready,"all_rows":80,"not_covered":["Unimplemented Python catalog modes remain parity gaps; these rows enumerate current connected owners, not all47 acceptance gates.","Windows, Android, public ISP classification and middlebox passage are not measured by this Linux namespace matrix.","Half duplex, compression-policy alternatives and proxy are separate functional selections; this manifest is the explicitly chosen Full native TUN baseline."],"metric_boundary":"Actual captured IP bytes and receiver application bytes; configured allowances are never substituted for physical wire bytes."});
+    let manifest = json!({"version":1,"kind":"current-common-native-matrix","baseline":{"ip_family":4,"duplex":"full","layer":"tun","tcp_flows":16,"forward_mbit_s":100,"reverse_mbit_s":10,"nominal_rtt_ms":70,"one_way_delay_ms":35,"loss_percent_each_way":15,"warmup_seconds":2,"sample_seconds":10,"directions":["forward","reverse","simultaneous"],"mtu":1500},"rows":exported,"ready_rows":ready,"all_rows":all_rows,"not_covered":["Unimplemented Python catalog modes remain parity gaps; these rows enumerate current connected owners, not all47 acceptance gates.","Windows, Android, public ISP classification and middlebox passage are not measured by this Linux namespace matrix.","Half duplex, compression-policy alternatives and proxy are separate functional selections; this manifest is the explicitly chosen Full native TUN baseline."],"metric_boundary":"Actual captured IP bytes and receiver application bytes; configured allowances are never substituted for physical wire bytes."});
     write_json(&directory.join("manifest.json"), &manifest)?;
     println!(
         "{}",
-        json!({"manifest":directory.join("manifest.json"),"ready_rows":ready,"all_rows":80})
+        json!({"manifest":directory.join("manifest.json"),"ready_rows":ready,"all_rows":all_rows})
     );
     Ok(())
 }

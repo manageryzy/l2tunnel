@@ -460,3 +460,94 @@ python3 simulator/studies/packed_latency_study.py --policy queue-aware-repair-bu
 python3 simulator/studies/packed_tail_export.py \
   --archive work/packed-targeted-20261118/fresh-full-r1 --out work/c48-original-tail
 ```
+
+## Rust implementation of the C48 candidate
+
+The authenticated Packed/Rolling descriptor selects `TargetedExact` (version
+5) independently in each direction. Version 4 selects the existing exact
+source control. Both use actual source bytes, local GF repairs over 128
+sources and every sixteenth regular equation over up to 8192. The candidate
+adds an authenticated, lossy request naming specific missing IDs. Each
+request round can name up to eight previously observed gaps, including
+old gaps beyond the first 32-source bitmap. A 140 ms quiet timer can probe
+the oldest unconfirmed original even when the receiver has no evidence of
+a later source. Sender custody ends at cumulative confirmation. Solved
+packed units may be admitted to their own channel before the cumulative
+source prefix advances. That channel still owns record order and compression
+context.
+
+The Common sender samples the age of its oldest locally queued MUX frame
+when handling authenticated feedback. A requested retry earns half its
+accepted wire cost at or below 5 ms, or the full cost at or above 15 ms.
+Between those thresholds it keeps the previous tier. The request retains
+that tier through output backpressure. Credit is capped at 32 MTUs and can
+displace only a complete prospective regular repair. The calculation includes
+the selected framing and all fragments. Quiet probes and repeat copies are
+accounted separately. The age and work budgets use caller-supplied time.
+
+The paired exporter option `--packed-c48-pair` produces matched control and
+candidate descriptors for the four Common carriers. The Linux experiment
+selects the authenticated UDP carrier and TUN, with 16 kernel CUBIC flows,
+512-byte timed application writes and 76 Mbit/s aggregate offered load.
+Kernel TCP segmentation, ACK generation, socket buffering, runtime CPU and
+the actual carrier MTU affect the result. The Python 75.99 Mbit/s and
+197.19 ms figures above describe the calibrated single-seed simulation.
+
+The protocol regression injects losses of sources 0 and 150 and drops recovery
+traffic before confirming all 201 sources. A two-driver UDP test combines an
+old gap with a second ordinary channel, reordered authenticated feedback,
+output backpressure and a duplicate retry. These tests exercise exact native
+delivery and original custody. Standalone Rolling and Research components
+retain their existing cohort deadlines. The sliding Rolling scheduler uses
+the deadline of the actual oldest retained source on each side, so confirming
+one source cannot renew another or expire a younger source prematurely.
+
+### Matched Linux TUN/UDP observation
+
+One release binary ran both arms in owned namespaces on a 100/10 Mbit/s
+link with 35 ms delay and 15% netem loss in each direction. Only the two
+directional recovery-version bytes differed between descriptors. The test
+offered 76 Mbit/s forward over 16 CUBIC flows for 12 seconds, including
+2 seconds of warmup. Goodput uses receiver TCP payload bytes in the next
+10 seconds. Latency includes all complete 512-byte application records through
+drain. Each arm used an independent kernel loss draw.
+
+| Native metric | Exact control | Queue-aware candidate |
+| --- | ---: | ---: |
+| Case outcome | Expired at source 3916 | Passed |
+| Receiver sample goodput | Unqualified, 1,481,176 bytes observed | 27.07 Mbit/s |
+| Scheduled / completely written / completely read | Incomplete | 222,657 / 80,503 / 80,503 |
+| First attempted write to complete read P99 | Unqualified | 1,048.75 ms |
+| Scheduled release to complete read P99 | Unqualified | 8,406.42 ms |
+| Unconfirmed immediately after application EOF, forward / reverse | Unqualified | 74 / 7 |
+| Unconfirmed at terminal snapshot, forward / reverse | Unqualified | 0 / 0 |
+
+In the candidate, requested retries, silent probes and regular equations
+accounted for 23,753,233 / 70,870,762 accepted Common record IP bytes forward
+(33.52%) and 632,982 / 4,863,648 reverse (13.01%) over the full session.
+These fractions exclude short copies from the numerator and management from
+the denominator. The schedule left 142,154 records unsubmitted at the offer
+cutoff. Both P99s describe the 80,503 delivered records. The failed control
+cannot establish a passing speed ratio. The candidate preserved old-source
+recovery in this trial, with a substantial native performance gap against the
+calibrated Python workload. This comparison keeps the existing exact version
+available. [Build, manifest, commands and per-file source hashes](../../work/packed-native-c48-20261118/matched-3/run.json)
+and [native results for both arms](../../work/packed-native-c48-20261118/matched-3/summary.json)
+
+The candidate receiver measured at most 95.74 ms from authenticated input to
+decoder admission across 61,847 forward inputs. The sending daemon measured
+30,324 per-flow admission stalls with a maximum of 40.37 ms. During 9.69
+seconds inside the sample, the receiving daemon used 0.87 logical CPUs in
+user space and 0.23 in the kernel. These intervals cover separate operations.
+The trial did not correlate individual application records with TCP, MUX,
+recovery and channel-order waits, so their contributions to the 1.05 s
+end-to-end P99 remain unresolved. [CPU samples and queue measurements](../../work/packed-native-c48-20261118/matched-3/bottlenecks.json)
+
+A separate build isolated the C48 protocol and original-deadline fixes from
+the concurrent Rolling decoder and runtime optimizations. Both arms failed.
+The candidate read 754 of 5,326 written records and had 1,176 forward sources
+unconfirmed at expiry. The receiver observed source 1074 at tick 11,531,456
+and admitted it at tick 14,926,679, a 3.395 s wait. The decoder was copying
+a retained row while the unresolved prefix was 468. The 27.07 Mbit/s result
+above belongs to the integrated worktree. [Isolated build](../../work/packed-native-c48-20261118/checkpoint-pair/run.json)
+and [failed case results](../../work/packed-native-c48-20261118/checkpoint-pair/summary.json)

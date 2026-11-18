@@ -20,6 +20,71 @@ pub use rolling_ingress::{
     RollingIngressLimits, RollingIngressObservation, RollingIngressPolicies, RollingIngressStatus,
 };
 
+/// Physical retransmission credits and regular FEC spending in the active local sender.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RollingRepairBudget {
+    /// Remaining and maximum credit, expressed in half-bytes.
+    pub balance_half_bytes: u64,
+    /// Selected 32-MTU credit ceiling, in half-bytes.
+    pub cap_half_bytes: u64,
+    /// Accepted named retries that earned half their physical cost.
+    pub half_weight_retries: u64,
+    /// Accepted named retries that earned their full physical cost.
+    pub full_weight_retries: u64,
+    /// Opportunities to send a regular equation.
+    pub regular_opportunities: u64,
+    /// Number of whole proactive equations displaced.
+    pub displaced_repairs: u64,
+    /// Sum of prospectively avoided physical IP bytes.
+    pub displaced_wire_bytes: u64,
+    /// Actual physical wire bytes of accepted solicited retransmissions.
+    pub requested_retry_wire_bytes: u64,
+    /// Accepted quiet probes of the oldest retained original.
+    pub quiet_probes: u64,
+    /// Actual physical wire bytes of accepted quiet probes.
+    pub quiet_probe_wire_bytes: u64,
+    /// Actual physical wire bytes of accepted proactive repairs.
+    pub regular_wire_bytes: u64,
+    /// Actual physical wire bytes of accepted extra configured source copies.
+    pub copy_wire_bytes: u64,
+    /// Originals retained beyond the authenticated cumulative prefix.
+    pub unconfirmed_sources: u32,
+    /// Credit earned before saturation, in half-bytes.
+    pub earned_half_bytes: u64,
+    /// Credit above the fixed cap, in half-bytes.
+    pub capped_half_bytes: u64,
+    /// Residual credit expired on full confirmation, in half-bytes.
+    pub expired_half_bytes: u64,
+    /// Prospective total physical bytes of regular opportunities.
+    pub opportunity_wire_bytes: u64,
+    /// Current hysteresis state of this local sender.
+    pub full_credit: bool,
+}
+impl From<l2tunnel::rolling_records::RepairBudgetStatus> for RollingRepairBudget {
+    fn from(s: l2tunnel::rolling_records::RepairBudgetStatus) -> Self {
+        Self {
+            balance_half_bytes: s.balance_half_bytes,
+            cap_half_bytes: s.cap_half_bytes,
+            half_weight_retries: s.half_weight_retries,
+            full_weight_retries: s.full_weight_retries,
+            regular_opportunities: s.regular_opportunities,
+            displaced_repairs: s.displaced_repairs,
+            displaced_wire_bytes: s.displaced_wire_bytes,
+            requested_retry_wire_bytes: s.requested_retry_wire_bytes,
+            quiet_probes: s.quiet_probes,
+            quiet_probe_wire_bytes: s.quiet_probe_wire_bytes,
+            regular_wire_bytes: s.regular_wire_bytes,
+            copy_wire_bytes: s.copy_wire_bytes,
+            unconfirmed_sources: s.unconfirmed_sources,
+            earned_half_bytes: s.earned_half_bytes,
+            capped_half_bytes: s.capped_half_bytes,
+            expired_half_bytes: s.expired_half_bytes,
+            opportunity_wire_bytes: s.opportunity_wire_bytes,
+            full_credit: s.full_credit,
+        }
+    }
+}
+
 #[path = "common_maintained_status.rs"]
 mod maintained;
 #[path = "common_raw_status.rs"]
@@ -371,6 +436,9 @@ pub struct Status {
     /// Actual optional authenticated work policy. Each step caps send and receive
     /// independently; at most two live epochs produce four directional caps/turn.
     pub rolling_work: Option<RollingWork>,
+    /// Observed only when the active descriptor selects targeted recovery locally.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rolling_repair_budget: Option<RollingRepairBudget>,
     /// Explicit immutable Benchmark policy and actual Engine ingress observations.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ack_coalescing: Option<AckStatus>,
@@ -749,6 +817,9 @@ mod observe {
                 ack_coalescing: requested_ack
                     .map(|requested| AckStatus::observe(requested, snapshot))
                     .transpose()?,
+                rolling_repair_budget: snapshot
+                    .and_then(|s| s.rolling_repair_budget)
+                    .map(Into::into),
                 rolling_ingress: requested_rolling
                     .map(|requested| RollingIngressStatus::observe(requested, snapshot))
                     .transpose()?,

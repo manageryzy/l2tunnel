@@ -56,6 +56,13 @@ impl Owner {
             Self::Packed(endpoint) => endpoint
                 .enable_physical_send_confirmation()
                 .map_err(Error::Aligned),
+            Self::Rolling(endpoint) if endpoint.uses_targeted_sender() => {
+                let mtu = u16::try_from(configuration.descriptor().path_mtu())
+                    .map_err(|_| Error::Configuration)?;
+                endpoint
+                    .enable_queue_aware_repair_budget(mtu)
+                    .map_err(Error::Rolling)
+            }
             Self::Swift(_) | Self::Rolling(_) | Self::Research(_) | Self::Connections(_) => Ok(()),
         }
     }

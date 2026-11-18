@@ -1045,6 +1045,27 @@ impl Pipeline {
         self.states.get(key).map(|state| state.snapshot)
     }
 
+    /// Earliest local queue admission among TAP channel or TUN flow heads.
+    /// Observing it does not advance round-robin order or earn DRR deficit.
+    pub fn oldest_queued_at(&self) -> Option<Duration> {
+        if self.usage.packets == 0 {
+            return None;
+        }
+        let head_time = |queue: &MetadataQueue| {
+            queue
+                .front(&self.metadata_pool)
+                .map(|head| head.timing.admitted)
+        };
+        if self.qos.is_some() {
+            self.states
+                .iter()
+                .filter_map(|(_, flow)| head_time(&flow.metadata))
+                .min()
+        } else {
+            self.channel_metadata.iter().filter_map(head_time).min()
+        }
+    }
+
     /// Inspect each live TUN FIFO head without allocation, selection or mutation.
     /// Work is bounded by configured flow capacity; TAP keeps its system policy.
     pub fn tun_flow_heads(&self) -> Result<impl Iterator<Item = FlowHead> + '_, PipelineError> {

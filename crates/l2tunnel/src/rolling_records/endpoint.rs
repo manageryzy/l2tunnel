@@ -16,6 +16,7 @@ pub struct PreparedOutput {
     pub(super) instance: u64,
     pub(super) serial: u64,
     pub(super) source_copy: Option<scheduler::SourceCopy>,
+    pub(super) retry_full_credit: Option<bool>,
     pub(super) prepared_at: Tick,
     /// Exact authoritative scheduler output identity.
     pub id: OutputId,
@@ -103,6 +104,7 @@ pub struct Endpoint<P: RecoveryPolicy = scheduler::Policy> {
     pub(super) send_scope: receiver::Scope,
     pub(super) receive_scope: receiver::Scope,
     pub(super) sender: P::Sender,
+    pub(super) repair_budget: Option<repair_budget::Budget>,
     pub(super) incoming: P::Receiver,
     pub(super) ingress: Option<ingress::Ingress>,
     pub(super) packing: packed_sender::Sender,
@@ -124,6 +126,7 @@ pub struct Endpoint<P: RecoveryPolicy = scheduler::Policy> {
     pub(super) receive_progress: bool,
     receive_unit: Option<receiver::SourceId>,
     preview_next: u32,
+    preview_end: u32,
     preview: Option<Preview>,
     preview_blocked: bool,
     preview_rescan: bool,
@@ -345,6 +348,11 @@ impl<P: RecoveryPolicy> Endpoint<P> {
             send_scope,
             receive_scope,
             sender,
+            repair_budget: send_config
+                .scheduler
+                .targeted()
+                .then(|| repair_budget::Budget::new(send_config.scheduler.recovery().window))
+                .transpose()?,
             incoming,
             ingress,
             packing,
@@ -366,6 +374,7 @@ impl<P: RecoveryPolicy> Endpoint<P> {
             receive_progress: false,
             receive_unit: Some(receive_config.receiver.first_source),
             preview_next: 0,
+            preview_end: 0,
             preview: None,
             preview_blocked: false,
             preview_rescan: false,
@@ -473,6 +482,7 @@ impl<P: RecoveryPolicy> Endpoint<P> {
         if channel >= self.send_config.receiver.channels
             || frame.is_empty()
             || frame.len() > self.send_config.receiver.body.max_frame_bytes
+            || self.repair_budget.as_ref().is_some_and(|b| !b.configured())
         {
             return Err(Error::Configuration);
         }
@@ -562,6 +572,9 @@ impl<P: RecoveryPolicy> Endpoint<P> {
             copies,
         ) {
             Ok(id) if id == expected => {
+                if let Some(budget) = &mut self.repair_budget {
+                    budget.record_source(id, length)?;
+                }
                 let result = self.packing.commit_source().map_err(Error::Sender);
                 if let Err(error) = result {
                     return self.fail(error);
@@ -641,14 +654,17 @@ impl<P: RecoveryPolicy> Endpoint<P> {
             Err(error) => self.fail(error),
         }
     }
+    fn previews_sources(&self) -> bool {
+        self.receive_config.scheduler.targeted()
+            || self
+                .receive_config
+                .receiver
+                .body
+                .independent_short_frame_bytes
+                != 0
+    }
     fn request_preview_scan(&mut self) {
-        if self
-            .receive_config
-            .receiver
-            .body
-            .independent_short_frame_bytes
-            != 0
-        {
+        if self.previews_sources() {
             self.preview_rescan = true;
             self.preview_blocked = false;
         }
@@ -658,12 +674,7 @@ impl<P: RecoveryPolicy> Endpoint<P> {
         now: Tick,
         budget: &mut rolling::WorkBudget,
     ) -> Result<bool, Error> {
-        if self
-            .receive_config
-            .receiver
-            .body
-            .independent_short_frame_bytes
-            == 0
+        if !self.previews_sources()
             || P::receive_state(&self.incoming, rolling_tick(now)).feedback_building
             || self.preview_blocked
         {
@@ -680,8 +691,11 @@ impl<P: RecoveryPolicy> Endpoint<P> {
                 let status = P::receive_state(&self.incoming, rolling_tick(now)).decoder;
                 // New committed availability may precede the retained cursor.
                 // Coalesce it without discarding an in-progress slab copy.
-                if self.preview_rescan {
+                if self.preview_rescan
+                    && (!config.scheduler.targeted() || self.preview_next >= self.preview_end)
+                {
                     self.preview_next = status.handoff_prefix;
+                    self.preview_end = status.observed_end;
                     self.preview_rescan = false;
                 }
                 self.preview_next = self.preview_next.max(status.handoff_prefix);
@@ -760,6 +774,15 @@ impl<P: RecoveryPolicy> Endpoint<P> {
                             native_progress |=
                                 outcomes[..count].contains(&receiver::Admission::Accepted);
                         }
+                        Err(
+                            receiver::Error::Capacity
+                            | receiver::Error::RecordWindow
+                            | receiver::Error::SourceWindow,
+                        ) if config.scheduler.targeted() => {
+                            // Another solved source can belong to a ready channel.
+                            // Native commits and ordered handoff re-arm this scan.
+                            continue;
+                        }
                         Err(receiver::Error::Capacity | receiver::Error::RecordWindow) => {
                             self.preview = Some(preview);
                             self.preview_blocked = true;
@@ -792,6 +815,16 @@ impl<P: RecoveryPolicy> Endpoint<P> {
                     .map_err(Error::Envelope)?
                     .nth(preview.unit)
                     .ok_or(Error::Identity)?;
+                if config.scheduler.targeted()
+                    && self
+                        .records
+                        .source_observed(self.receive_scope, unit.identity.source)
+                        .map_err(Error::Receiver)?
+                {
+                    preview.unit += 1;
+                    self.preview = Some(preview);
+                    continue;
+                }
                 let offset = (unit.bytes.as_ptr() as usize)
                     .checked_sub(bytes.as_ptr() as usize)
                     .ok_or(Error::Identity)?;
@@ -848,10 +881,11 @@ impl<P: RecoveryPolicy> Endpoint<P> {
             budget.metadata -= 1;
             visits += 1;
             check_policy(config, symbol)?;
-            if self
-                .records
-                .is_independent_short(current.identity, symbol)
-                .map_err(Error::Receiver)?
+            if config.scheduler.targeted()
+                || self
+                    .records
+                    .is_independent_short(current.identity, symbol)
+                    .map_err(Error::Receiver)?
             {
                 preview.selected[preview.unit / 64] |= 1 << (preview.unit % 64);
             }
@@ -869,8 +903,7 @@ impl<P: RecoveryPolicy> Endpoint<P> {
         self.advance(now)?;
         self.pump_send(now)?;
         self.service_ingress(now)?;
-        let send =
-            P::send_step(&mut self.sender, rolling_tick(now), work).map_err(Error::Rolling)?;
+        let send = self.step_sender(now, work)?;
         if self.receive_progress {
             self.request_preview_scan();
         }
@@ -967,13 +1000,7 @@ impl<P: RecoveryPolicy> Endpoint<P> {
         } else {
             self.overhead
         };
-        let (packets, wire_bytes) = if let Some(mut framing) = self.framing {
-            framing.outer_overhead_bytes = overhead;
-            let geometry = framing.geometry(length).map_err(Error::Fragment)?;
-            (geometry.fragments(), geometry.wire_bytes())
-        } else {
-            (1, length.checked_add(overhead).ok_or(Error::Arithmetic)?)
-        };
+        let (packets, wire_bytes) = wire_charge(self.framing, length, overhead)?;
         let feedback_operation = match id {
             OutputId::Feedback(id) => Some(waits::Operation {
                 id: id.0,
@@ -1042,6 +1069,11 @@ impl<P: RecoveryPolicy> Endpoint<P> {
             serial: self.next_output,
             prepared_at: now,
             source_copy,
+            retry_full_credit: if matches!(id, OutputId::Data(_)) {
+                P::requested_credit(&self.sender)
+            } else {
+                None
+            },
             id,
             kind,
             security_number,
@@ -1112,6 +1144,10 @@ impl<P: RecoveryPolicy> Endpoint<P> {
         if let Err(error) = result {
             return self.fail(error);
         }
+        if let Some(budget) = &mut self.repair_budget {
+            budget.accepted(pending);
+        }
+        self.expire_confirmed_credit();
         Ok(())
     }
     /// Accept complete plaintext only after caller carrier authentication/replay.
@@ -1171,6 +1207,7 @@ impl<P: RecoveryPolicy> Endpoint<P> {
                     rolling_tick(now),
                 )
                 .map_err(Error::Rolling)?;
+                self.expire_confirmed_credit();
             }
             EmissionKind::Source(SourceForm::SystematicFec) | EmissionKind::Repair => {
                 let (observed, scope) =
@@ -1288,6 +1325,7 @@ impl<P: RecoveryPolicy> Endpoint<P> {
                 return self.fail(error);
             }
             owner.queue.complete_front().map_err(Error::Ingress)?;
+            self.expire_confirmed_credit();
             return Ok(());
         }
         if !matches!(
@@ -1366,6 +1404,10 @@ impl<P: RecoveryPolicy> Endpoint<P> {
     /// Actual per-generation input custody, independent of decoded/native receipt.
     pub fn ingress_status(&self) -> Option<IngressStatus> {
         self.ingress.as_ref().map(|owner| owner.status())
+    }
+    /// Whether this local sending direction selected request-based recovery.
+    pub fn uses_targeted_sender(&self) -> bool {
+        self.send_config.scheduler.targeted()
     }
     /// Borrow actual source witnesses; repairs contain no original native unit.
     pub fn outgoing_units(
@@ -1460,12 +1502,7 @@ impl<P: RecoveryPolicy> Endpoint<P> {
             || receive.work_pending
             || (self.receive_progress
                 && receive.decoder.decoded_prefix > receive.decoder.handoff_prefix)
-            || (self
-                .receive_config
-                .receiver
-                .body
-                .independent_short_frame_bytes
-                != 0
+            || (self.previews_sources()
                 && !self.preview_blocked
                 && (self.preview.is_some()
                     || self.preview_rescan
@@ -1562,7 +1599,8 @@ fn admit_packed<P: RecoveryPolicy>(
         .0
         .checked_add(view.len() as u64)
         .map(receiver::SourceId);
-    let preview = config.receiver.body.independent_short_frame_bytes != 0;
+    let targeted = config.scheduler.targeted();
+    let preview = targeted || config.receiver.body.independent_short_frame_bytes != 0;
     let floor = records.status().source_floor;
     let mut inputs = empty_inputs(scope);
     let mut count = 0;
@@ -1593,13 +1631,20 @@ fn admit_packed<P: RecoveryPolicy>(
         return Ok(());
     }
     let mut outcomes = [receiver::Admission::Accepted; 255];
-    let admitted = records
-        .admit_validated_batch_authenticated_into(
-            &inputs[..count],
-            receiver_tick(now),
-            &mut outcomes[..count],
-        )
-        .map_err(Error::Receiver)?;
+    // Other channels may legitimately retain complete context-dependent records
+    // behind a gap. Their semantic validation runs at their own ordered head.
+    let admit = if targeted {
+        receiver::Receiver::admit_batch_authenticated_into
+    } else {
+        receiver::Receiver::admit_validated_batch_authenticated_into
+    };
+    let admitted = admit(
+        records,
+        &inputs[..count],
+        receiver_tick(now),
+        &mut outcomes[..count],
+    )
+    .map_err(Error::Receiver)?;
     if admitted != count
         || outcomes[..count].iter().any(|a| {
             !(matches!(a, receiver::Admission::Accepted)

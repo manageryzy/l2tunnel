@@ -4,11 +4,11 @@ use super::{Error, RepairId, Scope, Tick};
 /// The actual owner/check retaining an unchanged original deadline.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Kind {
-    /// Encoder cohort remains unresolved until all admitted sources confirm.
+    /// The sliding sender's oldest unconfirmed original, or a standalone cohort.
     EncoderDebt,
     /// Original resumable encoding job, including its immutable result.
     EncoderJob,
-    /// Decoder observed cohort remains unresolved.
+    /// Sliding receiver still owes a cumulative receipt extent, or a standalone cohort.
     DecoderDebt,
     /// Original resumable decoding candidate.
     DecoderJob,

@@ -108,6 +108,8 @@ pub struct CommonSnapshot {
     pub rolling_ingress: Option<l2tunnel::rolling_records::IngressLimits>,
     /// Actual current-generation input queue observation, absent when inactive.
     pub rolling_input: Option<l2tunnel::rolling_records::IngressStatus>,
+    /// Effective local queue-aware budget in the active record generation.
+    pub rolling_repair_budget: Option<l2tunnel::rolling_records::RepairBudgetStatus>,
     /// Actual current Engine fragment selection; absent for other record families.
     pub rolling_fragments: Option<engine::FragmentPolicy>,
     /// Actual independently retained reassembly and completed-body custody.
@@ -1096,6 +1098,7 @@ impl Driver {
             rolling_work: self.config.rolling_work,
             rolling_ingress: self.config.rolling_ingress,
             rolling_input: state.engine(state.epoch())?.rolling_ingress_status(),
+            rolling_repair_budget: state.engine(state.epoch())?.rolling_repair_budget(),
             rolling_fragments: state.engine(state.epoch())?.fragment_policy(),
             fragment_ingress: state.engine(state.epoch())?.fragment_ingress_snapshot(),
             fragment_statistics: state.engine(state.epoch())?.fragment_statistics(),

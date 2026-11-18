@@ -3,10 +3,11 @@ use super::*;
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
 #[test]
-fn current_repair_grammar_roundtrips_both_source_formats_and_rejects_old_versions() -> TestResult {
+fn current_repair_grammar_roundtrips_selected_formats_and_rejects_unknown_versions() -> TestResult {
     for format in [
         fec::rolling::wire::SourceWire::Padded,
         fec::rolling::wire::SourceWire::Exact,
+        fec::rolling::wire::SourceWire::TargetedExact,
     ] {
         let config = crate::record_engine::rolling_tests::fixture(false, format)?;
         let mut bytes = [0; CONFIGURATION_BYTES];
@@ -20,7 +21,7 @@ fn current_repair_grammar_roundtrips_both_source_formats_and_rejects_old_version
                 &bytes[offset..offset + 8],
                 &u64::from(format.version()).to_be_bytes()
             );
-            for old in [1u64, 2] {
+            for old in [1u64, 2, 6] {
                 let mut stale = bytes;
                 stale[offset..offset + 8].copy_from_slice(&old.to_be_bytes());
                 assert_eq!(Configuration::decode(&stale), Err(Error::Prefix));

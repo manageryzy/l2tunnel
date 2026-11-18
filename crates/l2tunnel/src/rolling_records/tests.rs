@@ -1,6 +1,8 @@
 //! Actual independent owners exchange wire bytes; no sender source ledger is read.
 #[path = "early_tests.rs"]
 mod early;
+#[path = "repair_budget_tests.rs"]
+mod repair_budget_tests;
 use super::*;
 use crate::{
     codec::{aligned_body, aligned_sender, packed},

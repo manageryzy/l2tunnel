@@ -16,12 +16,14 @@ pub const MAX_RECORD_BYTES: usize = HEADER_BYTES + MAX_PAYLOAD + 2;
 pub const VERSION: u8 = 3;
 /// Version with exact sources and effective repair extents.
 pub const EXACT_SOURCE_VERSION: u8 = 4;
+/// Exact originals with negotiated named-hole recovery and queue-aware repair accounting.
+pub const TARGETED_VERSION: u8 = 5;
 
 /// Explicitly selected systematic-source encoding, bound by the authenticated policy.
 ///
-/// Both formats share the header, identities and effective repair extents and
+/// All formats share the header, identities and effective repair extents and
 /// present the identical original bytes to the decoder. Each accepts only its
-/// own version byte, so records of the two formats can never be mixed.
+/// own version byte, so records of different formats cannot be mixed.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum SourceWire {
     /// Version 3: every source record carries its complete zero-padded vector.
@@ -30,13 +32,20 @@ pub enum SourceWire {
     /// Version 4: a source record ends after its exact original bytes. The
     /// receiver's decoder reconstructs the same bounded zero-padded vector.
     Exact,
+    /// Version 5 retains exact source and repair extents and selects targeted feedback.
+    TargetedExact,
 }
 impl SourceWire {
+    /// Whether the authenticated selection permits named source requests and retries.
+    pub const fn is_targeted(self) -> bool {
+        matches!(self, Self::TargetedExact)
+    }
     /// Wire version byte required in every record of this format.
     pub const fn version(self) -> u8 {
         match self {
             Self::Padded => VERSION,
             Self::Exact => EXACT_SOURCE_VERSION,
+            Self::TargetedExact => TARGETED_VERSION,
         }
     }
 }
@@ -51,7 +60,7 @@ pub fn source_len(config: Config, format: SourceWire, original: usize) -> Result
     }
     match format {
         SourceWire::Padded => add(HEADER_BYTES, width),
-        SourceWire::Exact => add(add(HEADER_BYTES, 2)?, original),
+        SourceWire::Exact | SourceWire::TargetedExact => add(add(HEADER_BYTES, 2)?, original),
     }
 }
 const MAGIC: &[u8; 4] = b"L2RW";
@@ -116,7 +125,7 @@ pub fn inspect_with(config: Config, format: SourceWire, bytes: &[u8]) -> Result<
     let width = config.width()?;
     let full = add(HEADER_BYTES, width)?;
     let variable = bytes.len() >= HEADER_BYTES
-        && (bytes[5] == REPAIR || format == SourceWire::Exact && bytes[5] == SOURCE);
+        && (bytes[5] == REPAIR || format != SourceWire::Padded && bytes[5] == SOURCE);
     if variable {
         if bytes.len() < add(HEADER_BYTES, 3)? || bytes.len() > full {
             return Err(Error::Length);
@@ -163,7 +172,7 @@ pub fn inspect_with(config: Config, format: SourceWire, bytes: &[u8]) -> Result<
         let tail = vector.get(2 + length..).ok_or(Error::Length)?;
         let canonical = match format {
             SourceWire::Padded => tail.iter().all(|b| *b == 0),
-            SourceWire::Exact => tail.is_empty(),
+            SourceWire::Exact | SourceWire::TargetedExact => tail.is_empty(),
         };
         if !canonical {
             return Err(Error::Length);

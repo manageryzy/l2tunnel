@@ -365,3 +365,55 @@ fn preview_reports_native_progress_only_after_actual_short_admission() -> TestRe
 
 #[path = "ingress_tests.rs"]
 mod ingress;
+
+#[test]
+fn targeted_ordinary_channel_delivery_crosses_old_source_without_duplicate_native_write()
+-> TestResult {
+    let mut config = short_config(0, rolling::wire::SourceWire::TargetedExact);
+    config.forward.scheduler.repair_numerator = 0;
+    let mut sender = endpoint(config, Role::Client)?;
+    sender.enable_queue_aware_repair_budget(1500)?;
+    let mut receiver = make_receiver(config, true)?;
+    receiver.enable_queue_aware_repair_budget(1500)?;
+    let mut datagrams = Vec::new();
+    let mut number = 999;
+    for (channel, byte) in [(0, 0x12), (1, 0x43), (1, 0x81)] {
+        let frame = packet(true, byte, 100);
+        let identity = sender
+            .enqueue_admitted_identified(Tick(0), channel, &frame)?
+            .ok_or("could not admit ordinary frame")?;
+        sender.flush(Tick(0))?;
+        sender.step(Tick(0), work())?;
+        let (_, data) = emit(&mut sender, Tick(0), &mut number, true)?.ok_or("missing source")?;
+        datagrams.push((identity, frame, data));
+    }
+    let mut out = [0; 1024];
+    // Withhold the oldest channel and reverse two ordinary records on the other.
+    for index in [2, 1, 0] {
+        let (_, _, data) = &datagrams[index];
+        receiver.accept_authenticated(Tick(6), data.kind, &data.bytes)?;
+        for _ in 0..128 {
+            receiver.step(Tick(6), work())?;
+            if !receiver.work_pending() {
+                break;
+            }
+        }
+        let expected: &[usize] = match index {
+            2 => &[],
+            1 => &[1, 2],
+            _ => &[0],
+        };
+        for &delivered in expected {
+            let receipt = ready(&mut receiver, Tick(6), &mut out)?;
+            assert_eq!(receipt.identity(), datagrams[delivered].0);
+            assert_eq!(&out[..receipt.bytes()], datagrams[delivered].1.as_slice());
+            receiver.commit_native(Tick(6), receipt.token())?;
+        }
+        if index != 0 {
+            assert_eq!(receiver.receiver_status().decoder.handoff_prefix, 0);
+        }
+    }
+    assert_eq!(receiver.receiver_status().decoder.handoff_prefix, 3);
+    assert_eq!(receiver.statistics().committed, 3);
+    Ok(())
+}

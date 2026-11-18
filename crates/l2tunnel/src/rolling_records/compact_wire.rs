@@ -60,12 +60,19 @@ impl CompactRecovery<scheduler::Policy> for Rolling {
         rw::encode_data(sender.pending_output().ok_or(rolling::Error::Busy)?, output)
     }
     fn feedback_len(receiver: &scheduler::Receiver) -> Result<Option<usize>, rolling::Error> {
-        Ok(receiver.pending_feedback().map(rw::feedback_len))
+        Ok(if let Some(r) = receiver.pending_request() {
+            Some(rw::gap_len(r))
+        } else {
+            receiver.pending_feedback().map(rw::feedback_len)
+        })
     }
     fn encode_feedback(
         receiver: &scheduler::Receiver,
         output: &mut [u8],
     ) -> Result<usize, rolling::Error> {
+        if let Some(request) = receiver.pending_request() {
+            return receiver.encode_compact_request(request, output);
+        }
         rw::encode_feedback(
             receiver.pending_feedback().ok_or(rolling::Error::Busy)?,
             output,
@@ -89,7 +96,7 @@ impl CompactRecovery<scheduler::Policy> for Rolling {
             rw::View::Data(rolling::wire::View::Repair(value)) => {
                 Ok(recovery::View::Repair { scope: value.scope })
             }
-            rw::View::Feedback(_) => Err(rolling::Error::Format),
+            rw::View::Feedback(_) | rw::View::Gap(_) => Err(rolling::Error::Format),
         }
     }
     fn kind(
@@ -103,6 +110,8 @@ impl CompactRecovery<scheduler::Policy> for Rolling {
             }
             rw::View::Data(rolling::wire::View::Repair(_)) => EmissionKind::Repair,
             rw::View::Feedback(_) => EmissionKind::Feedback,
+            rw::View::Gap(_) if policy.source_wire.is_targeted() => EmissionKind::Feedback,
+            rw::View::Gap(_) => return Err(rolling::Error::Format),
         })
     }
     fn extent(
@@ -119,6 +128,8 @@ impl CompactRecovery<scheduler::Policy> for Rolling {
                 (RecordKind::Repair, value.bytes.len())
             }
             rw::View::Feedback(_) => (RecordKind::Feedback, 0),
+            rw::View::Gap(_) if policy.source_wire.is_targeted() => (RecordKind::Feedback, 0),
+            rw::View::Gap(_) => return Err(rolling::Error::Format),
         };
         recovery_extent(bytes.len(), payload, kind)
     }
@@ -130,10 +141,12 @@ impl CompactRecovery<scheduler::Policy> for Rolling {
         _: rolling::Tick,
         now: rolling::Tick,
     ) -> Result<(), rolling::Error> {
-        let rw::View::Feedback(value) = rw::inspect(policy.recovery, scope, bytes)? else {
-            return Err(rolling::Error::Format);
-        };
-        sender.receive_feedback(value, now).map(|_| ())
+        match rw::inspect(policy.recovery, scope, bytes)? {
+            rw::View::Feedback(value) => sender.receive_feedback(value, now),
+            rw::View::Gap(request) => sender.receive_request(request, now),
+            _ => return Err(rolling::Error::Format),
+        }
+        .map(|_| ())
     }
     fn receive(
         policy: scheduler::Policy,
@@ -283,7 +296,7 @@ impl<P: RecoveryPolicy> Endpoint<P> {
         if self.compact_feedback_overhead.is_none() {
             return Err(Error::Configuration);
         }
-        let feedback = bytes.first() == Some(&3);
+        let feedback = matches!(bytes.first(), Some(3 | 5));
         let (policy, scope) = if feedback {
             (self.receive_config.scheduler, self.peer_rolling_scope())
         } else {
@@ -372,7 +385,7 @@ impl<P: RecoveryPolicy> Endpoint<P> {
     pub fn inspect_peer(&self, bytes: &[u8]) -> Result<EmissionKind, Error> {
         if self.compact_feedback_overhead.is_some() {
             // Retiring feedback describes our local sending policy and scope.
-            if bytes.first() == Some(&3) {
+            if matches!(bytes.first(), Some(3 | 5)) {
                 return P::Compact::kind(
                     self.send_config.scheduler,
                     self.send_rolling_scope,

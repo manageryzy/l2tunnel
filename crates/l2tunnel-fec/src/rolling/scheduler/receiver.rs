@@ -35,6 +35,8 @@ pub struct Receiver {
     policy: Policy,
     scope: Scope,
     decoder: Decoder,
+    gaps: targeted::GapTracker,
+    request: Option<GapRequest>,
     events: u32,
     due: Option<Tick>,
     scan: Option<Scan>,
@@ -65,14 +67,19 @@ impl Receiver {
     /// Observe every actual retained nested capacity, excluding the inline header.
     /// The same observation works with the unchanged compatibility constructor.
     pub fn storage_usage(&self) -> Result<storage::Usage, storage::Error> {
-        self.decoder.storage_usage()
+        self.decoder
+            .storage_usage()?
+            .join(self.gaps.queues.usage()?)
     }
 
     /// Conservative total reservation, excluding caller buffers/allocator overhead.
     pub fn memory_bound(policy: Policy) -> Result<usize, Error> {
         policy.validate()?;
         add(
-            Decoder::memory_bound(policy.recovery)?,
+            add(
+                Decoder::sliding_memory_bound(policy.recovery)?,
+                targeted::Queues::bytes(policy)?,
+            )?,
             std::mem::size_of::<Self>(),
         )
     }
@@ -83,7 +90,9 @@ impl Receiver {
         }
         deadline(now, policy.feedback_ticks)?;
         Ok(Self {
-            decoder: Decoder::new(policy.recovery, scope, now)?,
+            decoder: Decoder::new_sliding(policy.recovery, scope, now)?,
+            gaps: targeted::GapTracker::new(policy)?,
+            request: None,
             policy,
             scope,
             events: 0,
@@ -209,10 +218,26 @@ impl Receiver {
         {
             self.notice(now)?;
         }
+        self.gaps.observe(&self.decoder, now, &mut budget)?;
+        if self.scan.is_none()
+            && self.feedback.is_none()
+            && self.request.is_none()
+            && !self.decoder.status().pending_job
+            && budget.metadata > 0
+        {
+            self.request = self.gaps.poll(
+                &self.decoder,
+                self.scope,
+                FeedbackId(self.next_feedback),
+                now,
+                &mut budget,
+            )?;
+        }
         if self.scan.is_none()
             && self.feedback.is_none()
             && !self.decoder.status().pending_job
-            && (self.events >= self.policy.feedback_packets
+            && (self.request.is_some()
+                || self.events >= self.policy.feedback_packets
                 || self.due.is_some_and(|due| now >= due))
             && spend(&mut budget.metadata)
         {
@@ -231,8 +256,10 @@ impl Receiver {
                 },
                 copied: 0,
             });
-            self.events = 0;
-            self.due = None;
+            if self.request.is_none() {
+                self.events = 0;
+                self.due = None;
+            }
             self.output_end = Some(end);
         }
         while self.scan.is_some() && spend(&mut budget.metadata) {
@@ -242,7 +269,9 @@ impl Receiver {
                 if !spend(&mut budget.copies) {
                     break;
                 }
-                self.wire[scan.copied] = value.byte(scan.copied);
+                self.wire[scan.copied] = self
+                    .request
+                    .map_or_else(|| value.byte(scan.copied), |r| r.full_byte(scan.copied));
                 scan.copied += 1;
             } else {
                 self.feedback = Some(value);
@@ -263,7 +292,7 @@ impl Receiver {
             self.decoder.pending_source()
         }
     }
-    /// Original ordered-handoff cohort cap of the actual nested decoder.
+    /// Earliest original deadline among published sources awaiting ordered handoff.
     pub fn handoff_deadline(&self) -> Option<Tick> {
         self.decoder.handoff_deadline()
     }
@@ -297,6 +326,21 @@ impl Receiver {
             self.feedback
         }
     }
+    /// Named span accompanying the immutable selected feedback identity.
+    pub fn pending_request(&self) -> Option<GapRequest> {
+        self.pending_feedback().and(self.request)
+    }
+    /// Serialize the pending compact request under the receiver's authenticated policy.
+    pub fn encode_compact_request(
+        &self,
+        request: GapRequest,
+        output: &mut [u8],
+    ) -> Result<usize, Error> {
+        if self.pending_request() != Some(request) {
+            return Err(Error::Identity);
+        }
+        wire::compact::encode_gap(self.policy.recovery, request, output)
+    }
     /// Borrow the exact immutable structural wire bytes, without granting authentication.
     pub fn pending_feedback_wire(&self) -> Option<&[u8]> {
         self.pending_feedback().map(|_| self.wire.as_slice())
@@ -308,6 +352,7 @@ impl Receiver {
             return Err(Error::Identity);
         }
         self.feedback = None;
+        self.request = None;
         self.output_end = None;
         self.next_feedback += 1;
         Ok(())
@@ -339,7 +384,10 @@ impl Receiver {
     }
     /// Earliest hard expiry or first-event trigger; ready work remains explicit in status.
     pub fn wake_at(&self) -> Option<Tick> {
-        self.deadline().into_iter().chain(self.due).min()
+        self.deadline()
+            .into_iter()
+            .chain(self.status().feedback_due)
+            .min()
     }
     /// Constant-size current ownership snapshot, without a scan or new measurement.
     pub fn status(&self) -> ReceiverStatus {
@@ -348,7 +396,15 @@ impl Receiver {
             feedback_building: self.scan.is_some(),
             feedback_ready: self.pending_feedback().is_some(),
             feedback_events: self.events,
-            feedback_due: self.due,
+            feedback_due: if self.scan.is_none() && self.feedback.is_none() {
+                self.due
+                    .into_iter()
+                    .chain(self.request.map(|_| self.last))
+                    .chain(self.gaps.wake(&self.decoder, self.last))
+                    .min()
+            } else {
+                self.due
+            },
             terminal: self.terminal,
         }
     }

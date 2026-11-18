@@ -33,7 +33,21 @@ mod ingress;
 mod native;
 #[doc(hidden)]
 pub mod recovery;
+mod repair_budget;
 use recovery::RecoveryPolicy;
+fn wire_charge(
+    framing: Option<codec::FragmentConfig>,
+    length: usize,
+    overhead: usize,
+) -> Result<(usize, usize), Error> {
+    if let Some(mut framing) = framing {
+        framing.outer_overhead_bytes = overhead;
+        let geometry = framing.geometry(length).map_err(Error::Fragment)?;
+        Ok((geometry.fragments(), geometry.wire_bytes()))
+    } else {
+        Ok((1, length.checked_add(overhead).ok_or(Error::Arithmetic)?))
+    }
+}
 /// Exact backing of the actual codec, rolling schedulers and scratch owners.
 pub mod storage;
 #[cfg(test)]
@@ -49,6 +63,7 @@ pub use l2tunnel_aligned::NativePolicy;
 pub use l2tunnel_reliable::OutboundBudget;
 pub use native::{NativePreparation, NativeToken, PreparedNative};
 pub use record_engine::{Context, Geometry, Tick};
+pub use repair_budget::RepairBudgetStatus;
 
 /// Explicit local admission, retained ownership or authoritative engine failure.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

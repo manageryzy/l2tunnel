@@ -69,6 +69,9 @@ pub trait RecoveryPolicy: sealed::Sealed + Copy + Eq {
     const COPIES: bool;
     const DOMAIN: &'static [u8];
     const STREAM_DOMAIN: &'static [u8];
+    fn targeted(self) -> bool {
+        false
+    }
     fn validate(self) -> Result<(), rolling::Error>;
     fn recovery(self) -> rolling::Config;
     fn validate_owner_bounds(self) -> Result<(), Error>;
@@ -110,6 +113,18 @@ pub trait RecoveryPolicy: sealed::Sealed + Copy + Eq {
         now: rolling::Tick,
         work: rolling::WorkBudget,
     ) -> Result<rolling::WorkUsed, rolling::Error>;
+    fn send_step_filtered(
+        sender: &mut Self::Sender,
+        now: rolling::Tick,
+        work: rolling::WorkBudget,
+        _filter: impl FnMut(rolling::RepairId, rolling::Support) -> Result<bool, rolling::Error>,
+    ) -> Result<rolling::WorkUsed, rolling::Error> {
+        Self::send_step(sender, now, work)
+    }
+    fn requested_credit(_sender: &Self::Sender) -> Option<bool> {
+        None
+    }
+    fn observe_mux_wait(_sender: &mut Self::Sender, _age: u64) {}
     fn receive_step(
         receiver: &mut Self::Receiver,
         now: rolling::Tick,
@@ -166,6 +181,9 @@ pub trait RecoveryPolicy: sealed::Sealed + Copy + Eq {
 }
 
 impl RecoveryPolicy for scheduler::Policy {
+    fn targeted(self) -> bool {
+        self.source_wire.is_targeted()
+    }
     type Compact = compact_wire::Rolling;
     type Sender = scheduler::Sender;
     type Receiver = scheduler::Receiver;
@@ -288,7 +306,10 @@ impl RecoveryPolicy for scheduler::Policy {
             encoder: x.encoder,
             output_ready: x.output_ready,
             work_pending: !x.output_ready
-                && (x.encoder.pending_repair || x.regular_due > 0 || x.tail_remaining > 0),
+                && (x.encoder.pending_repair
+                    || x.regular_due > 0
+                    || x.tail_remaining > 0
+                    || s.requested_retry_waiting()),
             drained: !x.output_ready
                 && x.regular_due == 0
                 && x.tail_remaining == 0
@@ -321,6 +342,20 @@ impl RecoveryPolicy for scheduler::Policy {
         w: rolling::WorkBudget,
     ) -> Result<rolling::WorkUsed, rolling::Error> {
         s.step(n, w)
+    }
+    fn send_step_filtered(
+        s: &mut Self::Sender,
+        n: rolling::Tick,
+        w: rolling::WorkBudget,
+        filter: impl FnMut(rolling::RepairId, rolling::Support) -> Result<bool, rolling::Error>,
+    ) -> Result<rolling::WorkUsed, rolling::Error> {
+        s.step_with_regular_filter(n, w, filter)
+    }
+    fn requested_credit(s: &Self::Sender) -> Option<bool> {
+        s.pending_requested_credit()
+    }
+    fn observe_mux_wait(s: &mut Self::Sender, age: u64) {
+        s.observe_mux_wait_micros(age);
     }
     fn receive_step(
         r: &mut Self::Receiver,
@@ -357,6 +392,12 @@ impl RecoveryPolicy for scheduler::Policy {
             (scheduler::OutputId::Source(id), Some(c)) if c.source() == id => {
                 s.confirm_source_copy(n, a, c)
             }
+            (scheduler::OutputId::Source(_), None) if s.pending_retry_token().is_some() => s
+                .confirm_retry(
+                    s.pending_retry_token().ok_or(rolling::Error::Identity)?,
+                    a,
+                    n,
+                ),
             (id, None) => s.confirm_output(id, n),
             _ => Err(rolling::Error::Identity),
         }

@@ -65,7 +65,7 @@ impl Plan {
     /// Plan the actual sender buffers and preserve both legacy reservation guards.
     pub fn for_sender(policy: scheduler::Policy) -> Result<Self, Error> {
         policy.validate()?;
-        if Encoder::memory_bound(policy.recovery)? > policy.recovery.memory_bytes
+        if Encoder::sliding_memory_bound(policy.recovery)? > policy.recovery.memory_bytes
             || scheduler::Sender::memory_bound(policy)? > policy.memory_bytes
         {
             return Err(Error::Recovery(super::Error::Capacity));
@@ -73,14 +73,16 @@ impl Plan {
         Ok(Self {
             policy,
             kind: Kind::Sender,
-            usage: Encoder::requested_storage(policy.recovery)?,
+            usage: Encoder::requested_storage(policy.recovery)?
+                .join(requested::<Tick>(policy.recovery.window)?)?
+                .join(scheduler::targeted::Queues::plan(policy)?)?,
         })
     }
 
     /// Plan every real decoder bank, decision/free pool, history and scratch buffer.
     pub fn for_receiver(policy: scheduler::Policy) -> Result<Self, Error> {
         policy.validate()?;
-        if Decoder::memory_bound(policy.recovery)? > policy.recovery.memory_bytes
+        if Decoder::sliding_memory_bound(policy.recovery)? > policy.recovery.memory_bytes
             || scheduler::Receiver::memory_bound(policy)? > policy.memory_bytes
         {
             return Err(Error::Recovery(super::Error::Capacity));
@@ -88,7 +90,8 @@ impl Plan {
         Ok(Self {
             policy,
             kind: Kind::Receiver,
-            usage: Decoder::requested_storage(policy.recovery)?,
+            usage: Decoder::sliding_requested_storage(policy.recovery)?
+                .join(scheduler::targeted::Queues::plan(policy)?)?,
         })
     }
 

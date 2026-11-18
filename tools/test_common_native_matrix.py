@@ -460,7 +460,7 @@ class MatrixTests(unittest.TestCase):
                 process.stderr.close()
 
     def test_actual_selector_transfer_preserves_one_way_and_simultaneous_hash_eof(self):
-        for phase in matrix.PHASES:
+        for phase, paced in [*((name, False) for name in matrix.PHASES), ('forward', True)]:
             pairs = [socket.socketpair() for _ in range(2)]
             a, b = [pair[0] for pair in pairs], [pair[1] for pair in pairs]
             started = time.monotonic_ns() + 20_000_000
@@ -468,7 +468,7 @@ class MatrixTests(unittest.TestCase):
             results, errors = [{}, {}], []
             def worker(index, streams, sending):
                 try:
-                    probe.transfer(streams, sending, clock, started + 2_000_000_000, results[index])
+                    probe.transfer(streams, sending, clock, started + 2_000_000_000, results[index], paced=paced)
                 except Exception as error:
                     errors.append(error)
             try:
@@ -489,9 +489,36 @@ class MatrixTests(unittest.TestCase):
                 inactive = results[1] if phase == 'forward' else results[0]
                 if phase != 'simultaneous':
                     self.assertEqual(sum(flow['sent'] for flow in inactive['flows']), 0)
+                if paced:
+                    written = results[0]['paced_records']['fully_written_records']
+                    received = results[1]['paced_records']
+                    self.assertGreater(written, 0)
+                    self.assertEqual(received['fully_read_records'], written)
+                    self.assertEqual(received['first_write_to_complete_read']['count'], written)
+                    self.assertLessEqual(received['first_write_to_complete_read']['p99_ms'],
+                                         received['scheduled_offer_to_complete_read']['p99_ms'])
+                    self.assertEqual(received['partial_receive_bytes'], 0)
             finally:
                 for stream in a + b:
                     stream.close()
+
+    def test_c48_slots_timestamps_and_partial_io(self):
+        clock = dict(start_ns=1000, end_ns=100_001_000)
+        writer = probe.c48.RecordFlow(7, 16, clock)
+        reader = probe.c48.RecordFlow(7, 16, clock)
+        due = writer.due_ns(0)
+        self.assertFalse(writer.offer(due - 1, probe.BLOCK))
+        record = writer.offer(due + 10, probe.BLOCK)
+        writer.accepted(7)
+        self.assertEqual(writer.offer(due + 40, probe.BLOCK), record[7:])
+        writer.accepted(505)
+        reader.receive(record[:30], due + 40)
+        reader.receive(record[30:], due + 55)
+        self.assertEqual(list(reader.delivery), [45])
+        self.assertEqual(list(reader.scheduled_delivery), [55])
+        self.assertFalse(writer.offer(clock['end_ns'], probe.BLOCK))
+        with self.assertRaises(ValueError):
+            reader.receive(record, due + 90)
 
 
 if __name__ == '__main__':

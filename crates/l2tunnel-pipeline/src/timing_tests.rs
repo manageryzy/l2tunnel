@@ -37,6 +37,7 @@ fn actual_tap_and_tun_queue_keeps_original_cap_and_refuses_invalid_timing_before
             timing.original_deadline.ok_or("explicit cap")?,
         )?;
         assert_eq!(original.timing, timing);
+        assert_eq!(pipeline.oldest_queued_at(), Some(timing.admitted));
         let queued = pipeline.usage();
         for _ in 0..3 {
             let result = pipeline.offer_front_borrowed(|metadata, bytes| {
@@ -45,6 +46,7 @@ fn actual_tap_and_tun_queue_keeps_original_cap_and_refuses_invalid_timing_before
                 Ok::<Option<()>, std::convert::Infallible>(None)
             })?;
             assert_eq!(result, None);
+            assert_eq!(pipeline.oldest_queued_at(), Some(timing.admitted));
             assert_eq!(pipeline.usage(), queued);
         }
         let handed = pipeline
@@ -55,6 +57,7 @@ fn actual_tap_and_tun_queue_keeps_original_cap_and_refuses_invalid_timing_before
             })?
             .ok_or("actual original queue handoff")?;
         assert_eq!(handed.metadata, original);
+        assert_eq!(pipeline.oldest_queued_at(), None);
         assert_eq!(pipeline.usage(), before);
         // A later flush cannot replace the packet's original cap with its flush time.
         assert_eq!(

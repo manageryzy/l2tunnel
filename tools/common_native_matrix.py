@@ -437,7 +437,7 @@ def readiness(case, binary, secrets, daemons):
         time.sleep(.1)
 
 
-def compare_probes(a, b, phase):
+def compare_probes(a, b, phase, *, paced=False):
     require(a.get('status') == b.get('status') == 'passed', 'TCP probe did not complete within original bounds')
     require(a['clock'] == b['clock'] and len(a['flows']) == len(b['flows']) == 16, 'shared clock or flow count differs')
     for endpoint in (a, b):
@@ -456,6 +456,18 @@ def compare_probes(a, b, phase):
         active = phase == 'simultaneous' or (phase == 'forward') == (direction == 'a_to_b')
         require(count > 0 if active else count == 0, 'phase sent no measured bytes or inactive direction sent data')
         result[direction] = {'receiver_unique_sample_bytes': count, 'sample_seconds': 10, 'goodput_mbit_s': count * 8 / 10_000_000}
+        if paced and active:
+            submitted, delivered = sender['paced_records'], receiver['paced_records']
+            expected = submitted['fully_written_records']
+            require(0 < expected == submitted['started_records'] <= submitted['scheduled_records']
+                    and delivered['fully_read_records'] == expected
+                    and expected * 512 == sum(row['received'] for row in receiver['flows'])
+                    and delivered['partial_receive_bytes'] == 0, 'paced application records incomplete')
+            result[direction]['paced_records'] = {
+                'scheduled': submitted['scheduled_records'], 'fully_written_and_read': expected,
+                'unsubmitted_at_offer_cutoff': submitted['scheduled_records'] - expected,
+                'first_write_to_complete_read': delivered['first_write_to_complete_read'],
+                'scheduled_offer_to_complete_read': delivered['scheduled_offer_to_complete_read']}
     return result
 
 
@@ -599,6 +611,7 @@ def disconnect_sessions(case, binary, secrets, deadline):
 
 
 def phase(case, name, binary, secrets, daemons):
+    paced = getattr(case, 'paced_c48', False)
     output = case.output / name
     output.mkdir()
     result = {'phase': name, 'status': 'running', 'cpu': [], 'status_samples': [], 'captures': {}}
@@ -623,7 +636,8 @@ def phase(case, name, binary, secrets, daemons):
         for side, role, address in [('b', 'listen', NATIVE['b']), ('a', 'connect', NATIVE['b'])]:
             child = case.spawn('endpoint_' + side, name + '-probe-' + side,
                 [sys.executable, str(probe), role, '--phase', name, '--address', address, '--port', '24451',
-                 '--deadline-ns', str(deadline_ns), '--clock', str(clock), '--result', str(output / (side + '.json'))])
+                 '--deadline-ns', str(deadline_ns), '--clock', str(clock), '--result', str(output / (side + '.json')),
+                 *(['--packed-c48-workload'] if paced else [])])
             probes.append(child)
             if role == 'listen':
                 case.wait_marker(child, 'Listening', deadline)
@@ -659,7 +673,13 @@ def phase(case, name, binary, secrets, daemons):
                 raise OutcomeError(probe_result.get('status', 'tool_failure'), 'native TCP probe ' + side + ': ' + probe_result.get('error', 'incomplete'))
         for child in probes:
             require(child['process'].returncode == 0, 'native TCP probe exit disagrees with passing result')
-        result['throughput'] = compare_probes(probe_results['a'], probe_results['b'], name)
+        result['throughput'] = compare_probes(probe_results['a'], probe_results['b'], name, paced=paced)
+        if paced:
+            result['after_application_eof'] = {}
+            for side in ('a', 'b'):
+                endpoint = status(case, binary, secrets, side, deadline)
+                result['after_application_eof'][side] = {'at_ns': time.monotonic_ns(), 'endpoint': endpoint}
+                require_ready(endpoint, case.row)
         result['status'] = 'passed'
     except Exception as error:
         result.update(status=failure_status(error), error_type=type(error).__name__, error=str(error))
@@ -682,6 +702,8 @@ def phase(case, name, binary, secrets, daemons):
                         'receiver_unique_sample_bytes': sum(flow.get('measured', 0) for flow in observed.get('flows', [])),
                         'sample_window_completed': clock is not None and observed.get('completed_ns', 0) >= clock['end_ns']}
                     sample = result['probe_results'][side]
+                    if paced:
+                        sample['paced_records'] = observed.get('paced_records')
                     complete = sample['sample_window_completed']
                     result.setdefault('throughput_observed', {})['b_to_a' if side == 'a' else 'a_to_b'] = {
                         'receiver_unique_sample_bytes': sample['receiver_unique_sample_bytes'], 'configured_sample_seconds': 10,
@@ -727,6 +749,7 @@ def run_case(row, ordinal, args, binary, inputs, secrets, state_dir):
     output = args.output / row['id']
     output.mkdir()
     case = Case(row, spec, output)
+    case.paced_c48 = getattr(args, 'packed_c48_workload', False)
     case.value['selected_phases'] = args.phases
     created = False
     try:
@@ -829,8 +852,11 @@ def main(argv=None):
     parser.add_argument('--parallel-lane', choices=('udp', 'raw', 'tls', 'quic'),
                         help='Explicit concurrent carrier lane; fixed eight-CPU affinity and distinct owned lab prefix required')
     parser.add_argument('--apply', action='store_true')
+    parser.add_argument('--packed-c48-workload', action='store_true',
+                        help='Offer 512-byte timestamped application records at aggregate 76 Mbit/s on 16 CUBIC flows')
     args = parser.parse_args(argv)
     args.phases = list(dict.fromkeys(args.phase or PHASES))
+    require(not args.packed_c48_workload or args.phases == ['forward'], 'paced C48 probe requires --phase forward')
     require(re.fullmatch('[a-z][a-z0-9-]{0,14}', args.lab_id), 'lab prefix must fit owned namespace names')
     args.manifest, args.binary, args.output = (path.absolute() for path in (args.manifest, args.binary, args.output))
     document, rows = manifest_rows(args.manifest, set(args.case))
@@ -849,6 +875,7 @@ def main(argv=None):
     plan = {'version': 1, 'status': 'planned', 'manifest': str(args.manifest), 'manifest_sha256': file_hash(args.manifest),
             'binary': str(args.binary), 'rows': rows, 'bounds': BOUNDS, 'phases': args.phases,
             'flows_per_phase': 16, 'warmup_seconds': 2, 'sample_seconds': 10,
+            'workload': 'paced 512-byte TCP application records, 76 Mbit/s aggregate' if args.packed_c48_workload else 'saturating native TCP',
             'network': {'forward_mbit_s': 100, 'reverse_mbit_s': 10, 'one_way_delay_ms': 35, 'loss_percent_each_direction': 15},
             'captures': 'each endpoint WAN and native, both directions, full packets; each surface remains separate',
             'measurement': 'application recv goodput; captured IPv4 byte totals and packet-size distributions; no p99-overhead inference',
@@ -881,7 +908,7 @@ def main(argv=None):
             binary.chmod(0o700)
             result['binary_sha256'] = file_hash(binary)
             result['runner_source_sha256'] = {str(path.relative_to(ROOT)): file_hash(path) for path in
-                [Path(__file__).resolve(), ROOT / 'tools/common_native_probe.py', ROOT / 'tools/common_native_observe.py',
+                [Path(__file__).resolve(), ROOT / 'tools/common_native_probe.py', ROOT / 'tools/common_native_c48.py', ROOT / 'tools/common_native_observe.py',
                  ROOT / 'tools/netns_lab.py', ROOT / 'tools/throughput_probe.py',
                  ROOT / 'tools/proxy_native_smoke.py', ROOT / 'tools/secure_udp_native.py', ROOT / 'tools/native_throughput.py']}
             result['binary_source_binding'] = 'binary hash observed; use the separate parent build receipt for its source revision'

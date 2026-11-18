@@ -147,6 +147,29 @@ Android operation, public ISP QoS classification, or production performance. Thi
 runner's unprivileged parser/socketpair tests are separate from real namespace
 execution, which requires its own preserved receipts.
 
+## Packed C48 native comparison
+
+Generate both descriptors using `common_benchmark_plan --output-dir NEW --packed-c48-pair`.
+Run `--case packed-c48-control-udp --case packed-c48-queue-aware-udp --phase forward
+--packed-c48-workload` on one release binary. The optional probe schedules 512-byte
+application records round-robin on 16 ordinary CUBIC TCP streams at an aggregate
+76 Mbit/s. Each record carries its sequence and monotonic first-write timestamp
+in its 512 bytes. The receiver timestamps a record when the application has read
+all its bytes. Each flow requests 128 KiB per socket send/receive buffer and
+reports the kernel's effective values. The kernel owns segmentation, congestion
+and retransmission. The original native 2-second warmup, 10-second sample and
+60-second phase cap still apply.
+
+The receipt gives one P99 from the first attempted write and a second from its
+scheduled release. Both distributions cover complete records received during
+the offer and drain. The scheduled, started, fully written and fully read counts
+expose backpressure and incomplete transfers. The ordinary payload hash, EOF,
+capture and teardown checks also apply. After passing application EOF, the runner
+queries each live endpoint for its outstanding recovery state before disconnect.
+The kernel netem draws and actual TCP hosts are independent of the simulated C48
+seed. Compare the two Rust cells under this workload and retain the scope when
+comparing them to the 90-second Python experiment.
+
 ## Saved-result reporting
 
 `common_matrix_report.py --manifest MANIFEST --results RESULTS --output NEW_DIR`

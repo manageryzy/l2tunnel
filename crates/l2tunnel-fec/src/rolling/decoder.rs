@@ -3,6 +3,7 @@ use crate::field;
 
 #[cfg(test)]
 mod expiry_detail_tests;
+mod lifetimes;
 mod transaction;
 use transaction::{Cell, Pool, Ticket};
 
@@ -304,6 +305,7 @@ pub struct Decoder {
     terminal: Option<Error>,
     expiry_failure: Option<expiry::Failure>,
     explicit: Option<explicit::DecoderState>,
+    sliding: Option<lifetimes::Sliding>,
 }
 // The outer step already paid the first metadata visit. A coefficient chunk
 // stops before the row end; the following transition keeps its separate visit.
@@ -386,6 +388,10 @@ impl Decoder {
             .join(storage::Usage::vector(&self.candidate)?)?
             .join(storage::Usage::vector(&self.history)?)?
             .join(storage::Usage::vector(&self.history_meta)?)?;
+        let usage = match &self.sliding {
+            Some(sliding) => usage.join(sliding.usage()?)?,
+            None => usage,
+        };
         match &self.explicit {
             Some(state) => usage.join(state.storage_usage()?),
             None => Ok(usage),
@@ -404,6 +410,26 @@ impl Decoder {
             explicit::DecoderState::memory_bound(config.repair_history)?,
         )
     }
+    pub(crate) fn sliding_requested_storage(
+        config: Config,
+    ) -> Result<storage::Usage, storage::Error> {
+        Self::requested_storage(config)?.join(lifetimes::Sliding::requested(config)?)
+    }
+    pub(crate) fn sliding_memory_bound(config: Config) -> Result<usize, Error> {
+        add(
+            Self::memory_bound(config)?,
+            lifetimes::Sliding::bytes(config)?,
+        )
+    }
+    pub(crate) fn new_sliding(config: Config, scope: Scope, now: Tick) -> Result<Self, Error> {
+        if Self::sliding_memory_bound(config)? > config.memory_bytes {
+            return Err(Error::Capacity);
+        }
+        let mut owner = Self::new(config, scope, now)?;
+        owner.sliding = Some(lifetimes::Sliding::new(config)?);
+        Ok(owner)
+    }
+
     pub(crate) fn new_explicit(config: Config, scope: Scope, now: Tick) -> Result<Self, Error> {
         if Self::explicit_memory_bound(config)? > config.memory_bytes {
             return Err(Error::Capacity);
@@ -485,6 +511,7 @@ impl Decoder {
             terminal: None,
             expiry_failure: None,
             explicit: None,
+            sliding: None,
         })
     }
     fn time(&mut self, now: Tick) -> Result<(), Error> {
@@ -558,7 +585,16 @@ impl Decoder {
             });
             return self.fail(Error::Expired);
         }
-        Ok((job_end, debt))
+        // Sliding windows retain the original cap only for newly evidenced IDs.
+        // Existing IDs already have their own cap. A job still observes both.
+        Ok((
+            job_end,
+            if self.sliding.is_some() {
+                Some(debt_end)
+            } else {
+                debt
+            },
+        ))
     }
     fn stage(
         &mut self,
@@ -1592,6 +1628,10 @@ impl Decoder {
                 }
             }
             Phase::Commit => {
+                let observed_at = (self.shadow.observed > self.live.observed)
+                    .then_some(job.debt)
+                    .flatten();
+                let published_at = self.publication_deadline(self.shadow.prefix, now)?;
                 let delivery = if self.shadow.prefix > self.handoff {
                     Some(match self.delivery {
                         Some(value) => value,
@@ -1621,11 +1661,26 @@ impl Decoder {
                     None
                 };
                 self.delivery = delivery;
+                self.refresh_sliding(observed_at, published_at);
                 return Ok(Action::Accepted);
             }
         }
         Ok(Action::Continue)
     }
+    fn publication_deadline(&mut self, new_prefix: u32, now: Tick) -> Result<Option<Tick>, Error> {
+        if self.sliding.is_some() && new_prefix > self.live.prefix {
+            return self.expires(now, self.config.handoff_ticks).map(Some);
+        }
+        Ok(None)
+    }
+
+    fn refresh_sliding(&mut self, observed_at: Option<Tick>, published_at: Option<Tick>) {
+        if let Some(sliding) = &mut self.sliding {
+            (self.debt, self.delivery) =
+                sliding.refresh(self.live, self.handoff, observed_at, published_at);
+        }
+    }
+
     /// Advance only within supplied copy, field and metadata budgets.
     /// Upper handoff can continue during a job; publication obeys its separate bound.
     pub fn step(&mut self, now: Tick, mut budget: WorkBudget) -> Result<DecodeStep, Error> {
@@ -1652,6 +1707,10 @@ impl Decoder {
             }
             if self.live.prefix == self.live.observed {
                 self.debt = None;
+            }
+            if old < self.live.prefix && self.sliding.is_some() {
+                let published_at = self.expires(now, self.config.handoff_ticks)?;
+                self.refresh_sliding(None, Some(published_at));
             }
             return if old == self.live.prefix {
                 Ok(DecodeStep::Idle(used(before, budget)))
@@ -1729,6 +1788,7 @@ impl Decoder {
         if id.0 != self.handoff || self.pending_source().is_none() {
             return Err(Error::Identity);
         }
+        let old_prefix = self.live.prefix;
         self.handoff = self.handoff.checked_add(1).ok_or(Error::Exhausted)?;
         // A pending job owns a snapshot of prefix metadata; only its separate
         // handoff watermark may change until the bank is atomically committed.
@@ -1747,9 +1807,15 @@ impl Decoder {
         {
             self.delivery = None;
         }
+        let published_at = if self.sliding.is_some() && self.live.prefix > old_prefix {
+            Some(self.expires(now, self.config.handoff_ticks)?)
+        } else {
+            None
+        };
+        self.refresh_sliding(None, published_at);
         Ok(())
     }
-    /// Original ordered-handoff cohort cap, without renewing it for a new source.
+    /// Earliest retained original ordered handoff deadline.
     pub const fn handoff_deadline(&self) -> Option<Tick> {
         self.delivery
     }

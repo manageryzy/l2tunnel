@@ -272,3 +272,6 @@ fn actual_common_silent_tail_rearms_native_after_bounded_short_preview() -> Resu
 
 #[path = "transport_common_rolling_ingress_tests.rs"]
 mod wire_ingress;
+
+#[path = "transport_common_targeted_tests.rs"]
+mod targeted;

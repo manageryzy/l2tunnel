@@ -41,6 +41,9 @@ pub struct Encoder {
     job: Option<Job>,
     last: Tick,
     debt: Option<Tick>,
+    // Only the continuously sliding scheduler tracks the original cap of each
+    // admitted source. Standalone/cohort owners retain their existing policy.
+    source_deadlines: Vec<Tick>,
     terminal: Option<Error>,
     expiry_failure: Option<expiry::Failure>,
     explicit: Option<explicit::Row>,
@@ -56,7 +59,8 @@ impl Encoder {
     pub(crate) fn storage_usage(&self) -> Result<storage::Usage, storage::Error> {
         let usage = storage::Usage::vector(&self.vectors)?
             .join(storage::Usage::vector(&self.ids)?)?
-            .join(storage::Usage::vector(&self.output)?)?;
+            .join(storage::Usage::vector(&self.output)?)?
+            .join(storage::Usage::vector(&self.source_deadlines)?)?;
         match &self.explicit {
             Some(row) => usage.join(row.storage_usage()?),
             None => Ok(usage),
@@ -112,10 +116,25 @@ impl Encoder {
             job: None,
             last: now,
             debt: None,
+            source_deadlines: Vec::new(),
             terminal: None,
             expiry_failure: None,
             explicit: None,
         })
+    }
+    pub(crate) fn sliding_memory_bound(config: Config) -> Result<usize, Error> {
+        add(
+            Self::memory_bound(config)?,
+            mul(config.window, std::mem::size_of::<Tick>())?,
+        )
+    }
+    pub(crate) fn new_sliding(config: Config, scope: Scope, now: Tick) -> Result<Self, Error> {
+        if Self::sliding_memory_bound(config)? > config.memory_bytes {
+            return Err(Error::Capacity);
+        }
+        let mut owner = Self::new(config, scope, now)?;
+        owner.source_deadlines = slots(config.window, Tick(0))?;
+        Ok(owner)
     }
     fn time(&mut self, now: Tick) -> Result<(), Error> {
         if self.terminal.is_some() {
@@ -185,11 +204,6 @@ impl Encoder {
             return Err(Error::Capacity);
         }
         let end = self.next.checked_add(1).ok_or(Error::Exhausted)?;
-        let debt = if self.debt.is_none() {
-            Some(self.expires(now, self.config.debt_ticks)?)
-        } else {
-            self.debt
-        };
         let index = self.next as usize % self.config.window;
         if let Some(old) = self.ids[index]
             && (old >= self.confirmed
@@ -201,6 +215,13 @@ impl Encoder {
         {
             return Err(Error::Capacity);
         }
+        if self.debt.is_none() || !self.source_deadlines.is_empty() {
+            let expires = self.expires(now, self.config.debt_ticks)?;
+            if let Some(slot) = self.source_deadlines.get_mut(index) {
+                *slot = expires;
+            }
+            self.debt.get_or_insert(expires);
+        }
         let vector = &mut self.vectors[index * self.width..(index + 1) * self.width];
         vector.fill(0);
         vector[..2].copy_from_slice(&(original.len() as u16).to_be_bytes());
@@ -208,7 +229,6 @@ impl Encoder {
         let id = SourceId(self.next);
         self.ids[index] = Some(self.next);
         self.next = end;
-        self.debt = debt;
         Ok(id)
     }
     /// Borrow an exact original retained source for systematic transmission.
@@ -230,11 +250,26 @@ impl Encoder {
             return Err(Error::Identity);
         }
         self.time(now)?;
-        self.confirmed = self.confirmed.max(prefix);
-        if self.confirmed == self.next {
+        if prefix <= self.confirmed {
+            return Ok(());
+        }
+        self.confirmed = prefix;
+        if prefix == self.next {
             self.debt = None;
+        } else if let Some(&original) = self
+            .source_deadlines
+            .get(prefix as usize % self.config.window)
+        {
+            self.debt = Some(original);
         }
         Ok(())
+    }
+    pub(super) fn next_regular(&self) -> Result<(RepairId, Support), Error> {
+        if self.next_repair == u64::MAX {
+            return Err(Error::Exhausted);
+        }
+        let id = RepairId(self.next_repair);
+        Ok((id, self.config.support(self.next, id, false)?))
     }
     /// Begin the next owned regular/tail equation. A failed call consumes no ID.
     pub fn begin_repair(&mut self, tail: bool, now: Tick) -> Result<RepairId, Error> {

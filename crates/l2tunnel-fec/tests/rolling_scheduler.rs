@@ -151,7 +151,7 @@ fn full_wire_two_owners_recover_eight_windows_with_data_repair_and_feedback_loss
                                 bytes.len(),
                                 match source_wire {
                                     SourceWire::Padded => full,
-                                    SourceWire::Exact =>
+                                    SourceWire::Exact | SourceWire::TargetedExact =>
                                         rolling::wire::HEADER_BYTES + 2 + original.len(),
                                 }
                             );

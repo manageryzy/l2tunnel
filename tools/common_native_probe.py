@@ -18,13 +18,19 @@ import socket
 import time
 
 try:
+    from . import common_native_c48 as c48
     from .throughput_probe import tcp_info
 except ImportError:
+    import common_native_c48 as c48
     from throughput_probe import tcp_info
 
 FLOWS = 16
 MAX_BYTES = 32 * 1024 * 1024
 BLOCK = random.Random(0x12AA2026).randbytes(65536)
+
+
+class ProbeStopped(Exception):
+    """A requested stop must propagate through selectors that catch InterruptedError."""
 
 
 def write_json(path, value):
@@ -81,12 +87,13 @@ def identify_stream(stream, expected, seen, deadline_ns):
     return observed
 
 
-def transfer(streams, sending, clock, deadline_ns, result):
+def transfer(streams, sending, clock, deadline_ns, result, *, paced=False):
     states = [dict(flow_id=index, sent=0, received=0, warmup=0, measured=0, postwindow=0,
                    write_closed=False, eof=False, bound_exhausted=False,
                    send_hash=hashlib.sha256(), receive_hash=hashlib.sha256()) for index, _ in enumerate(streams)]
     result['clock'], result['samples'] = clock, []
     start, measured, end = (clock[key] for key in ('start_ns', 'measure_start_ns', 'end_ns'))
+    records = [c48.RecordFlow(i, len(streams), clock) for i in range(len(streams))] if paced else []
     next_sample = start
     with selectors.DefaultSelector() as poll:
         for index, stream in enumerate(streams):
@@ -107,7 +114,8 @@ def transfer(streams, sending, clock, deadline_ns, result):
                         'flows': [tcp_info(stream) for stream in streams]})
                     next_sample = now + 500_000_000
                 for index, (stream, state) in enumerate(zip(streams, states)):
-                    if not state['write_closed'] and (now >= end or state['sent'] == MAX_BYTES):
+                    unfinished = paced and records[index].pending
+                    if not state['write_closed'] and ((now >= end and not unfinished) or state['sent'] == MAX_BYTES):
                         state['bound_exhausted'] = state['sent'] == MAX_BYTES and now < end
                         stream.shutdown(socket.SHUT_WR)
                         state['write_closed'] = True
@@ -116,6 +124,12 @@ def transfer(streams, sending, clock, deadline_ns, result):
                                 poll.unregister(stream)
                         else:
                             poll.modify(stream, selectors.EVENT_READ, index)
+                # In the one-way paced workload the forward sender has no
+                # application payload to read while waiting for its next slot.
+                if paced and sending and now < end:
+                    next_due = min(flow.due_ns(flow.outgoing) for flow in records)
+                    if now < next_due:
+                        time.sleep((min(next_due, end) - now) / 1e9)
                 for key, events in poll.select(min(.01, (deadline_ns - now) / 1e9)):
                     stream, state = key.fileobj, states[key.data]
                     if events & selectors.EVENT_READ and not state['eof']:
@@ -137,20 +151,34 @@ def transfer(streams, sending, clock, deadline_ns, result):
                             if state['received'] > MAX_BYTES:
                                 raise ValueError('peer exceeded original per-flow byte cap')
                             state['receive_hash'].update(chunk)
+                            if paced:
+                                records[key.data].receive(chunk, at)
                             bucket = 'warmup' if at < measured else 'measured' if at < end else 'postwindow'
                             state[bucket] += len(chunk)
-                    if sending and events & selectors.EVENT_WRITE and not state['write_closed'] and time.monotonic_ns() < end:
-                        offset = state['sent'] % len(BLOCK)
-                        chunk = BLOCK[offset:offset + min(len(BLOCK) - offset, MAX_BYTES - state['sent'])]
+                    if sending and events & selectors.EVENT_WRITE and not state['write_closed']:
+                        at = time.monotonic_ns()
+                        if paced:
+                            chunk = records[key.data].offer(at, BLOCK)
+                            if not chunk:
+                                continue
+                        else:
+                            if at >= end:
+                                continue
+                            offset = state['sent'] % len(BLOCK)
+                            chunk = BLOCK[offset:offset + min(len(BLOCK) - offset, MAX_BYTES - state['sent'])]
                         try:
                             count = stream.send(chunk)
                         except BlockingIOError:
                             count = 0
                         state['send_hash'].update(chunk[:count])
                         state['sent'] += count
+                        if paced:
+                            records[key.data].accepted(count)
         finally:
             result['flows'] = public_flows(states)
             result['completed_ns'] = time.monotonic_ns()
+            if paced:
+                result['paced_records'] = c48.measurements(records, sending)
 
 
 def run(args):
@@ -182,10 +210,21 @@ def run(args):
                 stream.settimeout(remaining)
                 stream.connect((args.address, args.port))
             stream.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            if args.packed_c48_workload:
+                stream.setsockopt(socket.IPPROTO_TCP, socket.TCP_CONGESTION, b'cubic')
+                # Linux doubles SO_SNDBUF/SO_RCVBUF for its bookkeeping. Report
+                # the actual values; these socket limits do not set kernel cwnd.
+                for key in (socket.SO_SNDBUF, socket.SO_RCVBUF):
+                    stream.setsockopt(socket.SOL_SOCKET, key, 128 * 1024)
             identity = identify_stream(stream, None if listener else index, seen, deadline)
             ordered[identity] = stream
-            result['flow_identity']['connections'].append({'flow_id': identity,
-                'local': stream.getsockname(), 'peer': stream.getpeername()})
+            connection = {'flow_id': identity, 'local': stream.getsockname(), 'peer': stream.getpeername()}
+            if args.packed_c48_workload:
+                connection.update(send_buffer_bytes=stream.getsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF),
+                                  receive_buffer_bytes=stream.getsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF),
+                                  tcp_congestion=stream.getsockopt(socket.IPPROTO_TCP, socket.TCP_CONGESTION, 16)
+                                                       .rstrip(b'\x00').decode('ascii'))
+            result['flow_identity']['connections'].append(connection)
         if any(stream is None for stream in ordered):
             raise ValueError('incomplete flow identity set')
         streams = ordered
@@ -204,11 +243,12 @@ def run(args):
         if not time.monotonic_ns() < start < measured < end < deadline or measured - start != 2_000_000_000 or end - measured != 10_000_000_000:
             raise ValueError('late or changed 2s warmup/10s sample clock')
         sending = args.phase == 'simultaneous' or (args.phase == 'forward') == (args.role == 'connect')
-        transfer(streams, sending, clock, deadline, result)
+        transfer(streams, sending, clock, deadline, result, paced=args.packed_c48_workload)
         result['status'] = 'bound_exhausted' if any(row['bound_exhausted'] for row in result['flows']) else 'passed'
     except Exception as error:
         result.update(status='bound_exhausted' if isinstance(error, TimeoutError) else 'failed',
-                      error_type=type(error).__name__, error=str(error))
+                      error_type='InterruptedError' if isinstance(error, ProbeStopped) else type(error).__name__,
+                      error=str(error))
     finally:
         for stream in streams:
             stream.close()
@@ -228,7 +268,10 @@ def main():
     parser.add_argument('--deadline-ns', type=int, required=True)
     parser.add_argument('--clock', type=Path, required=True)
     parser.add_argument('--result', type=Path, required=True)
+    parser.add_argument('--packed-c48-workload', action='store_true')
     args = parser.parse_args()
+    if args.packed_c48_workload and args.phase != 'forward':
+        parser.error('C48 workload requires the one-way forward phase')
     if not 1024 <= args.port <= 65535 or not time.monotonic_ns() < args.deadline_ns <= time.monotonic_ns() + 60_000_000_000:
         parser.error('port or original maximum60s workload deadline outside bound')
     if args.result.exists() or args.result.is_symlink():
@@ -236,7 +279,7 @@ def main():
     def interrupted(signum, _frame):
         # Preserve the existing deadline and publish partial counters from the
         # transfer/run finally blocks before the parent's bounded cleanup ends.
-        raise InterruptedError(f'probe interrupted by signal {signum}')
+        raise ProbeStopped(f'probe interrupted by signal {signum}')
     signal.signal(signal.SIGTERM, interrupted)
     return run(args)
 

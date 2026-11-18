@@ -92,16 +92,36 @@ pub struct SenderStatus {
     /// Original wrapper failure, if any.
     pub terminal: Option<Error>,
 }
+/// Unique local physical-handoff witness for a retained-original retransmission.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RetryToken {
+    id: SourceId,
+    serial: u64,
+    prepared: Tick,
+}
 #[derive(Clone, Copy)]
 enum Pending {
     Source(SourceId),
-    Repair { id: RepairId, tail: bool },
+    Retry {
+        id: SourceId,
+        full_credit: Option<bool>,
+    },
+    Repair {
+        id: RepairId,
+        tail: bool,
+    },
 }
 /// One pure sender: a real encoder, exact repair credit and one immutable output.
 pub struct Sender {
     policy: Policy,
     scope: Scope,
     encoder: Encoder,
+    retry_queue: targeted::Queues,
+    mux_age_micros: u64,
+    full_credit: bool,
+    requested_prefix: u32,
+    retry_serial: u64,
+    retry_token: Option<RetryToken>,
     pending: Option<Pending>,
     output_end: Option<Tick>,
     source_copy: Option<SourceCopy>,
@@ -134,14 +154,19 @@ impl Sender {
     /// Observe actual retained nested capacities, excluding the inline owner header.
     /// This observation is also available for the unchanged compatibility constructor.
     pub fn storage_usage(&self) -> Result<storage::Usage, storage::Error> {
-        self.encoder.storage_usage()
+        self.encoder
+            .storage_usage()?
+            .join(self.retry_queue.usage()?)
     }
 
     /// Conservative total retained reservation, excluding caller buffers/allocator overhead.
     pub fn memory_bound(policy: Policy) -> Result<usize, Error> {
         policy.validate()?;
         add(
-            Encoder::memory_bound(policy.recovery)?,
+            add(
+                Encoder::sliding_memory_bound(policy.recovery)?,
+                targeted::Queues::bytes(policy)?,
+            )?,
             std::mem::size_of::<Self>(),
         )
     }
@@ -152,7 +177,13 @@ impl Sender {
         }
         deadline(now, policy.tail_ticks)?;
         Ok(Self {
-            encoder: Encoder::new(policy.recovery, scope, now)?,
+            encoder: Encoder::new_sliding(policy.recovery, scope, now)?,
+            retry_queue: targeted::Queues::new(policy)?,
+            mux_age_micros: 0,
+            full_credit: false,
+            requested_prefix: 0,
+            retry_serial: 0,
+            retry_token: None,
             policy,
             scope,
             pending: None,
@@ -213,13 +244,18 @@ impl Sender {
         self.time(now)?;
         if self.pending.is_some()
             || self.regular_due != 0
-            || self.tail_remaining != 0
-            || self.tail_due.is_some_and(|due| now >= due)
+            || self.retry_queue.has_retries()
+            || (!self.policy.source_wire.is_targeted()
+                && (self.tail_remaining != 0 || self.tail_due.is_some_and(|due| now >= due)))
         {
             return Err(Error::Busy);
         }
         let end = self.later(now, self.policy.recovery.job_ticks)?;
         let id = self.encoder.admit_source(original, now)?;
+        if self.policy.source_wire.is_targeted() {
+            self.tail_remaining = 0;
+            self.tail_due = None;
+        }
         self.pending = Some(Pending::Source(id));
         self.source_copy = Some(SourceCopy {
             source: id,
@@ -231,12 +267,30 @@ impl Sender {
         Ok(id)
     }
     /// Advance at most one bounded repair job. All-zero work cannot start a job.
-    pub fn step(&mut self, now: Tick, mut budget: WorkBudget) -> Result<WorkUsed, Error> {
+    pub fn step(&mut self, now: Tick, budget: WorkBudget) -> Result<WorkUsed, Error> {
+        self.step_with_regular_filter(now, budget, |_, _| Ok(false))
+    }
+    /// An opt-in targeted sender may displace an earned regular opportunity with
+    /// already accepted retry bytes. A displaced opportunity starts no equation
+    /// and consumes no repair serial, output reservation or source custody.
+    pub fn step_with_regular_filter(
+        &mut self,
+        now: Tick,
+        mut budget: WorkBudget,
+        mut displace: impl FnMut(RepairId, Support) -> Result<bool, Error>,
+    ) -> Result<WorkUsed, Error> {
         budget.validate()?;
         self.time(now)?;
         let before = budget;
         if self.pending.is_none() && spend(&mut budget.metadata) {
             let state = self.encoder.status();
+            if let Some((id, full_credit)) = self
+                .retry_queue
+                .next_retry(state.confirmed_prefix, &mut budget)
+            {
+                self.queue_retry(id, Some(full_credit), now)?;
+                return Ok(used(before, budget));
+            }
             if state.confirmed_prefix == state.next_source {
                 self.regular_due = 0;
                 self.tail_remaining = 0;
@@ -246,10 +300,21 @@ impl Sender {
                     && self.tail_remaining == 0
                     && self.tail_due.is_some_and(|due| now >= due)
                 {
+                    if self.policy.source_wire.is_targeted() {
+                        self.queue_retry(SourceId(state.confirmed_prefix), None, now)?;
+                        return Ok(used(before, budget));
+                    }
                     self.tail_remaining = self.feedback.map_or(1, |f| f.deficit.max(1));
                 }
                 let tail = self.regular_due == 0;
                 if !tail || self.tail_remaining != 0 {
+                    if !tail && self.policy.source_wire.is_targeted() {
+                        let (id, support) = self.encoder.next_regular()?;
+                        if displace(id, support)? {
+                            self.regular_due -= 1;
+                            return Ok(used(before, budget));
+                        }
+                    }
                     let end = self.later(now, self.policy.recovery.job_ticks)?;
                     let id = self.encoder.begin_repair(tail, now)?;
                     if !tail {
@@ -266,13 +331,79 @@ impl Sender {
         }
         Ok(used(before, budget))
     }
+    fn queue_retry(
+        &mut self,
+        id: SourceId,
+        full_credit: Option<bool>,
+        now: Tick,
+    ) -> Result<(), Error> {
+        if self.encoder.source(id).is_none() {
+            return Err(Error::Identity);
+        }
+        self.output_end = Some(self.later(now, self.policy.recovery.job_ticks)?);
+        self.retry_serial = self.retry_serial.checked_add(1).ok_or(Error::Exhausted)?;
+        self.retry_token = Some(RetryToken {
+            id,
+            serial: self.retry_serial,
+            prepared: now,
+        });
+        self.pending = Some(Pending::Retry { id, full_credit });
+        Ok(())
+    }
+    /// Read the immutable witness for one exact retry, retained across local backpressure.
+    pub fn pending_retry_token(&self) -> Option<RetryToken> {
+        self.retry_token
+    }
+    /// Consume this retry once after the actual complete physical handoff.
+    pub fn confirm_retry(
+        &mut self,
+        token: RetryToken,
+        accepted: Tick,
+        observed: Tick,
+    ) -> Result<(), Error> {
+        if self.retry_token != Some(token) {
+            return Err(Error::Identity);
+        }
+        if token.prepared > accepted || accepted > observed {
+            return self.fail(Error::TimeRegression);
+        }
+        self.time(observed)?;
+        self.finish_output(OutputId::Source(token.id), observed, accepted)
+    }
+    /// Only a named retry earns shared repair credit at complete physical acceptance.
+    pub fn pending_requested_retry(&self) -> bool {
+        self.pending_requested_credit().is_some()
+    }
+    /// Tier bound to the request that scheduled this retained original.
+    /// None denotes an ordinary output or a quiet probe.
+    pub fn pending_requested_credit(&self) -> Option<bool> {
+        match self.pending {
+            Some(Pending::Retry { full_credit, .. }) => full_credit,
+            _ => None,
+        }
+    }
+    /// Age of the oldest local unadmitted frame when processing authenticated feedback.
+    pub fn observe_mux_wait_micros(&mut self, age: u64) {
+        self.mux_age_micros = age;
+    }
+    /// At least one received request awaits inspection under the next work budget.
+    pub fn requested_retry_waiting(&self) -> bool {
+        self.retry_queue.has_retries()
+    }
+    fn idle_ticks(&self) -> u64 {
+        if self.policy.source_wire.is_targeted() {
+            targeted::PROBE
+        } else {
+            self.policy.tail_ticks
+        }
+    }
     /// Borrow the exact current immutable complete output. Polling changes nothing.
     pub fn pending_output(&self) -> Option<Output<'_>> {
         if self.terminal.is_some() {
             return None;
         }
         match self.pending? {
-            Pending::Source(id) => Some(Output::Source {
+            Pending::Source(id) | Pending::Retry { id, .. } => Some(Output::Source {
                 scope: self.scope,
                 id,
                 original: self.encoder.source(id)?,
@@ -333,7 +464,7 @@ impl Sender {
     /// Confirm an ordinary one-copy source or repair. Explicit repeated-source
     /// groups require their ordinal-bearing witness and cannot use this method.
     pub fn confirm_output(&mut self, id: OutputId, now: Tick) -> Result<(), Error> {
-        if self.source_copy.is_some_and(|copy| copy.total != 1) {
+        if self.retry_token.is_some() || self.source_copy.is_some_and(|copy| copy.total != 1) {
             return Err(Error::Identity);
         }
         self.time(now)?;
@@ -379,7 +510,7 @@ impl Sender {
         match self.pending.ok_or(Error::Busy)? {
             Pending::Source(source) => {
                 let tail_due =
-                    deadline(accepted, self.policy.tail_ticks).or_else(|error| self.fail(error))?;
+                    deadline(accepted, self.idle_ticks()).or_else(|error| self.fail(error))?;
                 self.sent = source.0.checked_add(1).ok_or(Error::Exhausted)?;
                 let earned = self.credit + self.policy.repair_numerator;
                 self.regular_due += earned / self.policy.repair_denominator;
@@ -390,12 +521,27 @@ impl Sender {
                 // Remaining physical copies pinned the exact encoder payload;
                 // applying the retained real prefix now cannot invent receipt.
                 if let Some(feedback) = self.feedback {
-                    self.encoder.confirm_prefix(feedback.prefix, now)?;
+                    self.encoder
+                        .confirm_prefix(feedback.prefix.max(self.requested_prefix), now)?;
                     if feedback.prefix == self.encoder.status().next_source {
                         self.regular_due = 0;
                         self.tail_remaining = 0;
                         self.tail_due = None;
                     }
+                }
+            }
+            Pending::Retry { full_credit, .. } => {
+                self.retry_token = None;
+                if full_credit.is_none() {
+                    self.tail_due = Some(self.later(accepted, targeted::PROBE)?);
+                }
+                let prefix = self
+                    .requested_prefix
+                    .max(self.feedback.map_or(0, |f| f.prefix));
+                self.encoder
+                    .confirm_prefix(prefix.max(self.encoder.status().confirmed_prefix), now)?;
+                if self.encoder.status().confirmed_prefix == self.sent {
+                    self.tail_due = None;
                 }
             }
             Pending::Repair { id, tail } => {
@@ -460,6 +606,7 @@ impl Sender {
         let released = self
             .source_copy
             .map_or(feedback.prefix, |copy| feedback.prefix.min(copy.source.0));
+        let released = self.pin_retry(released);
         self.encoder.confirm_prefix(released, now)?;
         self.feedback = Some(feedback);
         if released == self.encoder.status().next_source {
@@ -469,12 +616,73 @@ impl Sender {
         }
         Ok(FeedbackDisposition::Applied)
     }
+    fn pin_retry(&self, prefix: u32) -> u32 {
+        match self.pending {
+            Some(Pending::Retry { id, .. }) => prefix.min(id.0),
+            _ => prefix,
+        }
+    }
+    /// Admit authenticated, observed source requests while retaining older unconfirmed bytes.
+    pub fn receive_request(
+        &mut self,
+        request: GapRequest,
+        now: Tick,
+    ) -> Result<FeedbackDisposition, Error> {
+        if !self.policy.source_wire.is_targeted() {
+            return Err(Error::Format);
+        }
+        request.validate(self.policy.recovery)?;
+        if request.scope != self.scope {
+            return Err(Error::Scope);
+        }
+        let last = request.start + (31 - request.mask.leading_zeros());
+        if last >= self.sent {
+            return Err(Error::Identity);
+        }
+        self.time(now)?;
+        self.requested_prefix = self.requested_prefix.max(request.prefix);
+        let mut release = self
+            .requested_prefix
+            .max(self.encoder.status().confirmed_prefix);
+        if let Some(copy) = self.source_copy {
+            release = release.min(copy.source.0);
+        }
+        self.encoder.confirm_prefix(self.pin_retry(release), now)?;
+        let base = self
+            .encoder
+            .status()
+            .confirmed_prefix
+            .max(self.requested_prefix);
+        let mut mask = request.mask;
+        while mask != 0 {
+            let id = request.start + mask.trailing_zeros();
+            if id >= base {
+                let full_credit = match self.mux_age_micros {
+                    0..=5_000 => false,
+                    15_000.. => true,
+                    _ => self.full_credit,
+                };
+                if self
+                    .retry_queue
+                    .enqueue_retry(id, request.id.0, full_credit)
+                {
+                    self.full_credit = full_credit;
+                }
+            }
+            mask &= mask - 1;
+        }
+        Ok(FeedbackDisposition::Applied)
+    }
     /// Parse structurally, then apply under the same mandatory caller authentication boundary.
     pub fn receive_feedback_wire(
         &mut self,
         bytes: &[u8],
         now: Tick,
     ) -> Result<FeedbackDisposition, Error> {
+        if bytes.get(5) == Some(&5) {
+            return self
+                .receive_request(GapRequest::decode_full(self.policy.recovery, bytes)?, now);
+        }
         self.receive_feedback(decode_feedback(self.policy.recovery, bytes)?, now)
     }
     /// Read original outer and nested lifetimes without advancing service.
@@ -482,7 +690,7 @@ impl Sender {
         use expiry::{Deadline, Identity, Kind};
         let mut snapshot = self.encoder.expiry_snapshot();
         let identity = self.pending.map(|pending| match pending {
-            Pending::Source(id) => Identity::Sources {
+            Pending::Source(id) | Pending::Retry { id, .. } => Identity::Sources {
                 first: id.0,
                 end: id.0 + 1,
             },

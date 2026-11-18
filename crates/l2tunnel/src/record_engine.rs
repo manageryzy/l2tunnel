@@ -828,6 +828,9 @@ impl Engine {
         if body.is_empty() || body.len() > self.receive_max {
             return self.fail(Error::PacketSize);
         }
+        if kind == EmissionKind::Feedback {
+            self.observe_recovery_queue(now)?;
+        }
         let result = if matches!(&self.owner, Owner::Connections(_))
             && kind == EmissionKind::UnreliableNative
         {
@@ -862,6 +865,23 @@ impl Engine {
         }
     }
 
+    fn observe_recovery_queue(&mut self, now: Tick) -> Result<(), Error> {
+        if let Owner::Rolling(endpoint) = &mut self.owner
+            && endpoint.uses_targeted_sender()
+        {
+            let age = self
+                .pipeline
+                .oldest_queued_at()
+                .map(|at| duration(now).checked_sub(at).ok_or(Error::Time))
+                .transpose()?
+                .unwrap_or_default();
+            endpoint.observe_mux_wait_micros(
+                u64::try_from(age.as_micros()).map_err(|_| Error::Arithmetic)?,
+            );
+        }
+        Ok(())
+    }
+
     /// Actual selected research owner status; absent for every other family.
     /// These committed local observations grant no peer authentication or drain authority.
     pub fn research_status(
@@ -874,6 +894,14 @@ impl Engine {
             Owner::Research(endpoint) => {
                 Some((endpoint.sender_status(), endpoint.receiver_status()))
             }
+            _ => None,
+        }
+    }
+
+    /// Counters of the local sending direction's selected repair budget.
+    pub fn rolling_repair_budget(&self) -> Option<rolling_records::RepairBudgetStatus> {
+        match &self.owner {
+            Owner::Rolling(endpoint) => endpoint.repair_budget_status(),
             _ => None,
         }
     }

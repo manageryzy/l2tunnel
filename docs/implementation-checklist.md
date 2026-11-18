@@ -1065,6 +1065,13 @@ The same study includes the ranked baseline originals and a sender policy
 that adjusts the byte budget using local MUX queue age in each direction.
 Matched kernel validation and the existing named runtime acceptance gates remain open.
 
+TEST-12 and PBA-03/06 also track the
+[Rust Packed/Rolling C48 candidate](modules/frame-channel-experiment.md#rust-implementation-of-the-c48-candidate).
+The authenticated selected Common engine implements named retries, bounded
+old-gap custody, independent channel release and MUX-age-based repair accounting.
+Protocol tests and a two-peer UDP failure-injection test cover these mechanisms.
+The exact-source control remains selectable for matched native measurements.
+
 ## Per-mode parity implementation gates
 
 Each P-* gate means the named algorithm/codec/workload adapter is implemented and

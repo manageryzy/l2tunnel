@@ -44,8 +44,8 @@ fn exact_plans_observe_all_real_buffers_and_refuse_one_short() -> TestResult {
     let receiver = Plan::for_receiver(policy)?;
     assert_eq!(sender.policy(), policy);
     assert_eq!(receiver.policy(), policy);
-    assert_eq!(sender.allocations(), 3);
-    assert_eq!(receiver.allocations(), 13);
+    assert_eq!(sender.allocations(), 4);
+    assert_eq!(receiver.allocations(), 15);
     for plan in [sender, receiver] {
         let limits = Limits {
             capacity_bytes: plan.capacity_bytes() - 1,

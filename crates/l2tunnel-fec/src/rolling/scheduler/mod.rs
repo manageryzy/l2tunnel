@@ -7,9 +7,13 @@ use super::*;
 mod feedback;
 mod receiver;
 mod sender;
+pub(in crate::rolling) mod targeted;
 pub use feedback::{FEEDBACK_BYTES, Feedback, FeedbackId, decode_feedback, encode_feedback};
 pub use receiver::{Receiver, ReceiverStatus, ReceiverStep};
-pub use sender::{FeedbackDisposition, Output, OutputId, Sender, SenderStatus, SourceCopy};
+pub use sender::{
+    FeedbackDisposition, Output, OutputId, RetryToken, Sender, SenderStatus, SourceCopy,
+};
+pub use targeted::GapRequest;
 
 /// Explicit scheduling and total owner reservation, with no inferred link properties.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -57,3 +61,6 @@ fn remaining(before: WorkBudget, consumed: WorkUsed) -> WorkBudget {
         metadata: before.metadata - consumed.metadata,
     }
 }
+
+#[cfg(test)]
+mod targeted_tests;

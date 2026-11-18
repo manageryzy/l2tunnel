@@ -1,6 +1,6 @@
 //! Context-free selected rolling union; outer admission supplies the full scope.
 use super::*;
-use crate::rolling::scheduler::{Feedback, FeedbackId, Output};
+use crate::rolling::scheduler::{Feedback, FeedbackId, GapRequest, Output};
 
 /// Selected source/repair/strong-feedback body under an established context.
 #[derive(Clone, Copy, Debug)]
@@ -9,6 +9,8 @@ pub enum View<'a> {
     Data(super::View<'a>),
     /// Strongly authenticated retiring feedback, never a short-check data arm.
     Feedback(Feedback),
+    /// Explicit named-source request under the negotiated targeted policy.
+    Gap(GapRequest),
 }
 /// Worst-case complete selected data union, before enclosing protection.
 pub fn maximum_data_bytes(config: Config) -> Result<usize, Error> {
@@ -31,9 +33,17 @@ pub fn data_len(output: Output<'_>) -> Result<usize, Error> {
             if repair.id.0 == u64::MAX {
                 return Err(Error::Identity);
             }
-            Ok(1 + len(repair.id.0) + len(u64::from(repair.support.end)) + repair.bytes.len())
+            repair_len(repair.id, repair.support.end, repair.bytes.len())
         }
     }
+}
+/// Exact selected regular/tail body length from the frozen support end,
+/// transmitted serial and true coded extent (including the coded length word).
+pub fn repair_len(id: RepairId, end: u32, extent: usize) -> Result<usize, Error> {
+    if id.0 == 0 || id.0 == u64::MAX || end == 0 || !(3..=MAX_PAYLOAD + 2).contains(&extent) {
+        return Err(Error::Length);
+    }
+    Ok(1 + len(id.0) + len(u64::from(end)) + extent)
 }
 /// Serialize actual fields once; exact source bytes have no zero tail or duplicate length.
 pub fn encode_data(value: Output<'_>, output: &mut [u8]) -> Result<usize, Error> {
@@ -88,6 +98,29 @@ pub fn encode_feedback(feedback: Feedback, output: &mut [u8]) -> Result<usize, E
     }
     Ok(required)
 }
+/// Exact length of an authenticated named-source request.
+pub fn gap_len(request: GapRequest) -> usize {
+    5 + len(request.id.0) + len(u64::from(request.prefix)) + len(u64::from(request.start))
+}
+/// Encode the immutable requested span. The outer carrier authenticates the scope.
+pub fn encode_gap(config: Config, request: GapRequest, output: &mut [u8]) -> Result<usize, Error> {
+    request.validate(config)?;
+    let size = gap_len(request);
+    if output.len() < size {
+        return Err(Error::OutputTooSmall);
+    }
+    output[0] = 5;
+    let mut pos = 1;
+    for v in [
+        request.id.0,
+        u64::from(request.prefix),
+        u64::from(request.start),
+    ] {
+        write(v, output, &mut pos);
+    }
+    output[pos..size].copy_from_slice(&request.mask.to_be_bytes());
+    Ok(size)
+}
 /// Canonical bounded union parsing with complete externally established scope.
 pub fn inspect(config: Config, scope: Scope, bytes: &[u8]) -> Result<View<'_>, Error> {
     config.validate()?;
@@ -141,6 +174,20 @@ pub fn inspect(config: Config, scope: Scope, bytes: &[u8]) -> Result<View<'_>, E
                 return Err(Error::Identity);
             }
             Ok(View::Feedback(feedback))
+        }
+        5 => {
+            let prefix = word(bytes, &mut position)?;
+            let start = word(bytes, &mut position)?;
+            let mask = u32::from_be_bytes(bytes[position..].try_into().map_err(|_| Error::Length)?);
+            let request = GapRequest {
+                scope,
+                id: FeedbackId(id),
+                prefix,
+                start,
+                mask,
+            };
+            request.validate(config)?;
+            Ok(View::Gap(request))
         }
         _ => Err(Error::Format),
     }
