@@ -1061,6 +1061,8 @@ The [C48 original-frame latency study](modules/frame-channel-experiment.md#origi
 measures MUX admission, source recovery, decoder queueing and ordered release
 on the same slowest TCP originals, and tests sharing regular FEC bytes with
 explicit retries while preserving old-source custody.
+The same study includes the ranked baseline originals and a sender policy
+that adjusts the byte budget using local MUX queue age in each direction.
 Matched kernel validation and the existing named runtime acceptance gates remain open.
 
 ## Per-mode parity implementation gates

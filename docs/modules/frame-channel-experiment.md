@@ -387,3 +387,76 @@ Forward decoder overflows fell from 50,286 to zero. The forward MUX still
 accumulated 3.00 MB and the slowest one percent spent 276.31 ms on average
 waiting for admission. Both arms confirmed every offered original by the
 end of drain. [Fixed half-credit comparison](../../work/packed-latency-20261118/comparison.json)
+
+The [ranked per-original export](../../work/packed-latency-20261118/full-tail-segments-1/slowest-originals.jsonl.gz)
+contains a row for each of the 14,964 baseline originals. Of these, 12,553
+waited for channel order. A named retry unlocked the last required source
+for 5,617 originals, including 2,270 whose solution depended on another
+source's retry. For each of those 5,617 rows the observer matched the gap
+evidence, the request that reached the sender and the resulting transmission.
+The remaining 9,347 got their own last required source from a systematic
+packet. The cause counts overlap the channel-wait count.
+[Export validation](../../work/packed-latency-20261118/full-tail-segments-1/readback.json)
+
+Flow 14 segment 16249 sat exactly at the baseline P99. It spent 301.12 ms
+at MUX admission and 185.11 ms from source sealing to the successful retry
+of source 131567. Forward propagation took 35.00 ms, decoder FIFO wait took
+9.81 ms, and the solved record waited 46.17 ms for channel 12. Source 131559
+then advanced the expected channel serial from 16249 to 16252. The physical
+FIFO, transmission and decode execution accounted for the remaining 0.52 ms.
+[Original-frame timelines](../../work/packed-latency-20261118/full-tail-segments-1/examples.json)
+
+The [queue-aware policy](../../simulator/src/l2tunnel_sim/packed_backlog_policy.py)
+samples the oldest locally queued MUX frame in the retry's direction when
+the sender handles a request. At 15 ms or more the sender credits the full
+retry size against future regular repairs. At 5 ms or less it returns to
+half credit. Between the thresholds it keeps the previous weight. It
+preserves MUX admission order, source retention, the silence probe and the
+request retry deadlines. These thresholds control the sender's budgeting
+decision at a request event and do not impose a maximum per-frame delay.
+
+The forced-loss test holds source zero while its sender switches to full
+credit and back to half credit. It also erases sources 129
+through 142 and every coded repair. The receiver verifies the exact bytes
+of the other 399 frames before the oldest frame arrives, then confirms all
+400. [Old-source recovery test](../../simulator/tests/test_packed_latency_policy.py)
+
+| Full C48 first seed, forward bulk application | Original targeted | Fixed half credit | Queue-aware credit |
+| --- | ---: | ---: | ---: |
+| Goodput in seconds 5–90 (Mbit/s) | 67.86 | 75.41 | 75.99 |
+| Application delivery P99 including drain (ms) | 577.73 | 399.55 | 197.19 |
+| Mean MUX admission time in slowest 1% (ms) | 325.86 | 276.31 | 9.09 |
+| Mean channel-order wait in slowest 1% (ms) | 151.94 | 62.99 | 136.98 |
+| Forward wire bytes spent on FEC and retries | 29.21% | 21.45% | 20.79% |
+| Forward decoder FIFO drops | 50,286 | 0 | 0 |
+| Original segments delivered and acknowledged by 120 s | 1,496,400 | 1,656,671 | 1,664,546 |
+
+With queue-aware credit all 1,664,546 original frames waited at most 16.99 ms
+for MUX admission. Median wait was 9.17 ms and P99 was 14.82 ms. Peak forward
+MUX occupancy fell from 3,178,422 to 171,088 bytes. At 90 seconds the candidate
+still had 1,372 forward and 13 reverse unconfirmed sources and 3,014 inner
+unacknowledged TCP segments. All were confirmed by the drain cutoff. Reverse
+repair and retry share increased from 10.92% to 12.76%, before counting
+short-source copies. Each arm uses the same link seed, but the changed packet
+schedule changes which original packets encounter a given erasure.
+
+The candidate's slowest 16,646 originals averaged 210.30 ms. Channel order
+accounted for 136.98 ms, propagation for 35.00 ms, time until the solving
+transmission for 28.10 ms, MUX admission for 9.09 ms and the decoder FIFO
+for 0.94 ms. In the whole cohort, 90,907 segments waited at least 100 ms for
+channel order. This remaining wait is visible even after standing MUX queues
+clear. These figures describe a calibrated Python simulation with one full
+seed. [Full comparison](../../work/packed-latency-20261118/queue-aware-comparison.json)
+and [all-original stage distributions](../../work/packed-latency-20261118/queue-aware-full-1/completed-stage-distributions.json)
+
+To repeat the full comparison and export the reference originals, choose
+fresh output directories and run
+
+```sh
+export PYTHONPATH=simulator/src
+python3 simulator/studies/packed_latency_study.py --out work/c48-original-baseline
+python3 simulator/studies/packed_latency_study.py --policy queue-aware-repair-budget \
+  --stage-distributions --out work/c48-queue-aware
+python3 simulator/studies/packed_tail_export.py \
+  --archive work/packed-targeted-20261118/fresh-full-r1 --out work/c48-original-tail
+```

@@ -5,6 +5,8 @@ import json
 from pathlib import Path
 from time import perf_counter
 
+import numpy as np
+
 from aggregate_ack_deadlines import execute
 from packed_service_sensitivity import ROOT, digest, write
 from packed_targeted_study import DIRECTIONS, read, require, row_metrics, sample, track_source_copies, window
@@ -28,7 +30,23 @@ def bind(directory):
     return manifest, original
 
 
-def run(archive, destination, options):
+def stage_distributions(observer):
+    """Marginals on every completed original. Percentiles are independently interpolated."""
+    from l2tunnel_sim.packed_frame_path import PHASES
+
+    summary = {}
+    for phase, column in zip(PHASES, observer.columns):
+        values = np.asarray(column)
+        if values.size:
+            p50, p99 = np.percentile(values, [50, 99])
+            summary[phase] = dict(samples=int(values.size), mean_ms=float(values.mean()), p50_ms=float(p50),
+                                  p99_ms=float(p99), max_ms=float(values.max()), at_least_100ms=int((values >= 100).sum()))
+        else:
+            summary[phase] = dict(samples=0, mean_ms=None, p50_ms=None, p99_ms=None, max_ms=None, at_least_100ms=0)
+    return summary
+
+
+def run(archive, destination, options, *, measure_stages=False):
     from l2tunnel_sim.packed_frame_path import PackedFramePath
 
     audited, original = bind(archive)
@@ -80,6 +98,8 @@ def run(archive, destination, options):
                 "passive frame tracing changed the original simulation")
     report = trace[0].report(warmup_s=task["warmup_s"])
     write(destination / "frame-path.json", report)
+    if measure_stages:
+        write(destination / "completed-stage-distributions.json", stage_distributions(trace[0]))
     measured = row_metrics(result)
     measured["matched_wire"] = {
         d: window(snapshots["warmup_end"]["directions"][d], snapshots["traffic_end"]["directions"][d])
@@ -93,12 +113,18 @@ def run(archive, destination, options):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--archive", type=Path, default=ARCHIVE / "fresh-full-r1")
-    parser.add_argument("--options", type=Path, help="JSON object containing the experimental packed_latency_policy")
+    policy = parser.add_mutually_exclusive_group()
+    policy.add_argument("--options", type=Path, help="JSON object containing the experimental packed_latency_policy")
+    policy.add_argument("--policy", help="experimental packed_latency_policy name")
+    parser.add_argument("--stage-distributions", action="store_true",
+                        help="save marginal time distributions across every completed forward TCP segment")
     parser.add_argument("--out", type=Path, required=True)
     args = parser.parse_args()
     options = read(args.options) if args.options else {}
+    if args.policy:
+        options = {"packed_latency_policy": args.policy}
     require(isinstance(options, dict), "candidate options must be a JSON object")
-    run(args.archive, args.out, options)
+    run(args.archive, args.out, options, measure_stages=args.stage_distributions)
 
 
 if __name__ == "__main__":

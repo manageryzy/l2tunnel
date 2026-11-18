@@ -5,12 +5,14 @@ import pytest
 from l2tunnel_sim.compact_wire import CompactWireConfig, decode_packet
 from l2tunnel_sim.config import PathConfig, Scenario, Strategy, Traffic
 from l2tunnel_sim.model import Simulation
+from l2tunnel_sim.packed_backlog_policy import BacklogPackedWireTransport
 from l2tunnel_sim.packed_latency_policy import LatencyPackedWireTransport
 from l2tunnel_sim.packed_targeted import TargetedPolicy
 
 
 @pytest.mark.parametrize("variant,weight", [
     ("shared-repair-budget", 1), ("half-shared-repair-budget", .5),
+    ("queue-aware-repair-budget", 1),
 ])
 def test_byte_budget_keeps_old_debt_and_charges_exact_regular_extent(variant, weight):
     sim = Simulation(Scenario(70, 0), Traffic(duration_s=1, drain_s=1), (PathConfig(100,10),),
@@ -18,7 +20,13 @@ def test_byte_budget_keeps_old_debt_and_charges_exact_regular_extent(variant, we
     config = CompactWireConfig(repair_ratio=.25, feedback_ms=1, encapsulation="raw_ipv4_crc32",
                                trim_repair_padding=True, pack_sources_max_delay_ms=.5)
     policy = TargetedPolicy(probe_ms=80, window=8, max_ids=4)
-    tx = LatencyPackedWireTransport(sim, False, config, policy=policy, variant=variant)
+    if variant == "queue-aware-repair-budget":
+        # The oldest hole outlives both the pressure interval and a local
+        # repair window. Exercise credit switching during the loss episode.
+        tx = BacklogPackedWireTransport(sim, False, config, policy=policy,
+                                        oldest_wait_ms=lambda: 20 if sim.now < .25 else 0)
+    else:
+        tx = LatencyPackedWireTransport(sim, False, config, policy=policy, variant=variant)
     send = tx._send_wire
     regular_serials = []
     recovered = []
@@ -62,3 +70,5 @@ def test_byte_budget_keeps_old_debt_and_charges_exact_regular_extent(variant, we
     assert costs["retry_credit_bytes"] == (costs["displaced_regular_ip_bytes"]
         + costs["expired_on_confirmation_bytes"] + costs["cap_discarded_bytes"])
     assert 0 < costs["retry_credit_bytes"] <= tx.targeted_counts["retry_ip_bytes"] * weight
+    if variant == "queue-aware-repair-budget":
+        assert costs["entered_full_credit"] and costs["returned_to_half_credit"]

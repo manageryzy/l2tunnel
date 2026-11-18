@@ -87,6 +87,11 @@ def make_simulation(task):
         if latency_policy is None:
             transports = tuple(TargetedPackedWireTransport(sim.flows[0], reverse, config)
                                for reverse in (False, True))
+        elif latency_policy == "queue-aware-repair-budget":
+            from l2tunnel_sim.packed_backlog_policy import BacklogPackedWireTransport, oldest_mux_wait_ms
+            transports = tuple(BacklogPackedWireTransport(
+                sim.flows[0], reverse, config, policy=TargetedPolicy(),
+                oldest_wait_ms=partial(oldest_mux_wait_ms, sim.mux, reverse)) for reverse in (False, True))
         else:
             from l2tunnel_sim.packed_latency_policy import LatencyPackedWireTransport
             transports = tuple(LatencyPackedWireTransport(
