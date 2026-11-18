@@ -1182,3 +1182,53 @@ pair fell from 1,272 to 1,066 microseconds, but the first equation required
 90 service grants instead of 85 and its median rose from 631 to 958 microseconds.
 The original encoder remains in the runtime while the cost of delaying that
 first repair is unresolved. [Paired encoder replay](../../work/c48-parity-20261119/recovery/r21-paired/summary.json).
+
+### Which TCP byte holds up the next read
+
+One original-socket R19 run with sparse markers delivered 42.47 Mbit/s.
+The two TUN captures and both applications matched TCP payloads by flow,
+sequence range and hash. The 2,008 matched application records covered
+all 16 flows. Their last required native segment took a mean of 151.21 ms
+between TUN devices. Its sender MUX residence averaged 8.59 ms and the
+sealed source waited 0.75 ms for physical UDP acceptance. At the receiver,
+the datagram that made the source solvable spent 14.10 ms awaiting decoder
+admission, the transaction took 0.12 ms and exposing the solved unit to
+the record receiver took 10.74 ms. The complete record then waited 65.88 ms
+for native preparation. Of that last interval, 65.73 ms overlapped a missing
+preceding TCP byte on the same flow. Once the preceding byte reached the
+receiver TUN, preparation followed in 0.16 ms on average (P99 0.61 ms).
+The marker run's first-write P99 was 398.63 ms. The two uninstrumented
+runs had 272.52 and 264.26 ms.
+
+Among the 2,002 records whose preceding records could all be indexed,
+1,826 depended on a named retry for their latest preceding source. In
+457 cases the retry carried that exact source. In 1,369 cases receiving
+a different requested original completed an existing equation and recovered
+the blocking source. These samples share dependencies and represent 1,532
+distinct blocking sources. The time from the blocking source's first
+send to the successful retransmission's send averaged 101.64 ms in the
+1,826 retry-dependent cases. In the remaining 176 cases, 84 depended on
+a repair datagram and 92 on the first original.
+
+An optimistic replay retained the observed loss dependencies and original
+source transmissions. It assumed an immediate request upon the first evidence
+of a gap, a successful first retransmission, exactly 35 ms for each trip
+and zero receiver CPU or delivery time. Even under those assumptions the
+mean forward delay was at least 97.60 ms for this cohort. Adding the observed
+40 ms return ACK path gives about 138 ms. With 16 streams each holding
+125 segments of 512 bytes, 75.78 Mbit/s would require a mean ACK cycle
+of about 108 ms. These figures bound this specific replay. Earlier proactive
+recovery or a change in the effective TCP flight would change its assumptions.
+[Native run](../../work/c48-parity-20261119/native/diagnostic-r19-source-stages/summary.json),
+[matched stage and dependency results](../../work/c48-parity-20261119/recovery/r19-stage/result.json)
+and [sampled source and frame identities](../../work/c48-parity-20261119/recovery/r19-stage/samples.json).
+
+The native C48 planner also reserves 200 bytes of the MTU for worst-case
+framing. Replaying the two strict-credit captures with the actual Rust
+codec at the current planner's 1,313-byte safe symbol limit instead of
+1,251 bytes saved 0.223 and 0.248 Mbit/s of source and prescribed-copy
+wire bytes. Most 1,448-byte Linux TCP payloads still needed two fragments.
+On the original all-512-byte R19 trace the ten-second saving was 201 bytes.
+This replay fixes the input sequence and measures encoding costs. It does
+not reproduce feedback, CPU scheduling or new loss draws.
+[Offline geometry and per-direction byte costs](../../work/c48-parity-20261119/native/compact-geometry/summary.json).
