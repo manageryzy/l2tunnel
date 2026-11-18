@@ -1051,6 +1051,11 @@ integration or performance acceptance.
 - [ ] [TEST-13] Run remote Linux/Windows CI and Android compile gates; keep native device execution as a separate gate.
 - [ ] [TEST-14] Run native Windows TAP/Wintun and Android VpnService/protect/lifecycle tests, not only cross-compilation.
 
+TEST-12 now has a [causal frame-channel experiment and PackedWire service study](modules/frame-channel-experiment.md)
+with independently ordered frames, bounded admission, lossy gap requests,
+actual XOR reconstruction, serialized decoding and per-direction IP accounting.
+Matched kernel validation and the existing named runtime acceptance gates remain open.
+
 ## Per-mode parity implementation gates
 
 Each P-* gate means the named algorithm/codec/workload adapter is implemented and

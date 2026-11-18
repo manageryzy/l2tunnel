@@ -17,6 +17,7 @@ from l2tunnel_sim.compact_wire import CompactWireConfig, CompactWireTransport
 from l2tunnel_sim.config import PathConfig, Scenario, Strategy, Traffic
 from l2tunnel_sim.shared_records import SharedRecordMultiFlow
 from l2tunnel_sim.mux_tcp import MuxTCP, UnifiedMuxMultiFlow, UnifiedMuxHandshakeProbe
+from l2tunnel_sim.packed_receiver_service import DecoderCurve, PackedReceiverService, ReceiverCost
 from l2tunnel_sim.tcp_syn_probe import SYNProbeConfig, TCPHandshakeProbe
 from deadline_metrics import SegmentDeadlineObserver, deadline_metrics
 from payload_sizes import TCPRTTObserver, rtt_metrics, summarize, write_csv
@@ -79,6 +80,18 @@ def make_simulation(task):
 def execute(task):
     started = perf_counter()
     sim = make_simulation(task)
+    services = {}
+    costs = {"packed_receiver_cost": ReceiverCost, "packed_decoder_curve": DecoderCurve}
+    selected = costs.keys() & task.keys()
+    if selected:
+        if len(selected) != 1:
+            raise ValueError("select exactly one packed receiver pricing model")
+        if not hasattr(sim, "mux"):
+            raise ValueError("packed receiver cost requires a duplex packed MUX")
+        key = selected.pop()
+        cost = costs[key](**task[key])
+        services = {name: PackedReceiverService(getattr(sim, "shared_" + name), cost)
+                    for name in ("forward", "reverse")}
     probe_settings = task["profile"].get("tcp_syn_probe")
     probe_type = UnifiedMuxHandshakeProbe if hasattr(sim, "mux") else TCPHandshakeProbe
     probe = (probe_type(sim, SYNProbeConfig(**probe_settings), start_s=task["warmup_s"])
@@ -182,6 +195,8 @@ def execute(task):
         row["ack_batch_departed_wire_bytes"] = sum(flow.wire[True]["ack_batch"] for flow in sim.flows)
         row["ack_batch_departed_datagrams"] = sum(flow.datagrams[True]["ack_batch"] for flow in sim.flows)
     row["compute_seconds"] = perf_counter() - started
+    if services:
+        row["packed_receiver_service"] = {name: service.measurements() for name, service in services.items()}
     if probe is not None:
         row.update(probe.measurements())
         row["tcp_syn_ping_joint_target_met"] = bool(
