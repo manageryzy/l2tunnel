@@ -15,6 +15,7 @@ from .coding import _eliminate
 from .compact import coefficient
 from .compact_wire import SYMBOL_BYTES, decode_packet
 from .packed_wire import PackedWireTransport
+from .packed_rank import PackedRankDecoder
 
 
 @dataclass(frozen=True)
@@ -91,13 +92,20 @@ def equation_work(decoder, coefficients):
 class PackedReceiverService:
     """One active job and a bounded drop-tail FIFO per directional recovery owner."""
 
-    def __init__(self, transport, cost):
+    def __init__(self, transport, cost, rank_backend="reference"):
         if not isinstance(transport, PackedWireTransport) or transport.decoder.known or transport.decoder.rows:
             raise ValueError("attach receiver service before traffic to a fresh packed transport")
         self.transport = transport
         self.sim = transport.sim
         self.cost = cost
         self.decode = transport._receive_wire
+        if rank_backend == "reference":
+            self.preview = lambda values: equation_work(transport.decoder, values)
+        elif rank_backend == "dense":
+            transport.decoder = PackedRankDecoder()
+            self.preview = transport.decoder.preview
+        else:
+            raise ValueError("unsupported packed rank backend")
         self.waiting = deque()
         self.active = False
         self.arrivals = self.drops = self.peak_waiting = self.completed = 0
@@ -136,7 +144,7 @@ class PackedReceiverService:
                     known_contributions += factor != 0
                 else:
                     coefficients[i] = factor
-        row_mixes, coefficient_updates, pivot_probes = equation_work(self.transport.decoder, coefficients)
+        row_mixes, coefficient_updates, pivot_probes = self.preview(coefficients)
         # A dense payload term accounts for folding known systematic symbols
         # out of repairs and scaling/eliminating actual symbol-sized rows.
         gf_bytes = (known_contributions + row_mixes) * SYMBOL_BYTES

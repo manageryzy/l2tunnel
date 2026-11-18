@@ -27,6 +27,7 @@ def main():
     parser.add_argument("--anchors", required=True, type=Path)
     parser.add_argument("--paired-manifest", required=True, type=Path)
     parser.add_argument("--out", required=True, type=Path)
+    parser.add_argument("--rank-backend", choices=("reference", "dense"), default="reference")
     args = parser.parse_args()
     args.out.mkdir(parents=True, exist_ok=False)
     anchors = json.loads(args.anchors.read_text())["arms_by_source_support"]
@@ -42,6 +43,8 @@ def main():
         anchors=str(args.anchors), anchor_sha256=digest(args.anchors), paired_manifest=str(args.paired_manifest),
         paired_manifest_sha256=digest(args.paired_manifest), driver_sha256=digest(Path(__file__)),
         receiver_sha256=digest(Path(__file__).resolve().parents[1] / "src/l2tunnel_sim/packed_receiver_service.py"),
+        rank_backend=args.rank_backend,
+        rank_sha256=digest(Path(__file__).resolve().parents[1] / "src/l2tunnel_sim/packed_rank.py"),
         service="Piecewise linear whole-decoder microseconds versus logical GF payload bytes. "
                 "Fits local/global single-hole dense repair medians and uses the local systematic "
                 "batch mean as the price for zero GF work. No separate kernel, metadata, or source charge.",
@@ -50,6 +53,7 @@ def main():
     for task in jobs:
         task.pop("packed_receiver_cost", None)
         task["packed_decoder_curve"] = asdict(curve)
+        task["packed_rank_backend"] = args.rank_backend
         write(args.out / f"rep-{task['replication']}.json", execute(task))
 
 

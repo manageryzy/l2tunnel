@@ -9,6 +9,7 @@ import pytest
 from l2tunnel_sim import coding
 from l2tunnel_sim.compact_wire import CompactWireConfig
 from l2tunnel_sim.packed_receiver_service import DecoderCurve, PackedReceiverService, ReceiverCost, equation_work
+from l2tunnel_sim.packed_rank import PackedRankDecoder
 from l2tunnel_sim.packed_wire import PackedWireTransport
 from test_compact_wire_duplex import make_simulation
 from test_mux_tcp import mux_case
@@ -111,3 +112,27 @@ def test_curve_prices_calibrated_total_once_and_source_visibility_waits_for_comm
         sim.now, _, callback, args = heappop(sim.events)
         callback(*args)
     assert got == [frame]
+
+
+def test_dense_backend_matches_every_sparse_row_and_charge_across_insertions():
+    ref = coding.Decoder()
+    dense = PackedRankDecoder()
+    rng = Random(27621)
+    # Absolute IDs cross a wrapped on-wire ID. Random coefficients, zero
+    # factors, known duplicates, reverse insertion order and mixed support
+    # produce partial pivots, fill-in and old holes.
+    first = 2**24 - 20
+    traces = []
+    for batch in range(4):
+        support = list(range(first + 20 * batch, first + 20 * batch + 43))
+        for _ in range(25):
+            values = {i: rng.randrange(256) for i in rng.sample(support, rng.randint(1, 20))}
+            traces.extend((values, dict(reversed(values.items()))))
+    traces.extend({i: 1} for i in range(first, first + 103))
+    for item in traces:
+        assert dense.preview(item) == equation_work(ref, item)
+        assert dense.known == ref.known
+        assert dense.insert(item) == ref.insert(item)
+        assert dense.known == ref.known
+        assert {i: {i + j: val for j, val in enumerate(row.values) if val}
+                for i, row in dense.rows.items()} == ref.rows

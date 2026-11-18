@@ -77,7 +77,7 @@ def make_simulation(task):
     return sim
 
 
-def execute(task):
+def execute(task, *, observe_packed=None):
     started = perf_counter()
     sim = make_simulation(task)
     services = {}
@@ -90,8 +90,11 @@ def execute(task):
             raise ValueError("packed receiver cost requires a duplex packed MUX")
         key = selected.pop()
         cost = costs[key](**task[key])
-        services = {name: PackedReceiverService(getattr(sim, "shared_" + name), cost)
+        services = {name: PackedReceiverService(getattr(sim, "shared_" + name), cost,
+                                                task.get("packed_rank_backend", "reference"))
                     for name in ("forward", "reverse")}
+    elif "packed_rank_backend" in task:
+        raise ValueError("rank backend selection requires a packed receiver service")
     probe_settings = task["profile"].get("tcp_syn_probe")
     probe_type = UnifiedMuxHandshakeProbe if hasattr(sim, "mux") else TCPHandshakeProbe
     probe = (probe_type(sim, SYNProbeConfig(**probe_settings), start_s=task["warmup_s"])
@@ -104,6 +107,8 @@ def execute(task):
 
     for when in (task["warmup_s"], task["duration_s"]):
         sim.flows[0].at(when, snapshot, when)
+    if observe_packed is not None:
+        observe_packed(sim, services)
     sim.run()
     row = {key: value for key, value in task.items() if key != "profile"}
     row.update(profile=json.dumps(task["profile"], sort_keys=True), strategy=task["profile"]["name"],

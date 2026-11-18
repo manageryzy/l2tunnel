@@ -185,6 +185,19 @@ repairs in the zero-cost arm and 2,171 in the whole-decoder arm, even as its
 source count fell from 23,888 to 11,705.
 [C46/C47 whole-decoder controls](../../work/frame-channel-study-20261118/other-packed-curve/summary.json)
 
+A C48 short-run intervention tested whether feedback-driven tail bursts account
+for the queue. It allowed one full-support tail repair per timer expiry and
+preserved regular local/global repairs. Tail counts fell from 2,171 and 7,176
+to 29 in each seed. Forward queue P99 fell from 1.91/1.93 seconds to
+47.7/45.4 ms. Throughput rose from 13.39 to 20.23 Mbit/s in seed one and
+stayed at 14.87 Mbit/s in seed two. At cutoff the senders still held 7,381
+and 7,694 unconfirmed sources, respectively. Both TCP and MUX confirmation
+failed in both capped cases. The all-cohort lower bound on P99 delivery
+worsened in both cases. This intervention identifies a cause of the queue
+and a simultaneous loss of recovery progress. Its receipt records a concurrent
+change to an unused observer argument during the post-run source audit.
+[Tail intervention and terminal state](../../work/frame-channel-study-20261118/tail-control/summary.json)
+
 On the full original C48 first seed (90 seconds of traffic, 5 seconds of
 warmup and 30 seconds of drain), the unchanged-cost rerun reproduced all 423
 shared observation/configuration fields other than wall-clock runtime. Both
@@ -194,6 +207,36 @@ were 75.9963 and 75.9936 Mbit/s, and their TCP application delivery P99s were
 5.52 ms without queue overflow.
 [Historical field comparison](../../work/frame-channel-study-20261118/packed-full-pair/historical-comparison.json)
 and [full kernel control](../../work/frame-channel-study-20261118/packed-full-pair/summary.json)
+
+The same complete C48 workload with the whole-decoder service curve delivered
+**0.884832 Mbit/s** in seconds 5 to 90. TCP application delivery P99 through
+drain was **19.677 seconds**. The forward decoder dropped 400,072 of 424,674
+arrivals at its full input queue. The 24,602 serviced jobs had queue P99 of
+2.248 seconds. The reverse decoder had zero queue wait and overflow.
+All 45,051 application frames actually offered under TCP backpressure were
+acknowledged by the end of the 30-second drain, and both MUX directions
+confirmed. The steady-state gate produced no active SYN probe samples.
+
+Over the entire run the sender produced 472,041 tail repairs for 22,626
+source symbols. In the throughput window, 504,543,422 forward IP bytes
+carried repair packets and 9,048,376 carried sources. Repair took 98.24% of
+the forward wire bytes. A receiver that stays behind delays feedback, the
+sender spends more service on old gaps and inner TCP submits much less new
+data. Fitting a service curve to isolated repairs exposes this feedback loop.
+The quantitative result is conditional on the cost curve and one long seed.
+[Full calibrated C48 observation](../../work/frame-channel-study-20261118/packed-rank-dense-full/result.json)
+
+The optional dense rank backend executes the same GF operations using translated
+byte rows and integer XOR in the simulator process. It charges the same model
+work before committing each job. The historical sparse solver remains available.
+The two short seeds reproduced the sparse receiver and application metrics.
+The long workload also records simultaneous checkpoints of both receive
+directions, equation/known-state hashes, all flow counters, losses, wire bytes
+and the hash of the whole sequence of realized FIFO waits. All seven checkpoints
+at 1, 3, 5, 8, 10, 12 and 15 simulated seconds matched the sparse reference
+byte for byte. The dense backend completed the 90-second workload and 30-second
+drain. The independent sparse reference was checked through 15 seconds.
+[Rank replay manifest](../../work/frame-channel-study-20261118/packed-rank-dense-full/manifest.json)
 
 The regular study entry accepts either a kernel-work price
 (`packed_receiver_cost`) or an empirically fitted whole-decoder price
@@ -214,5 +257,6 @@ PYTHONPATH=simulator/src python3 simulator/studies/packed_service_sensitivity.py
   --full-pair --gf-manifest "$study/packed-full-pair/manifest.json" --out work/c48-full-replay
 PYTHONPATH=simulator/src python3 simulator/studies/packed_decoder_sensitivity.py \
   --anchors "$study/calibration/rolling-service-summary.json" \
-  --paired-manifest work/c48-full-replay/manifest.json --out work/c48-full-decoder-replay
+  --paired-manifest work/c48-full-replay/manifest.json --rank-backend dense \
+  --out work/c48-full-decoder-replay
 ```
