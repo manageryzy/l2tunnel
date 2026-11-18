@@ -961,3 +961,55 @@ directions drained every remaining source. The original 75.78–75.94 Mbit/s
 Python target remains open.
 [First R13 run](../../work/c48-parity-20261119/native/candidate-r13-preview/summary.json)
 and [second R13 run](../../work/c48-parity-20261119/native/candidate-r13-preview-repeat/summary.json).
+
+The instrumented repeat counted 643,398 full parses for 72,351 ordered source
+handoffs at the receiver, down from 79.0 to 8.9 parses per handoff. Its counter
+also recorded 11,997,524 source IDs skipped with an existing proof.
+[Receiver counters](../../work/c48-parity-20261119/native/diagnostic-r13-preview-counts/preview-counts.json).
+
+The targeted sender can now offer one fresh source or a requested retry
+while an unexposed full-window regular equation is being computed. The
+encoder keeps the selected support, original deadline and every unread ring
+slot. Physical acceptance of the intervening source restores the pending
+equation. The FIFO-to-encoder transfer charges its copy work once, including
+when selected using the remainder after a previous physical acceptance.
+On a 24,000-source replay, 604 fresh sources became available before their
+global equation finished. All 69 global equations matched the independent
+scalar oracle byte for byte. A separate run mixed zero, insufficient and
+exact copy grants and preserved that result.
+[Work grants and repair bytes](../../work/c48-parity-20261119/recovery/global-copy-replay-summary.json).
+
+With a clean release build of this version, two standard four-capture runs
+delivered 52.14 and 53.03 Mbit/s. First-write P99 measured 536.00 and
+589.32 ms. Scheduled P99 measured 5111.48 and 5566.09 ms. The two runs
+left 70,798 and 67,932 scheduled records unsubmitted. Both peers drained to
+zero. At EOF the forward/reverse unconfirmed counts were 1468/46 and
+1134/81. The receiver's in-order TUN to application read P99 stayed below
+0.2 ms in both. Two earlier cached-build runs of the same sources delivered
+47.64 and 47.20 Mbit/s. Their binary hash differed. These trials do not
+establish a throughput effect for the copy-accounting correction alone.
+[Clean run](../../work/c48-parity-20261119/native/candidate-r13-accounting-clean/summary.json)
+and [clean repeat](../../work/c48-parity-20261119/native/candidate-r13-accounting-clean-repeat/summary.json).
+
+In a separate Python sensitivity run, both original seeds used the projected
+UDP/IPv4, record-number and 16-byte authentication costs on each modeled send.
+The new price was applied before loss and to repair scheduling. Forward
+regular repairs plus named retries fell from 20.83–20.86% to 18.71–18.76%
+of physical bytes. The runs delivered 75.73 and 76.06 Mbit/s, with scheduled
+P99 of 634.25 and 609.10 ms. Kernel work, byte-wise coding, actual TCP
+segmentation and authenticated management remain outside this sensitivity
+model. The original 75.78–75.94 Mbit/s reference remains the acceptance
+target. [Both seeds and cost assumptions](../../work/c48-parity-20261119/python/authenticated-udp-sensitivity/comparison.json).
+
+A separate encoder experiment avoided clearing bytes that the new source
+immediately overwrites. On the same 23,999 queued source transfers, actual
+ring writes fell from 49,201,220 to 20,390,827 bytes and all 69 global
+repairs matched the scalar oracle. In the two ordinary native runs this
+version delivered 48.64 and 47.23 Mbit/s, and 82,157 and 83,051 scheduled
+records remained unsubmitted. A third run of the original clean binary after
+the experiment delivered 52.45 Mbit/s and left 68,469 unsubmitted.
+The experiment is retained separately. The qualified implementation still
+clears the full slot and charges the actual clear plus the length and payload.
+[Ring-slot replay](../../work/c48-parity-20261119/recovery/source-surplus-summary.json),
+[experiment and tests](../../work/c48-parity-20261119/recovery/source-surplus-with-tests.patch)
+and [bracketing run](../../work/c48-parity-20261119/native/bracket-r13-after-r14/summary.json).

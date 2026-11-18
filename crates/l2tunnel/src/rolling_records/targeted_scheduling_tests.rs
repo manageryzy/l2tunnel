@@ -1,6 +1,127 @@
 use super::*;
 
 #[test]
+fn targeted_physical_continuation_charges_exact_fifo_transfer_once() -> TestResult {
+    let mut cfg = config(true, rolling::wire::SourceWire::TargetedExact);
+    cfg.forward.scheduler.repair_numerator = 0;
+    let mut endpoint = endpoint(cfg, Role::Client)?;
+    let now = Tick(0);
+    let at = rolling_tick(now);
+    let first = endpoint.sender.admit_source(b"first", at)?;
+    let second = endpoint.sender.admit_source(b"second", at)?;
+    let third = endpoint.sender.admit_source(b"x", at)?;
+    endpoint
+        .sender
+        .confirm_output(scheduler::OutputId::Source(first), at)?;
+    let width = cfg.forward.scheduler.recovery.width()?;
+    let cost = width + 2 + b"second".len();
+    let grant = |copies| rolling::WorkBudget { copies, ..work() };
+    for copies in [0, cost - 1] {
+        assert_eq!(
+            endpoint.continue_targeted_send(now, grant(copies))?.copies,
+            0
+        );
+        assert_eq!(endpoint.sender_status().queued_fresh, 2);
+        assert!(endpoint.sender.pending_output().is_none());
+    }
+    assert_eq!(
+        endpoint.continue_targeted_send(now, grant(cost))?.copies,
+        cost
+    );
+    assert_eq!(endpoint.sender_status().queued_fresh, 1);
+    assert_eq!(
+        endpoint.sender.pending_output().map(scheduler::Output::id),
+        Some(scheduler::OutputId::Source(second))
+    );
+    assert_eq!(
+        endpoint.continue_targeted_send(now, grant(cost))?,
+        rolling::WorkUsed::default()
+    );
+    endpoint
+        .sender
+        .confirm_output(scheduler::OutputId::Source(second), at)?;
+    assert_eq!(endpoint.step(now, grant(width + 3))?.send.copies, width + 3);
+    assert_eq!(
+        endpoint.sender.pending_output().map(scheduler::Output::id),
+        Some(scheduler::OutputId::Source(third))
+    );
+    Ok(())
+}
+
+#[test]
+fn continuation_shares_one_copy_grant_between_global_clear_and_wrapped_source() -> TestResult {
+    let mut cfg = config(true, rolling::wire::SourceWire::TargetedExact);
+    let policy = &mut cfg.forward.scheduler;
+    policy.recovery.global_every = 1;
+    policy.repair_numerator = 1;
+    policy.repair_denominator = policy.recovery.window as u32;
+    let width = policy.recovery.width()?;
+    let window = policy.recovery.window as u32;
+    let mut endpoint = endpoint(cfg, Role::Client)?;
+    let now = Tick(0);
+    let at = rolling_tick(now);
+    let scope = endpoint.sender.expiry_snapshot().scope;
+    for id in 0..window {
+        let original = endpoint.sender.admit_source(&id.to_be_bytes(), at)?;
+        endpoint
+            .sender
+            .confirm_output(scheduler::OutputId::Source(original), at)?;
+    }
+    endpoint.sender.receive_feedback(
+        scheduler::Feedback {
+            scope,
+            id: scheduler::FeedbackId(1),
+            prefix: window / 2,
+            observed_end: window,
+            deficit: 0,
+        },
+        at,
+    )?;
+    endpoint.step(
+        now,
+        rolling::WorkBudget {
+            metadata: 1,
+            ..Default::default()
+        },
+    )?;
+    assert!(endpoint.sender.computing_full_global());
+    let fresh = endpoint.sender.admit_source(&window.to_be_bytes(), at)?;
+    let transfer = width + 2 + window.to_be_bytes().len();
+    let grant = |copies, field| rolling::WorkBudget {
+        copies,
+        field,
+        ..work()
+    };
+    let used = endpoint.continue_targeted_send(now, grant(width + transfer - 1, 6))?;
+    assert_eq!((used.copies, used.field), (width, 6));
+    assert_eq!(endpoint.sender_status().queued_fresh, 1);
+    assert!(endpoint.sender.pending_output().is_none());
+    let used = endpoint.continue_targeted_send(now, grant(transfer, 1))?;
+    assert_eq!((used.copies, used.field), (transfer, 1));
+    assert_eq!(
+        endpoint.sender.pending_output().map(scheduler::Output::id),
+        Some(scheduler::OutputId::Source(fresh))
+    );
+    // A repeated poll advances only the pending equation. The unchanged
+    // physical original consumes no second transfer allowance.
+    assert_eq!(
+        endpoint
+            .continue_targeted_send(now, grant(transfer, 1))?
+            .copies,
+        0
+    );
+    endpoint
+        .sender
+        .confirm_output(scheduler::OutputId::Source(fresh), at)?;
+    endpoint.continue_targeted_send(now, work())?;
+    assert_eq!(
+        endpoint.sender.pending_output().map(scheduler::Output::id),
+        Some(scheduler::OutputId::Repair(rolling::RepairId(1)))
+    );
+    Ok(())
+}
+
+#[test]
 fn packed_fragment_tails_reconstruct_after_loss_without_blocking_another_channel() -> TestResult {
     let mut config = short_config(0, rolling::wire::SourceWire::TargetedExact);
     config.forward.scheduler.repair_numerator = 0;

@@ -324,6 +324,7 @@ impl RecoveryPolicy for scheduler::Policy {
     }
     fn send_state(s: &Self::Sender) -> SendState {
         let x = s.status();
+        let computing_global = s.computing_full_global();
         SendState {
             encoder: x.encoder,
             next_source: x.next_source,
@@ -331,13 +332,15 @@ impl RecoveryPolicy for scheduler::Policy {
             peak_queued_fresh: x.peak_queued_fresh,
             fresh_queue_limit: x.fresh_queue_limit,
             output_ready: x.output_ready,
-            work_pending: !x.output_ready
-                && (x.queued_fresh > 0
-                    || x.encoder.pending_repair
-                    || x.regular_due > 0
-                    || x.tail_remaining > 0
-                    || s.requested_retry_waiting()),
+            work_pending: computing_global
+                || !x.output_ready
+                    && (x.queued_fresh > 0
+                        || x.encoder.pending_repair
+                        || x.regular_due > 0
+                        || x.tail_remaining > 0
+                        || s.requested_retry_waiting()),
             drained: !x.output_ready
+                && !computing_global
                 && x.queued_fresh == 0
                 && x.regular_due == 0
                 && x.tail_remaining == 0

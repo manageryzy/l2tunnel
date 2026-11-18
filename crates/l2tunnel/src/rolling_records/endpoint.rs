@@ -989,7 +989,7 @@ impl<P: RecoveryPolicy> Endpoint<P> {
     pub(crate) fn continue_targeted_send(
         &mut self,
         now: Tick,
-        mut work: rolling::WorkBudget,
+        work: rolling::WorkBudget,
     ) -> Result<rolling::WorkUsed, Error> {
         let idle = rolling::WorkUsed::default();
         if !self.send_config.scheduler.targeted() || work.metadata == 0 {
@@ -1002,38 +1002,7 @@ impl<P: RecoveryPolicy> Endpoint<P> {
         if !state.work_pending || P::feedback(&self.incoming).is_some() {
             return Ok(idle);
         }
-        // Fresh selection clears and then fills one retained encoder vector.
-        // Reserve those copies before arbitration; a regular repair still gets
-        // only this turn's remaining GF/copy/metadata allowance.
-        let width = self
-            .send_config
-            .scheduler
-            .recovery()
-            .width()
-            .map_err(Error::Rolling)?;
-        if state.queued_fresh > 0 {
-            let max_transfer = width.checked_mul(2).ok_or(Error::Arithmetic)?;
-            let Some(copies) = work.copies.checked_sub(max_transfer) else {
-                return Ok(idle);
-            };
-            work.copies = copies;
-        }
-        let mut used = self.step_sender(now, work)?;
-        if state.queued_fresh > 0
-            && let Some((id, bytes)) = P::pending_original(&self.sender)
-            && id.0 == state.encoder.next_source
-        {
-            let payload = bytes
-                .checked_add(2)
-                .filter(|size| *size <= width)
-                .ok_or(Error::Identity)?;
-            used.copies = used
-                .copies
-                .checked_add(width)
-                .and_then(|cost| cost.checked_add(payload))
-                .ok_or(Error::Arithmetic)?;
-        }
-        Ok(used)
+        self.step_sender(now, work)
     }
 
     /// Consume queued targeted inputs with this turn's remaining receive grant.

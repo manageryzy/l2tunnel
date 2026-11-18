@@ -497,6 +497,204 @@ fn targeted_queued_originals_preserve_global_repair_across_ring_wrap() -> Result
 }
 
 #[test]
+fn full_global_accepts_only_scanned_reuse_and_recovers_old_gap_after_overtake() -> Result<(), Error>
+{
+    let (mut policy, scope, work) = setup();
+    policy.recovery.window = 8;
+    policy.recovery.local_window = 2;
+    policy.recovery.handoff_sources = 8;
+    policy.recovery.global_every = 1;
+    policy.repair_numerator = 1;
+    policy.repair_denominator = 8;
+    let now = Tick(1);
+    let mut s = Sender::new(policy, scope, now)?;
+    let mut r = Receiver::new(policy, scope, now)?;
+    let mut serial = Encoder::new(policy.recovery, scope, now)?;
+    for id in 0u32..8 {
+        admit_source(&mut s, id, now)?;
+        serial.admit_source(&id.to_be_bytes(), now)?;
+        if id < 6 {
+            inject(&mut r, id, now, work)?;
+            r.confirm_handoff(SourceId(id), now)?;
+        }
+    }
+    serial.begin_repair(false, now)?;
+    serial.step(now, work)?;
+    let expected = serial.pending_repair().ok_or(Error::Busy)?;
+    s.receive_feedback(
+        Feedback {
+            scope,
+            id: FeedbackId(1),
+            prefix: 6,
+            observed_end: 8,
+            deficit: 2,
+        },
+        now,
+    )?;
+    s.step(
+        now,
+        WorkBudget {
+            metadata: 1,
+            ..WorkBudget::default()
+        },
+    )?;
+    let frozen_end = s.expiry_snapshot().candidates[1];
+    assert!(frozen_end.is_some());
+    s.admit_source_with_copies(&8u32.to_be_bytes(), now, 2)?;
+    s.admit_source(&9u32.to_be_bytes(), now)?;
+
+    // Even a confirmed source stays pinned through its last field byte.
+    let small = |field| WorkBudget { field, ..work };
+    let width = policy.recovery.width()?;
+    let transfer = width + 2 + 8u32.to_be_bytes().len();
+    assert_eq!(s.step(now, small(1))?.copies, width);
+    assert!(s.pending_output().is_none());
+    // Finishing the first old column makes reuse safe. The next source
+    // nevertheless stays untouched without its complete copy allowance.
+    for (field, copies) in [(5, 0), (1, transfer - 1)] {
+        let used = s.step(
+            now,
+            WorkBudget {
+                field,
+                copies,
+                ..work
+            },
+        )?;
+        assert_eq!(used.copies, 0);
+        assert_eq!(s.status().queued_fresh, 2);
+        assert_eq!(s.status().encoder.next_source, 8);
+        assert!(s.pending_output().is_none());
+    }
+    assert_eq!(
+        s.step(
+            now,
+            WorkBudget {
+                field: 1,
+                copies: transfer,
+                ..work
+            }
+        )?
+        .copies,
+        transfer
+    );
+    let first = s.pending_source_copy().ok_or(Error::Busy)?;
+    assert_eq!(
+        (first.source(), first.ordinal(), first.total()),
+        (SourceId(8), 1, 2)
+    );
+    assert!(s.computing_full_global());
+    assert_eq!(s.expiry_snapshot().candidates[1], frozen_end);
+    assert_eq!(
+        s.confirm_output(OutputId::Repair(expected.id), now),
+        Err(Error::Identity)
+    );
+    s.step(now, small(1))?;
+    assert_eq!(s.pending_source_copy(), Some(first));
+    inject(&mut r, 8, now, work)?;
+    s.confirm_source_copy_charged(now, now, first, 80)?;
+    let second = s.pending_source_copy().ok_or(Error::Busy)?;
+    assert_eq!(second.ordinal(), 2);
+    assert_eq!(
+        s.confirm_source_copy_charged(now, now, first, 80),
+        Err(Error::Identity)
+    );
+    s.confirm_source_copy_charged(now, now, second, 80)?;
+    s.receive_request(
+        GapRequest {
+            scope,
+            id: FeedbackId(2),
+            prefix: 6,
+            start: 7,
+            mask: 1,
+        },
+        now,
+    )?;
+    s.step(now, small(2))?;
+    let token = s.pending_retry_token().ok_or(Error::Busy)?;
+    let Output::Source { id, original, .. } = s.pending_output().ok_or(Error::Busy)? else {
+        return Err(Error::Identity);
+    };
+    assert_eq!(id, SourceId(7));
+    assert_eq!(original, &7u32.to_be_bytes());
+    // Finishing the equation behind a refused physical retry cannot replace it.
+    s.step(now, work)?;
+    assert!(!s.computing_full_global());
+    assert_eq!(s.pending_retry_token(), Some(token));
+    assert_eq!(
+        s.pending_output().map(Output::id),
+        Some(OutputId::Source(id))
+    );
+    inject(&mut r, 7, now, work)?;
+    s.confirm_retry_charged(token, now, now, 72)?;
+    let Output::Repair(actual) = s.pending_output().ok_or(Error::Busy)? else {
+        return Err(Error::Identity);
+    };
+    assert_eq!(
+        (actual.id, actual.support, actual.bytes),
+        (expected.id, expected.support, expected.bytes)
+    );
+    r.receive_view_until(wire::View::Repair(actual), now, now, Tick(u64::MAX))?;
+    r.step(now, work)?;
+    s.confirm_output(OutputId::Repair(expected.id), now)?;
+    for id in 6u32..=8 {
+        assert_eq!(
+            r.pending_source(),
+            Some((SourceId(id), id.to_be_bytes().as_slice()))
+        );
+        r.confirm_handoff(SourceId(id), now)?;
+    }
+    assert_eq!(r.status().decoder.decoded_prefix, 9);
+    Ok(())
+}
+
+#[test]
+fn blocked_interleaved_source_retains_original_global_job_cap() -> Result<(), Error> {
+    let (mut policy, scope, work) = setup();
+    policy.recovery.window = 4;
+    policy.recovery.local_window = 2;
+    policy.recovery.global_every = 1;
+    policy.recovery.handoff_sources = 4;
+    policy.recovery.job_ticks = 40;
+    policy.repair_numerator = 1;
+    policy.repair_denominator = 4;
+    let mut s = Sender::new(policy, scope, Tick(0))?;
+    for id in 0..4 {
+        admit_source(&mut s, id, Tick(0))?;
+    }
+    s.receive_feedback(
+        Feedback {
+            scope,
+            id: FeedbackId(1),
+            prefix: 2,
+            observed_end: 4,
+            deficit: 0,
+        },
+        Tick(1),
+    )?;
+    s.step(
+        Tick(5),
+        WorkBudget {
+            metadata: 1,
+            ..WorkBudget::default()
+        },
+    )?;
+    let job = s.expiry_snapshot().candidates[1].ok_or(Error::Busy)?;
+    s.admit_source(b"later", Tick(10))?;
+    s.step(Tick(10), WorkBudget { field: 6, ..work })?;
+    assert_eq!(
+        s.pending_output().map(Output::id),
+        Some(OutputId::Source(SourceId(4)))
+    );
+    assert_eq!(s.deadline(), Some(Tick(45)));
+    assert_eq!(s.step(Tick(45), work), Err(Error::Expired));
+    assert_eq!(
+        s.expiry_snapshot().failure.ok_or(Error::Busy)?.selected,
+        job
+    );
+    Ok(())
+}
+
+#[test]
 fn targeted_creation_deadlines_survive_reordering_and_queue_service() -> Result<(), Error> {
     let (policy, scope, work) = setup();
     let now = Tick(100);

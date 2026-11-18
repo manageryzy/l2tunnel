@@ -139,6 +139,9 @@ pub struct Sender {
     retry_token: Option<RetryToken>,
     pending: Option<Pending>,
     output_end: Option<Tick>,
+    // Unexposed full-window equation behind one immutable physical source.
+    // Its encoder retains the original cap and all unread columns.
+    parked_regular: Option<(RepairId, Tick)>,
     source_copy: Option<SourceCopy>,
     sent: u32,
     credit: u32,
@@ -221,6 +224,7 @@ impl Sender {
             scope,
             pending: None,
             output_end: None,
+            parked_regular: None,
             source_copy: None,
             sent: 0,
             credit: 0,
@@ -363,11 +367,23 @@ impl Sender {
         });
         self.output_end = Some(end);
     }
-    fn select_fresh(&mut self, now: Tick) -> Result<(), Error> {
+    fn select_fresh(
+        &mut self,
+        now: Tick,
+        during_global: bool,
+        budget: &mut WorkBudget,
+    ) -> Result<bool, Error> {
         let (e, original) = self.fresh.front().ok_or(Error::Busy)?;
-        let id = self
-            .encoder
-            .admit_source_created(original, Tick(e.created), now)?;
+        let Some(id) = self.encoder.admit_queued_source(
+            original,
+            Tick(e.created),
+            now,
+            during_global,
+            budget,
+        )?
+        else {
+            return Ok(false);
+        };
         self.fresh.pop();
         self.install_source(
             id,
@@ -375,7 +391,7 @@ impl Sender {
             now,
             deadline(Tick(e.created), self.policy.recovery.job_ticks)?,
         );
-        Ok(())
+        Ok(true)
     }
     /// Advance at most one bounded repair job. All-zero work cannot start a job.
     pub fn step(&mut self, now: Tick, budget: WorkBudget) -> Result<WorkUsed, Error> {
@@ -410,8 +426,10 @@ impl Sender {
             if !self.competing {
                 self.balance = 0;
             }
-            if self.fresh.len > 0 && (!recovery || (self.balance <= 0 && self.regular_due < 2)) {
-                self.select_fresh(now)?;
+            if self.fresh.len > 0
+                && (!recovery || (self.balance <= 0 && self.regular_due < 2))
+                && (self.select_fresh(now, false, &mut budget)? || !recovery)
+            {
                 return Ok(used(before, budget));
             }
             // The oldest unconfirmed source gets an independent timed probe even
@@ -459,11 +477,66 @@ impl Sender {
                 }
             }
         }
-        if matches!(self.pending, Some(Pending::Repair { .. })) {
+        if matches!(self.pending, Some(Pending::Repair { .. })) || self.parked_regular.is_some() {
+            let interleave = matches!(self.pending, Some(Pending::Repair { tail: false, .. }))
+                && self.policy.source_wire.is_targeted()
+                && budget.field > 0
+                && budget.metadata > 1
+                && self.encoder.computing_full_global()
+                && (self.fresh.len > 0
+                    || self.retry_queue.has_retries()
+                    || self.tail_due.is_some_and(|due| now >= due));
+            if interleave {
+                budget.metadata -= 1;
+            }
             let consumed = self.encoder.step(now, budget)?;
             budget = remaining(budget, consumed);
+            if interleave && consumed.field > 0 && self.encoder.computing_full_global() {
+                self.serve_during_global(now, &mut budget)?;
+            }
         }
         Ok(used(before, budget))
+    }
+    fn serve_during_global(&mut self, now: Tick, budget: &mut WorkBudget) -> Result<(), Error> {
+        let Some(Pending::Repair { id, tail: false }) = self.pending else {
+            return Err(Error::Identity);
+        };
+        let end = self.output_end.ok_or(Error::Identity)?;
+        let state = self.encoder.status();
+        let named = self.retry_queue.has_retries();
+        let probe = state.confirmed_prefix < self.sent && self.tail_due.is_some_and(|t| now >= t);
+        self.competing = self.fresh.len > 0;
+        let fresh = self.competing && self.regular_due < 2;
+        if fresh && (!(named || probe) || self.balance <= 0) {
+            match self.select_fresh(now, true, budget) {
+                Ok(true) => {
+                    self.parked_regular = Some((id, end));
+                    return Ok(());
+                }
+                // A fuller grant or release of the partly consumed slot is needed.
+                Ok(false) | Err(Error::Capacity) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        if probe && !(self.last_probe && named) {
+            self.last_probe = true;
+            self.queue_retry(SourceId(state.confirmed_prefix), None, now)?;
+        } else if let Some((source, credit)) =
+            self.retry_queue.next_retry(state.confirmed_prefix, budget)
+        {
+            self.last_probe = false;
+            self.last_named = true;
+            self.queue_retry(source, Some(credit), now)?;
+        } else {
+            return Ok(());
+        }
+        self.parked_regular = Some((id, end));
+        Ok(())
+    }
+    /// This targeted equation needs a grant, including while a physical source
+    /// is outstanding or all currently sent sources have just been confirmed.
+    pub fn computing_full_global(&self) -> bool {
+        self.policy.source_wire.is_targeted() && self.encoder.computing_full_global()
     }
     fn queue_retry(
         &mut self,
@@ -777,8 +850,10 @@ impl Sender {
             }
         }
         self.charge(matches!(pending, Pending::Source(_)), wire_bytes);
-        self.pending = None;
-        self.output_end = None;
+        (self.pending, self.output_end) = match self.parked_regular.take() {
+            Some((id, end)) => (Some(Pending::Repair { id, tail: false }), Some(end)),
+            None => (None, None),
+        };
         Ok(())
     }
     /// Apply only caller-authenticated feedback bound to this complete forward scope.

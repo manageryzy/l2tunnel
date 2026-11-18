@@ -1109,8 +1109,11 @@ cache reduced full source parses from 79.0 to 8.9 per ordered handoff on the
 receiving endpoint. Two four-capture native runs delivered 50.95 and 52.26
 Mbit/s and drained both endpoints. The same-turn sender can also reuse a
 remaining work grant after physical acceptance. TEST-12 remains open against
-the original 75.78–75.94 Mbit/s Python reference. See the C48 evidence in
-`docs/modules/frame-channel-experiment.md`.
+the original 75.78–75.94 Mbit/s Python reference. Interleaving source sends
+with a full global equation passed scalar byte comparison on 69 repairs and
+two clean UDP runs at 52.14 and 53.03 Mbit/s. Charging projected native
+authentication and UDP sizes in the Python model yielded 75.73 and 76.06
+Mbit/s. See the C48 evidence in `docs/modules/frame-channel-experiment.md`.
 
 ## Per-mode parity implementation gates
 

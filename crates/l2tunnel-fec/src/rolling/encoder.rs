@@ -13,6 +13,12 @@ struct Job {
     factor: Option<u8>,
     ready: bool,
 }
+#[derive(Clone, Copy, PartialEq)]
+enum Admission {
+    Idle,
+    Explicit,
+    ScannedGlobal,
+}
 /// Bounded sender state; confirmations are recovery receipts, not native delivery.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct EncoderStatus {
@@ -182,7 +188,7 @@ impl Encoder {
     /// Admit one exact source. A pending encoding job freezes its support.
     /// This performs at most two fixed-width copies/clears, each <=4098 bytes.
     pub fn admit_source(&mut self, original: &[u8], now: Tick) -> Result<SourceId, Error> {
-        self.admit_source_in(original, now, now, false)
+        self.admit_source_in(original, now, now, Admission::Idle)
     }
     pub(super) fn admit_source_created(
         &mut self,
@@ -190,7 +196,43 @@ impl Encoder {
         created: Tick,
         now: Tick,
     ) -> Result<SourceId, Error> {
-        self.admit_source_in(original, created, now, false)
+        self.admit_source_in(original, created, now, Admission::Idle)
+    }
+    pub(super) fn computing_full_global(&self) -> bool {
+        self.job.as_ref().is_some_and(|job| {
+            !job.ready
+                && !job.support.tail
+                && job.profile.is_none()
+                && self.explicit.is_none()
+                && self.config.local_window < self.config.window
+                && job.support.end - job.support.start == self.config.window as u32
+        })
+    }
+    // Queued originals move from separate custody into a ring vector. The
+    // reservation covers its complete clear, encoded length and actual bytes.
+    pub(super) fn admit_queued_source(
+        &mut self,
+        original: &[u8],
+        created: Tick,
+        now: Tick,
+        during_global: bool,
+        budget: &mut WorkBudget,
+    ) -> Result<Option<SourceId>, Error> {
+        let cost = add(self.width, add(2, original.len())?)?;
+        let Some(remaining) = budget.copies.checked_sub(cost) else {
+            return Ok(None);
+        };
+        let admission = if during_global {
+            if !self.computing_full_global() {
+                return Err(Error::Busy);
+            }
+            Admission::ScannedGlobal
+        } else {
+            Admission::Idle
+        };
+        let id = self.admit_source_in(original, created, now, admission)?;
+        budget.copies = remaining;
+        Ok(Some(id))
     }
     // The legacy admission owner pins every queued/unsent column before calling
     // this opt-in path. A frozen explicit equation permits later non-overwriting
@@ -203,20 +245,20 @@ impl Encoder {
         if self.explicit.is_none() {
             return Err(Error::Configuration);
         }
-        self.admit_source_in(original, now, now, true)
+        self.admit_source_in(original, now, now, Admission::Explicit)
     }
     fn admit_source_in(
         &mut self,
         original: &[u8],
         created: Tick,
         now: Tick,
-        explicit_admission: bool,
+        admission: Admission,
     ) -> Result<SourceId, Error> {
         if original.is_empty() || original.len() > self.config.max_payload {
             return Err(Error::Length);
         }
         self.time(now)?;
-        if self.job.is_some() && !explicit_admission {
+        if self.job.is_some() && admission == Admission::Idle {
             return Err(Error::Busy);
         }
         if self.next == u32::MAX {
@@ -231,10 +273,12 @@ impl Encoder {
         if let Some(old) = self.ids[index]
             && (old >= self.confirmed
                 || old >= end.saturating_sub(self.config.window as u32)
-                || self
-                    .job
-                    .as_ref()
-                    .is_some_and(|job| (job.support.start..job.support.end).contains(&old)))
+                || self.job.as_ref().is_some_and(|job| {
+                    // A partial column is still referenced. Only complete
+                    // contributions before the cursor survive reuse in output.
+                    (job.support.start..job.support.end).contains(&old)
+                        && (admission != Admission::ScannedGlobal || old >= job.source)
+                }))
         {
             return Err(Error::Capacity);
         }
