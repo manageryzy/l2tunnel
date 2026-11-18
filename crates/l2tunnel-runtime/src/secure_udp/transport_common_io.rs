@@ -88,6 +88,27 @@ impl Driver {
         Ok(())
     }
 
+    pub(super) fn clear_rolling_sender_grant(&mut self) {
+        if let Some(runtime) = self.common.as_deref_mut() {
+            runtime.rolling_sender_grant = None;
+        }
+    }
+
+    pub(super) fn remaining_rolling_work(
+        grant: l2tunnel_fec::rolling::WorkBudget,
+        used: l2tunnel_fec::rolling::WorkUsed,
+    ) -> io::Result<l2tunnel_fec::rolling::WorkBudget> {
+        let invalid = || protocol("rolling computation exceeded its directional grant");
+        Ok(l2tunnel_fec::rolling::WorkBudget {
+            field: grant.field.checked_sub(used.field).ok_or_else(invalid)?,
+            copies: grant.copies.checked_sub(used.copies).ok_or_else(invalid)?,
+            metadata: grant
+                .metadata
+                .checked_sub(used.metadata)
+                .ok_or_else(invalid)?,
+        })
+    }
+
     /// Service every current owner's bounded maintenance once per sole-loop turn,
     /// with explicit Rolling work when selected; never from per-packet callbacks.
     pub(super) fn service_common_rolling(&mut self, now: u64) -> io::Result<()> {
@@ -95,13 +116,16 @@ impl Driver {
         if self.common.is_none() || !self.check_expiry(now)? {
             return Ok(());
         }
+        self.clear_rolling_sender_grant();
         self.retry_common_fragment_inputs(now)?;
         for epoch in self.common_epochs().into_iter().flatten() {
             let step = if let Some(work) = work {
-                self.common_state_mut()?
-                    .entry(epoch)?
+                let mut entry = self.common_state_mut()?.entry(epoch)?;
+                let generation = entry.generation();
+                entry
                     .step(engine::Tick(now), work)
                     .map_err(protocol)?
+                    .map(|step| (generation, step, work))
             } else {
                 self.common_state_mut()?
                     .entry(epoch)?
@@ -109,7 +133,7 @@ impl Driver {
                     .map_err(protocol)?;
                 None
             };
-            if let Some(step) = step {
+            if let Some((generation, step, granted)) = step {
                 let visits = if step.source_handed || step.native_progress {
                     Some(self.common_state()?.engine(epoch)?.native_scan_visits())
                 } else {
@@ -119,6 +143,12 @@ impl Driver {
                     .common
                     .as_deref_mut()
                     .ok_or_else(|| protocol("rolling service owner"))?;
+                if epoch.0 == self.source_scope.epoch.0 && step.send.metadata < granted.metadata {
+                    runtime.rolling_sender_grant = Some((
+                        generation,
+                        Self::remaining_rolling_work(granted, step.send)?,
+                    ));
+                }
                 runtime.rolling_scheduler_steps = runtime.rolling_scheduler_steps.saturating_add(2);
                 for (total, (sent, received)) in runtime.rolling_work_used.iter_mut().zip([
                     (step.send.field, step.receive.work.field),
@@ -1127,6 +1157,7 @@ impl Driver {
             pending.carrier,
             pending.fragment,
         );
+        let generation = confirmation.as_ref().ok().copied().flatten();
         // Evaluate semantic eligibility once in its original precedence before
         // a last-unit receipt is allowed to release the independent Bridge.
         let eligibility = (|| {
@@ -1181,6 +1212,7 @@ impl Driver {
         #[cfg(unix)]
         proxy_completion?;
         self.retry_common_feedback(at)?;
+        self.continue_rolling_after_receipt(pending.scope, at, generation)?;
         Ok(true)
     }
     #[cfg(test)]
@@ -1286,6 +1318,7 @@ impl Driver {
                     pending.carrier,
                     pending.fragment,
                 );
+                let generation = confirmation.as_ref().ok().copied().flatten();
                 let physical_time = sampled.as_ref().ok().copied();
                 let eligibility = (|| {
                     sampled?;
@@ -1329,6 +1362,7 @@ impl Driver {
                 #[cfg(unix)]
                 proxy_completion?;
                 self.retry_common_feedback(completed)?;
+                self.continue_rolling_after_receipt(pending.scope, completed, generation)?;
                 Ok(true)
             }
             Ok(_) => Err(io::Error::new(

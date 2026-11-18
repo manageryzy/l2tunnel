@@ -98,7 +98,14 @@ fn source_admission<P: RecoveryPolicy>(config: Config<P>) -> TestResult {
     assert_eq!(pending.operation.id, 1);
     assert_eq!(pending.since, Tick(10));
     assert_eq!(pending.operation.deadline, owner.stage_deadline);
+    // The downstream owner is still occupied. A temporary sentinel in the
+    // private output slab detects a second encoding, even if it would have
+    // produced identical bytes. Restore that byte before allowing admission.
+    let original = owner.source[0];
+    owner.source[0] = !original;
     owner.step(Tick(12), work())?;
+    assert_eq!(owner.source[0], !original);
+    owner.source[0] = original;
     assert_eq!(
         owner.wait_snapshot(Tick(12)).ok_or("retry")?.sites[0]
             .pending

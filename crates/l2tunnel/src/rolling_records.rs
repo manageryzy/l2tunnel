@@ -32,6 +32,7 @@ pub mod expiry;
 mod fin_order;
 mod ingress;
 mod native;
+mod previewed;
 #[doc(hidden)]
 pub mod recovery;
 mod repair_budget;

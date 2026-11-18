@@ -320,6 +320,7 @@ impl Ingress {
             .iter()
             .flatten()
             .filter_map(|state| state.pending)
+            .take(self.usage.held.packets)
     }
     /// Whether a connection still has unsent ingress custody.
     pub fn retains_flow(&self, key: &FlowKey) -> bool {
@@ -416,12 +417,14 @@ impl Ingress {
                 timing,
                 Forward::Bypass(false),
             )?;
-            for slot in &mut self.slots {
-                if slot.is_some_and(|state| key.is_none_or(|key| state.key.flow == key)) {
-                    *slot = None;
+            if self.usage.histories != 0 {
+                for slot in &mut self.slots {
+                    if slot.is_some_and(|state| key.is_none_or(|key| state.key.flow == key)) {
+                        *slot = None;
+                        self.usage.histories -= 1;
+                    }
                 }
             }
-            self.usage.histories = self.slots.iter().flatten().count();
             return Ok(admitted);
         };
         let index = self
@@ -754,6 +757,9 @@ impl Ingress {
         key: Option<FlowKey>,
         now: Duration,
     ) -> Result<(), Error> {
+        if self.is_empty() {
+            return Ok(());
+        }
         for index in 0..self.slots.len() {
             if self.slots[index].is_some_and(|state| key.is_none_or(|key| state.key.flow == key)) {
                 self.emit(pipeline, index, now)?;

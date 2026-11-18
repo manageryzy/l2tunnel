@@ -419,6 +419,19 @@ fn targeted_ordinary_channel_delivery_crosses_old_source_without_duplicate_nativ
         if index != 0 {
             assert_eq!(receiver.receiver_status().decoder.handoff_prefix, 0);
         }
+        if index == 1 {
+            // Committing the independent channel permits another preview.
+            // The already admitted source can be skipped while the missing
+            // oldest source remains eligible for its original ordered handoff.
+            for _ in 0..128 {
+                receiver.step(Tick(6), work())?;
+                if !receiver.work_pending() {
+                    break;
+                }
+            }
+            assert_eq!(receiver.previewed.skip(0, 3), 0);
+            assert_eq!(receiver.previewed.skip(2, 3), 3);
+        }
     }
     assert_eq!(receiver.receiver_status().decoder.handoff_prefix, 3);
     assert_eq!(receiver.statistics().committed, 3);

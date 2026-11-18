@@ -959,6 +959,23 @@ impl Engine {
         }
     }
 
+    /// Continue only targeted sender work after the caller confirmed a complete
+    /// physical data record at this tick, within its unused current sender grant.
+    pub fn continue_targeted_send(
+        &mut self,
+        now: Tick,
+        work: crate::fec::rolling::WorkBudget,
+    ) -> Result<crate::fec::rolling::WorkUsed, Error> {
+        self.healthy()?;
+        let Owner::Rolling(endpoint) = &mut self.owner else {
+            return Ok(crate::fec::rolling::WorkUsed::default());
+        };
+        match endpoint.continue_targeted_send(now, work) {
+            Ok(used) => Ok(used),
+            Err(error) => self.fail(Error::Rolling(error)),
+        }
+    }
+
     /// Earliest original expiry or actual rolling packing/tail/feedback trigger.
     pub fn wake_at(&self) -> Result<Option<Tick>, Error> {
         let deadline = self.deadline()?;

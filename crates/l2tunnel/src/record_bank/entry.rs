@@ -375,6 +375,16 @@ impl<'a> Entry<'a> {
     ) -> Result<Option<crate::rolling_records::Step>, Error> {
         self.engine.step(now, work).map_err(Error::Engine)
     }
+    /// Resume this physical receipt's sender using unused work from its current turn.
+    pub fn continue_targeted_send(
+        &mut self,
+        now: engine::Tick,
+        work: l2tunnel_fec::rolling::WorkBudget,
+    ) -> Result<l2tunnel_fec::rolling::WorkUsed, Error> {
+        self.engine
+            .continue_targeted_send(now, work)
+            .map_err(Error::Engine)
+    }
     /// Actual packing/tail/feedback trigger, independent of an original expiry cap.
     pub fn wake_at(&self) -> Result<Option<engine::Tick>, Error> {
         self.engine.wake_at().map_err(Error::Engine)

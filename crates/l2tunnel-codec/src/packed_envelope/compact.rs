@@ -91,7 +91,7 @@ pub fn decode_compact(
         identity,
         records: &input[start..end],
         payload: &input[end..],
-        config,
+        validated_units: payload_units(&input[end..], config, count)?,
         count: count as u8,
         variable_records: variable,
     };

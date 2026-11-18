@@ -830,6 +830,9 @@ impl Driver {
         prior_error: Option<&io::Error>,
         mut sample: impl FnMut() -> Instant,
     ) -> io::Result<()> {
+        // Cancellation, errors and normal termination can all leave an unspent
+        // grant. Terminal settlement consumes only irreversible physical facts.
+        self.clear_rolling_sender_grant();
         self.complete_carrier_io_inner(socket, true, prior_error, &mut sample)
     }
     fn complete_carrier_io_inner<R: RawBacking>(

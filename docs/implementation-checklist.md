@@ -1104,7 +1104,13 @@ The four-flow Linux trace joins original TCP byte ranges to native reads, MUX
 admission, recovery and application completion. Performance parity remains open.
 The same study records the local/global decoder work reduction, the
 per-device-write ACK service regression and end-to-end 50.44 Mbit/s repeat.
-Another draw exceeded the original ACK deadline. TEST-12 remains open.
+Another draw exceeded the original ACK deadline. A later receiver preview
+cache reduced full source parses from 79.0 to 8.9 per ordered handoff on the
+receiving endpoint. Two four-capture native runs delivered 50.95 and 52.26
+Mbit/s and drained both endpoints. The same-turn sender can also reuse a
+remaining work grant after physical acceptance. TEST-12 remains open against
+the original 75.78–75.94 Mbit/s Python reference. See the C48 evidence in
+`docs/modules/frame-channel-experiment.md`.
 
 ## Per-mode parity implementation gates
 

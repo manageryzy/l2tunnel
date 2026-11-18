@@ -242,3 +242,214 @@ fn protected_udp_targeted_gap_retries_retained_original_and_charges_local_mux_pr
             Ok(())
         })
 }
+
+#[tokio::test]
+async fn one_targeted_sender_grant_crosses_multiple_physical_accepts_but_not_would_block() -> Result
+{
+    let mut fixture = queued_targeted_sender().await?;
+    let epoch = fixture.endpoints[0].driver.common_state()?.epoch();
+    let sender = &mut fixture.endpoints[0];
+    let now = fixture.now;
+    assert!(
+        sender
+            .driver
+            .common_state()?
+            .engine(epoch)?
+            .rolling_repair_budget()
+            .ok_or("targeted sender")?
+            .queued_fresh
+            >= 2
+    );
+    // A zero metadata grant cannot select a second datagram after a physical
+    // receipt, even when other components still have unused capacity.
+    sender.driver.config.rolling_work = Some(rolling::WorkBudget {
+        metadata: 0,
+        ..work()
+    });
+    sender.driver.service_common_rolling(now)?;
+    assert!(
+        sender
+            .driver
+            .send_common_user_with(now, |bytes| sender.socket.try_send(bytes))?
+    );
+    assert!(
+        !sender
+            .driver
+            .send_common_user_with(now, |bytes| sender.socket.try_send(bytes))?
+    );
+    sender.driver.config.rolling_work = Some(work());
+    sender.driver.service_common_rolling(now)?;
+    let phys = sender.driver.counters.socket_accepted_packets;
+    let (steps, used, grant) = {
+        let runtime = sender.driver.common.as_ref().ok_or("runtime")?;
+        (
+            runtime.rolling_scheduler_steps,
+            runtime.rolling_work_used,
+            runtime.rolling_sender_grant.ok_or("sender grant")?,
+        )
+    };
+    for _ in 0..2 {
+        assert!(
+            !sender
+                .driver
+                .send_common_user_with(now, |_| Err(io::ErrorKind::WouldBlock.into()))?
+        );
+        let runtime = sender.driver.common.as_ref().ok_or("runtime")?;
+        assert_eq!(runtime.rolling_sender_grant, Some(grant));
+        assert_eq!(runtime.rolling_work_used, used);
+        assert_eq!(sender.driver.counters.socket_accepted_packets, phys);
+    }
+    let held = {
+        let runtime = sender.driver.common.as_ref().ok_or("runtime")?;
+        let sealed = runtime.sealed.as_ref().ok_or("original custody")?;
+        runtime.wire[..sealed.sealed.bytes].to_vec()
+    };
+    let instant = sender.driver.origin + duration(now);
+    sender
+        .driver
+        .send_sampled(&sender.socket, now, instant, || instant)?;
+    let runtime = sender.driver.common.as_ref().ok_or("runtime")?;
+    assert_eq!(runtime.rolling_scheduler_steps, steps);
+    assert!(sender.driver.counters.socket_accepted_packets >= phys + 2);
+    let delta = std::array::from_fn::<_, 3, _>(|idx| runtime.rolling_work_used[idx] - used[idx]);
+    assert_eq!(delta[0], 0);
+    assert!(delta[1] > 0 && delta[1] <= grant.1.copies as u64);
+    assert!(delta[2] > 0 && delta[2] <= grant.1.metadata as u64);
+    let mut accepted = Vec::new();
+    for _ in phys - 1..sender.driver.counters.socket_accepted_packets {
+        accepted.push(read_datagram(&fixture, 1).await?);
+    }
+    assert!(accepted.iter().any(|datagram| datagram == &held));
+    assert!(accepted.windows(2).all(|pair| pair[0] != pair[1]));
+    Ok(())
+}
+
+async fn queued_targeted_sender() -> Result<Fixture> {
+    let kind = cover::Appearance::QuicLike;
+    let mut fixture = Fixture::from_contracts(kind, contracts_targeted(kind)?).await?;
+    let epoch = fixture.endpoints[0].driver.common_state()?.epoch();
+    // Retain a prepared source and queue later sealed sources before this turn.
+    for i in 0..5 {
+        fixture.admit(0, &frame(41_001, 70 + i)).await?;
+        let sender = &mut fixture.endpoints[0];
+        let mut entry = sender.driver.common_state_mut()?.entry(epoch)?;
+        assert!(entry.admit_borrowed(engine::Tick(fixture.now))?.is_some());
+        fixture.now += 10_000;
+        sender.driver.service_common_rolling(fixture.now)?;
+    }
+    Ok(fixture)
+}
+
+#[tokio::test]
+async fn deferred_whole_receipt_retires_original_without_using_an_ended_turn_or_late_cap() -> Result
+{
+    #[derive(Clone, Copy)]
+    enum Boundary {
+        NextTurn,
+        Terminal,
+        Late,
+        InvalidGrant,
+    }
+    for boundary in [
+        Boundary::NextTurn,
+        Boundary::Terminal,
+        Boundary::Late,
+        Boundary::InvalidGrant,
+    ] {
+        let mut fixture = queued_targeted_sender().await?;
+        let endpoint = &mut fixture.endpoints[0];
+        let driver = &mut endpoint.driver;
+        let now = fixture.now;
+        assert!(!driver.send_common_user_with(now, |_| Err(io::ErrorKind::WouldBlock.into()))?);
+        let runtime = driver.common.as_ref().ok_or("runtime")?;
+        assert!(runtime.rolling_sender_grant.is_some());
+        let used = runtime.rolling_work_used;
+        let pending = runtime.sealed.as_ref().ok_or("sealed output")?;
+        let epoch = core::Epoch(pending.scope.epoch.0);
+        let accepted_before = driver.counters.socket_accepted_packets;
+        let bytes_before = driver.counters.socket_accepted_ip_bytes;
+        let id = carrier::UserIdentity {
+            scope: pending.scope,
+            number: pending.sealed.number,
+            bytes: pending.sealed.bytes,
+            deadline: driver.origin + duration(pending.deadline),
+        };
+        let accepted = driver.origin + duration(now);
+        let observed = accepted + Duration::from_micros(10);
+        let receipt = carrier::AcceptedReceipt {
+            record_bytes: id.bytes,
+            udp_bytes: Some(id.bytes),
+            charged_bytes: pending.cost,
+            socket_ip_bytes: Some(pending.cost),
+            boundary: crate::secure_udp::SendBoundary::SocketAccepted,
+            accepted_at: accepted,
+            deadline: id.deadline,
+        };
+        let fresh = driver
+            .common_state()?
+            .engine(epoch)?
+            .rolling_repair_budget()
+            .ok_or("targeted sender")?
+            .queued_fresh;
+        assert!(fresh >= 2);
+        assert_eq!(
+            endpoint.socket.try_send(&runtime.wire[..id.bytes])?,
+            id.bytes
+        );
+        match boundary {
+            Boundary::Terminal => {
+                let mut udp: carrier::IoOwner =
+                    tokio::net::UdpSocket::bind("127.0.0.1:0").await?.into();
+                driver.complete_carrier_io_terminal(&mut udp, None, || observed)?;
+            }
+            Boundary::NextTurn => driver.clear_rolling_sender_grant(),
+            Boundary::Late => {}
+            Boundary::InvalidGrant => {
+                // Inject a selector error after a genuine physical receipt.
+                let (_, grant) = driver
+                    .common
+                    .as_mut()
+                    .and_then(|r| r.rolling_sender_grant.as_mut())
+                    .ok_or("active sender grant")?;
+                grant.field = usize::MAX;
+            }
+        }
+        let result =
+            driver.complete_common_carrier(id, receipt, matches!(boundary, Boundary::Late), || {
+                observed
+            });
+        match boundary {
+            Boundary::Late => assert_eq!(
+                result.err().ok_or("missing late failure")?.kind(),
+                io::ErrorKind::TimedOut
+            ),
+            Boundary::InvalidGrant => assert!(
+                result
+                    .err()
+                    .ok_or("missing selector failure")?
+                    .to_string()
+                    .contains("WorkLimit")
+            ),
+            Boundary::NextTurn | Boundary::Terminal => assert!(result?),
+        }
+        assert_eq!(driver.counters.socket_accepted_packets, accepted_before + 1);
+        assert_eq!(
+            driver.counters.socket_accepted_ip_bytes,
+            bytes_before + receipt.charged_bytes as u64
+        );
+        let runtime = driver.common.as_ref().ok_or("runtime")?;
+        assert!(runtime.sealed.is_none());
+        assert_eq!(runtime.rolling_work_used, used);
+        let engine = driver.common_state()?.engine(epoch)?;
+        assert!(engine.pending_carrier_output().is_none());
+        assert_eq!(
+            engine
+                .rolling_repair_budget()
+                .ok_or("targeted sender")?
+                .queued_fresh,
+            fresh
+        );
+        assert_eq!(read_datagram(&fixture, 1).await?.len(), id.bytes);
+    }
+    Ok(())
+}

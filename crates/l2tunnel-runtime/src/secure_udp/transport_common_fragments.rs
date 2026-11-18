@@ -99,18 +99,19 @@ impl Driver {
         order: Option<l2tunnel::codec::CausalTime>,
         carrier: Option<record_bank::CarrierOutputToken>,
         fragment: Option<record_bank::FragmentOutputToken>,
-    ) -> io::Result<()> {
+    ) -> io::Result<Option<record_bank::GenerationId>> {
         if carrier.is_some() && fragment.is_some() {
             return Err(protocol(
                 "one physical write has two logical custody witnesses",
             ));
         }
         if carrier.is_none() && fragment.is_none() {
-            return Ok(());
+            return Ok(None);
         }
         let mut entry = self.common_state_mut()?.entry(core::Epoch(scope.epoch.0))?;
-        if let Some(token) = fragment {
-            match order {
+        let generation = entry.generation();
+        let complete_data = if let Some(token) = fragment {
+            let receipt = match order {
                 Some(order) => entry.confirm_fragment_ordered_at(
                     engine::Tick(observed),
                     engine::Tick(accepted),
@@ -122,7 +123,9 @@ impl Driver {
                 }
             }
             .map_err(protocol)?;
+            matches!(receipt, engine::FragmentReceipt::GroupComplete(group) if group.kind != engine::EmissionKind::Feedback)
         } else if let Some(token) = carrier {
+            let data = token.emission().kind != engine::EmissionKind::Feedback;
             match order {
                 Some(order) => entry.confirm_carrier_output_ordered_at(
                     engine::Tick(observed),
@@ -137,6 +140,53 @@ impl Driver {
                 ),
             }
             .map_err(protocol)?;
+            data
+        } else {
+            false
+        };
+        Ok(complete_data.then_some(generation))
+    }
+
+    // All physical accounting, timing checks, proxy receipts and feedback service
+    // have completed before any next-output selection can introduce a new error.
+    pub(super) fn continue_rolling_after_receipt(
+        &mut self,
+        scope: Scope,
+        observed: u64,
+        generation: Option<record_bank::GenerationId>,
+    ) -> io::Result<()> {
+        let Some((owner, remaining)) = self
+            .common
+            .as_deref()
+            .and_then(|runtime| runtime.rolling_sender_grant)
+        else {
+            return Ok(());
+        };
+        if generation != Some(owner) {
+            return Ok(());
+        }
+        let mut entry = self.common_state_mut()?.entry(core::Epoch(scope.epoch.0))?;
+        if entry.generation() != owner {
+            return Err(protocol("rolling sender grant lost issuing generation"));
+        }
+        let used = entry
+            .continue_targeted_send(engine::Tick(observed), remaining)
+            .map_err(protocol)?;
+        let residual = Self::remaining_rolling_work(remaining, used)?;
+        let runtime = self
+            .common
+            .as_deref_mut()
+            .ok_or_else(|| protocol("rolling sender grant owner"))?;
+        runtime.rolling_sender_grant = (used != l2tunnel_fec::rolling::WorkUsed::default()
+            && residual.metadata != 0)
+            .then_some((owner, residual));
+        for (total, delta) in
+            runtime
+                .rolling_work_used
+                .iter_mut()
+                .zip([used.field, used.copies, used.metadata])
+        {
+            *total = total.saturating_add(delta as u64);
         }
         Ok(())
     }

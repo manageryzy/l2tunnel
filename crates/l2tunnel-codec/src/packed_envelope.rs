@@ -97,6 +97,7 @@ fn count_valid(config: Config, identity: Identity, count: usize) -> Result<(), E
         .ok_or(Error::Exhausted)?;
     Ok(())
 }
+#[derive(Clone)]
 enum PayloadUnits<'a> {
     Single(Option<&'a [u8]>),
     Packed(packed::Units<'a>),
@@ -176,7 +177,7 @@ pub struct View<'a> {
     identity: Identity,
     records: &'a [u8],
     payload: &'a [u8],
-    config: Config,
+    validated_units: PayloadUnits<'a>,
     count: u8,
     variable_records: bool,
 }
@@ -202,7 +203,7 @@ impl<'a> View<'a> {
         Ok(Units {
             identity: self.identity,
             records: self.records,
-            payload: payload_units(self.payload, self.config, self.len())?,
+            payload: self.validated_units.clone(),
             index: 0,
             remaining: self.len(),
             variable_records: self.variable_records,
@@ -285,14 +286,15 @@ pub fn decode(config: Config, expected: Scope, input: &[u8]) -> Result<View<'_>,
     }
     let payload = &input[body_start..];
     let records = &input[HEADER_BYTES..body_start];
-    for (index, unit) in payload_units(payload, config, count)?.enumerate() {
+    let validated_units = payload_units(payload, config, count)?;
+    for (index, unit) in validated_units.clone().enumerate() {
         check_unit(unit, RecordId(word64(records, index * 8)), config)?;
     }
     Ok(View {
         identity,
         records,
         payload,
-        config,
+        validated_units,
         count: count as u8,
         variable_records: false,
     })

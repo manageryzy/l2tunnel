@@ -1145,8 +1145,27 @@ impl Receiver {
         if Some(id) == self.expected(channel)? {
             return Ok(());
         }
+        // Totals include all reserved channel heads. When even that upper
+        // bound fits, excluding the heads cannot change the decision.
+        if self.retention.records < self.limits.lookahead_records
+            && self
+                .retention
+                .record_bytes
+                .checked_add(bytes)
+                .is_some_and(|used| used <= self.limits.lookahead_bytes)
+            && self
+                .retention
+                .fragment_slots
+                .checked_add(fragments)
+                .is_some_and(|used| used <= self.limits.lookahead_fragments)
+        {
+            return Ok(());
+        }
         let (mut count, mut total, mut slots) = (1usize, bytes, fragments);
-        for entry in self.records.iter().flatten() {
+        for &index in &self.ordered_slots {
+            let entry = self.records[usize::from(index)]
+                .as_ref()
+                .ok_or(Error::Malformed)?;
             if Some(entry.id) != self.channels[usize::from(entry.channel.0)].expected {
                 count += 1;
                 total += entry.bytes.len();

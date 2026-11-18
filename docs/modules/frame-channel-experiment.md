@@ -929,3 +929,35 @@ writes and found a maximum of 5.29 ms. It did not reproduce that failed trial.
 [Regular repeat](../../work/c48-parity-20261119/native/candidate-r11-repeat/summary.json),
 [profile](../../work/c48-parity-20261119/native/candidate-r11-steady-perf/profile.json)
 and [failed trial](../../work/c48-parity-20261119/native/candidate-r11/diagnostic-failure.json).
+
+Two sender-only R12 measurements allowed the next data selection to spend the
+remaining grant after a complete physical handoff. The active sender used
+about 0.86–0.89 CPU cores versus 1.00 for the R11 repeat and accepted
+1.29–1.33 packets per turn versus 0.63. The resulting 48.55 and 50.93 Mbit/s
+did not establish a throughput increase. The runtime also fences the remaining
+grant at the next turn and terminal settlement. The delayed-completion tests
+cover the original physical receipt, immutable token, and terminal and
+late-error handling. [Sender results and receipt tests](../../work/c48-parity-20261119/native/r12-guarded-overlay/evidence.json).
+
+In a separate R11 receive measurement, 70,600 ordered source handoffs on the
+server involved 5,576,638 full parses in ordered and preview handling.
+Of 1,540,255 completed previews, 1,470,484 selected no new units. The
+targeted receiver now remembers absolute source blocks once a complete
+preview proves that every unit already has a receipt. It can skip consecutive
+proven bits with one bounded metadata visit. An absent proof, a hole, or a
+reused slot with another absolute block number still requires normal processing.
+The W8192 cache uses 2048 bytes. The ordered owner retains its original check
+of unit sequence, framing and policy. The codec also retains validated
+container framing for repeated iteration, and the sender preserves an
+immutable serialized source over admission refusals.
+[Original parse counts](../../work/c48-parity-20261119/native/candidate-r11-preview-counts/preview-counts.json)
+and [sender replay](../../work/c48-parity-20261119/recovery/sealed-source-comparison.json).
+
+The R13 preview experiment includes these codec changes and uses R11 sender
+scheduling. Its two regular runs delivered 50.95 and 52.26 Mbit/s, with
+first-write P99 of 443.96 and 470.70 ms and scheduled P99 of 4354.28 and
+5740.85 ms. All four captures and stream hashes passed in both runs. Both
+directions drained every remaining source. The original 75.78–75.94 Mbit/s
+Python target remains open.
+[First R13 run](../../work/c48-parity-20261119/native/candidate-r13-preview/summary.json)
+and [second R13 run](../../work/c48-parity-20261119/native/candidate-r13-preview-repeat/summary.json).

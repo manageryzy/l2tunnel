@@ -145,6 +145,7 @@ impl<'a> Container<'a> {
 }
 
 /// Borrowed iterator constructed only from a fully validated container.
+#[derive(Clone)]
 pub struct Units<'a> {
     bytes: &'a [u8],
     position: usize,

@@ -305,6 +305,10 @@ pub(super) struct Runtime {
     pub(super) witnesses: Vec<l2tunnel_codec::aligned_receiver::UnitWitness>,
     pub(super) sent: Option<super::common_actions::Boundary>,
     pub(super) delivered: Option<super::common_actions::Boundary>,
+    pub(super) rolling_sender_grant: Option<(
+        l2tunnel::record_bank::GenerationId,
+        l2tunnel_fec::rolling::WorkBudget,
+    )>,
     pub(super) rolling_scheduler_steps: u64,
     pub(super) rolling_work_used: [u64; 3],
     pub(super) fragment_data_drops: u64,
@@ -944,6 +948,7 @@ impl Driver {
                 witnesses,
                 sent: None,
                 delivered: None,
+                rolling_sender_grant: None,
                 rolling_scheduler_steps: 0,
                 rolling_work_used: [0; 3],
                 fragment_data_drops: 0,

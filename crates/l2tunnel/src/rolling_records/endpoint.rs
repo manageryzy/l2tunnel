@@ -76,6 +76,7 @@ struct PreviewUnit {
 #[derive(Clone, Copy)]
 struct Preview {
     source: rolling::SourceId,
+    first_unit: receiver::SourceId,
     count: usize,
     unit: usize,
     current: Option<PreviewUnit>,
@@ -112,6 +113,9 @@ pub struct Endpoint<P: RecoveryPolicy = scheduler::Policy> {
     pub(super) packing: packed_sender::Sender,
     pub(super) records: receiver::Receiver,
     pub(super) source: Vec<u8>,
+    // Only pump_send writes this slab. The packer keeps the sealed units
+    // immutable until their exact recovery source is admitted and committed.
+    encoded_source: Option<(rolling::SourceId, usize)>,
     pub(super) symbols: Vec<u8>,
     pub(super) overhead: usize,
     pub(super) compact_feedback_overhead: Option<usize>,
@@ -129,6 +133,7 @@ pub struct Endpoint<P: RecoveryPolicy = scheduler::Policy> {
     receive_unit: Option<receiver::SourceId>,
     preview_next: u32,
     preview_end: u32,
+    pub(super) previewed: previewed::Previewed,
     preview: Option<Preview>,
     preview_blocked: bool,
     preview_rescan: bool,
@@ -361,6 +366,7 @@ impl<P: RecoveryPolicy> Endpoint<P> {
             packing,
             records,
             source,
+            encoded_source: None,
             symbols,
             overhead,
             compact_feedback_overhead: None,
@@ -378,6 +384,7 @@ impl<P: RecoveryPolicy> Endpoint<P> {
             receive_unit: Some(receive_config.receiver.first_source),
             preview_next: 0,
             preview_end: 0,
+            previewed: previewed::Previewed::new(receive_config)?,
             preview: None,
             preview_blocked: false,
             preview_rescan: false,
@@ -561,13 +568,21 @@ impl<P: RecoveryPolicy> Endpoint<P> {
             return Ok(());
         }
         let expected = rolling::SourceId(P::send_state(&self.sender).next_source);
-        let length = if self.compact_feedback_overhead.is_some() {
-            self.packing.write_pending_compact(&mut self.source)
-        } else {
-            self.packing
-                .write_pending(receiver::SourceId(u64::from(expected.0)), &mut self.source)
-        }
-        .map_err(Error::Sender)?;
+        let length = match self.encoded_source {
+            Some((id, length)) if id == expected => length,
+            Some(_) => return self.fail(Error::Identity),
+            None => {
+                let length = if self.compact_feedback_overhead.is_some() {
+                    self.packing.write_pending_compact(&mut self.source)
+                } else {
+                    self.packing
+                        .write_pending(receiver::SourceId(u64::from(expected.0)), &mut self.source)
+                }
+                .map_err(Error::Sender)?;
+                self.encoded_source = Some((expected, length));
+                length
+            }
+        };
         let copies = self.packing.pending_copies().map_err(Error::Sender)?;
         let admitted = self
             .packing
@@ -598,6 +613,7 @@ impl<P: RecoveryPolicy> Endpoint<P> {
                 if let Err(error) = result {
                     return self.fail(error);
                 }
+                self.encoded_source = None;
                 if let Some(waits) = self.waits.first_mut() {
                     waits.progress(waits::Site::SourceAdmission, operation, now);
                 }
@@ -719,6 +735,11 @@ impl<P: RecoveryPolicy> Endpoint<P> {
                 if self.preview_next >= status.observed_end {
                     break;
                 }
+                let next = self.previewed.skip(self.preview_next, status.observed_end);
+                if next != self.preview_next {
+                    self.preview_next = next;
+                    continue;
+                }
                 let source = rolling::SourceId(self.preview_next);
                 self.preview_next = self.preview_next.checked_add(1).ok_or(Error::Arithmetic)?;
                 let Some(bytes) =
@@ -735,6 +756,7 @@ impl<P: RecoveryPolicy> Endpoint<P> {
                 )?;
                 self.preview = Some(Preview {
                     source,
+                    first_unit: view.identity().first_unit,
                     count: view.len(),
                     unit: 0,
                     current: None,
@@ -746,6 +768,13 @@ impl<P: RecoveryPolicy> Endpoint<P> {
             if preview.unit == preview.count {
                 budget.metadata -= 1;
                 visits += 1;
+                if preview.selected == [0; 4] {
+                    // Targeted selection includes every previously unobserved
+                    // unit. A completely empty pass proves every unit already
+                    // has receiver custody or has retired below its frontier.
+                    self.previewed.mark(preview.source.0);
+                    continue;
+                }
                 let bytes = P::decoded_source(&self.incoming, preview.source)
                     .map_err(Error::Rolling)?
                     .ok_or(Error::Identity)?;
@@ -829,6 +858,25 @@ impl<P: RecoveryPolicy> Endpoint<P> {
             if preview.current.is_none() {
                 budget.metadata -= 1;
                 visits += 1;
+                // The first parse checked every unit and the entire absolute
+                // ID range. A retained proof can be looked up before parsing
+                // this same immutable recovery source again.
+                if config.scheduler.targeted() {
+                    let id = preview
+                        .first_unit
+                        .0
+                        .checked_add(preview.unit as u64)
+                        .ok_or(Error::Identity)?;
+                    if self
+                        .records
+                        .source_observed(self.receive_scope, receiver::SourceId(id))
+                        .map_err(Error::Receiver)?
+                    {
+                        preview.unit += 1;
+                        self.preview = Some(preview);
+                        continue;
+                    }
+                }
                 let bytes = P::decoded_source(&self.incoming, preview.source)
                     .map_err(Error::Rolling)?
                     .ok_or(Error::Identity)?;
@@ -847,16 +895,6 @@ impl<P: RecoveryPolicy> Endpoint<P> {
                     .map_err(Error::Envelope)?
                     .nth(preview.unit)
                     .ok_or(Error::Identity)?;
-                if config.scheduler.targeted()
-                    && self
-                        .records
-                        .source_observed(self.receive_scope, unit.identity.source)
-                        .map_err(Error::Receiver)?
-                {
-                    preview.unit += 1;
-                    self.preview = Some(preview);
-                    continue;
-                }
                 let offset = (unit.bytes.as_ptr() as usize)
                     .checked_sub(bytes.as_ptr() as usize)
                     .ok_or(Error::Identity)?;
@@ -944,6 +982,58 @@ impl<P: RecoveryPolicy> Endpoint<P> {
             source_handed,
             native_progress,
         })
+    }
+
+    /// Continue the targeted selector once after a complete physical data receipt.
+    /// The receipt has already advanced time and installed any deferred source extent.
+    pub(crate) fn continue_targeted_send(
+        &mut self,
+        now: Tick,
+        mut work: rolling::WorkBudget,
+    ) -> Result<rolling::WorkUsed, Error> {
+        let idle = rolling::WorkUsed::default();
+        if !self.send_config.scheduler.targeted() || work.metadata == 0 {
+            return Ok(idle);
+        }
+        if self.now != now {
+            return Err(Error::Time);
+        }
+        let state = P::send_state(&self.sender);
+        if !state.work_pending || P::feedback(&self.incoming).is_some() {
+            return Ok(idle);
+        }
+        // Fresh selection clears and then fills one retained encoder vector.
+        // Reserve those copies before arbitration; a regular repair still gets
+        // only this turn's remaining GF/copy/metadata allowance.
+        let width = self
+            .send_config
+            .scheduler
+            .recovery()
+            .width()
+            .map_err(Error::Rolling)?;
+        if state.queued_fresh > 0 {
+            let max_transfer = width.checked_mul(2).ok_or(Error::Arithmetic)?;
+            let Some(copies) = work.copies.checked_sub(max_transfer) else {
+                return Ok(idle);
+            };
+            work.copies = copies;
+        }
+        let mut used = self.step_sender(now, work)?;
+        if state.queued_fresh > 0
+            && let Some((id, bytes)) = P::pending_original(&self.sender)
+            && id.0 == state.encoder.next_source
+        {
+            let payload = bytes
+                .checked_add(2)
+                .filter(|size| *size <= width)
+                .ok_or(Error::Identity)?;
+            used.copies = used
+                .copies
+                .checked_add(width)
+                .and_then(|cost| cost.checked_add(payload))
+                .ok_or(Error::Arithmetic)?;
+        }
+        Ok(used)
     }
 
     /// Consume queued targeted inputs with this turn's remaining receive grant.
@@ -1820,14 +1910,17 @@ fn admit_packed<P: RecoveryPolicy>(
         .map_err(Error::Envelope)?
         .zip(symbols.chunks_exact_mut(config.receiver.body.symbol_bytes))
     {
-        let (payload, padding) = symbol.split_at_mut(unit.bytes.len());
-        payload.copy_from_slice(unit.bytes);
-        padding.fill(0);
-        check_policy(config, symbol)?;
+        // Unit framing is already verified, and policy checks only the body
+        // tag and fragment header. Materialize a full symbol for the record
+        // owner only when the unit still needs admission.
+        check_policy(config, unit.bytes)?;
         units += 1;
         if preview && floor.is_none_or(|floor| unit.identity.source.0 < floor.0) {
             continue;
         }
+        let (payload, padding) = symbol.split_at_mut(unit.bytes.len());
+        payload.copy_from_slice(unit.bytes);
+        padding.fill(0);
         inputs
             .try_push(receiver::AuthenticatedSymbol {
                 identity: unit.identity,

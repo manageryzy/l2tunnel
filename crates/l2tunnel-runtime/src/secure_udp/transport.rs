@@ -245,6 +245,8 @@ where
     let mut native_first = true;
     let result: io::Result<StopReason> = async {
         loop {
+            // Previous-turn receipts must settle before the new sender grant.
+            driver.clear_rolling_sender_grant();
             execution.turn();
             if execution
                 .measure_future(
@@ -639,6 +641,7 @@ where
         }
     }
     .await;
+    driver.clear_rolling_sender_grant();
     let metric_stop = sample();
     // Freeze before terminal settlement. Existing buffer export owns the prepaid
     // diagnostic from here. The stack guard handles cancellation before this
