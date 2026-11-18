@@ -39,6 +39,9 @@ def make_simulation(task):
     targeted = task.get("packed_targeted_recovery", False)
     if type(targeted) is not bool:
         raise ValueError("packed_targeted_recovery must be a boolean")
+    latency_policy = task.get("packed_latency_policy")
+    if latency_policy is not None and (not targeted or not isinstance(latency_policy, str)):
+        raise ValueError("packed_latency_policy requires targeted recovery and a policy name")
     if targeted and (mux is None or profile.get("wire_format") != "compact_wire"
                      or profile["compact"].get("pack_sources_max_delay_ms", 0) <= 0):
         raise ValueError("targeted recovery requires a packed duplex MUX")
@@ -80,9 +83,15 @@ def make_simulation(task):
     if targeted:
         # Install before producers, probes or receiver service attach. The named
         # historical MUX constructor and its source fingerprint stay reproducible.
-        from l2tunnel_sim.packed_targeted import TargetedPackedWireTransport
-        transports = tuple(TargetedPackedWireTransport(sim.flows[0], reverse, config)
-                           for reverse in (False, True))
+        from l2tunnel_sim.packed_targeted import TargetedPackedWireTransport, TargetedPolicy
+        if latency_policy is None:
+            transports = tuple(TargetedPackedWireTransport(sim.flows[0], reverse, config)
+                               for reverse in (False, True))
+        else:
+            from l2tunnel_sim.packed_latency_policy import LatencyPackedWireTransport
+            transports = tuple(LatencyPackedWireTransport(
+                sim.flows[0], reverse, config, policy=TargetedPolicy(), variant=latency_policy)
+                for reverse in (False, True))
         for previous, current in zip(sim.mux.transports, transports):
             current.capacity_callback = previous.capacity_callback
             previous.capacity_callback = None
@@ -154,6 +163,11 @@ def execute(task, *, observe_packed=None):
     shared = sim.shared_forward
     if task.get("packed_targeted_recovery"):
         row["targeted_policy"] = asdict(shared.policy)
+        if task.get("packed_latency_policy") is not None:
+            row["packed_latency_policy"] = task["packed_latency_policy"]
+            row["packed_latency_counts"] = {name: dict(transport.latency_counts)
+                                            for name, transport in (("forward", shared),
+                                                                    ("reverse", sim.shared_reverse))}
         row["targeted_counts"] = {name: dict(transport.targeted_counts)
                                   for name, transport in (("forward", shared),
                                                           ("reverse", sim.shared_reverse))}

@@ -319,3 +319,71 @@ seeded erasure stream differently.
 [matched historical control](../../work/packed-targeted-20261118/fresh-full-r1/archived-full-summary.json),
 [short seed one](../../work/packed-targeted-20261118/fresh-pilot-r1/summary.json)
 and [short seed two](../../work/packed-targeted-20261118/fresh-pilot-r2/summary.json)
+
+## Original-frame latency in the calibrated C48 run
+
+The [frame observer](../../simulator/src/l2tunnel_sim/packed_frame_path.py)
+follows each original forward TCP segment from the inner sender's first
+submission to contiguous application delivery. It joins the TCP flow and
+segment number to the MUX attempt that reached TCP first, the last required
+packed source to become available, and the physical packet that unlocked
+that source. A retry of a *different* source can unlock an existing equation.
+Time spent waiting for that transmission includes any intervening failed
+attempts. Time after all of the frame's own sources are known is measured
+separately at channel release and at ordered TCP delivery. The measured
+origin excludes demand waiting to enter the inner TCP sender.
+
+Sort the completed originals by their total lifetime and take the slowest
+one percent, rounded up to a whole frame. Phase means below refer to those
+same frames and add up to their mean total lifetime. The decoder FIFO's P99
+uses a different population, individual physical packets that entered service.
+Input overflow, erasure, and an earlier missing record can delay application
+delivery beyond any single accepted packet's decoder wait.
+
+The [byte-budget policy](../../simulator/src/l2tunnel_sim/packed_latency_policy.py)
+lets a requested retransmission displace future proactive FEC on its own
+direction. It charges the actual IP bytes of each retry and the encoded size
+of each prospective repair. The selected variant credits half the retry
+bytes, with a cap of 32 MTUs for this workload. A regular repair is skipped
+only once its entire cost is covered. Residual credit expires at full
+confirmation. All transmitted equations keep their local 128 / every 16th
+global schedule. The source custody bound remains 8,192 and the sender can
+retry an old missing original while another channel delivers newer frames.
+
+In two short pilots, crediting every retry byte reduced mean MUX wait below
+0.4 ms, but increased application P99 to 301 and 334 ms. Half credit retained
+more proactive FEC and yielded 135 and 132 ms. Both pilots use one second of
+warmup, three seconds of offered traffic and three seconds of drain.
+[Two-seed budget comparison](../../work/packed-latency-20261118/budget-pilots/comparison.json)
+
+The full original-seed replay reproduced 418 stored result fields and all
+three cutoff snapshots. The baseline delivered 1,496,400 original segments.
+Its slowest 14,964 spent 325.86 ms on average waiting for MUX admission,
+151.94 ms waiting for earlier channel records after their own data was
+known, and 75.98 ms waiting for the transmission that unlocked their own
+last required source. Forward propagation added 35.00 ms and waiting for
+decoder service added 27.28 ms. Packing, physical FIFO wait, serialization
+and decoder execution together added 0.34 ms. The mean lifetime of these
+frames was 616.39 ms. Inner TCP reordering added zero time in this cohort.
+The baseline's slowest original, flow 8 segment 21618, waited 361.79 ms for
+MUX admission and a further 312.93 ms until the sender issued the successful
+retry of source 175043. It reached the application 731.14 ms after submission.
+[Baseline phase evidence](../../work/packed-latency-20261118/baseline-full-1/frame-path.json)
+and [baseline replay check](../../work/packed-latency-20261118/baseline-full-1/parity.json)
+
+The original sender schedules proactive FEC in addition to each named
+retransmission. Both occupy the physical FIFO. The MUX admits the next user
+frame only when that serializer is free. In the 85-second measurement window,
+the baseline used 29.21 Mbit/s for forward repairs and retries on the
+saturated 100 Mbit/s link, leaving 70.74 Mbit/s for forward source IP
+packets including all headers. The inner sender requested 76 Mbit/s of
+application payload. Under sustained load, original frames accumulated
+*before* MUX admission. This explains why the physical FIFO residence of
+the final solving packet itself could be very short.
+
+At full duration the fixed half-credit policy increased TCP goodput from
+67.86 to 75.41 Mbit/s and reduced delivery P99 from 577.73 to 399.55 ms.
+Forward decoder overflows fell from 50,286 to zero. The forward MUX still
+accumulated 3.00 MB and the slowest one percent spent 276.31 ms on average
+waiting for admission. Both arms confirmed every offered original by the
+end of drain. [Fixed half-credit comparison](../../work/packed-latency-20261118/comparison.json)

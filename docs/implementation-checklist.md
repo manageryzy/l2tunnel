@@ -1057,6 +1057,10 @@ actual XOR reconstruction, serialized decoding and per-direction IP accounting.
 The [PackedWire targeted-recovery comparison](modules/frame-channel-experiment.md#targeted-recovery-in-the-original-packedwire-workload)
 exercises these gap requests with the named C48 workload, calibrated receiver
 service, independent channel delivery and retained-source recovery.
+The [C48 original-frame latency study](modules/frame-channel-experiment.md#original-frame-latency-in-the-calibrated-c48-run)
+measures MUX admission, source recovery, decoder queueing and ordered release
+on the same slowest TCP originals, and tests sharing regular FEC bytes with
+explicit retries while preserving old-source custody.
 Matched kernel validation and the existing named runtime acceptance gates remain open.
 
 ## Per-mode parity implementation gates
