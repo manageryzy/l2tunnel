@@ -1146,6 +1146,7 @@ different event from application write readiness. The Python producer counts
 | Python original, two seeds | 75.94 / 75.78 | 179 / 194 | 471 / 555 | 5,375 / 6,599 |
 | Python authenticated UDP prices, same seeds | 75.73 / 76.06 | 265 / 269 | 634 / 609 | 6,767 / 6,232 |
 | Python same prices, observed 125-record admission cap | 50.01 / 49.31 | 179 / 183 | 4,241 / 4,304 | 77,954 / 78,584 |
+| Linux R13, strict payload credit and timed recheck | 51.93 / 56.37 | 1,114 / 997 | 6,219 / 6,147 | 69,176 / 57,090 |
 | Linux R19, original sockets | 42.49 / 43.00 | 273 / 264 | 5,302 / 5,197 | 95,930 / 94,053 |
 | Linux R19, strict payload credit and timed recheck | 64.09 / 66.96 | 898 / 757 | 3,477 / 2,860 | 34,236 / 25,458 |
 
@@ -1161,6 +1162,15 @@ apply to both runs. The original C48 acceptance comparison remains open.
 [native socket-only control](../../work/c48-parity-20261119/native/diagnostic-r19-socket-544k/send-readiness.json),
 [strict-credit measurement](../../work/c48-parity-20261119/native/diagnostic-r19-credit-wait/summary.json)
 and [repeat](../../work/c48-parity-20261119/native/diagnostic-r19-credit-wait-repeat/summary.json).
+
+The R13 strict-credit pair used its original clean release binary and the
+same socket probe, observer and manifest hashes as the R19 strict-credit pair.
+R13 left 1,370/10 and 747/52 forward/reverse sources outstanding at EOF.
+Both runs passed all four captures and drained to 0/0. In these four draws,
+R19 delivered more with matched payload credit even though R13 had delivered
+more with the original socket settings.
+[Strict-credit R13 run](../../work/c48-parity-20261119/native/diagnostic-r13-credit-wait/summary.json)
+and [repeat](../../work/c48-parity-20261119/native/diagnostic-r13-credit-wait-repeat/summary.json).
 
 The strict-credit experiments also distinguished TCP receive-window pressure
 from tunnel efficiency. Increasing only the receiving TCP sockets' buffer
@@ -1223,6 +1233,30 @@ recovery or a change in the effective TCP flight would change its assumptions.
 [matched stage and dependency results](../../work/c48-parity-20261119/recovery/r19-stage/result.json)
 and [sampled source and frame identities](../../work/c48-parity-20261119/recovery/r19-stage/samples.json).
 
+With the same marker binary and the strict 262,144-byte per-flow credit,
+Linux delivered 65.00 Mbit/s. All four captures passed. At EOF 2,523/23
+sources were outstanding; both peers drained to zero. For 3,019 sampled
+application completions across all 16 flows, mean sender MUX residence rose
+to 89.06 ms (P99 200.96 ms). Mean receiver decoder admission fell to 4.90 ms
+and the decoder transaction averaged 0.08 ms. Once the enclosing record
+was complete, an earlier byte in the same stream held it for another
+86.06 ms on average. In 2,936 of 2,984 completions with a complete
+predecessor index, a named retry supplied the last missing information.
+This observed cohort has different segmentation and admission pressure
+from the 125-segment socket sample.
+[Strict-credit marker run](../../work/c48-parity-20261119/native/diagnostic-r19-strict-credit-stages/summary.json)
+and [matched source and frame stages](../../work/c48-parity-20261119/recovery/r19-strict-stage/result.json).
+
+In the two strict-credit runs without these markers, the P99 from the last
+required sender TUN byte to application read was 459.29 and 413.96 ms.
+Ranking the completed application records by first write to read selected
+1,885 and 1,972 records in the slowest percent. They spent an average of
+879.03 and 569.04 ms from first write until the last required byte appeared
+on the sender TUN, then 167.36 and 253.74 ms between TUN devices. After the
+contiguous receiver bytes arrived, the read took 0.05 and 0.06 ms on average.
+[Completed-record reconstruction](../../work/c48-parity-20261119/native/diagnostic-r19-credit-wait/stages.json)
+and [repeat](../../work/c48-parity-20261119/native/diagnostic-r19-credit-wait-repeat/stages.json).
+
 The native C48 planner also reserves 200 bytes of the MTU for worst-case
 framing. Replaying the two strict-credit captures with the actual Rust
 codec at the current planner's 1,313-byte safe symbol limit instead of
@@ -1232,3 +1266,54 @@ On the original all-512-byte R19 trace the ten-second saving was 201 bytes.
 This replay fixes the input sequence and measures encoding costs. It does
 not reproduce feedback, CPU scheduling or new loss draws.
 [Offline geometry and per-direction byte costs](../../work/c48-parity-20261119/native/compact-geometry/summary.json).
+
+The first two strict-credit captures also separate framing cost from a
+changing volume in flight. Within the matched roughly eight-second status
+windows, data already seen at the sender TUN but still unread at the receiver
+grew by 883,888 and 633,592 bytes. This accounts for 0.01390 and 0.00941
+bytes per application byte in the interval. Fixed IPv4/UDP and authentication
+headers on fresh packets cost about 0.0475 bytes per application byte in
+Linux and 0.0483 in the priced Python runs. Inner compressed headers,
+fragment and unit framing, packed identities and length tables together
+cost about 0.030 in Linux and 0.016 in Python. An optimistic packing bound
+retaining the current symbol size, unit cap, flush deadline and copy classes
+could save at most 0.46 and 0.49 Mbit/s of fresh wire traffic in those
+windows. [Capture byte accounting and packing bound](../../work/c48-parity-20261119/native/fresh-attribution/breakdown.json).
+
+### An eight-source repair at two TCP flight limits
+
+A Python sensitivity run sent one additional forward equation for each group
+of eight new sources when the sender had earned enough bytes. It kept C48's
+ordinary local and global repairs, named retries and oldest-source recovery.
+Each new equation occupied the same serializer and lossy link and consumed
+receiver work. All rows below use 100/10 Mbit/s, 70 ms RTT and 15% loss per
+direction, with the projected authenticated UDP prices. The first two arms
+at each flight limit use both archived seeds. The local-credit arm uses seed
+one. Every arm drained all submitted data and both source frontiers.
+
+| Maximum in flight per TCP flow | Repair policy | Forward goodput (Mbit/s) | Issue to read P99 (ms) | Scheduled to read P99 (ms) |
+| ---: | --- | ---: | ---: | ---: |
+| 125 | C48 | 50.01 / 49.31 | 179 / 183 | 4,241 / 4,304 |
+| 125 | Additional eight-source repair | 69.82 / 70.31 | 87 / 83 | 1,170 / 1,082 |
+| 512 | C48 | 75.73 / 76.06 | 265 / 269 | 634 / 609 |
+| 512 | Additional eight-source repair | 70.40 / 70.33 | 442 / 443 | 1,112 / 1,105 |
+
+With 125 records per flow the baseline used about 68 Mbit/s on the forward
+link. The additional equation brought forward recovery from about 21.5%
+to 24.8% of IP bytes while increasing application throughput. At 512 the
+link was already full. Forward recovery rose from about 18.7% to 24.8%.
+The sender's instantaneous 1 ms queue check skipped at most one of about
+ten thousand opportunities in each run, including the saturated runs.
+The new rows used a rank model and a source payload ledger. The price of
+an additional row in the two-seed tests omitted its two coded length bytes.
+[Small flight results](../../work/c48-parity-20261119/python/near8/comparison-125.json)
+and [original flight results](../../work/c48-parity-20261119/python/near8/comparison-512.json).
+
+Charging those two bytes and letting the new equations displace up to half
+of the otherwise eligible 128-source local repairs produced 58.31 Mbit/s
+at 125 and 73.44 Mbit/s at 512. All periodic global slots were preserved.
+Named retry traffic rebounded from 2.10 to 6.75 MB and from 1.90 to
+9.50 MB respectively in the two ten-second comparisons with the additional
+repair arm. These research configurations leave the original C48 acceptance
+comparison open. [Local-credit rules and byte totals](../../work/c48-parity-20261119/python/near8-shared/comparison.json)
+and [independent length oracle](../../work/c48-parity-20261119/python/near8-shared/canonical-oracle.json).
