@@ -1535,7 +1535,8 @@ matrix and full original-native overhead remain open.
 
 ### Batch20 ACK coverage and decoder progress
 
-Implementation passes coordinated local validation below; native20 remains pending.
+Implementation passes coordinated local validation below; finite native20 evidence
+is recorded in the following section.
 Optional Reliable ACK attribution reuses the actual parsed selective ACK and the
 existing validation/retention passes. It captures exact prefix/bitmap, original
 arrival and observation, before/after retained minima and the same-flight physical
@@ -1579,3 +1580,44 @@ RTO differ from the closest Python legacy block-FEC model. The Aligned codec and
 CompactARQ recovery contracts are separate; no exact Python Strategy is bound to
 this row. These remain explicit parity gaps, not authority to enlarge benchmark
 limits or claim CompactARQ serial/RTT/fast-retry behavior for Cauchy.
+
+### Native20 ACK retirement and Rolling pre-admission residence
+
+The [completed findings](../../work/aligned-extents-20261117/native20-analysis1/findings1.json)
+and [canonical measurements](../../work/aligned-extents-20261117/native20-analysis1/extracted1/analysis.json)
+bind source `716294653c806bcfd9c8bb3a16ec2eb4438bac24` and its release executable.
+Both affected UDP forward cases retain the original Full/TUN, sixteen-flow,
+100/10 Mbit/s, 70 ms RTT, 15% loss each way configuration and all original quotas
+and deadlines. Source, binary and helpers remain stable; owned cleanup succeeds.
+
+Cauchy passes its data phase at 0.6046848 Mbit/s and requested local disconnect.
+The unchanged ordinary ARQ/FEC policy and one finite pass do not establish a
+performance improvement. Client staged waits total 48.123556 seconds over 160
+completed episodes, maximum 3.003403 seconds; server waits total 5.034656 seconds
+over 14 episodes, maximum 2.388140 seconds. Neither endpoint censors a staged wait.
+
+The client maximum is source 991 waiting behind source 927, with count falling
+from 29 to 2 and only the sequence-span predicate blocking. Actual ACK 84, prefix 991
+and bitmap 0, retires both remaining sources, including the unacknowledged oldest
+at attempt 5 with no held physical transmission. Admission follows 51 us later.
+The server maximum similarly retires source 1630 with ACK 255 / prefix 1694 / bitmap 0,
+then admits source 1694 after 26 us. These exact facts distinguish ordinary ACK
+retirement from a held physical-retry receipt. They do not prove whether the
+original source or feedback was lost, delayed or temporarily unavailable.
+
+Rolling still fails. The server selects Repair 459 / support [978,1106) DecoderJob
+expiry. The retained job matches that identity and deadline: received 5,822,707 us,
+admitted 10,770,249 us, deadline 10,822,707 us, failure 10,823,535 us, at
+`Scan { row: 92, index: 1996 }`. Pre-admission residence is 4,947,542 us;
+only 52,458 us remains at admission. Decoder custody is 53,286 us, with 828 us
+observed expiry lateness. These are elapsed ownership intervals, not CPU work
+or backpressure unions. The following ingress candidate is a different input;
+the client's separate CodecStage failure uses its own local clock. Targeted
+matrix scanning and earlier ingress residence require further investigation.
+
+Four buffer and four wire owners validate with zero rejected inputs. Protection
+remains 21 bytes mean/p99; systematic source fill remains zero for Cauchy
+6,083/2,926 and Rolling 1,385/102 a/b emissions. Same-emission IPv4 bytes outside
+codec body have mean/p99 of 69.440988/73 and 67.858402/72 B for Cauchy, and
+60.201444/68 and 69.794118/105 B for Rolling. These lifetime emission populations
+are not full original-native overhead. No full BP, matrix or parity gate closes.

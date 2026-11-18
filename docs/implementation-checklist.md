@@ -197,8 +197,12 @@ Rolling decoder GF work under the original byte allowances. Original decoder
 arrival/admission and returned-only expiry phase details distinguish earlier
 residence from retained job custody. The affected local continuation passes 813
 Rust and 45 Python cases, strict Clippy and rustdoc; unchanged passing check19
-stages are reused. Native20 remains pending. All original caps and open parent
-gates remain, including the documented Cauchy/Python recovery-policy differences.
+stages are reused. [Native20](modules/buffer-observability.md#native20-ack-retirement-and-rolling-pre-admission-residence)
+qualifies one Cauchy forward case at 0.6046848 Mbit/s and identifies exact ACK
+retirement at its maximum staged waits. Rolling still expires: the matching job
+spent 4.947542 seconds before decoder admission and 53.286 ms in decoder custody.
+All original caps and open parent gates remain, including the documented
+Cauchy/Python recovery-policy differences.
 
 This remains the persistent progress ledger. Unchecked work is required;
 a design, enum, successful build or deleted implementation does not complete a
