@@ -71,6 +71,14 @@ contiguous watermark reaches it. The header context is unchanged and a second
 copy cannot redeliver it. Other channels can continue through their own prepare
 calls while this channel retains a gap.
 
+`prepare_with_early_filter` lets the owner inspect the reconstructed native
+bytes before exposing an independent short record ahead of a gap. A rejected
+candidate consumes one visit. Later filtered calls skip that candidate until
+its ordered turn, and other eligible short frames on the channel can advance.
+An already exposed frame retains custody through device backpressure. The
+[Packed/Rolling half-close study](frame-channel-experiment.md#receiver-tcp-half-close-and-the-483-record-tail)
+describes the native TCP policy that uses this interface.
+
 At the first fragment, reserve the entire declared body and every fragment slot.
 Allocate one zeroed body buffer plus a fixed received-piece bitmap. Require total
 length to exceed ordinary symbol body capacity, aligned offsets, canonical final

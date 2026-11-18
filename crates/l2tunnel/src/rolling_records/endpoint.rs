@@ -105,6 +105,7 @@ pub struct Endpoint<P: RecoveryPolicy = scheduler::Policy> {
     pub(super) receive_scope: receiver::Scope,
     pub(super) sender: P::Sender,
     pub(super) repair_budget: Option<repair_budget::Budget>,
+    pub(super) fin_order: fin_order::Guard,
     pub(super) incoming: P::Receiver,
     pub(super) ingress: Option<ingress::Ingress>,
     pub(super) packing: packed_sender::Sender,
@@ -348,6 +349,7 @@ impl<P: RecoveryPolicy> Endpoint<P> {
             send_scope,
             receive_scope,
             sender,
+            fin_order: fin_order::Guard::new(receive_config)?,
             repair_budget: send_config
                 .scheduler
                 .targeted()
@@ -509,6 +511,8 @@ impl<P: RecoveryPolicy> Endpoint<P> {
         };
         match result {
             Ok(identity) => {
+                self.fin_order
+                    .admitted(self.send_config.native_policy, frame);
                 self.statistics.admitted = next;
                 self.refresh_stage_deadline()?;
                 Ok(Some(identity))

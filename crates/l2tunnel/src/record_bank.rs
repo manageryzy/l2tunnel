@@ -283,6 +283,26 @@ impl Bank {
         Ok(Entry::new(id, &mut slot.engine))
     }
 
+    /// Carry observed native TCP closes across a committed change of record generation.
+    /// The caller supplies the previous and newly active published owners of the same session.
+    pub fn inherit_fin_order(
+        &mut self,
+        previous: GenerationId,
+        next: GenerationId,
+    ) -> Result<(), Error> {
+        self.slot(previous, true)?;
+        self.slot(next, true)?;
+        let [old, new] = self
+            .slots
+            .get_disjoint_mut([previous.slot, next.slot])
+            .map_err(|_| Error::Stale)?;
+        let old = old.as_ref().ok_or(Error::Stale)?;
+        let new = new.as_mut().ok_or(Error::Stale)?;
+        new.engine
+            .inherit_fin_order(&old.engine)
+            .map_err(Error::Engine)
+    }
+
     /// Release a published owner after actual pure drain; external proof stays required.
     pub fn retire(&mut self, id: GenerationId) -> Result<(), Error> {
         self.release(id, true)

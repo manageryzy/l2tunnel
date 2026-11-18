@@ -915,6 +915,19 @@ impl Engine {
         }
     }
 
+    pub(crate) fn inherit_fin_order(&mut self, previous: &Self) -> Result<(), Error> {
+        if self.context.session != previous.context.session
+            || self.context.role != previous.context.role
+            || self.context.epoch <= previous.context.epoch
+        {
+            return Err(Error::Configuration);
+        }
+        if let (Owner::Rolling(next), Owner::Rolling(old)) = (&mut self.owner, &previous.owner) {
+            next.inherit_fin_order(old);
+        }
+        Ok(())
+    }
+
     /// Service injected owner deadlines, including native custody while idle.
     pub fn tick(&mut self, now: Tick) -> Result<(), Error> {
         self.advance(now)?;

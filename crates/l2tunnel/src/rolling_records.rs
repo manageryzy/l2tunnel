@@ -29,6 +29,7 @@ mod deferred_feedback;
 mod endpoint;
 /// Bounded original lifetime observations for actual selected recovery owners.
 pub mod expiry;
+mod fin_order;
 mod ingress;
 mod native;
 #[doc(hidden)]

@@ -363,6 +363,8 @@ fn preview_reports_native_progress_only_after_actual_short_admission() -> TestRe
     Ok(())
 }
 
+#[path = "fin_order_tests.rs"]
+mod fin_order;
 #[path = "ingress_tests.rs"]
 mod ingress;
 #[path = "targeted_scheduling_tests.rs"]

@@ -89,7 +89,7 @@ def identify_stream(stream, expected, seen, deadline_ns):
 
 def transfer(streams, sending, clock, deadline_ns, result, *, paced=False):
     states = [dict(flow_id=index, sent=0, received=0, warmup=0, measured=0, postwindow=0,
-                   write_closed=False, eof=False, bound_exhausted=False,
+                   write_closed=False, eof=False, write_closed_ns=None, peer_eof_ns=None, bound_exhausted=False,
                    send_hash=hashlib.sha256(), receive_hash=hashlib.sha256()) for index, _ in enumerate(streams)]
     result['clock'], result['samples'] = clock, []
     start, measured, end = (clock[key] for key in ('start_ns', 'measure_start_ns', 'end_ns'))
@@ -115,10 +115,16 @@ def transfer(streams, sending, clock, deadline_ns, result, *, paced=False):
                     next_sample = now + 500_000_000
                 for index, (stream, state) in enumerate(zip(streams, states)):
                     unfinished = paced and records[index].pending
-                    if not state['write_closed'] and ((now >= end and not unfinished) or state['sent'] == MAX_BYTES):
+                    # The offer cutoff belongs to the producer. A receive-only socket
+                    # sends its FIN after consuming the peer's ordered data and EOF.
+                    done_sending = state['eof']
+                    if sending:
+                        done_sending = (now >= end and not unfinished) or state['sent'] == MAX_BYTES
+                    if not state['write_closed'] and done_sending:
                         state['bound_exhausted'] = state['sent'] == MAX_BYTES and now < end
                         stream.shutdown(socket.SHUT_WR)
                         state['write_closed'] = True
+                        state['write_closed_ns'] = time.monotonic_ns()
                         if state['eof']:
                             if stream.fileno() in poll.get_map():
                                 poll.unregister(stream)
@@ -140,6 +146,7 @@ def transfer(streams, sending, clock, deadline_ns, result, *, paced=False):
                         at = time.monotonic_ns()
                         if chunk == b'':
                             state['eof'] = True
+                            state['peer_eof_ns'] = at
                             if state['write_closed']:
                                 poll.unregister(stream)
                             elif sending:

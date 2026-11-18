@@ -230,8 +230,21 @@ fn every_real_family_transition_publishes_the_exact_virgin_and_preserves_current
                 next.configuration()
             );
             assert!(matches!(bank.entry(prepared.id), Err(Error::Stale)));
+            assert_eq!(
+                bank.inherit_fin_order(current, prepared.id),
+                Err(Error::Stale)
+            );
             assert!(matches!(bank.prepare(next), Err(Error::Slots)));
             let published = bank.publish(&mut prepared)?;
+            bank.inherit_fin_order(current, published)?;
+            assert_eq!(
+                bank.inherit_fin_order(published, published),
+                Err(Error::Stale)
+            );
+            assert_eq!(
+                bank.inherit_fin_order(published, current),
+                Err(Error::Engine(engine::Error::Configuration))
+            );
             assert_eq!(bank.engine(published)? as *const engine::Engine, virgin);
             assert_eq!(bank.publish(&mut prepared), Err(Error::Stale));
             assert_eq!(bank.cancel(&mut prepared), Err(Error::Stale));

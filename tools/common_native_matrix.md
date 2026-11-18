@@ -170,6 +170,15 @@ The kernel netem draws and actual TCP hosts are independent of the simulated C48
 seed. Compare the two Rust cells under this workload and retain the scope when
 comparing them to the 90-second Python experiment.
 
+In a one-way phase the producer closes its write half at the offer cutoff,
+after finishing any partially written paced record. The receiver continues
+reading through peer EOF before closing its own write half. In a duplex
+phase each producer follows its own offer cutoff. Per-stream
+`write_closed_ns` and `peer_eof_ns` use the same host monotonic clock
+as the offer and record completion timestamps. EOF establishes application
+completion. Observing zero unconfirmed recovery sources at both peers requires
+a separate transport observation.
+
 ## Saved-result reporting
 
 `common_matrix_report.py --manifest MANIFEST --results RESULTS --output NEW_DIR`

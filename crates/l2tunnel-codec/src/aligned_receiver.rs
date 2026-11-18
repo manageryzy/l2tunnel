@@ -230,7 +230,7 @@ pub enum Admission {
 pub enum Prepared {
     /// No complete eligible frame is currently available.
     Idle,
-    /// Context/tombstone work consumed the supplied work allowance.
+    /// Preparation consumed its allowance on contexts, tombstones or early eligibility checks.
     Progress,
     /// The immutable frame exposed by `pending` awaits device acceptance.
     Ready,
@@ -296,6 +296,8 @@ struct Record {
     padding: Padding,
     deadline: Tick,
     early_delivered: bool,
+    // Filtered delivery rejected this complete short frame until its ordinary turn.
+    defer_early: bool,
 }
 impl Record {
     fn complete(&self) -> bool {
@@ -321,6 +323,11 @@ struct Pending {
     slot: usize,
     written: usize,
     early: bool,
+}
+enum EarlySelection<'a> {
+    Any,
+    Ordered,
+    Filtered(&'a mut dyn FnMut(&[u8]) -> bool),
 }
 struct Parsed<'a> {
     channel: ChannelId,
@@ -732,6 +739,7 @@ impl Receiver {
                     padding: parsed.padding,
                     deadline,
                     early_delivered: false,
+                    defer_early: false,
                 };
                 self.retention.add_record(&record);
                 self.deadlines.insert(record.deadline);
@@ -761,7 +769,26 @@ impl Receiver {
         now: Tick,
         max_records: usize,
     ) -> Result<Prepared, Error> {
-        self.prepare_selected(channel, now, max_records, true)
+        self.prepare_selected(channel, now, max_records, EarlySelection::Any)
+    }
+    /// Select independent short frames using their exact reconstructed native bytes.
+    /// Rejected records wait for their channel head on subsequent filtered calls.
+    /// Examining one candidate consumes one record visit. Other records on the
+    /// channel can still be considered within the allowance or on a later call.
+    /// The ordered head and an already prepared immutable delivery bypass the filter.
+    pub fn prepare_with_early_filter(
+        &mut self,
+        channel: ChannelId,
+        now: Tick,
+        max_records: usize,
+        mut allow: impl FnMut(&[u8]) -> bool,
+    ) -> Result<Prepared, Error> {
+        self.prepare_selected(
+            channel,
+            now,
+            max_records,
+            EarlySelection::Filtered(&mut allow),
+        )
     }
     /// Preserve channel FIFO even when independent short bodies are enabled.
     /// Already exposed native bytes retain custody until their original commit.
@@ -771,14 +798,14 @@ impl Receiver {
         now: Tick,
         max_records: usize,
     ) -> Result<Prepared, Error> {
-        self.prepare_selected(channel, now, max_records, false)
+        self.prepare_selected(channel, now, max_records, EarlySelection::Ordered)
     }
     fn prepare_selected(
         &mut self,
         channel: ChannelId,
         now: Tick,
         max_records: usize,
-        allow_early: bool,
+        mut selection: EarlySelection<'_>,
     ) -> Result<Prepared, Error> {
         self.check_time(now)?;
         self.expected(channel)?;
@@ -798,7 +825,9 @@ impl Receiver {
                 .find(channel, expected)
                 .filter(|slot| self.records[*slot].as_ref().is_some_and(Record::complete));
             let slot = head.or_else(|| {
-                if !allow_early || self.limits.body.independent_short_frame_bytes == 0 {
+                if matches!(selection, EarlySelection::Ordered)
+                    || self.limits.body.independent_short_frame_bytes == 0
+                {
                     return None;
                 }
                 self.records
@@ -811,6 +840,7 @@ impl Receiver {
                             && entry.complete()
                             && entry.pieces.is_empty()
                             && !entry.early_delivered
+                            && (matches!(selection, EarlySelection::Any) || !entry.defer_early)
                             && independent_length(&entry.bytes).is_some_and(|length| {
                                 length <= self.limits.body.independent_short_frame_bytes
                             }))
@@ -850,6 +880,17 @@ impl Receiver {
                     self.retire(slot)?;
                 }
                 aligned_body::Decoded::Frame { written, .. } => {
+                    if early
+                        && let EarlySelection::Filtered(allow) = &mut selection
+                        && !allow(&self.native[..written])
+                    {
+                        self.touch_record(slot, true)?;
+                        self.records[slot]
+                            .as_mut()
+                            .ok_or(Error::Malformed)?
+                            .defer_early = true;
+                        continue;
+                    }
                     self.pending = Some(Pending {
                         slot,
                         written,

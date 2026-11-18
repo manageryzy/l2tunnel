@@ -657,3 +657,109 @@ advertised right edge. The captures do not identify a kernel drop reason.
 Per-record application read timestamps were unavailable to subdivide the
 remaining time. [Tail records and socket evidence](../../work/packed-schedule-20261118/fifo-post-eof/receiver-tail.json)
 and [receiver-window evidence](../../work/packed-schedule-20261118/fifo-post-eof/tcp-window-trace.json)
+
+### Receiver TCP half-close and the 483-record tail
+
+At the end of the historical forward offer, the receive-only application at B
+closed its write half about 4 ms after cutoff while A still had application
+data in flight. B's FIN consumed one sequence number. The pure ACK confirming
+that FIN reached B ahead of 226 older forward data packets that matched
+byte-for-byte at both TUNs. Of these, 223 were first transmissions at A.
+The four TCP streams had nonzero receive windows and valid checksums. The
+table follows the segment starting at the first blocked application byte.
+All times are milliseconds relative to offer cutoff, and offsets exclude
+the SYN and the four identity bytes.
+
+| Flow | First blocked stream byte | Old-ACK data at B | Retry with current ACK at B | First covering cumulative ACK from B |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 2,395,120 | 1,549.619 | 9,375.345 | 9,375.373 |
+| 8 | 2,438,024 | 1,664.074 | 8,957.738 | 8,957.799 |
+| 12 | 2,344,496 | 1,573.833 | 7,746.741 | 7,746.801 |
+| 15 | 2,319,360 | 1,637.405 | 7,936.480 | 7,936.557 |
+
+After accepting the FIN acknowledgment, B entered `FIN_WAIT2`. The older
+data still acknowledged one byte less than B's new `SND.UNA`. On this
+Linux 6.8 path `tcp_ack` returns zero for that old ACK and
+`tcp_rcv_state_process` discards the segment before queuing its payload.
+Its sequence and payload can therefore look contiguous in tcpdump even
+while the receiving socket is missing the bytes. Reconstructing receipt
+with this check explains all 483 historical application records. At the
+four first holes the cumulative ACK followed the acceptable retry by
+28–77 microseconds. The archived trial has no per-packet kernel trace.
+[Original four-flow reconstruction](../../work/receiver-gap-20261118/topology/analysis.md),
+[full packet match](../../work/receiver-gap-20261118/seq/overtake.json),
+[Linux old-ACK handling](https://github.com/torvalds/linux/blob/v6.8/net/ipv4/tcp_input.c#L3762-L3775)
+and [half-closed state handling](https://github.com/torvalds/linux/blob/v6.8/net/ipv4/tcp_input.c#L6280-L6290).
+
+A separate reproduction traced B's inner TCP tuples inside its network
+namespace. All 564 first-seen old-ACK data packets observed after the FIN
+acknowledgment returned zero from `tcp_ack`. Fourteen started exactly at
+`RCV.NXT`. On each flow the receive cursor stayed put until a retry
+covering the same starting sequence carried the current ACK. All fourteen
+retries were accepted. The four captures passed and the kernel observer
+reported zero lost events.
+[Kernel and capture evidence](../../work/receiver-gap-20261118/lab/original-r1-cross.json).
+
+The one-way benchmark receiver now waits for the producer's EOF before
+calling `shutdown(SHUT_WR)`. An actual application is still free to close
+its write half while reading. With independent-short delivery enabled, the
+targeted Packed/Rolling receiver remembers a locally admitted TCP FIN and
+holds a short returning packet that acknowledges it until the ordinary
+record turn on its channel. Unrelated short frames, including ones sharing
+that channel, stay eligible for early delivery. Ordered native acceptance
+releases the matching FIN entry. The rule covers parsed, unfragmented native
+TCP, including TUN IP and supported TAP/VLAN headers. A bounded table falls
+back to ordered early ACKs for the affected hash bucket on overflow. Direct
+switches between targeted record generations carry the pending entries
+through authenticated commit. The change adds no wire bytes.
+[Two-peer gap regression](../../crates/l2tunnel/src/rolling_records/fin_order_tests.rs)
+and [native TCP tracking](../../crates/l2tunnel/src/rolling_records/fin_order.rs).
+
+#### Independent probe and tunnel changes
+
+The four qualified forward runs used 16 native CUBIC flows, 100/10 Mbit/s,
+70 ms RTT, 15% independent loss each way, MTU 1500, a 76 Mbit/s offer of
+512-byte records, 2 s warmup and a 10 s sample. All used the same capture
+and kernel observers. Each cell has one independent loss realization.
+Receiver TUN time is the first capture time at which all stream bytes
+through a record are present in sequence. Application time is the first
+attempted write through the complete read. The final column counts newly
+seen data packets discarded with the old ACK in `FIN_WAIT2`.
+
+| Rust | Receive-only probe | Forward Mbit/s | Application P99 (ms) | In-order TUN to read P99 (ms) | In-order TUN to covering ACK P99 (ms) | Old-ACK drops |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| Original | Closes at cutoff | 29.38 | 1,181.47 | 323.960 | 323.88 | 564 |
+| Original | Closes after peer EOF | 29.31 | 1,069.40 | 0.150 | 40.52 | 0 |
+| Fixed | Closes at cutoff | 30.15 | 1,064.58 | 0.135 | 40.69 | 0 |
+| Fixed | Closes after peer EOF | 28.50 | 1,148.46 | 0.155 | 40.40 | 0 |
+
+With the fixed Rust and the original early half-close, 1,095 first-seen
+data segments (1,369,568 bytes) were already between the TUNs when B sent
+FIN. All arrived before the FIN acknowledgment could overtake them. With
+both changes, 84,246 complete records were read. Forward/reverse recovery
+used 29.31%/12.92% of accepted physical record bytes. There were 1,538/26
+unconfirmed sources at application EOF, then two consecutive bilateral
+0/0 observations. All four qualified runs reached bilateral 0/0, validated
+the stream hashes, passed all four captures and lost zero BPF events.
+In the combined run, first write to in-order receiver TUN alone had P99
+1,148.39 ms. The residual end-to-end latency therefore needs investigation
+upstream of that observation. These runs establish the effect on TCP
+delivery during half-close. They do not establish a throughput improvement.
+[Four-arm comparison](../../work/receiver-gap-20261118/lab/comparison.json)
+and [combined timing distribution](../../work/receiver-gap-20261118/lab/combined.json).
+
+The focused two-peer regressions also exercise a sequence wrap, data-bearing
+FIN, an unrelated short ACK on the blocked channel and bounded table overflow.
+In the workspace check, strict Clippy passed. One OpenVPN impairment test
+delivered its full payload in both directions and timed out in its own close
+handshake. Rerunning that exact test from the same workspace test binary
+passed. Its close implementation and the Packed/Rolling receive path are
+separate. In the remaining checks the standalone loopback pressure-probe
+client exited nonzero once. The same IPv4/IPv6 test passed on a focused
+retry. The first run did not expose the client's error details. Both
+first-attempt failures remain visible in the logs.
+[Aggregate attempt](../../work/receiver-gap-20261118/verification/check.log),
+[exact retry](../../work/receiver-gap-20261118/verification/openvpn-workspace-binary-retry.log)
+and [remaining checks](../../work/receiver-gap-20261118/verification/check-remaining.log).
+[Pressure-probe retry](../../work/receiver-gap-20261118/verification/pressure-retry.log)
+and [simulator suite](../../work/receiver-gap-20261118/verification/simulator.log).

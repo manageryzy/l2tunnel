@@ -59,6 +59,11 @@ pub enum NativePreparation {
     AlreadyPending(PreparedNative),
 }
 impl<P: RecoveryPolicy> Endpoint<P> {
+    /// Carry pending local halves across the authenticated generation switch.
+    pub(crate) fn inherit_fin_order(&mut self, previous: &Self) {
+        self.fin_order.inherit(&previous.fin_order);
+    }
+
     /// Prepare one real reconstructed native body directly into caller custody.
     /// Full configured queues remain separate from this one pending codec token.
     pub fn prepare_native(
@@ -95,7 +100,16 @@ impl<P: RecoveryPolicy> Endpoint<P> {
             .ok_or(Error::Arithmetic)?;
         let channel =
             receiver::ChannelId(u8::try_from(self.next_channel).map_err(|_| Error::Identity)?);
-        let prepared = match self.records.prepare(channel, receiver_tick(now), work) {
+        let result = if self.fin_order.active() {
+            self.records
+                .prepare_with_early_filter(channel, receiver_tick(now), work, |frame| {
+                    self.fin_order
+                        .may_deliver_early(self.receive_config.native_policy, frame)
+                })
+        } else {
+            self.records.prepare(channel, receiver_tick(now), work)
+        };
+        let prepared = match result {
             Ok(prepared) => prepared,
             Err(error) => return self.fail(Error::Receiver(error)),
         };
@@ -178,6 +192,12 @@ impl<P: RecoveryPolicy> Endpoint<P> {
         self.statistics.committed = committed;
         self.prepared_native = None;
         timing?;
+        if let Some(delivery) = self.records.pending()
+            && !delivery.early
+        {
+            self.fin_order
+                .ordered_commit(self.receive_config.native_policy, delivery.bytes);
+        }
         if let Err(error) = self.records.commit_delivery(receiver_tick(now)) {
             return self.fail(Error::Receiver(error));
         }

@@ -1088,6 +1088,16 @@ unaffected channel during the retry backlog, then checks ordered recovery and
 cumulative confirmation. The physical-send batch experiment and its liveness
 failure are recorded separately in the same study.
 
+TEST-12 and PBA-03/06 also track the
+[receiver TCP half-close investigation](modules/frame-channel-experiment.md#receiver-tcp-half-close-and-the-483-record-tail).
+Four historical stream reconstructions and a separate Linux kernel trace
+identify why a FIN-covering ACK arriving early stalled native TCP delivery.
+The targeted Packed/Rolling owner now preserves channel order for that ACK,
+and the one-way measurement peer waits for incoming EOF before half-closing.
+The study distinguishes the two changes, application latency, cumulative ACK
+latency and bilateral recovery drain. Broader carrier and performance gates
+remain open.
+
 ## Per-mode parity implementation gates
 
 Each P-* gate means the named algorithm/codec/workload adapter is implemented and

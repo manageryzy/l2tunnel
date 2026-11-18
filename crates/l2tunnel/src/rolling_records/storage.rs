@@ -144,6 +144,7 @@ impl<P: RecoveryPolicy> Plan<P> {
             source_bytes,
             symbol_bytes,
             ingress_bytes,
+            fin_order::Guard::planned_bytes(receive),
             if send.scheduler.targeted() {
                 repair_budget::Budget::heap_bytes(send.scheduler.recovery().window)
             } else {
@@ -300,6 +301,7 @@ impl<P: RecoveryPolicy> Endpoint<P> {
             incoming.capacity_bytes,
             endpoint.source.capacity(),
             endpoint.symbols.capacity(),
+            endpoint.fin_order.capacity_bytes(),
             endpoint
                 .repair_budget
                 .as_ref()
@@ -321,6 +323,7 @@ impl<P: RecoveryPolicy> Endpoint<P> {
             incoming.allocations,
             usize::from(endpoint.source.capacity() != 0),
             usize::from(endpoint.symbols.capacity() != 0),
+            usize::from(endpoint.fin_order.capacity_bytes() != 0),
             usize::from(endpoint.repair_budget.is_some()),
             usize::from(endpoint.waits.capacity() != 0),
             endpoint

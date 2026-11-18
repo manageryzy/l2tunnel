@@ -501,10 +501,7 @@ impl Backend<C> for Bank {
             return Err(invalid("common commit operation differs"));
         }
         self.storage
-            .engine(generation.engine)
-            .map_err(io::Error::other)?;
-        self.storage
-            .engine(self.current.engine)
+            .inherit_fin_order(self.current.engine, generation.engine)
             .map_err(io::Error::other)?;
         let next = *generation;
         let old = self.current;

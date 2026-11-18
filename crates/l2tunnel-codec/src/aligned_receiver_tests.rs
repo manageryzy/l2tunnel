@@ -346,6 +346,90 @@ fn independent_short_tombstone_retains_body_gap_and_conflict_proof_until_contigu
     Ok(())
 }
 #[test]
+fn filtered_short_selection_preserves_order_without_blocking_another_record() -> TestResult {
+    let mut config = limits();
+    config.body.independent_short_frame_bytes = 128;
+    let mut receiver = Receiver::new(scope(), config)?;
+    let channel = ChannelId(0);
+    let now = Tick(1);
+    for (record, bytes) in [(1, b"waiting".as_slice()), (2, b"other")] {
+        receiver.admit_authenticated(
+            identity(record, record),
+            &raw(1460, 0, record, bytes),
+            now,
+        )?;
+    }
+    // One visit per call. The denied frame retains its bytes, age and custody.
+    assert_eq!(
+        receiver.prepare_with_early_filter(channel, now, 1, |bytes| {
+            assert_eq!(bytes, b"waiting");
+            false
+        })?,
+        Prepared::Progress
+    );
+    assert!(receiver.pending().is_none());
+    assert_eq!(
+        receiver.prepare_with_early_filter(channel, now, 1, |bytes| {
+            assert_eq!(bytes, b"other");
+            true
+        })?,
+        Prepared::Ready
+    );
+    assert_eq!(
+        receiver.pending().ok_or("early native")?.record,
+        RecordId(2)
+    );
+    receiver.commit_delivery(now)?;
+    assert_eq!(
+        receiver.prepare_with_early_filter(channel, now, 2, |_| unreachable!())?,
+        Prepared::Idle
+    );
+    receiver.admit_authenticated(identity(0, 0), &raw(1460, 0, 0, b"head"), now)?;
+    for bytes in [b"head".as_slice(), b"waiting"] {
+        assert_eq!(
+            receiver.prepare_with_early_filter(channel, now, 1, |_| unreachable!())?,
+            Prepared::Ready
+        );
+        assert_eq!(receiver.pending().ok_or("ordered native")?.bytes, bytes);
+        receiver.commit_delivery(now)?;
+    }
+    assert_eq!(receiver.prepare(channel, now, 2)?, Prepared::Idle);
+    assert_eq!(receiver.expected(channel)?, Some(RecordId(3)));
+    Ok(())
+}
+
+#[cfg(feature = "lz4")]
+#[test]
+fn early_filter_sees_decoded_lz4_and_preserves_malformed_block_errors() -> TestResult {
+    let mut config = limits();
+    config.body.independent_short_frame_bytes = 128;
+    let native = [0x52; 100];
+    let mut symbol = vec![0; config.body.symbol_bytes];
+    symbol[2] = 1;
+    let encoded = aligned_body::Encoder::new(config.body)?.encode_lz4(&native, &mut symbol[3..])?;
+    assert_eq!(encoded.kind, aligned_body::BodyKind::Lz4);
+    let mut receiver = Receiver::new(scope(), config)?;
+    receiver.admit_authenticated(identity(1, 1), &symbol, Tick(1))?;
+    assert_eq!(
+        receiver.prepare_with_early_filter(ChannelId(0), Tick(1), 1, |frame| {
+            assert_eq!(frame, native);
+            true
+        })?,
+        Prepared::Ready
+    );
+    assert_eq!(receiver.pending().ok_or("decoded short")?.bytes, native);
+
+    symbol[8..3 + encoded.body_len].fill(0xff);
+    let mut receiver = Receiver::new(scope(), config)?;
+    receiver.admit_authenticated(identity(1, 1), &symbol, Tick(1))?;
+    assert_eq!(
+        receiver.prepare_with_early_filter(ChannelId(0), Tick(1), 1, |_| unreachable!()),
+        Err(Error::Body(aligned_body::Error::Compression))
+    );
+    Ok(())
+}
+
+#[test]
 fn absolute_identity_scope_window_wrap_and_exhaustion_are_checked_before_interpretation()
 -> TestResult {
     let mut config = limits();

@@ -489,6 +489,8 @@ class MatrixTests(unittest.TestCase):
                 inactive = results[1] if phase == 'forward' else results[0]
                 if phase != 'simultaneous':
                     self.assertEqual(sum(flow['sent'] for flow in inactive['flows']), 0)
+                    for flow in inactive['flows']:
+                        self.assertLessEqual(flow['peer_eof_ns'], flow['write_closed_ns'])
                 if paced:
                     written = results[0]['paced_records']['fully_written_records']
                     received = results[1]['paced_records']
@@ -501,6 +503,21 @@ class MatrixTests(unittest.TestCase):
             finally:
                 for stream in a + b:
                     stream.close()
+
+    def test_passive_probe_keeps_write_half_open_through_postwindow_data(self):
+        now = time.monotonic_ns()
+        clock = dict(start_ns=now - 3, measure_start_ns=now - 2, end_ns=now - 1)
+        result = {}
+        peer, receiver = socket.socketpair()
+        with peer, receiver:
+            peer.sendall(b'bytes still draining')
+            peer.shutdown(socket.SHUT_WR)
+            with patch.object(probe, 'tcp_info', return_value={}):
+                probe.transfer([receiver], False, clock, now + 2_000_000_000, result)
+            flow, = result['flows']
+            self.assertEqual(flow['postwindow'], len(b'bytes still draining'))
+            self.assertLessEqual(flow['peer_eof_ns'], flow['write_closed_ns'])
+            self.assertEqual(peer.recv(1), b'')
 
     def test_c48_slots_timestamps_and_partial_io(self):
         clock = dict(start_ns=1000, end_ns=100_001_000)
