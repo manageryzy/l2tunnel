@@ -1794,9 +1794,10 @@ All four 82 Mbit/s paced cells had zero device drops and zero sampled inner
 TCP retransmitted bytes. Single-flow throughput and latency parity remain
 open. [Byte-exact resegmentation check](../../work/c48-parity-20261119/native/single-gap-custody-20261119/edge76/resegmentation.json).
 
-A repeat using the matrix's normal `--native-tun-txqueuelen 768
---native-forward-tun-maxrate-mbit 82` entry verified the effective sender
-rate of 10,250,000 bytes/s in the kernel. It delivered 67.26 and 55.82 Mbit/s
+A repeat used the same single-flow probe and flow-count adapter, with the
+matrix's shipped `--native-tun-txqueuelen 768` and
+`--native-forward-tun-maxrate-mbit 82` options. It verified the effective
+sender rate of 10,250,000 bytes/s in the kernel. It delivered 67.26 and 55.82 Mbit/s
 at the 76 and 90 Mbit/s offers, with first-write P99s of 843.38 and
 1,213.80 ms and scheduled P99s of 2,320.41 and 5,449.69 ms. Both native TUN
 captures matched the opposite endpoint's data with zero missing packets and
@@ -1832,3 +1833,18 @@ build, tests and measurements remain an isolated research result.
 [Linux startup charges at 76](../../work/c48-parity-20261119/native/single-gap-custody-20261119/grp76/startup-paid.json)
 and [90 Mbit/s](../../work/c48-parity-20261119/native/single-gap-custody-20261119/grp90/startup-paid.json),
 and [matched Python experiment](../../work/c48-parity-20261119/python/single-flow-near8-first-group-400ms-seed1/gate-comparison.json).
+
+With a 1,448-byte TCP payload in a 1,500-byte native IP packet, the
+optimistic payload ceiling at the 82 Mbit/s local FQ setting is 79.16 Mbit/s.
+An additional pair used 85 Mbit/s at the sender TUN to leave room for the
+80 Mbit/s application target. Both runs used the normal matrix provisioning
+options, the single-flow probe and the same FIFO-fix release. At 76 Mbit/s
+offered, goodput was 58.33 Mbit/s with first-write/scheduled P99 of
+1,110.56/3,669.27 ms. At 90 Mbit/s offered the values were 56.36 Mbit/s
+and 1,084.63/5,196.28 ms. Both cases recorded an effective 85 Mbit/s,
+zero full-ring events, zero device and qdisc drops on both native interfaces,
+zero sampled retransmitted TCP bytes, exact application payloads and 0/0
+unconfirmed after drain. The higher native rate did not close the throughput
+or latency gap in these samples.
+[76 Mbit/s offer](../../work/c48-parity-20261119/native/single-gap-custody-20261119/rate8576/measured.json)
+and [90 Mbit/s offer](../../work/c48-parity-20261119/native/single-gap-custody-20261119/rate8590/measured.json).
