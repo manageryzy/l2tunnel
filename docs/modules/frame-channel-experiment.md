@@ -1594,3 +1594,68 @@ and 3,618.47 ms scheduled P99. It verified bilateral drain. This diagnostic
 uses the earlier executable with profiling active.
 [Sampled call sites and owner ticks](../../work/c48-parity-20261119/native/near8-buffer-sample-perf-20261119/receiver-scan-ticks.json)
 and [profiled run](../../work/c48-parity-20261119/native/near8-buffer-sample-perf-20261119/profile-summary.json).
+
+### Single TCP connection and outstanding payload credit
+
+The forward target is 80 Mbit/s of unique application payload on one inner TCP
+connection. The sixteen-flow comparison above measures aggregate service. The
+single-flow credit experiment used one identified TCP connection, one producer,
+one receiver, the existing C48 v6/v5 Linux TUN/UDP binary, 512-byte application
+writes, a two-second warmup and a ten-second measurement. The link was 100/10
+Mbit/s with 70 ms propagation RTT and independent 15% loss in both directions.
+The probe set its socket buffers before the handshake so TCP could negotiate
+window scaling. The same socket buffer sizes were used for every credit setting.
+
+The probe's outstanding-payload cap counts bytes written to the socket that
+have yet to receive a cumulative TCP ACK, including unsent bytes. The TCP
+congestion window and peer advertised window independently limit transmission.
+At the propagation RTT alone, 256 KiB permits about 29.96 Mbit/s of sustained
+single-flow throughput. An application rate of 80 Mbit/s requires at least
+700,000 bytes in flight at 70 ms and 2,000,000 bytes at a 200 ms ACK cycle.
+The 76 Mbit/s offered-load experiments compare credit sensitivity. The
+90 Mbit/s offered-load experiments exercise the 80 Mbit/s acceptance target.
+
+| Offered Mbit/s | Per-flow credit | Linux delivered Mbit/s | Python seed 1 delivered Mbit/s | Linux first-write P99, ms | Linux scheduled P99, ms |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 76 | 256 KiB | 15.36 | 24.92 | 252.8 | 9,617.4 |
+| 76 | 1 MiB | 44.10 | 46.02 | 416.7 | 5,391.4 |
+| 76 | 4 MiB | 56.57 | 75.99 | 1,260.0 | 4,071.9 |
+| 90 | 4 MiB | 54.34 | 77.46 | 1,341.3 | 5,656.8 |
+| 90 | 160 MiB, never reached | 14.39 | — | 10,514.5 | 11,431.3 |
+
+Each reported rate is one completed workload on its named implementation. All
+five measured Linux transfers verified the stream contents. The 1 MiB data phase completed, then the client
+reported an expired authenticated liveness challenge. The case failed to verify
+bilateral drain and disconnect. The other four measured Linux cases passed.
+An earlier 160 MiB attempt ended during Noise admission before the TCP workload
+started. Both ends read back 32 MiB send and receive socket buffers. Python used one
+TCP model with cumulative ACKs and congestion control, the same initial cwnd
+of ten records and a fixed controller ceiling of 8,192 records across arms.
+In the 90 Mbit/s Python arm the forward IP rate was 99.78 Mbit/s and recovery
+used 17.22% of those bytes. All four model cases drained. Application delivery
+P99 includes completions after the ten-second goodput window.
+[Python receipts](../../work/c48-parity-20261119/python/single-flow-near8-seed1/comparison.json)
+and [single-flow TUN sequence and ACK analysis](../../work/c48-parity-20261119/native/near8-single-tcp-credit-20261119/ack-timeline.json).
+
+At 4 MiB and 76 Mbit/s offered, the first forward transmission to its covering
+cumulative ACK at the sender TUN took 253 ms at the median and 419 ms at P95.
+The reverse leg of the covering ACK took 41 ms at the median. For one missing
+1,448-byte segment, 77 ACKs repeated the same cumulative edge. Later bytes
+waited 348 ms at the receiving TUN until a packet matching the inner TCP
+retransmission filled the gap. At 90 Mbit/s offered a second example held later
+bytes for 442 ms. The 4 MiB runs were within one segment of the sampled Linux
+congestion window in 89% and 88% of snapshots. The original inner TCP segment
+has no join to its particular outer FEC source in this capture.
+
+The 160 MiB probe never denied a write on credit. Its sampled median socket
+send queue was 21.94 MB, including 21.52 MB still unsent. The median sent but
+unacknowledged payload was 0.417 MB, and the median peer advertised window
+was 14.01 MB. The sender TUN saw a 3.570-second interval with no new data
+during the measurement. At 1.656 seconds the covering ACK visible there had
+already acknowledged every forward byte seen at that TUN. The sender probe's
+periodic socket observations also have a gap, from 1.507 to 5.082 seconds.
+The traces cannot establish the kernel's socket state throughout that gap.
+This run demonstrates that removing the probe cap alone does not guarantee
+80 Mbit/s. The samples do not establish an optimal credit setting.
+[Socket observations, checksums and per-attempt lifecycle results](../../work/c48-parity-20261119/native/near8-single-tcp-credit-20261119/single-flow-summary.json)
+and [sender gap with its adjacent socket observations](../../work/c48-parity-20261119/native/near8-single-tcp-credit-20261119/nonbinding-sender-gap.json).

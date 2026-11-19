@@ -350,6 +350,13 @@ C48 on the same release. Record the measurement window's row count, IP cost,
 application latency and final confirmation separately. The original C48 target
 and the independent platform and carrier gates retain their existing criteria.
 
+The L3 TCP throughput target also applies to one inner TCP connection using the
+selected tunnel. Measure application goodput on that connection with enough
+offered traffic to exercise the 80 Mbit/s target. Keep the sixteen-connection
+aggregate comparison for the existing FIX-04 workload. Report the socket-level
+outstanding payload cap, send and receive buffers, congestion window and peer
+advertised window alongside the tunnel's recovery settings.
+
 Run independent implementation lanes in parallel: actual CompactARQ serial/RTT/
 receiver-delay/guarded-retry behavior; flow ownership, learned reverse affinity
 and ACK custody; L3 codec and actual rolling/copy execution. The integrator owns

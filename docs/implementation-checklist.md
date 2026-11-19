@@ -1214,3 +1214,8 @@ The indexed Aligned/Packed receiver snapshot matches the capacity-scan oracle,
 including variable-length proofs and rollback. One strict v6 Linux run on
 this release delivered 63.41 Mbit/s and verified bilateral drain. Repeated
 deadline stability and the 512-write throughput target are still open.
+
+FIX-04 and TEST-12 also require forward application goodput on one inner TCP
+connection at the 80 Mbit/s target. The sixteen-flow aggregate remains a
+separate comparison. The [single-connection credit study](modules/frame-channel-experiment.md#single-tcp-connection-and-outstanding-payload-credit)
+tracks the payload credit, kernel TCP windows and recovery behavior for this gate.
