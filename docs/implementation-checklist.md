@@ -1205,3 +1205,8 @@ strict-512 v5 with verified stream contents and bilateral drain. The first
 strict-512 v6 attempt hit an original held-ACK deadline in warmup. The
 [individual attempts](modules/frame-channel-experiment.md#combined-backlog-gate-on-linux-udp)
 track this failure separately from completed samples and modeled throughput.
+A same-binary strict v6 repeat completed with 66.27 Mbit/s and zero in-window
+eight-source rows. A later [decoder checkpoint](modules/frame-channel-experiment.md#servicing-a-held-ack-during-a-rolling-decode)
+passed the focused hold/expiry regression. Its strict v5 control completed,
+and its strict v6 attempt missed the same hard deadline in buffer sampling.
+Strict v6 qualification and Python-level throughput remain open.

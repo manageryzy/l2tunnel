@@ -395,6 +395,27 @@ impl<'a> Entry<'a> {
     ) -> Result<Option<crate::rolling_records::Step>, Error> {
         self.engine.step(now, work).map_err(Error::Engine)
     }
+    /// Advance a single sender turn and a separately bounded receive slice.
+    pub fn step_with_receive_budget(
+        &mut self,
+        now: engine::Tick,
+        send: l2tunnel_fec::rolling::WorkBudget,
+        receive: l2tunnel_fec::rolling::WorkBudget,
+    ) -> Result<Option<crate::rolling_records::Step>, Error> {
+        self.engine
+            .step_with_receive_budget(now, send, receive)
+            .map_err(Error::Engine)
+    }
+    /// Resume the existing receive transaction without advancing the sender again.
+    pub fn continue_rolling_decode(
+        &mut self,
+        now: engine::Tick,
+        work: l2tunnel_fec::rolling::WorkBudget,
+    ) -> Result<Option<crate::rolling_records::Step>, Error> {
+        self.engine
+            .continue_rolling_decode(now, work)
+            .map_err(Error::Engine)
+    }
     /// Resume this physical receipt's sender using unused work from its current turn.
     pub fn continue_targeted_send(
         &mut self,

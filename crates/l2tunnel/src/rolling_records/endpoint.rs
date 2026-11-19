@@ -983,11 +983,19 @@ impl<P: RecoveryPolicy> Endpoint<P> {
     /// Preview resumes use the existing scratch slab and remaining receive
     /// metadata/copy allowance, with unit actions capped by packing.work_limit.
     pub fn step(&mut self, now: Tick, work: rolling::WorkBudget) -> Result<Step, Error> {
+        self.step_budgets(now, work, work)
+    }
+    fn step_budgets(
+        &mut self,
+        now: Tick,
+        send_work: rolling::WorkBudget,
+        receive_work: rolling::WorkBudget,
+    ) -> Result<Step, Error> {
         self.advance(now)?;
         self.pump_send(now)?;
         self.service_ingress(now)?;
-        let send = self.step_sender(now, work)?;
-        let (receive, source_handed, native_progress) = self.receive_turn(now, work)?;
+        let send = self.step_sender(now, send_work)?;
+        let (receive, source_handed, native_progress) = self.receive_turn(now, receive_work)?;
         Ok(Step {
             send,
             receive,
@@ -1020,13 +1028,23 @@ impl<P: RecoveryPolicy> Endpoint<P> {
     /// Consume queued targeted inputs with this turn's remaining receive grant.
     /// Yield at the first native opportunity or newly prepared feedback. The
     /// sole sender step and all physical output remain owned by the outer turn.
+    #[cfg(test)]
     pub(crate) fn step_queued(
         &mut self,
         now: Tick,
         work: rolling::WorkBudget,
     ) -> Result<Step, Error> {
+        self.step_queued_budgets(now, work, work)
+    }
+
+    pub(crate) fn step_queued_budgets(
+        &mut self,
+        now: Tick,
+        send_work: rolling::WorkBudget,
+        work: rolling::WorkBudget,
+    ) -> Result<Step, Error> {
         let feedback = P::feedback(&self.incoming);
-        let mut step = self.step(now, work)?;
+        let mut step = self.step_budgets(now, send_work, work)?;
         if !self.receive_config.scheduler.targeted() {
             return Ok(step);
         }
@@ -1068,6 +1086,32 @@ impl<P: RecoveryPolicy> Endpoint<P> {
             step.native_progress = native;
         }
         Ok(step)
+    }
+
+    pub(crate) fn targeted_decode_feedback_ready(&self) -> Option<bool> {
+        if !self.receive_config.scheduler.targeted() {
+            return None;
+        }
+        let state = P::receive_state(&self.incoming, rolling_tick(self.now));
+        state.decoder.pending_job.then_some(state.feedback_ready)
+    }
+
+    pub(crate) fn continue_decode(
+        &mut self,
+        now: Tick,
+        work: rolling::WorkBudget,
+    ) -> Result<Option<Step>, Error> {
+        if self.targeted_decode_feedback_ready().is_none() {
+            return Ok(None);
+        }
+        self.advance(now)?;
+        let (receive, source_handed, native_progress) = self.receive_turn(now, work)?;
+        Ok(Some(Step {
+            send: rolling::WorkUsed::default(),
+            receive,
+            source_handed,
+            native_progress,
+        }))
     }
 
     fn receive_turn(

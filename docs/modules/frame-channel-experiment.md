@@ -1487,3 +1487,61 @@ service interval. The coalescer reported zero refusals. The two extra rows
 qualifying throughput, latency or drain measurement. The service timestamps do
 not separate CPU execution from time spent descheduled.
 [Four-cell results and captures](../../work/c48-parity-20261119/native/near8-mux-gate-20261119/four-cells.json).
+
+One independent repeat of the failed strict v6 cell with the same binary
+delivered 66.27 Mbit/s, with 733.54 ms first-write P99 and 2,513.44 ms
+scheduled P99. At cutoff 28,618 writes were unsubmitted. Forward and reverse
+recovery shares were 19.01% and 12.65%. Unconfirmed sources fell from 1,385/0
+at EOF to 0/0 at two consecutive observations. The ten-second window emitted
+zero eight-source rows. All 80 complete status buckets had ordinary backlog,
+and all 8,022 group opportunities in that interval were gated. The original
+failed attempt is counted alongside this repeat. The 512-write Python result
+remains outstanding on Linux.
+[Independent strict v6 repeat](../../work/c48-parity-20261119/native/near8-mux-gate-strict-repeat-20261119/strict-repeat.json).
+
+On the first strict v5 control, all 16 flows were simultaneously held at their
+sender payload credit for 4.515 seconds of the ten-second sample. Summing across
+flows gives 139.856 out of 160 flow-seconds. In approximately 5 ms TCP samples,
+77.3% of flow-time had a due write and was within one MSS of the advertised
+window. These intervals can overlap. The local forward UDP socket accepted IP
+at 86.17 Mbit/s between seconds 1.634 and 9.629 of the sample. Both Python
+seeds spent about 100 Mbit/s over their full ten seconds. The native forward
+recovery share was 19.66%, compared with 18.71–18.76% in the model. The traces
+establish underutilization and simultaneous credit stalls. They do not isolate
+how much of either is attributable to each queue or ACK delay.
+[Per-flow intervals, accounting and source hashes](../../work/c48-parity-20261119/native/near8-mux-gate-20261119/strict-credit-accounting.json).
+
+### Servicing a held ACK during a rolling decode
+
+During the failed strict v6 warmup, the server entered rolling service 1.682 ms
+before the ACK's 5 ms flush point and stopped 35 µs after its hard deadline.
+The unfinished regular equation numbered 592 covered sources `[0, 3176)`.
+Its own deadline was almost five seconds away. The driver now gives an active
+targeted decoder up to eight slices of its existing receive allowance while a
+local ACK is held. Between slices it reads the injected runtime clock and
+services due ACKs through normal MUX admission. An existing feedback record
+awaiting physical transmission keeps its original receipt identity. Newly
+prepared feedback can yield the remainder of the turn. The sender still gets
+one turn per epoch, and both directional work limits remain in force.
+
+The deterministic regression exercises the previous unsliced turn, a checkpoint
+before the soft deadline with pending feedback, admission at the soft deadline
+and rejection at the hard deadline. A thread that receives no CPU service for
+the full hold interval can still miss its deadline.
+
+The checkpoint release delivered 60.45 Mbit/s on strict v5, with first-write
+P99 of 901.69 ms and scheduled P99 of 4,007.19 ms. At cutoff 44,308 writes
+remained unsubmitted. Recovery IP shares were 20.00% forward and 12.31%
+reverse. The 16 streams matched and the endpoints drained from 1,491/1 at EOF
+to 0/0 twice. Strict v6 stopped in warmup. Three reverse ACKs (156 bytes) were
+held. Server buffer sampling ran from 8.470586 to 8.496010 seconds and
+finished 24.440 ms after the earliest soft deadline and 9.440 ms after its hard deadline.
+The driver stopped at 8.496013 seconds. The terminal sample had no active
+decoder job. Six other attempts had peak server buffer sampling intervals of
+0.372–1.244 ms. The 25.424 ms outlier is measured wall time for the aggregate
+sampling stage. The recorded timer cannot apportion it among sampler calls.
+The focused decoder regression passes. Strict v6 stability and application
+performance parity remain open.
+[Pair results](../../work/c48-parity-20261119/native/near8-ack-feedback-edge-20261119/checkpoint-pair.json),
+[server clocks](../../work/c48-parity-20261119/native/near8-ack-feedback-edge-20261119/failed-held-ack.json)
+and [stage maxima for all seven attempts](../../work/c48-parity-20261119/native/near8-ack-feedback-edge-20261119/stage-maxima-by-attempt.json).

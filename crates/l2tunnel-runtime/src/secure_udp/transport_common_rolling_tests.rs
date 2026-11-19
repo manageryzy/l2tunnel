@@ -19,7 +19,10 @@ fn work() -> rolling::WorkBudget {
     }
 }
 
-fn values(kind: cover::Appearance, source_wire: rolling::wire::SourceWire) -> Result<[C; 4]> {
+pub(super) fn values(
+    kind: cover::Appearance,
+    source_wire: rolling::wire::SourceWire,
+) -> Result<[C; 4]> {
     let old = udp_values(kind)?;
     let c::Profile::Packed { forward, reverse } = *old[2].descriptor().profile() else {
         return Err("actual packed fixture absent".into());

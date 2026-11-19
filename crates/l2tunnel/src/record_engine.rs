@@ -984,10 +984,24 @@ impl Engine {
         now: Tick,
         work: crate::fec::rolling::WorkBudget,
     ) -> Result<Option<rolling_records::Step>, Error> {
+        self.step_with_receive_budget(now, work, work)
+    }
+
+    /// Give Rolling its independent send and receive allowances. Other families
+    /// accept only their existing uniform grant.
+    pub fn step_with_receive_budget(
+        &mut self,
+        now: Tick,
+        work: crate::fec::rolling::WorkBudget,
+        receive: crate::fec::rolling::WorkBudget,
+    ) -> Result<Option<rolling_records::Step>, Error> {
+        if work != receive && !matches!(self.owner, Owner::Rolling(_)) {
+            return Err(Error::Configuration);
+        }
         self.advance(now)?;
         let result = match &mut self.owner {
             Owner::Rolling(endpoint) => endpoint
-                .step_queued(now, work)
+                .step_queued_budgets(now, work, receive)
                 .map(Some)
                 .map_err(Error::Rolling),
             Owner::Research(endpoint) => endpoint.step(now, work).map(Some).map_err(Error::Rolling),
@@ -996,6 +1010,36 @@ impl Engine {
         match result {
             Ok(step) => Ok(step),
             Err(error) => self.fail(error),
+        }
+    }
+
+    /// Whether this direction currently owns an unfinished targeted decoder transaction.
+    pub fn has_targeted_decode(&self) -> bool {
+        self.targeted_decode_feedback_ready().is_some()
+    }
+
+    /// For an unfinished targeted decoder transaction, report whether immutable
+    /// feedback is already waiting for its physical handoff.
+    pub fn targeted_decode_feedback_ready(&self) -> Option<bool> {
+        match &self.owner {
+            Owner::Rolling(endpoint) => endpoint.targeted_decode_feedback_ready(),
+            _ => None,
+        }
+    }
+
+    /// Resume only the already owned targeted input with unused receive work.
+    pub fn continue_rolling_decode(
+        &mut self,
+        now: Tick,
+        work: crate::fec::rolling::WorkBudget,
+    ) -> Result<Option<rolling_records::Step>, Error> {
+        self.advance(now)?;
+        let Owner::Rolling(endpoint) = &mut self.owner else {
+            return Ok(None);
+        };
+        match endpoint.continue_decode(now, work) {
+            Ok(step) => Ok(step),
+            Err(error) => self.fail(Error::Rolling(error)),
         }
     }
 

@@ -209,10 +209,20 @@ impl Driver {
 
     /// Service every current owner's bounded maintenance once per sole-loop turn,
     /// with explicit Rolling work when selected; never from per-packet callbacks.
+    #[cfg(test)]
     pub(super) fn service_common_rolling(&mut self, now: u64) -> io::Result<()> {
+        self.service_common_rolling_sampled(now, || Ok(now))
+            .map(|_| ())
+    }
+
+    pub(super) fn service_common_rolling_sampled(
+        &mut self,
+        mut now: u64,
+        mut sample: impl FnMut() -> io::Result<u64>,
+    ) -> io::Result<u64> {
         let work = self.config.rolling_work;
         if self.common.is_none() || !self.check_expiry(now)? {
-            return Ok(());
+            return Ok(now);
         }
         self.clear_rolling_sender_grant();
         self.retry_common_fragment_inputs(now)?;
@@ -220,12 +230,8 @@ impl Driver {
         for epoch in epochs.into_iter().flatten() {
             self.observe_near8_capacity(epoch, now, None, epochs)?;
             let step = if let Some(work) = work {
-                let mut entry = self.common_state_mut()?.entry(epoch)?;
-                let generation = entry.generation();
-                entry
-                    .step(engine::Tick(now), work)
-                    .map_err(protocol)?
-                    .map(|step| (generation, step, work))
+                self.rolling_step_with_ack_checkpoints(epoch, &mut now, work, &mut sample)?
+                    .map(|(generation, step)| (generation, step, work))
             } else {
                 self.common_state_mut()?
                     .entry(epoch)?
@@ -263,11 +269,96 @@ impl Driver {
                     runtime.native_work[(epoch.0 % 2) as usize] = visits;
                 }
             }
+            if self.terminal.is_some() {
+                return Ok(now);
+            }
         }
         self.retry_common_fragment_inputs(now)?;
         self.retry_common_feedback(now)?;
-        Ok(())
+        Ok(now)
     }
+    fn rolling_step_with_ack_checkpoints(
+        &mut self,
+        epoch: core::Epoch,
+        now: &mut u64,
+        work: l2tunnel_fec::rolling::WorkBudget,
+        sample: &mut impl FnMut() -> io::Result<u64>,
+    ) -> io::Result<Option<(record_bank::GenerationId, l2tunnel::rolling_records::Step)>> {
+        // Release the owner between slices only when an existing ACK
+        // can become due during an already active receive equation.
+        const SLICES: usize = 8;
+        let previous_feedback = if self.next_held_ack_service().is_some() {
+            self.common_state()?
+                .engine(epoch)?
+                .targeted_decode_feedback_ready()
+        } else {
+            None
+        };
+        let quantum = if previous_feedback.is_some() {
+            l2tunnel_fec::rolling::WorkBudget {
+                field: work.field.div_ceil(SLICES),
+                copies: work.copies.div_ceil(SLICES),
+                metadata: work.metadata.div_ceil(SLICES),
+            }
+        } else {
+            work
+        };
+        let mut entry = self.common_state_mut()?.entry(epoch)?;
+        let generation = entry.generation();
+        let mut first = entry
+            .step_with_receive_budget(engine::Tick(*now), work, quantum)
+            .map_err(protocol)?;
+        if let (Some(feedback_was_ready), Some(step)) = (previous_feedback, &mut first) {
+            for round in 1..SLICES {
+                if step.source_handed
+                    || step.native_progress
+                    || (step.receive.feedback_ready && !feedback_was_ready)
+                    || !matches!(
+                        step.receive.decode,
+                        l2tunnel_fec::rolling::DecodeStep::Pending(_)
+                    )
+                {
+                    break;
+                }
+                let mut remaining = Self::remaining_rolling_work(work, step.receive.work)?;
+                if remaining.metadata == 0 {
+                    break;
+                }
+                *now = sample()?;
+                self.service_due_acks(*now)?;
+                if self.terminal.is_some() {
+                    break;
+                }
+                remaining.metadata -= 1;
+                let last = round + 1 == SLICES || self.next_held_ack_service().is_none();
+                if !last {
+                    remaining.field = remaining.field.min(quantum.field);
+                    remaining.copies = remaining.copies.min(quantum.copies);
+                    remaining.metadata = remaining.metadata.min(quantum.metadata);
+                }
+                let Some(next) = self
+                    .common_state_mut()?
+                    .entry(epoch)?
+                    .continue_rolling_decode(engine::Tick(*now), remaining)
+                    .map_err(protocol)?
+                else {
+                    break;
+                };
+                let used = step.receive.work;
+                step.receive = next.receive;
+                step.receive.work.field += used.field;
+                step.receive.work.copies += used.copies;
+                step.receive.work.metadata += used.metadata + 1;
+                step.source_handed = next.source_handed;
+                step.native_progress = next.native_progress;
+                if last {
+                    break;
+                }
+            }
+        }
+        Ok(first.map(|step| (generation, step)))
+    }
+
     pub(super) fn has_transactions(&self) -> bool {
         self.common.is_some()
     }

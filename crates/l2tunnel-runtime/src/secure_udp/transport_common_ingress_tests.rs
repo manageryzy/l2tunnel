@@ -122,6 +122,217 @@ async fn turn(fixture: &mut Fixture, inputs: &mut [buffers::Inputs; 2]) -> Resul
     fixture.turn().await
 }
 #[test]
+fn pending_decode_yields_to_original_ack_within_one_directional_grant() -> Result {
+    use l2tunnel::fec::rolling as fec;
+    use l2tunnel::record_engine as engine;
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?
+        .block_on(Box::pin(async {
+            let kind = cover::Appearance::QuicLike;
+            let values = super::rolling::values(kind, fec::wire::SourceWire::TargetedExact)?;
+            let descriptors = values.map(|v| *v.descriptor());
+            let grant = fec::WorkBudget {
+                field: 1024,
+                copies: 1024,
+                metadata: 1024,
+            };
+            let base = contracts_with_catalog_and_work(
+                kind,
+                Catalog::new(descriptors[3], &descriptors)?,
+                16,
+                Some(grant),
+            )?;
+            let make = |old: &CommonTransactionContract| -> Result<CommonTransactionContract> {
+                let mut resources = old.resources();
+                resources.ack_coalescing = Some(ack::Policy {
+                    max_hold: Duration::from_millis(20),
+                    ..policy()
+                });
+                Ok(CommonTransactionContract::new_compact_wire(
+                    old.expected_configuration(),
+                    old.role(),
+                    [resources; 2],
+                    old.cover(),
+                    old.ipv6(),
+                    old.envelope(),
+                    old.catalog().clone(),
+                    old.settings(),
+                    old.compact_wire(),
+                )?)
+            };
+            for (guarded, expire, waiting_feedback) in [
+                (false, true, false),
+                (true, false, false),
+                (true, true, false),
+                (true, false, true),
+            ] {
+                let mut fixture =
+                    Fixture::from_contracts(kind, [make(&base[0])?, make(&base[1])?]).await?;
+                let mut input = fixture.endpoints[0].driver.take_inputs()?;
+                assert!(read(&mut fixture, &mut input, &packet(100)).await?);
+                for _ in 0..8 {
+                    fixture.turn().await?;
+                }
+                assert!(read(&mut fixture, &mut input, &packet(101)).await?);
+                let start = fixture.now;
+                let due = start + 5000;
+                let expires = start + 20000;
+                let driver = &mut fixture.endpoints[0].driver;
+                let epoch = driver.common_state()?.epoch();
+                let pending_feedback = if waiting_feedback {
+                    // Commit a distinct short equation and physically select
+                    // its feedback. The carrier does not confirm this output.
+                    let mut witnesses = driver
+                        .common
+                        .as_ref()
+                        .ok_or("missing runtime")?
+                        .witnesses
+                        .clone();
+                    let mut entry = driver.common_state_mut()?.entry(epoch)?;
+                    let mut prior = [2, 1, 4, 0, 0, 0];
+                    entry.accept_authenticated(
+                        engine::Tick(start),
+                        24,
+                        engine::EmissionKind::Repair,
+                        &mut prior,
+                    )?;
+                    let mut selected = None;
+                    for turn in 1..=20 {
+                        let t = engine::Tick(start + turn * 100);
+                        entry.step(t, grant)?;
+                        if let Some(output) = entry.poll(
+                            t,
+                            314,
+                            false,
+                            &mut [0; 1500],
+                            &mut l2tunnel_reliable::OutboundBudget {
+                                packets: 1,
+                                wire_bytes: 1500,
+                            },
+                            &mut witnesses,
+                        )? {
+                            assert_eq!(output.kind, engine::EmissionKind::Feedback);
+                            selected = entry.pending_carrier_output();
+                            break;
+                        }
+                    }
+                    Some(selected.ok_or("expected an actual unconfirmed feedback record")?)
+                } else {
+                    None
+                };
+                // A valid regular equation spanning eight missing sources. Its
+                // initialization alone exceeds this test's first receive slice.
+                let mut repair = vec![0; 1027];
+                repair[..3].copy_from_slice(&[2, 2, 8]);
+                let preceding = due - 1682;
+                driver
+                    .common_state_mut()?
+                    .entry(epoch)?
+                    .accept_authenticated(
+                        engine::Tick(preceding),
+                        25,
+                        engine::EmissionKind::Repair,
+                        &mut repair,
+                    )?;
+                assert!(driver.common_state()?.engine(epoch)?.has_targeted_decode());
+                assert_eq!(
+                    driver
+                        .common_state()?
+                        .engine(epoch)?
+                        .targeted_decode_feedback_ready(),
+                    Some(waiting_feedback)
+                );
+                if !guarded {
+                    // The previous driver spent its entire direction grant before
+                    // sampling the held ACK again, 34 us beyond its original cap.
+                    driver
+                        .common_state_mut()?
+                        .entry(epoch)?
+                        .step(engine::Tick(preceding), grant)?;
+                    assert_eq!(
+                        driver
+                            .service_due_acks(expires + 34)
+                            .err()
+                            .ok_or("unsliced decode crossed the original ACK deadline")?
+                            .to_string(),
+                        "original held ACK ingress deadline"
+                    );
+                    continue;
+                }
+                let runtime = driver.common.as_ref().ok_or("missing runtime")?;
+                let (before, turns) = (runtime.rolling_work_used, runtime.rolling_scheduler_steps);
+                let mut ticks = [due - 1, if expire { expires } else { due }].into_iter();
+                let result = if let Some(token) = pending_feedback {
+                    let mut checkpoints = 0;
+                    let last = driver.service_common_rolling_sampled(preceding, || {
+                        checkpoints += 1;
+                        Ok(due - 1)
+                    })?;
+                    assert!(checkpoints > 0);
+                    assert_eq!(last, due - 1);
+                    let entry = driver.common_state_mut()?.entry(epoch)?;
+                    assert_eq!(entry.pending_carrier_output(), Some(token));
+                    let owner = driver.common_state()?.engine(epoch)?;
+                    assert_eq!(
+                        owner
+                            .ingress_snapshot()
+                            .ok_or("held ACK")?
+                            .usage
+                            .held
+                            .packets,
+                        1
+                    );
+                    assert_eq!(owner.queue_usage().packets, 0);
+                    driver.service_due_acks(due)?;
+                    Ok(due)
+                } else {
+                    let result = driver.service_common_rolling_sampled(preceding, || {
+                        ticks
+                            .next()
+                            .ok_or_else(|| io::Error::other("checked clock after ACK transfer"))
+                    });
+                    assert_eq!(ticks.next(), None);
+                    result
+                };
+                let engine = driver.common_state()?.engine(epoch)?;
+                let ack = engine.ingress_snapshot().ok_or("ingress observation")?;
+                if expire {
+                    assert_eq!(
+                        result
+                            .err()
+                            .ok_or("late decoder checkpoint accepted an expired ACK")?
+                            .to_string(),
+                        "original held ACK ingress deadline"
+                    );
+                    assert_eq!(ack.usage.held.packets, 1);
+                    assert_eq!(ack.expiry, Some(engine::Tick(expires)));
+                } else {
+                    assert_eq!(result?, due);
+                    assert_eq!(ack.statistics.flushed, 1);
+                    assert_eq!(ack.usage.held.packets, 0);
+                    assert_eq!(engine.queue_usage().packets, 1);
+                    let r = driver.common.as_ref().ok_or("missing runtime")?;
+                    let used =
+                        std::array::from_fn::<_, 3, _>(|i| r.rolling_work_used[i] - before[i]);
+                    assert_eq!(r.rolling_scheduler_steps, turns + 2);
+                    let (_, retained) = r.rolling_sender_grant.ok_or("original sender reserve")?;
+                    let sender_spent = [
+                        grant.field - retained.field,
+                        grant.copies - retained.copies,
+                        grant.metadata - retained.metadata,
+                    ];
+                    assert!(used[1] > sender_spent[1] as u64 + 128);
+                    for (combined, sent) in used.into_iter().zip(sender_spent) {
+                        assert!(combined >= sent as u64 && combined - sent as u64 <= 1024);
+                    }
+                }
+            }
+            Ok(())
+        }))
+}
+
+#[test]
 fn protocol_stage_boundaries_service_original_ack_or_expire_it() -> Result {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()

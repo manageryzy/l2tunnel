@@ -27,15 +27,17 @@ impl Driver {
         };
         run(Stage::CommonNativeCollection, Self::collect_native)?;
         run(Stage::CommonTransactionProgress, Self::progress)?;
-        run(
-            Stage::CommonRollingComputation,
-            Self::service_common_rolling,
-        )?;
+        self.refresh_held_acks(&mut now, timing, &mut sample)?;
+        if self.terminal.is_none() {
+            now = timing.measure_result(Stage::CommonRollingComputation, || {
+                self.service_common_rolling_sampled(now, &mut sample)
+            })?;
+        }
         self.refresh_held_acks(&mut now, timing, &mut sample)?;
         Ok(now)
     }
 
-    fn next_held_ack_service(&self) -> Option<u64> {
+    pub(super) fn next_held_ack_service(&self) -> Option<u64> {
         self.common.as_deref()?.next_ack_service
     }
 
