@@ -1,10 +1,11 @@
 //! Inline derived state: no additional allocation or admission authority.
-use super::{Record, Tick};
+use super::{Proof, Record, Tick};
 use std::sync::OnceLock;
 
 #[derive(Clone, Copy, Default, Debug, Eq, PartialEq)]
 pub(super) struct Retention {
     pub sources: usize,
+    pub proof_bytes: usize,
     pub records: usize,
     pub native_records: usize,
     pub record_bytes: usize,
@@ -14,6 +15,14 @@ pub(super) struct Retention {
 impl Retention {
     // Every record/source has already passed the original finite reservation.
     // These counts mirror live ownership, including transactional replacements.
+    pub fn add_proof(&mut self, proof: &Proof) {
+        self.sources += 1;
+        self.proof_bytes += proof.bytes.len();
+    }
+    pub fn remove_proof(&mut self, proof: &Proof) {
+        self.sources -= 1;
+        self.proof_bytes -= proof.bytes.len();
+    }
     pub fn add_record(&mut self, record: &Record) {
         self.records += 1;
         self.native_records += usize::from(record.native_pending());

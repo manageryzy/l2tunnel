@@ -1545,3 +1545,42 @@ performance parity remain open.
 [Pair results](../../work/c48-parity-20261119/native/near8-ack-feedback-edge-20261119/checkpoint-pair.json),
 [server clocks](../../work/c48-parity-20261119/native/near8-ack-feedback-edge-20261119/failed-held-ack.json)
 and [stage maxima for all seven attempts](../../work/c48-parity-20261119/native/near8-ack-feedback-edge-20261119/stage-maxima-by-attempt.json).
+
+The Aligned and Packed receiver now uses its retention ledger to count proofs,
+actual proof bytes, records and fragments. It classifies head records using one
+indexed lookup per channel. Compact proofs can have different lengths. Their
+exact byte totals follow insertion, release and transaction rollback. The older
+capacity scan is retained as a test oracle. On one pinned EPYC 7B12 core, an
+optimized build with 1,198 occupied proof slots out of 16,384 and 650 records
+out of 1,040 reduced median time per snapshot from 15.166 to 0.402 µs across
+eight alternating batches of 4,096 calls. The timer covers the receiver query.
+The Linux driver times a broader sampling stage. The microbenchmark does not
+attribute the earlier 25.424 ms wall interval to this query.
+[Oracle and microbenchmark measurements](../../work/c48-parity-20261119/native/near8-ack-feedback-edge-20261119/buffer-snapshot-indexed-micro.json).
+
+One strict v6 run on the indexed-snapshot release delivered 63.41 Mbit/s.
+First-write P99 was 767.45 ms, scheduled P99 was 2,832.47 ms, and 38,159
+scheduled writes remained unsubmitted at cutoff. Forward and reverse recovery
+IP shares were 20.15% and 12.26%. All 16 streams verified, four captures had
+zero capture drops, and both endpoints had zero unconfirmed sources at EOF
+and in both final observations. The gate declined all 7,618 opportunities in
+the inner status interval. No eight-source repair was sent in the ten-second
+sample. The maximum server buffer-sampling interval was 167 µs across 265,721
+observations in this run. Stable deadline service across runs and throughput
+parity with either 512-write Python seed remain open. The corresponding two
+v6 model runs delivered 76.05 and 75.82 Mbit/s. Their first-write P99s were
+272.2 and 248.0 ms, their scheduled P99s were 612.9 and 580.8 ms, and their
+unsubmitted write counts were 6,249 and 6,147.
+[Indexed-snapshot Linux run](../../work/c48-parity-20261119/native/near8-snapshot-ledger-20261119/strict-v6.json)
+and [per-endpoint sampling times](../../work/c48-parity-20261119/native/near8-snapshot-ledger-20261119/buffer-sampling.json).
+
+A PID-scoped user CPU profile on the pre-indexed release recorded 4,287 server
+samples. Four hit `Receiver::buffer_snapshot` under `sample_protocol_buffers`.
+Their owner ticks were outside that run's 1.838 ms peak sampling interval.
+The 25.424 ms stall did not recur in the profiled run. These samples verify
+that the scan executed and leave the cause of the historical outlier open.
+The profiled transfer delivered 63.47 Mbit/s with 870.31 ms first-write P99
+and 3,618.47 ms scheduled P99. It verified bilateral drain. This diagnostic
+uses the earlier executable with profiling active.
+[Sampled call sites and owner ticks](../../work/c48-parity-20261119/native/near8-buffer-sample-perf-20261119/receiver-scan-ticks.json)
+and [profiled run](../../work/c48-parity-20261119/native/near8-buffer-sample-perf-20261119/profile-summary.json).

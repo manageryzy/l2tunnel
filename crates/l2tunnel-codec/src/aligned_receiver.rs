@@ -815,13 +815,14 @@ impl Receiver {
         };
         self.touch_proof(proof_slot)?;
         let bytes = self.proof_buffer(symbol)?;
-        self.proofs[proof_slot] = Some(Proof {
+        let proof = Proof {
             source: identity.source,
             record: identity.record,
             bytes,
             deadline,
-        });
-        self.retention.sources += 1;
+        };
+        self.retention.add_proof(&proof);
+        self.proofs[proof_slot] = Some(proof);
         self.deadlines.insert(deadline);
         self.advance_sources()?;
         self.last_time = Some(now);
@@ -1107,16 +1108,16 @@ impl Receiver {
             failure: self.failure,
         }
     }
-    /// Bounded read-only scan of retained proofs and records, with separate head reserves.
-    /// This allocates nothing; callers choose their diagnostic sampling cadence.
+    /// Exact retained proofs and records, with one indexed head lookup per channel.
     pub fn buffer_snapshot(&self) -> crate::diagnostics::ReceiverBuffers {
         use crate::diagnostics::{ReceiverBuffers, Retention};
         let channels = usize::from(self.limits.channels);
         let mut result = ReceiverBuffers {
             source_proofs: Retention {
+                items: self.retention.sources,
+                bytes: self.retention.proof_bytes,
                 item_capacity: self.limits.source_window,
                 byte_capacity: self.limits.source_window * self.limits.body.symbol_bytes,
-                ..Retention::default()
             },
             heads: Retention {
                 item_capacity: channels,
@@ -1135,25 +1136,23 @@ impl Receiver {
             pending_native_bytes: self.pending.map(|value| value.written),
             native_capacity_bytes: self.native.len(),
         };
-        for proof in self.proofs.iter().flatten() {
-            result.source_proofs.items += 1;
-            result.source_proofs.bytes += proof.bytes.len();
-        }
-        for record in self.records.iter().flatten() {
-            let head = self.channels[usize::from(record.channel.0)].expected == Some(record.id);
-            let retention = if head {
-                &mut result.heads
-            } else {
-                &mut result.lookahead
-            };
-            retention.items += 1;
-            retention.bytes += record.bytes.len();
-            if head {
-                result.head_fragments += record.pieces.len();
-            } else {
-                result.lookahead_fragments += record.pieces.len();
+        // The established retention bounds cover every head and lookahead row.
+        // Only the record at each channel's current frontier belongs to its head reserve.
+        if self.retention.records != 0 {
+            for (index, channel) in self.channels.iter().enumerate() {
+                if let Some(id) = channel.expected
+                    && let Ok(position) = self.record_position(ChannelId(index as u8), id)
+                    && let Some(record) = &self.records[usize::from(self.ordered_slots[position])]
+                {
+                    result.heads.items += 1;
+                    result.heads.bytes += record.bytes.len();
+                    result.head_fragments += record.pieces.len();
+                }
             }
         }
+        result.lookahead.items = self.retention.records - result.heads.items;
+        result.lookahead.bytes = self.retention.record_bytes - result.heads.bytes;
+        result.lookahead_fragments = self.retention.fragment_slots - result.head_fragments;
         result
     }
     /// First channel with retained records in round-robin order from `start`.
@@ -1282,7 +1281,7 @@ impl Receiver {
             }
             self.touch_proof(index)?;
             if let Some(proof) = self.proofs[index].take() {
-                self.retention.sources -= 1;
+                self.retention.remove_proof(&proof);
                 self.deadlines
                     .remove(proof.deadline, self.retention.is_empty());
                 self.recycle_proof(proof)?;

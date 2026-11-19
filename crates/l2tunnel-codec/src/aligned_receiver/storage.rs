@@ -372,7 +372,7 @@ impl Receiver {
         }
         let old = self.proofs[slot].take();
         if let Some(proof) = &old {
-            self.retention.sources -= 1;
+            self.retention.remove_proof(proof);
             self.deadlines
                 .remove(proof.deadline, self.retention.is_empty());
         }
@@ -489,7 +489,7 @@ impl Receiver {
                 }
             } else {
                 if let Some(proof) = self.proofs[slot].take() {
-                    self.retention.sources -= 1;
+                    self.retention.remove_proof(&proof);
                     self.deadlines
                         .remove(proof.deadline, self.retention.is_empty());
                     self.recycle_proof(proof)?;
@@ -500,7 +500,7 @@ impl Receiver {
                     Undo::Untouched => return Err(Error::Storage),
                 };
                 if let Some(proof) = &restored {
-                    self.retention.sources += 1;
+                    self.retention.add_proof(proof);
                     self.deadlines.insert(proof.deadline);
                 }
                 self.proofs[slot] = restored;

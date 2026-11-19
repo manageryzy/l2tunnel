@@ -1210,3 +1210,7 @@ eight-source rows. A later [decoder checkpoint](modules/frame-channel-experiment
 passed the focused hold/expiry regression. Its strict v5 control completed,
 and its strict v6 attempt missed the same hard deadline in buffer sampling.
 Strict v6 qualification and Python-level throughput remain open.
+The indexed Aligned/Packed receiver snapshot matches the capacity-scan oracle,
+including variable-length proofs and rollback. One strict v6 Linux run on
+this release delivered 63.41 Mbit/s and verified bilateral drain. Repeated
+deadline stability and the 512-write throughput target are still open.
