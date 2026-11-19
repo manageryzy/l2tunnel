@@ -1574,6 +1574,16 @@ unsubmitted write counts were 6,249 and 6,147.
 [Indexed-snapshot Linux run](../../work/c48-parity-20261119/native/near8-snapshot-ledger-20261119/strict-v6.json)
 and [per-endpoint sampling times](../../work/c48-parity-20261119/native/near8-snapshot-ledger-20261119/buffer-sampling.json).
 
+In that final ten-second run all 16 writers were simultaneously held at the
+configured outstanding-payload cap for 5.569 seconds. The sum was 147.827
+out of 160 flow-seconds. In the inner 8.053-second status span, the forward
+UDP socket accepted 87.02 Mbit/s, with 20.15% in recovery. The two v6 Python
+seeds spent approximately 100 Mbit/s over their full ten seconds, with 18.75%
+and 18.77% in recovery. The data establish delayed credit release and lower
+use of the configured forward link. The individual contributions of forward
+recovery and reverse cumulative ACK transit remain unresolved.
+[Final v6 credit intervals and byte totals](../../work/c48-parity-20261119/native/near8-snapshot-ledger-20261119/v6-credit-accounting.json).
+
 A PID-scoped user CPU profile on the pre-indexed release recorded 4,287 server
 samples. Four hit `Receiver::buffer_snapshot` under `sample_protocol_buffers`.
 Their owner ticks were outside that run's 1.838 ms peak sampling interval.
