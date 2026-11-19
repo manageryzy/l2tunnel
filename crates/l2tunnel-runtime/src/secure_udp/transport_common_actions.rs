@@ -588,6 +588,9 @@ impl Driver {
                         .descriptor()
                         .local(common_contract::mg_role(self.info.role));
                     self.bucket.rate = local.send().common().bytes_per_second();
+                    if let Some(serializer) = runtime.serializer.as_mut() {
+                        serializer.observe(now, self.bucket.rate)?;
+                    }
                     self.bucket.burst = local.send().common().burst_bytes();
                     self.bucket.tokens = self.bucket.tokens.min(self.bucket.burst as u128 * SCALE);
                     self.config.path_mtu = value.descriptor().path_mtu();

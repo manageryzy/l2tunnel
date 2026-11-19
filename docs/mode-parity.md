@@ -309,6 +309,12 @@ remain unqualified. Public codec/recovery components and Common service delivery
 do not close these named runtime requirements. L3 TCP has implementation priority;
 L2 and all existing entries retain their full scope.
 
+C48 also has an opt-in eight-source forward equation on original UDP. Its
+explicit Python study and Linux comparison use a shared bidirectional MUX,
+targeted feedback and the existing 8192/128 global/local windows. This
+variant adds no default or separate acceptance credit for the existing C48
+throughput target. [Comparison and evidence](modules/frame-channel-experiment.md#negotiated-eight-source-forward-repair).
+
 ## Recovery and scheduling
 
 | Catalog ID | Existing Python implementation | Knobs and behavior that must survive the port | Rust milestone |

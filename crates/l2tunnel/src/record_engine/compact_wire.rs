@@ -114,9 +114,23 @@ impl Engine {
                 .collection
                 .enable_compact_wire(feedback_overhead)
                 .map_err(Error::Connections)?,
-            Owner::Rolling(endpoint) => endpoint
-                .enable_compact_wire(feedback_overhead)
-                .map_err(Error::Rolling)?,
+            Owner::Rolling(endpoint) => {
+                let descriptor = self.configuration.descriptor();
+                let rate = descriptor
+                    .local(self.context.role)
+                    .send()
+                    .common()
+                    .bytes_per_second();
+                endpoint
+                    .validate_compact_wire_selection(self.overhead, feedback_overhead)
+                    .map_err(Error::Rolling)?;
+                endpoint
+                    .configure_near8(descriptor.path_mtu(), rate)
+                    .map_err(Error::Rolling)?;
+                endpoint
+                    .enable_compact_wire(feedback_overhead)
+                    .map_err(Error::Rolling)?;
+            }
             Owner::Research(endpoint) => endpoint
                 .enable_compact_wire(feedback_overhead)
                 .map_err(Error::Rolling)?,

@@ -33,6 +33,14 @@ impl CarrierOutputToken {
     pub const fn context(&self) -> Context {
         self.context
     }
+    /// Whether this prepared output is the optional forward near equation.
+    pub fn is_near8(&self) -> bool {
+        matches!(&self.prepared, Prepared::Rolling(p) if p.is_near8())
+    }
+    /// Whether the first systematic copy is also retained in the original sender slot.
+    pub fn owns_first_original(&self) -> bool {
+        matches!(&self.prepared, Prepared::Rolling(p) if p.owns_first_original())
+    }
     /// Exact complete configuration of the issuing Engine.
     pub const fn digest(&self) -> ConfigDigest {
         self.digest

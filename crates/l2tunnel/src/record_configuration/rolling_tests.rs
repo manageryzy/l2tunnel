@@ -21,7 +21,7 @@ fn current_repair_grammar_roundtrips_selected_formats_and_rejects_unknown_versio
                 &bytes[offset..offset + 8],
                 &u64::from(format.version()).to_be_bytes()
             );
-            for old in [1u64, 2, 6] {
+            for old in [1u64, 2, 7] {
                 let mut stale = bytes;
                 stale[offset..offset + 8].copy_from_slice(&old.to_be_bytes());
                 assert_eq!(Configuration::decode(&stale), Err(Error::Prefix));
@@ -241,5 +241,71 @@ fn tag5_binds_both_copy_policies_and_rejects_noncanonical_fields() -> TestResult
     ] {
         assert_ne!(select(changed)?.digest()?, selected.digest()?);
     }
+    Ok(())
+}
+
+#[test]
+fn near8_is_one_authenticated_forward_word_and_needs_its_own_catalog_entry() -> TestResult {
+    use fec::rolling::wire::SourceWire::{Exact, TargetedExact, TargetedNear8};
+    let old = crate::record_engine::rolling_tests::fixture(false, TargetedExact)?;
+    let Profile::Rolling { config, stream } = *old.descriptor().profile() else {
+        return Err("missing rolling fixture".into());
+    };
+    let descriptor = old.descriptor();
+    let select = |forward, reverse, with_copies| {
+        let mut config = config;
+        config.forward.scheduler.source_wire = forward;
+        config.reverse.scheduler.source_wire = reverse;
+        let profile = if with_copies {
+            Profile::RollingCopies {
+                config,
+                stream,
+                copies: rolling_records::CopyPolicies::ONE,
+            }
+        } else {
+            Profile::Rolling { config, stream }
+        };
+        Descriptor::new(
+            descriptor.path_mtu(),
+            descriptor.duplex(),
+            *descriptor.direction(Role::Client).common(),
+            *descriptor.direction(Role::Server).common(),
+            profile,
+        )
+    };
+    let baseline = select(TargetedExact, TargetedExact, true)?;
+    let proposed = select(TargetedNear8, TargetedExact, true)?;
+    let offset = HEADER_BYTES + COMMON_DIRECTION_BYTES + 40 * 8;
+    let mut bytes = [0; DESCRIPTOR_BYTES];
+    let mut old_bytes = bytes;
+    baseline.encode_into(&mut old_bytes)?;
+    proposed.encode_into(&mut bytes)?;
+    assert_eq!(&bytes[offset..offset + 8], &6u64.to_be_bytes());
+    assert_eq!(
+        &bytes[offset + DIRECTION_BYTES..offset + DIRECTION_BYTES + 8],
+        &5u64.to_be_bytes()
+    );
+    assert_eq!(Descriptor::decode(&bytes)?, proposed);
+    bytes[offset..offset + 8].copy_from_slice(&5u64.to_be_bytes());
+    assert_eq!(bytes, old_bytes);
+    assert_ne!(
+        Configuration::new(old.envelope(), baseline)?.digest()?,
+        Configuration::new(old.envelope(), proposed)?.digest()?
+    );
+    let old_catalog = Catalog::new(baseline, &[baseline])?;
+    let near_catalog = Catalog::new(proposed, &[proposed])?;
+    assert_ne!(old_catalog.root(), near_catalog.root());
+    assert!(matches!(
+        Catalog::new(proposed, &[baseline]),
+        Err(Error::Unlisted)
+    ));
+    assert!(select(TargetedExact, TargetedNear8, true).is_err());
+    assert!(select(TargetedNear8, TargetedNear8, true).is_err());
+    assert!(select(TargetedNear8, Exact, true).is_err());
+    assert!(select(TargetedNear8, TargetedExact, false).is_err());
+    let mut reverse_only = old_bytes;
+    reverse_only[offset + DIRECTION_BYTES..offset + DIRECTION_BYTES + 8]
+        .copy_from_slice(&6u64.to_be_bytes());
+    assert!(Descriptor::decode(&reverse_only).is_err());
     Ok(())
 }

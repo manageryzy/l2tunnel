@@ -6,6 +6,7 @@ use crate::{
     fec::rolling,
 };
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
+mod near8;
 
 pub(crate) fn fixture(
     raw: bool,

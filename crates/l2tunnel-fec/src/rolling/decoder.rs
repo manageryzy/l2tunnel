@@ -24,6 +24,7 @@ struct Descriptor {
     support: Support,
     profile: Option<crate::research::Profile>,
     confirmed: u32,
+    near_extent: u16,
 }
 #[derive(Clone, Copy)]
 enum Input {
@@ -37,6 +38,9 @@ impl Input {
                 first: id,
                 end: id + 1,
             },
+            Self::Repair(d) if d.near_extent != 0 => {
+                expiry::Identity::Near8(near8::Id(d.id.0 as u32))
+            }
             Self::Repair(d) => expiry::Identity::Repair {
                 id: d.id,
                 support: Some((d.support.start, d.support.end)),
@@ -332,6 +336,7 @@ pub struct Decoder {
     history_meta: Vec<Option<Descriptor>>,
     history_floor: u64,
     highest_repair: u64,
+    highest_near: u64,
     job: Option<Job>,
     handoff: u32,
     last: Tick,
@@ -574,6 +579,7 @@ impl Decoder {
             history_meta: slots(config.repair_history, None)?,
             history_floor: 1,
             highest_repair: 0,
+            highest_near: 0,
             job: None,
             handoff: 0,
             last: now,
@@ -861,7 +867,7 @@ impl Decoder {
         {
             return Err(Error::Identity);
         }
-        self.stage_repair(repair, None, 0, received, now, original_deadline)
+        self.stage_repair(repair, None, (0, false), received, now, original_deadline)
     }
     // Structural and canonical profile validation belongs to the research owner.
     // This entry point still enforces the real decoder's complete finite horizon,
@@ -895,7 +901,7 @@ impl Decoder {
         self.stage_repair(
             repair,
             Some(profile),
-            confirmed,
+            (confirmed, false),
             received,
             now,
             original_deadline,
@@ -926,7 +932,7 @@ impl Decoder {
         if support != repair.support {
             return Err(Error::Identity);
         }
-        let begin = self.stage_repair(repair, None, 0, received, now, cap)?;
+        let begin = self.stage_repair(repair, None, (0, false), received, now, cap)?;
         let state = self.explicit.as_mut().ok_or(Error::Configuration)?;
         match begin {
             Begin::Staged => state.input.load(terms),
@@ -940,15 +946,77 @@ impl Decoder {
         }
         Ok(begin)
     }
+
+    fn history_slot(&self, id: RepairId, near: bool) -> usize {
+        if near {
+            let count = self.history_meta.len() - self.config.repair_history;
+            self.config.repair_history + (id.0 % count as u64) as usize
+        } else {
+            (id.0 % self.config.repair_history as u64) as usize
+        }
+    }
+    pub(super) fn near_history_plan(c: Config) -> Result<storage::Usage, storage::Error> {
+        let count = c.window.div_ceil(8).min(c.repair_history);
+        // Both extra ranges occupy the two existing history allocations.
+        Ok(storage::Usage {
+            capacity_bytes: mul(
+                count,
+                add(c.width()?, std::mem::size_of::<Option<Descriptor>>())?,
+            )?,
+            allocations: 0,
+        })
+    }
+    pub(super) fn enable_near_history(&mut self) -> Result<(), Error> {
+        let count = self
+            .config
+            .window
+            .div_ceil(8)
+            .min(self.config.repair_history);
+        let bytes = mul(count, self.width)?;
+        self.history
+            .try_reserve_exact(bytes)
+            .map_err(|_| Error::Allocation)?;
+        self.history_meta
+            .try_reserve_exact(count)
+            .map_err(|_| Error::Allocation)?;
+        self.history.resize(add(self.history.len(), bytes)?, 0);
+        self.history_meta
+            .resize(add(self.history_meta.len(), count)?, None);
+        Ok(())
+    }
+    pub(super) fn begin_near_until(
+        &mut self,
+        row: near8::Row<'_>,
+        received: Tick,
+        now: Tick,
+        cap: Tick,
+    ) -> Result<Begin, Error> {
+        if self.history_meta.len() == self.config.repair_history {
+            return Err(Error::Configuration);
+        }
+        if row.scope != self.scope {
+            return Err(Error::Scope);
+        }
+        let support = row.id.support()?;
+        let repair = Repair {
+            scope: row.scope,
+            id: RepairId(u64::from(row.id.0)),
+            support,
+            bytes: row.bytes,
+        };
+        repair.validate_extent(self.width)?;
+        self.stage_repair(repair, None, (0, true), received, now, cap)
+    }
     fn stage_repair(
         &mut self,
         repair: Repair<'_>,
         profile: Option<crate::research::Profile>,
-        confirmed: u32,
+        context: (u32, bool),
         received: Tick,
         now: Tick,
         original_deadline: Tick,
     ) -> Result<Begin, Error> {
+        let (confirmed, near8) = context;
         self.time(now)?;
         if received > now {
             return self.fail(Error::TimeRegression);
@@ -959,9 +1027,13 @@ impl Decoder {
                 selected: expiry::Deadline::new(
                     expiry::Kind::IncomingCap,
                     original_deadline,
-                    Some(expiry::Identity::Repair {
-                        id: repair.id,
-                        support: Some((repair.support.start, repair.support.end)),
+                    Some(if near8 {
+                        expiry::Identity::Near8(near8::Id(repair.id.0 as u32))
+                    } else {
+                        expiry::Identity::Repair {
+                            id: repair.id,
+                            support: Some((repair.support.start, repair.support.end)),
+                        }
                     }),
                 ),
             });
@@ -970,7 +1042,14 @@ impl Decoder {
         if self.job.is_some() {
             return Err(Error::Busy);
         }
-        if repair.id.0 < self.history_floor {
+        let floor = if near8 {
+            self.highest_near
+                .saturating_sub((self.history_meta.len() - self.config.repair_history - 1) as u64)
+                .max(1)
+        } else {
+            self.history_floor
+        };
+        if repair.id.0 < floor {
             return Ok(Begin::Stale);
         }
         let descriptor = Descriptor {
@@ -978,8 +1057,9 @@ impl Decoder {
             support: repair.support,
             profile,
             confirmed,
+            near_extent: if near8 { repair.bytes.len() as u16 } else { 0 },
         };
-        let slot = (repair.id.0 % self.config.repair_history as u64) as usize;
+        let slot = self.history_slot(repair.id, near8);
         if let Some(old) = self.history_meta[slot]
             && old.id == repair.id
         {
@@ -1834,7 +1914,7 @@ impl Decoder {
                         if !spend(&mut budget.copies) {
                             return Ok(Action::Paused);
                         }
-                        let slot = (d.id.0 % self.config.repair_history as u64) as usize;
+                        let slot = self.history_slot(d.id, d.near_extent != 0);
                         if i < width {
                             let count = metadata_chunk(width - i, budget)?.min(1 + budget.copies);
                             let start = slot * width + i;
@@ -1866,16 +1946,20 @@ impl Decoder {
                     None
                 };
                 if let Input::Repair(d) = job.input {
-                    let slot = (d.id.0 % self.config.repair_history as u64) as usize;
+                    let slot = self.history_slot(d.id, d.near_extent != 0);
                     self.history_meta[slot] = Some(d);
                     if let Some(state) = &mut self.explicit {
                         state.commit(slot);
                     }
-                    self.highest_repair = self.highest_repair.max(d.id.0);
-                    self.history_floor = self
-                        .highest_repair
-                        .saturating_sub(self.config.repair_history as u64 - 1)
-                        .max(1);
+                    if d.near_extent != 0 {
+                        self.highest_near = self.highest_near.max(d.id.0);
+                    } else {
+                        self.highest_repair = self.highest_repair.max(d.id.0);
+                        self.history_floor = self
+                            .highest_repair
+                            .saturating_sub(self.config.repair_history as u64 - 1)
+                            .max(1);
+                    }
                 }
                 self.decisions.commit(job.ticket)?;
                 self.active = None;

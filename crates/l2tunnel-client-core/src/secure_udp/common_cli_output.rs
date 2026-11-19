@@ -105,6 +105,19 @@ pub(super) fn inspection(profile: &Profile, role: Role) -> io::Result<Vec<Value>
         });
         output[0] = bounded(std::mem::take(&mut output[0]))?;
     }
+    if let Some(selection) =
+        crate::secure_udp::common_status::RollingWireDirections::from_descriptor(
+            &profile.requested_catalog().initial(),
+        )
+    {
+        output[0]["rolling_wire_profiles"] =
+            json!(crate::secure_udp::common_status::RollingWireProfiles {
+                initial_requested: Some(selection),
+                pending: None,
+                effective: None,
+            });
+        output[0] = bounded(std::mem::take(&mut output[0]))?;
+    }
     if let Some(requested) =
         crate::secure_udp::common_status::AckPolicies::from_policies(profile.ack_coalescing())?
     {

@@ -20,6 +20,7 @@ pub(in crate::rolling) struct Queue {
     earliest: Option<usize>,
     pub(super) len: usize,
     pub(super) peak: usize,
+    pub(super) payload_bytes: usize,
 }
 
 impl Queue {
@@ -53,6 +54,7 @@ impl Queue {
             earliest: None,
             len: 0,
             peak: 0,
+            payload_bytes: 0,
         })
     }
     pub(super) fn usage(&self) -> Result<storage::Usage, storage::Error> {
@@ -75,6 +77,7 @@ impl Queue {
         }
         self.payloads[i * self.width..i * self.width + entry.len].copy_from_slice(original);
         self.len += 1;
+        self.payload_bytes += entry.len;
         self.peak = self.peak.max(self.len);
         Ok(())
     }
@@ -90,6 +93,7 @@ impl Queue {
         let removed = self.head;
         self.head = (self.head + 1) % self.limit();
         self.len -= 1;
+        self.payload_bytes -= self.entries[removed].len;
         if self.earliest == Some(removed) {
             // Packing timestamps from separate MUX channels can be unordered.
             // Scan at most seven slots on removal, keep all deadline polls O(1).

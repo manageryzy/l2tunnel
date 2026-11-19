@@ -18,6 +18,8 @@ pub const VERSION: u8 = 3;
 pub const EXACT_SOURCE_VERSION: u8 = 4;
 /// Exact originals with negotiated named-hole recovery and queue-aware repair accounting.
 pub const TARGETED_VERSION: u8 = 5;
+/// Exact targeted records with a separately negotiated eight-source repair arm.
+pub const TARGETED_NEAR8_VERSION: u8 = 6;
 
 /// Explicitly selected systematic-source encoding, bound by the authenticated policy.
 ///
@@ -34,11 +36,17 @@ pub enum SourceWire {
     Exact,
     /// Version 5 retains exact source and repair extents and selects targeted feedback.
     TargetedExact,
+    /// Version 6 additionally selects eight-source repairs for the marked direction.
+    TargetedNear8,
 }
 impl SourceWire {
     /// Whether the authenticated selection permits named source requests and retries.
     pub const fn is_targeted(self) -> bool {
-        matches!(self, Self::TargetedExact)
+        matches!(self, Self::TargetedExact | Self::TargetedNear8)
+    }
+    /// Whether this direction negotiated the separate eight-source repair arm.
+    pub const fn is_near8(self) -> bool {
+        matches!(self, Self::TargetedNear8)
     }
     /// Wire version byte required in every record of this format.
     pub const fn version(self) -> u8 {
@@ -46,6 +54,7 @@ impl SourceWire {
             Self::Padded => VERSION,
             Self::Exact => EXACT_SOURCE_VERSION,
             Self::TargetedExact => TARGETED_VERSION,
+            Self::TargetedNear8 => TARGETED_NEAR8_VERSION,
         }
     }
 }
@@ -60,7 +69,9 @@ pub fn source_len(config: Config, format: SourceWire, original: usize) -> Result
     }
     match format {
         SourceWire::Padded => add(HEADER_BYTES, width),
-        SourceWire::Exact | SourceWire::TargetedExact => add(add(HEADER_BYTES, 2)?, original),
+        SourceWire::Exact | SourceWire::TargetedExact | SourceWire::TargetedNear8 => {
+            add(add(HEADER_BYTES, 2)?, original)
+        }
     }
 }
 const MAGIC: &[u8; 4] = b"L2RW";
@@ -172,7 +183,9 @@ pub fn inspect_with(config: Config, format: SourceWire, bytes: &[u8]) -> Result<
         let tail = vector.get(2 + length..).ok_or(Error::Length)?;
         let canonical = match format {
             SourceWire::Padded => tail.iter().all(|b| *b == 0),
-            SourceWire::Exact | SourceWire::TargetedExact => tail.is_empty(),
+            SourceWire::Exact | SourceWire::TargetedExact | SourceWire::TargetedNear8 => {
+                tail.is_empty()
+            }
         };
         if !canonical {
             return Err(Error::Length);

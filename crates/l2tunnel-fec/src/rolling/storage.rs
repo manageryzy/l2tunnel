@@ -102,7 +102,12 @@ impl Plan {
             policy,
             kind: Kind::Receiver,
             usage: Decoder::sliding_requested_storage(policy.recovery)?
-                .join(scheduler::targeted::GapTracker::plan(policy)?)?,
+                .join(scheduler::targeted::GapTracker::plan(policy)?)?
+                .join(if policy.source_wire.is_near8() {
+                    Decoder::near_history_plan(policy.recovery)?
+                } else {
+                    Usage::default()
+                })?,
         })
     }
 

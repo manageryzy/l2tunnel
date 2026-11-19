@@ -151,7 +151,9 @@ fn full_wire_two_owners_recover_eight_windows_with_data_repair_and_feedback_loss
                                 bytes.len(),
                                 match source_wire {
                                     SourceWire::Padded => full,
-                                    SourceWire::Exact | SourceWire::TargetedExact =>
+                                    SourceWire::Exact
+                                    | SourceWire::TargetedExact
+                                    | SourceWire::TargetedNear8 =>
                                         rolling::wire::HEADER_BYTES + 2 + original.len(),
                                 }
                             );
@@ -160,6 +162,7 @@ fn full_wire_two_owners_recover_eight_windows_with_data_repair_and_feedback_loss
                             dropped[0] += usize::from(lose);
                             lose
                         }
+                        Output::Near8(_) => return Err(Error::Identity.into()),
                         Output::Repair(r) => {
                             let extent = (r.support.start..r.support.end)
                                 .map(|id| 2 + original(id).len())

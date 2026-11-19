@@ -8,6 +8,14 @@ pub struct FragmentOutputToken {
     token: engine::FragmentOutputToken,
 }
 impl FragmentOutputToken {
+    /// Whether the negotiated group is an eight-source forward repair.
+    pub fn is_near8(&self) -> bool {
+        self.token.is_near8()
+    }
+    /// Whether this group's first copy is still held by the FEC sender.
+    pub fn owns_first_original(&self) -> bool {
+        self.token.owns_first_original()
+    }
     /// Exact issuing Bank/slot/nonreusable generation.
     pub const fn generation(&self) -> GenerationId {
         self.generation

@@ -28,6 +28,7 @@ pub fn data_len(output: Output<'_>) -> Result<usize, Error> {
             }
             Ok(1 + len(u64::from(id.0)) + original.len())
         }
+        Output::Near8(row) => crate::rolling::near8::wire_len(row),
         Output::Repair(repair) => {
             repair.validate_extent(MAX_PAYLOAD + 2)?;
             if repair.id.0 == u64::MAX {
@@ -58,6 +59,7 @@ pub fn encode_data(value: Output<'_>, output: &mut [u8]) -> Result<usize, Error>
             write(u64::from(id.0), output, &mut position);
             original
         }
+        Output::Near8(row) => return crate::rolling::near8::encode(row, output),
         Output::Repair(repair) => {
             output[0] = if repair.support.tail { 4 } else { 2 };
             write(repair.id.0, output, &mut position);

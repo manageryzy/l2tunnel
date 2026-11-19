@@ -344,6 +344,12 @@ measurement units. The per-connection CompactARQ sensitivity and shared Packed
 C46/C47/C48 candidates are separate required comparisons, not interchangeable
 performance baselines. This changes no default selection.
 
+The additive C48 near8 comparison under TEST-12 uses a separately negotiated
+forward descriptor. Measure both socket admission settings against the original
+C48 on the same release. Record the measurement window's row count, IP cost,
+application latency and final confirmation separately. The original C48 target
+and the independent platform and carrier gates retain their existing criteria.
+
 Run independent implementation lanes in parallel: actual CompactARQ serial/RTT/
 receiver-delay/guarded-retry behavior; flow ownership, learned reverse affinity
 and ACK custody; L3 codec and actual rolling/copy execution. The integrator owns

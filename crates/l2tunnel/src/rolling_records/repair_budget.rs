@@ -5,6 +5,8 @@ use super::*;
 /// regular-repair charges. Half-byte units retain odd-sized half credits.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct RepairBudgetStatus {
+    /// Independent first-copy-funded forward repair, absent on every original sender.
+    pub near8: Option<rolling::near8::Status>,
     /// Named request identities independent of ordinary cumulative feedback.
     pub named_requests: scheduler::RequestCounts,
     /// Admitted originals beyond authenticated cumulative confirmation, including queued originals.

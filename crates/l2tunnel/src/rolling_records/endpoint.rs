@@ -35,6 +35,12 @@ pub struct PreparedOutput {
     pub witnesses: usize,
 }
 impl PreparedOutput {
+    pub(crate) fn is_near8(self) -> bool {
+        matches!(self.id, OutputId::Data(scheduler::OutputId::Near8(_)))
+    }
+    pub(crate) fn owns_first_original(self) -> bool {
+        self.source_copy.is_some_and(|copy| copy.ordinal() == 1)
+    }
     /// Exact physical-copy ordinal; this local witness is not I/O evidence.
     pub const fn source_copy(self) -> Option<scheduler::SourceCopy> {
         self.source_copy
@@ -400,6 +406,12 @@ impl<P: RecoveryPolicy> Endpoint<P> {
         Err(original)
     }
     pub(super) fn advance(&mut self, now: Tick) -> Result<(), Error> {
+        if self.compact_feedback_overhead.is_none()
+            && (self.send_config.scheduler.requires_compact_wire()
+                || self.receive_config.scheduler.requires_compact_wire())
+        {
+            return Err(Error::Configuration);
+        }
         if let Some(waits) = self.waits.first_mut() {
             waits.observe(now);
         }
@@ -1133,7 +1145,9 @@ impl<P: RecoveryPolicy> Endpoint<P> {
             };
             let kind = match data.id {
                 scheduler::OutputId::Source(_) => EmissionKind::Source(SourceForm::SystematicFec),
-                scheduler::OutputId::Repair(_) => EmissionKind::Repair,
+                scheduler::OutputId::Repair(_) | scheduler::OutputId::Near8(_) => {
+                    EmissionKind::Repair
+                }
             };
             let length = if self.compact_feedback_overhead.is_some() {
                 P::Compact::data_len(&self.sender)

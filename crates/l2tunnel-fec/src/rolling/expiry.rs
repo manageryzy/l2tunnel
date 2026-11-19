@@ -31,6 +31,8 @@ pub enum Kind {
 /// never an assertion about which already-completed source opened a cohort.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Identity {
+    /// Short-window equation in its own nonwrapping group namespace.
+    Near8(super::near8::Id),
     /// Half-open source extent, including a single systematic source.
     Sources {
         /// Inclusive first source.

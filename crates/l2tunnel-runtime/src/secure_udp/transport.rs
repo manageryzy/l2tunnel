@@ -2394,11 +2394,22 @@ impl Driver {
     ) -> io::Result<bool> {
         self.write_common_native(ready, now)
     }
+    #[cfg(test)]
     fn handed(
         &mut self,
         socket: &tokio::net::UdpSocket,
         bytes: usize,
         kind: performance::WireKind,
+    ) -> io::Result<()> {
+        let origin = self.origin;
+        self.handed_sampled(socket, bytes, kind, || clock(origin, Instant::now()))
+    }
+    fn handed_sampled(
+        &mut self,
+        socket: &tokio::net::UdpSocket,
+        bytes: usize,
+        kind: performance::WireKind,
+        sample: impl FnOnce() -> io::Result<u64>,
     ) -> io::Result<()> {
         let cost = bytes
             .checked_add(self.ip)
@@ -2416,6 +2427,13 @@ impl Driver {
                     .counters
                     .socket_accepted_ip_bytes
                     .saturating_add(cost as u64);
+                if self
+                    .common
+                    .as_deref()
+                    .is_some_and(|r| r.serializer.is_some())
+                {
+                    self.observe_near8_control_receipt(sample()?, cost)?;
+                }
                 Ok(())
             }
             Ok(_) => Err(io::Error::new(
@@ -2528,7 +2546,10 @@ impl Driver {
                 break;
             }
             if let Some(bytes) = self.tail(instant)? {
-                self.handed(socket, bytes, performance::WireKind::Bootstrap)?;
+                let origin = self.origin;
+                self.handed_sampled(socket, bytes, performance::WireKind::Bootstrap, || {
+                    clock(origin, sample().max(instant))
+                })?;
                 emitted += 1;
                 continue;
             }
@@ -2536,7 +2557,10 @@ impl Driver {
                 return Err(exhausted());
             }
             if let Some(bytes) = self.prepare_control(now)? {
-                self.handed(socket, bytes, performance::WireKind::Control)?;
+                let origin = self.origin;
+                self.handed_sampled(socket, bytes, performance::WireKind::Control, || {
+                    clock(origin, sample().max(instant))
+                })?;
                 emitted += 1;
                 continue;
             }

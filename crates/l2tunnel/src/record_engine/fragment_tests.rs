@@ -164,6 +164,7 @@ fn transfer(
     );
     assert!(old_output.iter().all(|b| *b == 0xa5));
     let mut final_admission = None;
+    let mut remaining = group.wire_bytes;
     for index in 0..group.packets {
         let observed = Tick(now.0 + u64::try_from(index)?);
         let mut output = [0; 1500];
@@ -181,6 +182,12 @@ fn transfer(
             .pending_fragment_output()
             .ok_or("exact physical token")?;
         assert_eq!(token.context(), context(Role::Client));
+        assert!(!token.is_near8());
+        assert_eq!(
+            sender.ordinary_fragment_backlog(),
+            Some((remaining, token.owns_first_original()))
+        );
+        remaining -= emitted.emission.wire_bytes;
         let duplicate = sender
             .pending_fragment_output()
             .ok_or("retained physical witness")?;
@@ -219,6 +226,8 @@ fn transfer(
         assert_eq!(sender.fragment_statistics(), stats);
     }
     assert_eq!(sender.pending_fragment_group(), None);
+    assert_eq!(sender.ordinary_fragment_backlog(), None);
+    assert_eq!(remaining, 0);
     Ok(Some((
         group,
         final_admission.ok_or("complete actual body")?,

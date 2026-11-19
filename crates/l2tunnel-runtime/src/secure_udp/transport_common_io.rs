@@ -4,7 +4,105 @@ use crate::buffer_metrics::{Reason, Site};
 use l2tunnel::{record_bank, record_configuration as configuration, record_engine as engine};
 use l2tunnel_reliable::OutboundBudget;
 
+#[path = "transport_common_serializer.rs"]
+mod serializer;
+pub(super) use serializer::{SerializerEstimate, SerializerPlan};
+
+/// A whole positive write observed before the issuing Engine has confirmed its token.
+struct GateTransfer {
+    epoch: core::Epoch,
+    primary: bool,
+    ordinary_fragment_bytes: usize,
+}
+
 impl Driver {
+    fn observe_near8_capacity(
+        &mut self,
+        epoch: core::Epoch,
+        now: u64,
+        transfer: Option<&GateTransfer>,
+        epochs: [Option<core::Epoch>; 2],
+    ) -> io::Result<()> {
+        if !self.common_state()?.engine(epoch)?.uses_near8_sender() {
+            return Ok(());
+        }
+        let mut ordinary = 0_usize;
+        let mut primary = transfer.is_some_and(|t| t.epoch == epoch && t.primary);
+        for owner in epochs.into_iter().flatten() {
+            if let Some((bytes, first)) = self
+                .common_state()?
+                .engine(owner)?
+                .ordinary_fragment_backlog()
+            {
+                let just_written = transfer
+                    .filter(|t| t.epoch == owner)
+                    .map_or(0, |t| t.ordinary_fragment_bytes);
+                ordinary =
+                    ordinary.saturating_add(bytes.checked_sub(just_written).ok_or_else(|| {
+                        protocol("fragment receipt exceeds outstanding ordinary IP bytes")
+                    })?);
+                primary |= owner == epoch && first;
+            }
+        }
+        let accepted = self.counters.socket_accepted_ip_bytes;
+        let runtime = self
+            .common
+            .as_deref_mut()
+            .ok_or_else(|| protocol("missing Common sender"))?;
+        let serial = runtime
+            .serializer
+            .as_mut()
+            .ok_or_else(|| protocol("unreserved near8 serializer"))?
+            .observe(now, self.bucket.rate)?;
+        // A fragment slot already belongs to the whole reserved group above.
+        // An unfragmented slot replaces the pending original's raw payload charge.
+        let slot = runtime
+            .sealed
+            .as_ref()
+            .map(|p| (p.scope, p.cost, p.carrier.as_ref(), p.fragment.is_some()))
+            .or_else(|| {
+                runtime
+                    .unsealed
+                    .as_ref()
+                    .map(|p| (p.scope, p.cost, p.carrier.as_ref(), p.fragment.is_some()))
+            });
+        if let Some((scope, cost, token, false)) = slot {
+            if !token.is_some_and(|t| t.is_near8()) {
+                ordinary = ordinary.saturating_add(cost);
+            }
+            primary |= scope.epoch.0 == epoch.0 && token.is_some_and(|t| t.owns_first_original());
+        }
+        self.common_state_mut()?
+            .entry(epoch)?
+            .observe_near8_capacity(
+                engine::Tick(now),
+                accepted,
+                serial.saturating_add(ordinary),
+                primary,
+            )
+            .map_err(protocol)
+    }
+
+    pub(super) fn observe_near8_control_receipt(
+        &mut self,
+        now: u64,
+        cost: usize,
+    ) -> io::Result<()> {
+        let Some(serializer) = self
+            .common
+            .as_deref_mut()
+            .and_then(|r| r.serializer.as_mut())
+        else {
+            return Ok(());
+        };
+        serializer.accepted(now, self.bucket.rate, cost, false)?;
+        let epochs = self.common_epochs();
+        for epoch in epochs.into_iter().flatten() {
+            self.observe_near8_capacity(epoch, now, None, epochs)?;
+        }
+        Ok(())
+    }
+
     fn common_authenticated_data(&self) -> bool {
         self.common.as_deref().is_some_and(|runtime| {
             runtime.contract.proxy_binding().is_some()
@@ -118,7 +216,9 @@ impl Driver {
         }
         self.clear_rolling_sender_grant();
         self.retry_common_fragment_inputs(now)?;
-        for epoch in self.common_epochs().into_iter().flatten() {
+        let epochs = self.common_epochs();
+        for epoch in epochs.into_iter().flatten() {
+            self.observe_near8_capacity(epoch, now, None, epochs)?;
             let step = if let Some(work) = work {
                 let mut entry = self.common_state_mut()?.entry(epoch)?;
                 let generation = entry.generation();
@@ -1310,6 +1410,44 @@ impl Driver {
                         super::super::SendBoundary::SocketAccepted,
                     );
                 }
+                let capacity = sampled
+                    .as_ref()
+                    .ok()
+                    .map(|at| {
+                        let Some(serializer) = self
+                            .common
+                            .as_deref_mut()
+                            .and_then(|r| r.serializer.as_mut())
+                        else {
+                            return Ok(());
+                        };
+                        let near = pending.carrier.as_ref().is_some_and(|t| t.is_near8())
+                            || pending.fragment.as_ref().is_some_and(|t| t.is_near8());
+                        let primary = pending
+                            .carrier
+                            .as_ref()
+                            .is_some_and(|t| t.owns_first_original())
+                            || pending
+                                .fragment
+                                .as_ref()
+                                .is_some_and(|t| t.owns_first_original());
+                        serializer.accepted(*at, self.bucket.rate, cost, near)?;
+                        let handed = GateTransfer {
+                            epoch: core::Epoch(pending.scope.epoch.0),
+                            primary,
+                            ordinary_fragment_bytes: if !near && pending.fragment.is_some() {
+                                cost
+                            } else {
+                                0
+                            },
+                        };
+                        let epochs = self.common_epochs();
+                        for owner in epochs.into_iter().flatten() {
+                            self.observe_near8_capacity(owner, *at, Some(&handed), epochs)?;
+                        }
+                        io::Result::Ok(())
+                    })
+                    .transpose();
                 let confirmation = self.confirm_common_output(
                     pending.scope,
                     completed,
@@ -1323,6 +1461,7 @@ impl Driver {
                 let eligibility = (|| {
                     sampled?;
                     confirmation?;
+                    capacity?;
                     if completed >= pending.deadline {
                         return Err(io::Error::new(
                             io::ErrorKind::TimedOut,

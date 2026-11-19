@@ -74,6 +74,9 @@ pub trait RecoveryPolicy: sealed::Sealed + Copy + Eq {
     const COPIES: bool;
     const DOMAIN: &'static [u8];
     const STREAM_DOMAIN: &'static [u8];
+    fn requires_compact_wire(self) -> bool {
+        false
+    }
     fn targeted(self) -> bool {
         false
     }
@@ -226,6 +229,9 @@ pub trait RecoveryPolicy: sealed::Sealed + Copy + Eq {
 }
 
 impl RecoveryPolicy for scheduler::Policy {
+    fn requires_compact_wire(self) -> bool {
+        self.source_wire.is_near8()
+    }
     fn targeted(self) -> bool {
         self.source_wire.is_targeted()
     }
@@ -358,12 +364,14 @@ impl RecoveryPolicy for scheduler::Policy {
             work_pending: computing_global
                 || !x.output_ready
                     && (x.queued_fresh > 0
+                        || x.near8_work_pending
                         || x.encoder.pending_repair
                         || x.regular_due > 0
                         || x.tail_remaining > 0
                         || s.requested_retry_waiting()),
             drained: !x.output_ready
                 && !computing_global
+                && !x.near8_work_pending
                 && x.queued_fresh == 0
                 && x.regular_due == 0
                 && x.tail_remaining == 0
@@ -454,7 +462,7 @@ impl RecoveryPolicy for scheduler::Policy {
     fn pending_original(s: &Self::Sender) -> Option<(rolling::SourceId, usize)> {
         match s.pending_output()? {
             scheduler::Output::Source { id, original, .. } => Some((id, original.len())),
-            scheduler::Output::Repair(_) => None,
+            scheduler::Output::Repair(_) | scheduler::Output::Near8(_) => None,
         }
     }
     fn confirm_data(
@@ -801,6 +809,7 @@ impl RecoveryPolicy for research::Config {
             match i {
                 scheduler::OutputId::Source(i) => research::OutputId::Source(i),
                 scheduler::OutputId::Repair(i) => research::OutputId::Repair(i),
+                scheduler::OutputId::Near8(_) => return Err(rolling::Error::Identity),
             },
             a,
             n,

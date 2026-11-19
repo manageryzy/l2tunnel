@@ -286,6 +286,7 @@ pub(super) struct Runtime {
     pub(super) request: Option<PendingRequest>,
     pub(super) cursor: bool,
     pub(super) native_work: [usize; 2],
+    pub(super) serializer: Option<super::common_io::SerializerEstimate>,
     pub(super) sealed: Option<PendingWire>,
     pub(super) unsealed: Option<PendingPlain>,
     pub(super) raw_control: Option<PendingRawControl>,
@@ -686,6 +687,17 @@ impl Driver {
         // Common state has its own cell. Validate and charge the complete
         // payload before provisioning.
         std::alloc::Layout::array::<Runtime>(1).map_err(io::Error::other)?;
+        let serializer_plan = contract.catalog().descriptors().iter()
+            .filter(|descriptor| matches!(descriptor.direction(role).profile(),
+                l2tunnel::record_configuration::DirectionProfile::Rolling { config, .. }
+                if config.scheduler.source_wire == l2tunnel_fec::rolling::wire::SourceWire::TargetedNear8))
+            .map(|descriptor| descriptor.path_mtu()).max()
+            .map(super::common_io::SerializerPlan::new).transpose()?;
+        let serializer_heap = serializer_plan
+            .as_ref()
+            .map(|plan| plan.heap_bytes())
+            .transpose()?
+            .unwrap_or(0);
         let external = std::mem::size_of::<Driver>()
             .checked_add(std::mem::size_of::<owner::StateCell<Driver>>())
             .and_then(|v| v.checked_add(std::mem::size_of::<Runtime>()))
@@ -701,6 +713,7 @@ impl Driver {
                         .map_or(0, |plan| plan.capacity_bytes()),
                 )
             })
+            .and_then(|v| v.checked_add(serializer_heap))
             .and_then(|v| v.checked_add(reuse_bytes))
             .and_then(|v| v.checked_add(records.compact_owner_bytes()))
             .and_then(|v| v.checked_add(message_bytes))
@@ -930,6 +943,7 @@ impl Driver {
                 request: None,
                 cursor: false,
                 native_work: [0; 2],
+                serializer: serializer_plan.map(|p| p.build()).transpose()?,
                 sealed: None,
                 unsealed: None,
                 raw_control: None,

@@ -48,6 +48,21 @@ pub trait CompactRecovery<P: RecoveryPolicy> {
 pub struct Rolling;
 #[doc(hidden)]
 pub struct Research;
+// Tag 6 belongs only to the forward grammar bound by the negotiated descriptor.
+fn near_row(
+    policy: scheduler::Policy,
+    scope: rolling::Scope,
+    bytes: &[u8],
+) -> Result<Option<rolling::near8::Row<'_>>, rolling::Error> {
+    if bytes.first() != Some(&rolling::near8::TAG) {
+        return Ok(None);
+    }
+    if policy.source_wire != rolling::wire::SourceWire::TargetedNear8 {
+        return Err(rolling::Error::Format);
+    }
+    rolling::near8::inspect(policy.recovery, scope, bytes).map(Some)
+}
+
 impl CompactRecovery<scheduler::Policy> for Rolling {
     const MAXIMUM_FEEDBACK: usize = rw::MAXIMUM_FEEDBACK_BYTES;
     fn maximum_data(policy: scheduler::Policy) -> Result<usize, rolling::Error> {
@@ -83,6 +98,9 @@ impl CompactRecovery<scheduler::Policy> for Rolling {
         scope: rolling::Scope,
         bytes: &[u8],
     ) -> Result<recovery::View<'_>, rolling::Error> {
+        if let Some(row) = near_row(policy, scope, bytes)? {
+            return Ok(recovery::View::Repair { scope: row.scope });
+        }
         match rw::inspect(policy.recovery, scope, bytes)? {
             rw::View::Data(rolling::wire::View::Source {
                 scope,
@@ -104,6 +122,9 @@ impl CompactRecovery<scheduler::Policy> for Rolling {
         scope: rolling::Scope,
         bytes: &[u8],
     ) -> Result<EmissionKind, rolling::Error> {
+        if near_row(policy, scope, bytes)?.is_some() {
+            return Ok(EmissionKind::Repair);
+        }
         Ok(match rw::inspect(policy.recovery, scope, bytes)? {
             rw::View::Data(rolling::wire::View::Source { .. }) => {
                 EmissionKind::Source(SourceForm::SystematicFec)
@@ -120,6 +141,9 @@ impl CompactRecovery<scheduler::Policy> for Rolling {
         bytes: &[u8],
     ) -> Result<l2tunnel_reliable::RecoveryExtent, rolling::Error> {
         use l2tunnel_reliable::RecordKind;
+        if let Some(row) = near_row(policy, scope, bytes)? {
+            return recovery_extent(bytes.len(), row.bytes.len(), RecordKind::Repair);
+        }
         let (kind, payload) = match rw::inspect(policy.recovery, scope, bytes)? {
             rw::View::Data(rolling::wire::View::Source { original, .. }) => {
                 (RecordKind::Systematic, original.len())
@@ -157,6 +181,9 @@ impl CompactRecovery<scheduler::Policy> for Rolling {
         now: rolling::Tick,
         cap: rolling::Tick,
     ) -> Result<rolling::Begin, rolling::Error> {
+        if let Some(row) = near_row(policy, scope, bytes)? {
+            return receiver.receive_near8_until(row, received, now, cap);
+        }
         let rw::View::Data(value) = rw::inspect(policy.recovery, scope, bytes)? else {
             return Err(rolling::Error::Format);
         };
@@ -273,6 +300,39 @@ fn recovery_extent(
         payload_bytes,
         systematic_coded_fill_bytes: 0,
     })
+}
+impl Endpoint<scheduler::Policy> {
+    pub(crate) fn configure_near8(&mut self, mtu: usize, rate: u64) -> Result<(), Error> {
+        if self.sender.near8_status().is_some() {
+            let (_, unit_cost) = wire_charge(self.framing, 1, self.overhead)?;
+            self.sender
+                .configure_near8(mtu, unit_cost - 1, rate)
+                .map_err(Error::Rolling)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn observe_near8_capacity(
+        &mut self,
+        now: Tick,
+        accepted: u64,
+        pipeline_bytes: usize,
+        serial: usize,
+        primary_in_carrier: bool,
+    ) -> Result<(), Error> {
+        let buffers = self.packing.buffer_snapshot();
+        let ordinary = pipeline_bytes
+            .saturating_add(buffers.stage.remaining_bytes)
+            .saturating_add(buffers.packing.source.bytes)
+            .saturating_add(self.sender.ordinary_backlog_bytes(primary_in_carrier));
+        self.sender
+            .observe_near8_capacity(rolling_tick(now), accepted, ordinary, serial)
+            .map_err(Error::Rolling)
+    }
+
+    pub(crate) fn near8_status(&self) -> Option<rolling::near8::Status> {
+        self.sender.near8_status()
+    }
 }
 impl<P: RecoveryPolicy> DirectionConfig<P> {
     /// Selected data body ceiling with no duplicate scope/profile or packing envelope.

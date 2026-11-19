@@ -7,6 +7,8 @@ pub enum OutputId {
     Source(SourceId),
     /// Complete repair identity, independent of the source namespace.
     Repair(RepairId),
+    /// Independent identified eight-source repair.
+    Near8(near8::Id),
 }
 /// Borrowed immutable output; encode it with the structural codec before handoff.
 #[derive(Clone, Copy, Debug)]
@@ -22,6 +24,8 @@ pub enum Output<'a> {
     },
     /// One completely computed actual-byte equation.
     Repair(Repair<'a>),
+    /// A complete optional short-window equation.
+    Near8(near8::Row<'a>),
 }
 impl Output<'_> {
     /// Identity required to confirm exactly this complete external handoff.
@@ -29,6 +33,7 @@ impl Output<'_> {
         match self {
             Self::Source { id, .. } => OutputId::Source(id),
             Self::Repair(value) => OutputId::Repair(value.id),
+            Self::Near8(row) => OutputId::Near8(row.id),
         }
     }
 }
@@ -95,6 +100,8 @@ pub struct SenderStatus {
     pub tail_due: Option<Tick>,
     /// Complete immutable output is ready for caller ownership transfer.
     pub output_ready: bool,
+    /// One optional near row is being computed or retained for physical acceptance.
+    pub near8_work_pending: bool,
     /// Latest applied actual receipt identity.
     pub feedback: Option<FeedbackId>,
     /// Original wrapper failure, if any.
@@ -109,6 +116,7 @@ pub struct RetryToken {
 }
 #[derive(Clone, Copy)]
 enum Pending {
+    Near8(near8::Id),
     Source(SourceId),
     Retry {
         id: SourceId,
@@ -144,6 +152,7 @@ pub struct Sender {
     parked_regular: Option<(RepairId, Tick)>,
     // Physical copies still available above the usual two-regular-debt gate.
     global_extra_copies: u8,
+    near8: Option<near8::State>,
     source_copy: Option<SourceCopy>,
     sent: u32,
     credit: u32,
@@ -180,13 +189,26 @@ impl Sender {
             .storage_usage()?
             .join(self.retry_queue.usage()?)?
             .join(self.fresh.usage()?)?
-            .join(storage::Usage::vector(&self.earned)?)
+            .join(storage::Usage::vector(&self.earned)?)?
+            .join(
+                self.near8
+                    .as_ref()
+                    .map(near8::State::usage)
+                    .transpose()?
+                    .unwrap_or_default(),
+            )
     }
 
     pub(in crate::rolling) fn earned_storage_plan(
         policy: Policy,
     ) -> Result<storage::Usage, storage::Error> {
-        storage::requested::<earned::Queue>(usize::from(policy.source_wire.is_targeted()))
+        storage::requested::<earned::Queue>(usize::from(policy.source_wire.is_targeted()))?.join(
+            storage::requested::<u8>(if policy.source_wire.is_near8() {
+                policy.recovery.width()?
+            } else {
+                0
+            })?,
+        )
     }
     /// Conservative total retained reservation, excluding caller buffers/allocator overhead.
     pub fn memory_bound(policy: Policy) -> Result<usize, Error> {
@@ -206,7 +228,14 @@ impl Sender {
                     fresh::Queue::bytes(policy)?,
                 )?,
             )?,
-            std::mem::size_of::<Self>(),
+            add(
+                std::mem::size_of::<Self>(),
+                if policy.source_wire.is_near8() {
+                    policy.recovery.width()?
+                } else {
+                    0
+                },
+            )?,
         )
     }
     /// Construct all encoder payload storage before accepting originals.
@@ -243,6 +272,14 @@ impl Sender {
             output_end: None,
             parked_regular: None,
             global_extra_copies: 0,
+            near8: if policy.source_wire.is_near8() {
+                if scope.direction != 0 {
+                    return Err(Error::Scope);
+                }
+                Some(near8::State::new(policy.recovery.width()?)?)
+            } else {
+                None
+            },
             source_copy: None,
             sent: 0,
             credit: 0,
@@ -255,6 +292,58 @@ impl Sender {
             terminal: None,
             expiry_failure: None,
         })
+    }
+    /// Configure actual single-carrier-packet geometry and pacing before admission.
+    pub fn configure_near8(
+        &mut self,
+        mtu: usize,
+        overhead: usize,
+        send_rate_bytes_per_sec: u64,
+    ) -> Result<(), Error> {
+        if self.status().next_source != 0 {
+            return Err(Error::Busy);
+        }
+        self.near8.as_mut().ok_or(Error::Configuration)?.configure(
+            mtu,
+            overhead,
+            send_rate_bytes_per_sec,
+            self.last,
+        )
+    }
+    /// Observe a local cumulative all-class IP counter and both local queued byte counts.
+    pub fn observe_near8_capacity(
+        &mut self,
+        now: Tick,
+        accepted_ip_total: u64,
+        ordinary_backlog_bytes: usize,
+        serial_backlog_bytes: usize,
+    ) -> Result<(), Error> {
+        if self.near8.is_none() {
+            return Ok(());
+        }
+        self.time(now)?;
+        self.near8.as_mut().ok_or(Error::Configuration)?.observe(
+            now,
+            accepted_ip_total,
+            ordinary_backlog_bytes,
+            serial_backlog_bytes,
+        )
+    }
+    /// Exact owned originals still awaiting their first physical receipt; repeats are excluded.
+    pub fn ordinary_backlog_bytes(&self, primary_in_carrier: bool) -> usize {
+        if primary_in_carrier {
+            return self.fresh.payload_bytes;
+        }
+        self.fresh.payload_bytes
+            + self
+                .source_copy
+                .filter(|copy| copy.ordinal == 1)
+                .and_then(|copy| self.encoder.source(copy.source))
+                .map_or(0, <[u8]>::len)
+    }
+    /// Actual selected gate and confirmed charged-byte accounting.
+    pub fn near8_status(&self) -> Option<near8::Status> {
+        self.near8.as_ref().map(|n| n.status)
     }
     /// Bind future regular equations to the original which earned them. Configure once
     /// before source admission; priced copy receipts settle displacement at that boundary.
@@ -332,7 +421,8 @@ impl Sender {
         now: Tick,
         copies: u8,
     ) -> Result<SourceId, Error> {
-        if !(1..=4).contains(&copies) {
+        if self.near8.as_ref().is_some_and(|near| !near.configured()) || !(1..=4).contains(&copies)
+        {
             return Err(Error::Configuration);
         }
         self.time(now)?;
@@ -565,6 +655,16 @@ impl Sender {
                 self.serve_during_global(now, &mut budget)?;
             }
         }
+        if self.pending.is_none()
+            && self.fresh.len == 0
+            && self.regular_due == 0
+            && !self.retry_queue.has_retries()
+            && let Some(near) = &mut self.near8
+            && let Some((id, cap)) = near.service(&self.encoder, now, &mut budget)?
+        {
+            self.pending = Some(Pending::Near8(id));
+            self.output_end = Some(cap);
+        }
         Ok(used(before, budget))
     }
     fn serve_during_global(&mut self, now: Tick, budget: &mut WorkBudget) -> Result<(), Error> {
@@ -732,6 +832,7 @@ impl Sender {
                 original: self.encoder.source(id)?,
             }),
             Pending::Repair { .. } => self.encoder.pending_repair().map(Output::Repair),
+            Pending::Near8(_) => self.near8.as_ref()?.pending(self.scope).map(Output::Near8),
         }
     }
     /// Encode the immutable pending output into caller-reserved storage, without consuming it.
@@ -750,6 +851,7 @@ impl Sender {
                 original,
                 output,
             ),
+            Output::Near8(row) => near8::encode(row, output),
             Output::Repair(repair) => wire::encode_repair_with(
                 self.policy.recovery,
                 self.policy.source_wire,
@@ -769,6 +871,7 @@ impl Sender {
                 original.len(),
             )
             .map(Some),
+            Some(Output::Near8(row)) => near8::wire_len(row).map(Some),
             Some(Output::Repair(repair)) => repair
                 .bytes
                 .len()
@@ -787,6 +890,9 @@ impl Sender {
     /// Confirm an ordinary one-copy source or repair. Explicit repeated-source
     /// groups require their ordinal-bearing witness and cannot use this method.
     pub fn confirm_output(&mut self, id: OutputId, now: Tick) -> Result<(), Error> {
+        if self.near8.is_some() {
+            return Err(Error::Configuration);
+        }
         let bytes = self.pending_wire_len()?.unwrap_or_default();
         self.confirm_output_charged(id, now, bytes)
     }
@@ -800,6 +906,14 @@ impl Sender {
         if self.retry_token.is_some() || self.source_copy.is_some_and(|copy| copy.total != 1) {
             return Err(Error::Identity);
         }
+        if let Some(copy) = self.source_copy
+            && self.near8.is_some()
+        {
+            if id != OutputId::Source(copy.source) {
+                return Err(Error::Identity);
+            }
+            return self.confirm_source_copy_charged(now, now, copy, wire_bytes);
+        }
         self.time(now)?;
         self.finish_output(id, now, now, wire_bytes, |_, _| Ok(false))
     }
@@ -812,6 +926,9 @@ impl Sender {
         accepted: Tick,
         copy: SourceCopy,
     ) -> Result<(), Error> {
+        if self.near8.is_some() {
+            return Err(Error::Configuration);
+        }
         let bytes = self.pending_wire_len()?.unwrap_or_default();
         self.confirm_source_copy_charged(observed, accepted, copy, bytes)
     }
@@ -847,6 +964,17 @@ impl Sender {
             return self.fail(Error::TimeRegression);
         }
         self.time(observed)?;
+        if copy.ordinal == 1
+            && let Some(near) = &mut self.near8
+        {
+            let length = self
+                .encoder
+                .source(copy.source)
+                .ok_or(Error::Identity)?
+                .len();
+            let cap = self.output_end.ok_or(Error::Identity)?;
+            near.first(copy.source, length, wire_bytes, accepted, cap)?;
+        }
         if copy.ordinal < copy.total {
             self.sent = copy.source.0.checked_add(1).ok_or(Error::Exhausted)?;
             self.source_copy = Some(SourceCopy {
@@ -958,6 +1086,11 @@ impl Sender {
                     self.tail_due = None;
                 }
             }
+            Pending::Near8(id) => self
+                .near8
+                .as_mut()
+                .ok_or(Error::Identity)?
+                .confirm(id, wire_bytes)?,
             Pending::Repair { id, tail } => {
                 let needs_timer = tail
                     && self.tail_remaining <= 1
@@ -1125,6 +1258,7 @@ impl Sender {
                 end: id.0 + 1,
             },
             Pending::Repair { id, .. } => Identity::Repair { id, support: None },
+            Pending::Near8(id) => Identity::Near8(id),
         });
         snapshot.candidates[3] = self
             .output_end
@@ -1182,6 +1316,7 @@ impl Sender {
             tail_remaining: self.tail_remaining,
             tail_due: self.tail_due,
             output_ready: self.pending_output().is_some(),
+            near8_work_pending: self.near8.as_ref().is_some_and(near8::State::has_job),
             feedback: self.feedback.map(|f| f.id),
             terminal: self.terminal,
         }

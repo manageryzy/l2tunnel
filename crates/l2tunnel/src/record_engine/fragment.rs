@@ -173,6 +173,14 @@ pub struct FragmentOutputToken {
     fragment: FragmentEmission,
 }
 impl FragmentOutputToken {
+    /// Whether the entire reserved group carries an eight-source forward equation.
+    pub fn is_near8(&self) -> bool {
+        self.group.is_near8()
+    }
+    /// Whether the logical first copy is also held by the source owner.
+    pub fn owns_first_original(&self) -> bool {
+        self.group.owns_first_original()
+    }
     /// Full issuing Engine origin, never truncated to the wire label.
     pub const fn context(&self) -> Context {
         self.context
@@ -390,6 +398,7 @@ struct Group {
     layout: codec::FragmentLayout,
     token: CarrierOutputToken,
     key: rolling_records::PreparedOutput,
+    remaining_ip_bytes: usize,
     next: usize,
     pending: Option<FragmentEmission>,
     accepted: Option<Tick>,
@@ -544,6 +553,17 @@ impl Engine {
     /// Actual finite reservation/physical observations, not delivery inference.
     pub fn fragment_statistics(&self) -> Option<FragmentStatistics> {
         self.fragments.as_ref().map(|s| s.statistics)
+    }
+    /// Unaccepted ordinary IP bytes in the current reserved group, and whether
+    /// that group owns the first copy still held by the FEC sender.
+    pub fn ordinary_fragment_backlog(&self) -> Option<(usize, bool)> {
+        let group = self.fragments.as_ref()?.group.as_ref()?;
+        let remaining = if group.key.is_near8() {
+            0
+        } else {
+            group.remaining_ip_bytes
+        };
+        Some((remaining, group.key.owns_first_original()))
     }
     /// Observe the same actual logical group without assigning another ID or debit.
     pub fn pending_fragment_group(&self) -> Option<FragmentGroup> {
@@ -735,6 +755,7 @@ impl Engine {
             layout,
             token,
             key: prepared,
+            remaining_ip_bytes: metadata.wire_bytes,
             next: 0,
             pending: None,
             accepted: None,
@@ -883,6 +904,10 @@ impl Engine {
                 u64::try_from(token.fragment.emission.wire_bytes).map_err(|_| Error::Arithmetic)?,
             )
             .ok_or(Error::Arithmetic)?;
+        group.remaining_ip_bytes = group
+            .remaining_ip_bytes
+            .checked_sub(token.fragment.emission.wire_bytes)
+            .ok_or(Error::Invariant)?;
         let complete = group.next == group.metadata.packets;
         if !complete {
             timing?;

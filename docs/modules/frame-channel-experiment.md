@@ -1398,3 +1398,92 @@ Named retry traffic rebounded from 2.10 to 6.75 MB and from 1.90 to
 repair arm. These research configurations leave the original C48 acceptance
 comparison open. [Local-credit rules and byte totals](../../work/c48-parity-20261119/python/near8-shared/comparison.json)
 and [independent length oracle](../../work/c48-parity-20261119/python/near8-shared/canonical-oracle.json).
+
+
+## Negotiated eight-source forward repair
+
+The forward descriptor selects `TargetedNear8` (wire version 6) and the reverse
+descriptor selects `TargetedExact` (version 5). The C48 experiment keeps
+8192 global and 128 local sources, every sixteenth regular equation global,
+named retransmission, silent-oldest probing and short-record copies. Both
+directions retain their original authentication and management paths. A peer
+with only the old descriptor rejects the new selection. The plan generator
+accepts `--packed-c48-near8` separately from `--packed-c48-pair`. Raw TCP,
+maintained TLS/QUIC and the separate OpenVPN carrier lack the all-traffic
+socket receipt used here and cannot select the new option.
+
+A group covers eight consecutive first transmissions. Each complete authenticated
+IP first-copy receipt earns one eighth of its actual bytes, up to one MTU of
+credit. One row costs the outer IP/UDP and Records bytes (49 in the IPv4
+ChaCha20-Poly1305 test), one tag byte, a canonical unsigned LEB128 exclusive
+group end, and two coded original-length bytes plus the longest original's
+payload extent. End 8 and end 128 use one and two index bytes respectively.
+The receiver uses its own retained equations, lengths and source bytes. Separate
+duplicate history keeps a coincident regular serial and group number distinct.
+
+The sender starts with forward repair disabled. Four consecutive complete,
+nonempty 100 ms intervals at or below 75% of the configured local IP rate
+with ordinary backlog within eight MTUs enable repair. An empty or skipped
+interval, utilization at or above 90%, or excess ordinary backlog at the
+boundary closes the gate. The same eight-MTU threshold applies at group selection. Its ordinary backlog
+combines native MUX custody, unconsumed packing bytes, untransmitted originals
+and whole ordinary IP packets awaiting the end of local virtual serialization.
+The local model charges every accepted IP packet at the configured rate. It does not observe the kernel or ISP queue.
+Fresh data, named retransmission and ordinary earned repair retain priority.
+The optional sender has a bounded work grant, original expiry and physical
+handoff. It records gate skips, insufficient credit, oversize and abandoned
+opportunities separately from accepted rows and IP bytes.
+
+In the frozen Python study, the 125-segment window went from 50.01 to 52.68
+and 49.31 to 50.74 Mbit/s on seeds 1 and 2. First-write P99 changed from
+178.6 to 168.9 and 183.0 to 168.3 ms. The sample sent 392 and 110 additional
+rows. At 512 segments the two sample windows emitted zero additional rows.
+Warmup did emit rows, changing the simulated loss draws. Throughput changed
+from 75.73 to 76.05 and 76.06 to 75.82 Mbit/s. All runs drained both directions
+and inner TCP. The model uses sender-source and rank bookkeeping for receiver
+recovery and a calibrated service curve. Rust reconstructs the application bytes
+from received data and equations. [Python results and byte accounting](../../work/c48-parity-20261119/python/near8-spare-mux/comparison.json).
+
+
+The initial Linux integration sampled ordinary and serializer backlog separately.
+Two counterbalanced original-socket pairs delivered 47.78/44.62 Mbit/s on v5
+and 46.94/44.28 on v6. The strict admission pairs delivered 61.75/66.08 on
+v5 and 65.27/63.40 on v6. Both strict v6 measurement windows sent zero extra
+rows. Regular repair, retry and extra-copy bytes were counted independently.
+The four captures for each run reported no capture drops, all TCP stream hashes
+matched, and each run recorded two consecutive zero-unconfirmed observations
+in both directions. These measurements characterize the first implementation;
+the matched gate uses the combined ordinary queue at both decision points.
+[Initial eight cells](../../work/c48-parity-20261119/native/near8-v6-20261119/eight-cells.json).
+
+### Combined backlog gate on Linux UDP
+
+The matched gate was tested with 16 Linux TCP connections, 512-byte writes,
+76 Mbit/s aggregate offered load, 100/10 Mbit/s link rates, 70 ms RTT and 15%
+independent loss in each direction. Each cell used the same release executable.
+The strict socket setting capped unacknowledged payload at 512 writes per flow.
+The ordinary socket used Linux's effective flight. Delivered goodput covers
+ten seconds after two seconds of warmup. Both latency percentiles include
+records completed during drain. Their clocks start at the first successful
+application write or at the scheduled offer, respectively.
+
+| Initial attempt | Delivered Mbit/s | First-write P99, ms | Scheduled P99, ms | Forward / reverse recovery IP bytes, % | Unsubmitted at cutoff |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Ordinary v5 | 40.52 | 490.91 | 5,720.46 | 23.20 / 12.74 | 100,824 |
+| Ordinary v6 | 44.97 | 322.16 | 5,064.10 | 21.63 / 13.22 | 87,406 |
+| Strict 512 v5 | 63.38 | 781.52 | 3,170.88 | 19.66 / 12.57 | 33,521 |
+| Strict 512 v6 | Failed during warmup | — | — | — | — |
+
+Recovery includes ordinary repair, named retransmission, oldest-source probes
+and eight-source rows, measured between status snapshots inside the sample.
+All three completed cells verified the 16 stream hashes and twice observed
+zero unconfirmed sources in both directions. Ordinary v6 emitted 11 rows
+costing 12,144 IP bytes. These were 0.020% of forward IP bytes in the inner
+8.12-second observation interval. This one pair does not establish a repeatable
+throughput gain. The strict v6 server held one original 52-byte ACK. Its 5 ms
+flush point and 20 ms hard deadline both passed within a 16.716 ms rolling
+service interval. The coalescer reported zero refusals. The two extra rows
+(376 IP bytes) preceded the measurement window. That attempt ended before any
+qualifying throughput, latency or drain measurement. The service timestamps do
+not separate CPU execution from time spent descheduled.
+[Four-cell results and captures](../../work/c48-parity-20261119/native/near8-mux-gate-20261119/four-cells.json).

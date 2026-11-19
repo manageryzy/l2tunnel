@@ -76,7 +76,16 @@ impl Receiver {
         add(
             add(
                 Decoder::sliding_memory_bound(policy.recovery)?,
-                targeted::GapTracker::bytes(policy)?,
+                add(
+                    targeted::GapTracker::bytes(policy)?,
+                    if policy.source_wire.is_near8() {
+                        Decoder::near_history_plan(policy.recovery)
+                            .map_err(|_| Error::Capacity)?
+                            .capacity_bytes
+                    } else {
+                        0
+                    },
+                )?,
             )?,
             std::mem::size_of::<Self>(),
         )
@@ -87,8 +96,25 @@ impl Receiver {
             return Err(Error::Capacity);
         }
         deadline(now, policy.feedback_ticks)?;
+        if policy.source_wire.is_near8()
+            && add(
+                Decoder::sliding_memory_bound(policy.recovery)?,
+                Decoder::near_history_plan(policy.recovery)
+                    .map_err(|_| Error::Capacity)?
+                    .capacity_bytes,
+            )? > policy.recovery.memory_bytes
+        {
+            return Err(Error::Capacity);
+        }
+        let mut decoder = Decoder::new_sliding(policy.recovery, scope, now)?;
+        if policy.source_wire.is_near8() {
+            if scope.direction != 0 {
+                return Err(Error::Scope);
+            }
+            decoder.enable_near_history()?;
+        }
         Ok(Self {
-            decoder: Decoder::new_sliding(policy.recovery, scope, now)?,
+            decoder,
             gaps: targeted::GapTracker::new(policy)?,
             request: None,
             policy,
@@ -181,6 +207,10 @@ impl Receiver {
         now: Tick,
         original_deadline: Tick,
     ) -> Result<Begin, Error> {
+        if self.policy.source_wire.is_near8() && bytes.first() == Some(&near8::TAG) {
+            let row = near8::inspect(self.policy.recovery, self.scope, bytes)?;
+            return self.receive_near8_until(row, received, now, original_deadline);
+        }
         self.time(now)?;
         let view = wire::inspect_with(self.policy.recovery, self.policy.source_wire, bytes)?;
         self.receive_view_until(view, received, now, original_deadline)
@@ -213,6 +243,24 @@ impl Receiver {
                     .begin_repair_until(value, received, now, original_deadline)?
             }
         };
+        if result != Begin::Staged {
+            self.notice(now)?;
+        }
+        Ok(result)
+    }
+    /// Admit an authenticated row only on the selected forward Near8 profile.
+    pub fn receive_near8_until(
+        &mut self,
+        row: near8::Row<'_>,
+        received: Tick,
+        now: Tick,
+        cap: Tick,
+    ) -> Result<Begin, Error> {
+        if !self.policy.source_wire.is_near8() {
+            return Err(Error::Configuration);
+        }
+        self.time(now)?;
+        let result = self.decoder.begin_near_until(row, received, now, cap)?;
         if result != Begin::Staged {
             self.notice(now)?;
         }

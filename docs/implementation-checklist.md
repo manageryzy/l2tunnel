@@ -1192,3 +1192,16 @@ planned. New mode IDs require new checklist entries automatically.
 - [ ] [RELEASE-02] Complete all P-* research ports for a full-parity claim; a narrower release must list exclusions explicitly.
 - [ ] [RELEASE-03] Choose project license, stable API/wire/config support policy, security contact, dependency audit and changelog.
 - [ ] [RELEASE-04] Publish reproducible native build/test receipts and reviewed artifacts only after separate release authorization.
+
+
+TEST-12 and PBA-03/06 also track the
+[opt-in C48 eight-source forward repair](modules/frame-channel-experiment.md#negotiated-eight-source-forward-repair).
+Its new forward wire grammar, independent FEC history, physical byte budget and
+gated Linux UDP sender are implemented. Protocol and Python comparisons cover
+dropped originals and distinct retained repair identities. The original C48
+performance and broader carrier gates remain open.
+The combined-backlog Linux UDP comparison completed ordinary v5/v6 and
+strict-512 v5 with verified stream contents and bilateral drain. The first
+strict-512 v6 attempt hit an original held-ACK deadline in warmup. The
+[individual attempts](modules/frame-channel-experiment.md#combined-backlog-gate-on-linux-udp)
+track this failure separately from completed samples and modeled throughput.

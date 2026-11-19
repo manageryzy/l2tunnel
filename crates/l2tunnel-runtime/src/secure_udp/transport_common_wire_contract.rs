@@ -122,6 +122,7 @@ impl CommonTransactionContract {
         outer: establish::carrier::AuthenticatedOuter,
         selection: record::compact::Selection,
     ) -> io::Result<Self> {
+        require_near8_socket_receipts(&catalog)?;
         let local = resources[match role {
             security::Role::Initiator => 0,
             security::Role::Responder => 1,

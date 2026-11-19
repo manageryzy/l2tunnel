@@ -898,10 +898,50 @@ impl Engine {
         }
     }
 
+    /// Whether the negotiated local sender owns eight-source forward repair.
+    pub fn uses_near8_sender(&self) -> bool {
+        matches!(&self.owner, Owner::Rolling(endpoint) if endpoint.near8_status().is_some())
+    }
+
+    /// Sample all-class accepted IP traffic and estimated local serializer custody.
+    pub fn observe_near8_capacity(
+        &mut self,
+        now: Tick,
+        accepted: u64,
+        serial: usize,
+    ) -> Result<(), Error> {
+        self.observe_near8_transfer(now, accepted, serial, false)
+    }
+
+    /// Sample backlog after the carrier has taken custody of an original's first copy.
+    pub fn observe_near8_transfer(
+        &mut self,
+        now: Tick,
+        accepted: u64,
+        serial: usize,
+        primary_in_carrier: bool,
+    ) -> Result<(), Error> {
+        if let Owner::Rolling(endpoint) = &mut self.owner {
+            endpoint
+                .observe_near8_capacity(
+                    now,
+                    accepted,
+                    self.pipeline.usage().bytes,
+                    serial,
+                    primary_in_carrier,
+                )
+                .map_err(Error::Rolling)?;
+        }
+        Ok(())
+    }
+
     /// Counters of the local sending direction's selected repair budget.
     pub fn rolling_repair_budget(&self) -> Option<rolling_records::RepairBudgetStatus> {
         match &self.owner {
-            Owner::Rolling(endpoint) => endpoint.repair_budget_status(),
+            Owner::Rolling(endpoint) => endpoint.repair_budget_status().map(|mut status| {
+                status.near8 = endpoint.near8_status();
+                status
+            }),
             _ => None,
         }
     }
@@ -1137,6 +1177,13 @@ impl Engine {
     }
     fn advance(&mut self, now: Tick) -> Result<(), Error> {
         self.healthy()?;
+        if self.compact_feedback_overhead.is_none()
+            && matches!(self.configuration.descriptor().profile(),
+                configuration::Profile::RollingCopies { config, .. }
+                    if config.forward.scheduler.source_wire.is_near8())
+        {
+            return Err(Error::Configuration);
+        }
         if self.last.is_some_and(|last| now < last) {
             return self.fail(Error::Time);
         }

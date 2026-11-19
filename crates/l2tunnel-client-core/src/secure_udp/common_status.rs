@@ -20,9 +20,122 @@ pub use rolling_ingress::{
     RollingIngressLimits, RollingIngressObservation, RollingIngressPolicies, RollingIngressStatus,
 };
 
+/// Selected source and repair grammar of one authenticated global direction.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RollingWireProfile {
+    /// Padded originals.
+    Padded,
+    /// Exact originals, with ordinary recovery feedback.
+    Exact,
+    /// Exact originals and targeted C48 recovery.
+    TargetedExact,
+    /// Targeted C48 recovery with forward eight-source equations.
+    TargetedNear8,
+}
+
+impl From<l2tunnel::fec::rolling::wire::SourceWire> for RollingWireProfile {
+    fn from(wire: l2tunnel::fec::rolling::wire::SourceWire) -> Self {
+        use l2tunnel::fec::rolling::wire::SourceWire;
+        match wire {
+            SourceWire::Padded => Self::Padded,
+            SourceWire::Exact => Self::Exact,
+            SourceWire::TargetedExact => Self::TargetedExact,
+            SourceWire::TargetedNear8 => Self::TargetedNear8,
+        }
+    }
+}
+
+/// The globally ordered C48 wire selection, identical at both peers.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RollingWireDirections {
+    /// Client-to-server grammar.
+    pub forward: RollingWireProfile,
+    /// Server-to-client grammar.
+    pub reverse: RollingWireProfile,
+}
+impl RollingWireDirections {
+    pub(crate) fn from_descriptor(
+        value: &l2tunnel::record_configuration::Descriptor,
+    ) -> Option<Self> {
+        use l2tunnel::record_configuration::Profile;
+        match value.profile() {
+            Profile::Rolling { config, .. } | Profile::RollingCopies { config, .. } => Some(Self {
+                forward: config.forward.scheduler.source_wire.into(),
+                reverse: config.reverse.scheduler.source_wire.into(),
+            }),
+            _ => None,
+        }
+    }
+}
+
+/// Original request, in-flight proposal and installed rolling grammar of the active epoch.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RollingWireProfiles {
+    /// Initial selection in the original pre-establishment catalog.
+    pub initial_requested: Option<RollingWireDirections>,
+    /// Candidate tracked by the transaction owner, when it is a rolling profile.
+    pub pending: Option<RollingWireDirections>,
+    /// Current rolling selection reported by the authenticated live owner.
+    pub effective: Option<RollingWireDirections>,
+}
+
+/// Observed capacity decisions for the selected eight-source profile.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct Near8GateCounts {
+    /// Intervals that could not be evaluated, including skipped intervals.
+    pub partial_buckets: u64,
+    /// Complete observed intervals with no physically accepted bytes.
+    pub empty_buckets: u64,
+    /// Complete nonempty intervals at or below 75 percent of the pacing budget.
+    pub light_buckets: u64,
+    /// Complete intervals above 75 and below 90 percent of the pacing budget.
+    pub middle_buckets: u64,
+    /// Complete intervals at or above 90 percent of the pacing budget.
+    pub busy_buckets: u64,
+    /// Complete intervals over the aggregate ordinary backlog threshold, across utilization bands.
+    pub backlogged_buckets: u64,
+    /// Boundary decisions that left the gate open for the following interval.
+    pub open_buckets: u64,
+    /// Gated groups lacking a capacity sample for the current interval.
+    pub stale_groups: u64,
+    /// Gated groups observed while the sustained gate was closed.
+    pub closed_groups: u64,
+    /// Gated groups above the instantaneous aggregate threshold, including when closed.
+    pub backlogged_groups: u64,
+}
+
+/// Independent eight-source repair budget observed at local physical handoff.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct Near8Budget {
+    /// Sustained spare-capacity gate.
+    pub spare: bool,
+    /// Independent counters for the observed reasons at each decision.
+    #[serde(default)]
+    pub gate: Near8GateCounts,
+    /// Non-overlapping, completed first-copy groups.
+    pub opportunities: u64,
+    /// Groups withheld by capacity, credit, MTU or pre-handoff cancellation.
+    pub gated: u64,
+    /// Groups without sufficient credit.
+    pub unfunded: u64,
+    /// Groups too large for one carrier datagram.
+    pub oversized: u64,
+    /// Unexposed rows abandoned under pressure or expiry.
+    pub abandoned: u64,
+    /// Rows physically accepted.
+    pub sent_rows: u64,
+    /// Actual accepted complete-IP cost.
+    pub sent_ip_bytes: u64,
+    /// Remaining physical-byte credit in eighths of one byte.
+    pub credit_eighths: u64,
+}
 /// Physical retransmission credits and regular FEC spending in the active local sender.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct RollingRepairBudget {
+    /// Present only for the selected near8 sender.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub near8: Option<Near8Budget>,
     /// Named source requests observed by the sender, when reported by this service.
     pub named_requests: Option<RollingNamedRequests>,
     /// Remaining and maximum credit, expressed in half-bytes.
@@ -91,6 +204,29 @@ pub struct RollingNamedRequests {
 impl From<l2tunnel::rolling_records::RepairBudgetStatus> for RollingRepairBudget {
     fn from(s: l2tunnel::rolling_records::RepairBudgetStatus) -> Self {
         Self {
+            near8: s.near8.map(|v| Near8Budget {
+                spare: v.spare,
+                gate: Near8GateCounts {
+                    partial_buckets: v.gate.partial_buckets,
+                    empty_buckets: v.gate.empty_buckets,
+                    light_buckets: v.gate.light_buckets,
+                    middle_buckets: v.gate.middle_buckets,
+                    busy_buckets: v.gate.busy_buckets,
+                    backlogged_buckets: v.gate.backlogged_buckets,
+                    open_buckets: v.gate.open_buckets,
+                    stale_groups: v.gate.stale_groups,
+                    closed_groups: v.gate.closed_groups,
+                    backlogged_groups: v.gate.backlogged_groups,
+                },
+                opportunities: v.opportunities,
+                gated: v.gated,
+                unfunded: v.unfunded,
+                oversized: v.oversized,
+                abandoned: v.abandoned,
+                sent_rows: v.sent_rows,
+                sent_ip_bytes: v.sent_ip_bytes,
+                credit_eighths: v.credit_eighths,
+            }),
             named_requests: Some(RollingNamedRequests {
                 first: s.named_requests.first,
                 repeated: s.named_requests.repeated,
@@ -475,6 +611,9 @@ pub struct Status {
     /// Actual optional authenticated work policy. Each step caps send and receive
     /// independently; at most two live epochs produce four directional caps/turn.
     pub rolling_work: Option<RollingWork>,
+    /// Requested, pending and effective rolling wire names in global direction order.
+    #[serde(default)]
+    pub rolling_wire_profiles: RollingWireProfiles,
     /// Observed only when the active descriptor selects targeted recovery locally.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rolling_repair_budget: Option<RollingRepairBudget>,
@@ -841,6 +980,19 @@ mod observe {
                 cross_profile_switching: true,
                 retained_state_recovery: false,
                 fresh_rekey: false,
+                rolling_wire_profiles: RollingWireProfiles {
+                    initial_requested: RollingWireDirections::from_descriptor(
+                        &profile.requested_catalog().initial(),
+                    ),
+                    pending: snapshot
+                        .and_then(|value| value.requested)
+                        .and_then(|configuration| {
+                            RollingWireDirections::from_descriptor(configuration.descriptor())
+                        }),
+                    effective: snapshot.and_then(|value| {
+                        RollingWireDirections::from_descriptor(value.current.descriptor())
+                    }),
+                },
                 rolling_work: profile
                     .runtime_contract(info.role)?
                     .resources()

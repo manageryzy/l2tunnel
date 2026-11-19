@@ -140,6 +140,9 @@ fn decode(
         version if version == u64::from(fec::rolling::wire::TARGETED_VERSION) => {
             fec::rolling::wire::SourceWire::TargetedExact
         }
+        version if version == u64::from(fec::rolling::wire::TARGETED_NEAR8_VERSION) => {
+            fec::rolling::wire::SourceWire::TargetedNear8
+        }
         _ => return Err(Error::Prefix),
     };
     let scheduler = fec::rolling::scheduler::Policy {

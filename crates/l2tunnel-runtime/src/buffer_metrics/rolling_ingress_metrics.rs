@@ -60,6 +60,7 @@ fn job(out: &mut impl Write, v: Option<DecoderJob>) -> io::Result<()> {
             }
             write!(out, "}}")?;
         }
+        Identity::Near8(id) => write!(out, "{{\"kind\":\"near8\",\"group\":{}}}", id.0)?,
         Identity::Feedback(id) => write!(out, "{{\"kind\":\"unexpected_feedback\",\"id\":{id}}}")?,
     }
     write!(

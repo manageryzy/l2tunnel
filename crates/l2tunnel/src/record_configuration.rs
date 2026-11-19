@@ -556,9 +556,24 @@ impl Descriptor {
         forward.profile.validate()?;
         reverse.profile.validate()?;
         match self.profile {
-            Profile::Rolling { config, .. } => config.validate().map_err(|_| Error::Profile)?,
+            Profile::Rolling { config, .. } => {
+                if config.forward.scheduler.source_wire.is_near8()
+                    || config.reverse.scheduler.source_wire.is_near8()
+                {
+                    return Err(Error::Profile);
+                }
+                config.validate().map_err(|_| Error::Profile)?
+            }
             Profile::Research { config, .. } => config.validate().map_err(|_| Error::Profile)?,
             Profile::RollingCopies { config, copies, .. } => {
+                let forward = config.forward.scheduler.source_wire;
+                let reverse = config.reverse.scheduler.source_wire;
+                if reverse.is_near8()
+                    || (forward.is_near8()
+                        && reverse != fec::rolling::wire::SourceWire::TargetedExact)
+                {
+                    return Err(Error::Relation);
+                }
                 copies.validate(config).map_err(|_| Error::Profile)?
             }
             _ => {}

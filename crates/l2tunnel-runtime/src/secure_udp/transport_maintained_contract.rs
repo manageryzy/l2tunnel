@@ -16,6 +16,7 @@ impl CommonTransactionContract {
         request: Request,
         selection: record::compact::Selection,
     ) -> io::Result<core::ConfigDigest> {
+        require_near8_socket_receipts(catalog)?;
         request.validate()?;
         selection.validate().map_err(invalid)?;
         if resources[0].security != resources[1].security

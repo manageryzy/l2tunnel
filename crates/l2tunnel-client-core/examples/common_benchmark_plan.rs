@@ -83,7 +83,7 @@ enum Algorithm {
         copies: bool,
     },
     PackedC48 {
-        targeted: bool,
+        source_wire: fec::rolling::wire::SourceWire,
     },
     Research(fec::research::Profile),
 }
@@ -539,22 +539,23 @@ fn profile(algorithm: Algorithm, carrier: Carrier) -> Result<c::Profile> {
         Algorithm::Rolling { .. } | Algorithm::PackedC48 { .. } => {
             let mut selected = rolling_direction(carrier)?;
             let copies = match algorithm {
-                Algorithm::PackedC48 { targeted } => {
+                Algorithm::PackedC48 { source_wire } => {
                     selected.scheduler.repair_numerator = 41;
                     selected.scheduler.repair_denominator = 200;
                     selected.scheduler.feedback_packets = 64;
-                    if targeted {
-                        selected.scheduler.source_wire =
-                            fec::rolling::wire::SourceWire::TargetedExact;
-                    }
+                    selected.scheduler.source_wire = source_wire;
                     true
                 }
                 Algorithm::Rolling { copies } => copies,
                 _ => return Err("invalid rolling selection".into()),
             };
+            let mut reverse = selected;
+            if selected.scheduler.source_wire.is_near8() {
+                reverse.scheduler.source_wire = fec::rolling::wire::SourceWire::TargetedExact;
+            }
             let config = rolling_records::Config {
                 forward: selected,
-                reverse: selected,
+                reverse,
                 geometry: geometry(carrier),
                 native_stall_micros: NATIVE_STALL_US,
             };
@@ -747,6 +748,11 @@ fn cli(carrier: Carrier, client: bool) -> Vec<String> {
     result
 }
 fn export_row(directory: &Path, row: &Row, carrier: Carrier) -> Result<Value> {
+    if matches!(row.algorithm, Algorithm::PackedC48 { source_wire } if source_wire.is_near8())
+        && !matches!(carrier, Carrier::Udp)
+    {
+        return Err("near8 needs an all-traffic complete-IP socket receipt".into());
+    }
     let id = format!("{}-{}", row.id, carrier.id());
     let selected = profile(row.algorithm, carrier)?;
     let descriptor = c::Descriptor::new(
@@ -856,10 +862,9 @@ fn export_row(directory: &Path, row: &Row, carrier: Carrier) -> Result<Value> {
 fn run() -> Result<()> {
     let arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
     let c48_pair = arguments.len() == 3 && arguments[2] == "--packed-c48-pair";
-    if (arguments.len() != 2 && !c48_pair) || arguments[0] != "--output-dir" {
-        return Err(
-            "usage: common_benchmark_plan --output-dir NEW_DIRECTORY [--packed-c48-pair]".into(),
-        );
+    let near8 = arguments.len() == 3 && arguments[2] == "--packed-c48-near8";
+    if (arguments.len() != 2 && !c48_pair && !near8) || arguments[0] != "--output-dir" {
+        return Err("usage: common_benchmark_plan --output-dir NEW_DIRECTORY [--packed-c48-pair | --packed-c48-near8]".into());
     }
     let selected_rows = if c48_pair {
         vec![
@@ -867,15 +872,28 @@ fn run() -> Result<()> {
                 id: "packed-c48-control",
                 family: "rolling_copies",
                 variant: "exact-regular-fec",
-                algorithm: Algorithm::PackedC48 { targeted: false },
+                algorithm: Algorithm::PackedC48 {
+                    source_wire: fec::rolling::wire::SourceWire::Exact,
+                },
             },
             Row {
                 id: "packed-c48-queue-aware",
                 family: "rolling_copies",
                 variant: "targeted-queue-aware-fec",
-                algorithm: Algorithm::PackedC48 { targeted: true },
+                algorithm: Algorithm::PackedC48 {
+                    source_wire: fec::rolling::wire::SourceWire::TargetedExact,
+                },
             },
         ]
+    } else if near8 {
+        vec![Row {
+            id: "packed-c48-near8",
+            family: "rolling_copies",
+            variant: "targeted-near8-forward",
+            algorithm: Algorithm::PackedC48 {
+                source_wire: fec::rolling::wire::SourceWire::TargetedNear8,
+            },
+        }]
     } else {
         rows()
     };

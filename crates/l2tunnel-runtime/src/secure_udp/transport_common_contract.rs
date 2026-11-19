@@ -2,6 +2,24 @@
 use super::*;
 use l2tunnel::{record_configuration as common, record_engine as engine};
 
+fn catalog_uses_near8(catalog: &common::Catalog) -> bool {
+    catalog.descriptors().iter().any(|value| {
+        matches!(value.direction(mg::Role::Client).profile(),
+        common::DirectionProfile::Rolling { config, .. }
+        if config.scheduler.source_wire == l2tunnel_fec::rolling::wire::SourceWire::TargetedNear8)
+    })
+}
+
+fn require_near8_socket_receipts(catalog: &common::Catalog) -> io::Result<()> {
+    if catalog_uses_near8(catalog) {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "near8 requires a complete-IP socket receipt for all outgoing traffic",
+        ));
+    }
+    Ok(())
+}
+
 fn selected_data_overhead(
     selection: record::compact::Selection,
     descriptor: common::Descriptor,
@@ -360,6 +378,11 @@ impl CommonTransactionContract {
             return Err(invalid("initial common MTU differs from resource template"));
         }
         compact_wire.validate().map_err(invalid)?;
+        if catalog_uses_near8(&catalog)
+            && compact_wire.protection == security::compact::Protection::ChaCha20Crc32c
+        {
+            return Err(invalid("near8 requires authenticated compact data"));
+        }
         if extra_wire_bytes != 0 {
             return Err(invalid(
                 "compact wire requires explicit initial-only final packet geometry",

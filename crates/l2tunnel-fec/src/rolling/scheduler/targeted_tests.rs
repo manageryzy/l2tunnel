@@ -917,6 +917,7 @@ fn targeted_contended_regular_debt_is_bounded_and_all_classes_advance() -> Resul
             match id {
                 OutputId::Source(_) => fresh += 1,
                 OutputId::Repair(_) => regular += 1,
+                OutputId::Near8(_) => return Err(Error::Identity),
             }
             s.confirm_output_charged(id, now, 120)?;
         }

@@ -60,6 +60,15 @@ class RollingIngressTests(unittest.TestCase):
             with self.subTest(outcome=name):
                 self.assertEqual(self.check(resolved(name), 100 if name == 'censored' else None)[0], [])
 
+    def test_near8_blocker_has_an_independent_checked_group(self):
+        value = fixture()
+        identity = {'kind': 'near8', 'group': 1}
+        value['pending']['first_blocker']['identity'] = identity
+        self.assertEqual(self.check(value)[0], [])
+        identity['group'] = 1 << 29
+        with self.assertRaisesRegex(ValueError, 'repair group'):
+            self.check(value)
+
     def test_historical_absence_and_unknown_identity_remain_unavailable(self):
         old = rolling_fixture()
         issues, gaps = [], []

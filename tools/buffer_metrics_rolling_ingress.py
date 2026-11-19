@@ -30,10 +30,13 @@ def validate(value, observed, terminal, send_direction, path, issues, gaps):
         value = obj(value)
         identity = obj(value.get('identity'))
         kind = identity.get('kind')
-        need(kind in ('source', 'repair'), 'invalid actual decoder identity')
+        need(kind in ('source', 'repair', 'near8'), 'invalid actual decoder identity')
         if kind == 'source':
             need(num(identity, 'first') + 1 == num(identity, 'end') <= (1 << 32) - 1,
                  'invalid systematic job identity')
+        elif kind == 'near8':
+            need(0 < num(identity, 'group') <= ((1 << 32) - 1) // 8,
+                 'invalid eight-source repair group')
         else:
             need(num(identity, 'id') < MAX, 'invalid repair identity')
             support = identity.get('support')
@@ -43,7 +46,7 @@ def validate(value, observed, terminal, send_direction, path, issues, gaps):
         received, admitted, cap = (num(value, k) for k in
                                    ('received_us', 'admitted_us', 'original_deadline_us'))
         need(received <= admitted <= at < cap, 'invalid decoder job times')
-        return kind
+        return 'repair' if kind == 'near8' else kind
 
     def pending(value, end):
         value = obj(value)
@@ -277,7 +280,8 @@ def render(lines, metadata, table, cell):
                                      ('latest blocker', p['latest_blocker']), ('newly admitted', admitted)]:
                 if job_value is not None:
                     ident = job_value['identity']
-                    identity = str(ident['id']) if ident['kind'] == 'repair' else str(ident['first'])
+                    key = {'repair': 'id', 'near8': 'group', 'source': 'first'}[ident['kind']]
+                    identity = str(ident[key])
                     jobs.append([name, label, ident['kind'], identity, job_value['received_us'],
                                  job_value['admitted_us'], job_value['original_deadline_us']])
         table(lines, ['Context', 'Job role', 'Kind', 'ID', 'Job arrival us', 'Job admission us', 'Job cap us'], jobs)

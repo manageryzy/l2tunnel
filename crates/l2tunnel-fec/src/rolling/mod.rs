@@ -11,6 +11,8 @@ mod encoder;
 pub mod expiry;
 pub(crate) mod explicit;
 mod gf_batch;
+/// Negotiated bounded forward equations over eight consecutive originals.
+pub mod near8;
 pub mod scheduler;
 pub mod storage;
 pub mod wire;

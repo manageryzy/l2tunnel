@@ -41,7 +41,8 @@ impl Policy {
     /// Validate scalar limits before constructing owners or allocating payloads.
     pub fn validate(self) -> Result<(), Error> {
         self.recovery.validate()?;
-        if !(1..=65_536).contains(&self.repair_denominator)
+        if (self.source_wire.is_near8() && self.recovery.window < 8)
+            || !(1..=65_536).contains(&self.repair_denominator)
             || self.repair_numerator > self.repair_denominator
             || self.tail_ticks == 0
             || self.tail_ticks >= self.recovery.debt_ticks

@@ -302,6 +302,14 @@ reliable management, common security, selected-carrier continuity and every
 existing mode/SW-11/platform/resource/performance requirement remain in scope.
 No new default profile or owner wire decision follows from this source audit.
 
+The optional C48 forward repair profile binds a separate forward grammar in the
+authenticated Common catalog. Eight consecutive first transmissions can earn one
+extra GF(256) equation. Its independent group number leaves local and global
+repair serials, reverse feedback, named retry and silent-oldest recovery intact.
+Its current runtime uses the original UDP socket's all-traffic accepted IP byte
+counter. The gate estimates local serialization from that counter and the
+configured pacer. See [wire costs and measured scope](modules/frame-channel-experiment.md#negotiated-eight-source-forward-repair).
+
 ## Reviewed target and implementation boundary
 
 The 2026-11-13 owner discussion confirmed a fixed point-to-point deployment for

@@ -25,6 +25,14 @@ impl CarrierOutputToken {
         self.token.emission()
     }
 
+    /// Whether this prepared output is the forward near equation.
+    pub fn is_near8(&self) -> bool {
+        self.token.is_near8()
+    }
+    /// Whether this token accounts for the sender's outstanding first systematic copy.
+    pub fn owns_first_original(&self) -> bool {
+        self.token.owns_first_original()
+    }
     /// Original exact Engine context; this public label is not authentication.
     pub fn context(&self) -> engine::Context {
         self.token.context()
@@ -364,6 +372,18 @@ impl<'a> Entry<'a> {
         }
         self.engine
             .confirm_carrier_output_ordered_at(now, accepted, order, token.token)
+            .map_err(Error::Engine)
+    }
+    /// Supply a local carrier observation to this generation's selected sender.
+    pub fn observe_near8_capacity(
+        &mut self,
+        now: engine::Tick,
+        accepted: u64,
+        serial: usize,
+        primary_in_carrier: bool,
+    ) -> Result<(), Error> {
+        self.engine
+            .observe_near8_transfer(now, accepted, serial, primary_in_carrier)
             .map_err(Error::Engine)
     }
     /// Advance actual rolling work only within the caller's explicit GF/copy/visit caps.
