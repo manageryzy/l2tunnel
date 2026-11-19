@@ -57,7 +57,7 @@ struct Gauge {
     capacity: Option<u64>,
 }
 
-const NAMES: [&str; 38] = [
+const NAMES: [&str; 39] = [
     "codec_stage_items",
     "codec_stage_bytes",
     "codec_stage_remaining_bytes",
@@ -96,6 +96,7 @@ const NAMES: [&str; 38] = [
     "reliable_physical_main_bytes",
     "reliable_physical_feedback_bytes",
     "reliable_outbound_packet_bytes_maximum",
+    "receiver_compacted_replay_records",
 ];
 
 // Reuse the existing row storage; Swift channel pools have different meanings.
@@ -196,6 +197,11 @@ impl Row {
         self.retention(6, received.source_proofs);
         self.retention(8, received.heads);
         self.retention(10, received.lookahead);
+        self.gauge(
+            38,
+            Some(received.compacted_records),
+            Some(received.compacted_record_capacity),
+        );
         self.gauge(
             12,
             Some(received.head_fragments),

@@ -339,3 +339,35 @@ versions. This documentation reconciliation ran no tests, builds, formatting,
 native or performance workloads. Master checklist/status integration remains
 root-owned; the full `python3 tools/check.py` requirement and all parent gates
 retain their original definitions.
+
+## Early native TCP delivery on targeted TUN
+
+The targeted native IP header sender periodically emits an ordinary full IP
+context at a channel record serial divisible by eight. A context has its own
+serial and consumes real packing, transmission and recovery credit. Subsequent
+frames keep the existing header-delta grammar. A raw fallback at the boundary
+leaves the previous context intact. The receiver can also read streams from
+senders that refresh only when a header requires it.
+
+For established TCP on TUN, the receiver can prepare a fully reassembled raw
+or stateless LZ4 packet across a hole. For a header delta it needs a complete
+explicit IP context and every intervening record through that delta. Preview
+uses a separate bounded header checkpoint per channel. The canonical decoder
+advances when the ordered record frontier catches up. A successful device write
+commits that packet once. An incomplete write or a pending device operation
+retains the original packet. TCP setup, close, uncertain flow identity and
+ACKs covering a local FIN retain their ordering rules. The receiver continues
+to request and recover missing outer sources while Linux processes out-of-order
+TCP data and generates its own SACKs.
+
+After a successful early write, targeted TUN can move the record into bounded
+replay storage. It retains the exact encoded bytes, fragment map and deadline.
+The ordinary lookahead record slot becomes available immediately. Both stores
+still count against the existing byte and fragment limits. If the replay
+store is full or the encoding exceeds its narrow slot width, the ordinary
+slot retains custody. Ordinary Aligned and Packed owners keep their original
+allocation policy. The runtime exports `receiver_compacted_replay_records`
+alongside the ordinary lookahead occupancy.
+
+The [single-flow experiment](frame-channel-experiment.md#early-ip-tcp-delivery-across-a-compression-gap)
+records code coverage, observed native behavior and performance separately.

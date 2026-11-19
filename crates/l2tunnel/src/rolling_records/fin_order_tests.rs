@@ -165,7 +165,7 @@ fn overflow_keeps_live_fences_and_allows_other_buckets() -> TestResult {
 }
 
 #[test]
-fn short_payload_waits_for_physical_predecessor_while_another_flow_and_sacks_pass() -> TestResult {
+fn tun_delivers_future_tcp_data_and_sacks_before_late_predecessor_exactly_once() -> TestResult {
     let mut config = short_config(64, rolling::wire::SourceWire::TargetedExact);
     config.forward.scheduler.repair_numerator = 0;
     config.forward.receiver.lookahead_records = 16;
@@ -183,7 +183,7 @@ fn short_payload_waits_for_physical_predecessor_while_another_flow_and_sacks_pas
         tcp(true, 1001, 40, 2000, 0, 2),
         tcp(true, 1000, 100, 1001, 0, 0x10),
         tcp(true, 1002, 100, 8000, 0, 0x10),
-        tcp(true, 1000, 56, 1061, 0, 0x10),
+        tcp(true, 1000, 160, 1061, 0, 0x10),
         tcp(true, 1001, 56, 2001, 0, 0x10),
         sack.clone(),
         sack,
@@ -214,11 +214,16 @@ fn short_payload_waits_for_physical_predecessor_while_another_flow_and_sacks_pas
     for i in 4..8 {
         accept(&mut receiver, i, Tick(2))?;
     }
-    for i in 5..8 {
+    for i in 4..8 {
         let n = ready(&mut receiver, Tick(2), &mut buf)?;
         assert_eq!(n.identity(), rows[i].0);
         assert!(n.early());
         assert_eq!(&buf[..n.bytes()], frames[i]);
+        assert_eq!(
+            receiver.prepare_native(Tick(2), 8, Tick(8_000_000), &mut buf)?,
+            NativePreparation::AlreadyPending(n)
+        );
+        assert_eq!(n.deadline(), Tick(5_000_002));
         receiver.commit_native(Tick(2), n.token())?;
     }
     for _ in 0..config.forward.receiver.channels {
@@ -231,26 +236,12 @@ fn short_payload_waits_for_physical_predecessor_while_another_flow_and_sacks_pas
     let older = ready(&mut receiver, Tick(4), &mut buf)?;
     assert_eq!(older.identity(), rows[2].0);
     assert_eq!(&buf[..older.bytes()], frames[2]);
-    assert!(matches!(
-        receiver
-            .fin_order
-            .decision(NativePolicy::RawIp, &frames[4], 5),
-        receiver::EarlyDecision::Wait(_)
-    ));
     assert_eq!(
         receiver.prepare_native(Tick(5), 8, Tick(8_000_000), &mut buf)?,
         NativePreparation::AlreadyPending(older)
     );
     receiver.commit_native(Tick(5), older.token())?;
-    let tail = ready(&mut receiver, Tick(6), &mut buf)?;
-    assert!(
-        tail.early(),
-        "a different missing record still holds the channel head"
-    );
-    assert_eq!(tail.identity(), rows[4].0);
-    assert_eq!(&buf[..tail.bytes()], frames[4]);
-    assert_eq!(tail.deadline(), Tick(5_000_002));
-    receiver.commit_native(Tick(6), tail.token())?;
+    assert_eq!(receiver.record_status().early_tombstones, 4);
     accept(&mut receiver, 4, Tick(7))?;
     accept(&mut receiver, 3, Tick(8))?;
     let last = ready(&mut receiver, Tick(8), &mut buf)?;
@@ -347,5 +338,49 @@ fn unknown_midstream_flow_learns_from_contiguous_ordered_commits_and_preserves_l
     assert!(overflow > 0);
     assert!(matches!(guard.decision(policy, &tail, 5), Allow));
     assert_eq!(guard.capacity_bytes(), capacity);
+    Ok(())
+}
+
+#[test]
+fn independent_tun_data_requires_live_flow_and_keeps_lifecycle_fences() -> TestResult {
+    use crate::rolling_records::fin_order::Guard;
+    use receiver::EarlyDecision::{Allow, Ordered, Wait};
+
+    let cfg = short_config(64, rolling::wire::SourceWire::TargetedExact);
+    let mut guard = Guard::new(cfg.forward)?;
+    let policy = NativePolicy::IpHeaders;
+    let start = u32::MAX - 32;
+    let future = tcp(true, 1000, 150, 48, 0, 0x10);
+    assert!(matches!(
+        guard.independent_ip_decision(policy, &future, 0, false),
+        Wait(_)
+    ));
+    guard.native_commit(policy, &tcp(true, 1000, 40, start, 0, 2), false, 0);
+    assert!(matches!(
+        guard.independent_ip_decision(policy, &future, 1, false),
+        Allow
+    ));
+    assert!(matches!(
+        guard.independent_ip_decision(policy, &future, 5_000_000, false),
+        Wait(_)
+    ));
+    for flags in [0x12, 0x11, 0x14] {
+        let control = tcp(true, 1000, 150, 48, 0, flags);
+        assert!(matches!(
+            guard.independent_ip_decision(policy, &control, 1, false),
+            Ordered
+        ));
+    }
+    let ambiguous = tcp(true, 1000, 150, (start + 1).wrapping_add(1 << 31), 0, 0x10);
+    assert!(matches!(
+        guard.independent_ip_decision(policy, &ambiguous, 1, false),
+        Wait(_)
+    ));
+    guard.admitted(policy, &tcp(false, 1000, 40, 999, 0, 0x11));
+    let covering = tcp(true, 1000, 150, 48, 1000, 0x10);
+    assert!(matches!(
+        guard.independent_ip_decision(policy, &covering, 1, false),
+        Ordered
+    ));
     Ok(())
 }

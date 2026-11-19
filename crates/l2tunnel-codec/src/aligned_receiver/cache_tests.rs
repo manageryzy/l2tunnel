@@ -89,6 +89,8 @@ fn scanned_buffers(r: &Receiver) -> crate::diagnostics::ReceiverBuffers {
             byte_capacity: r.limits.lookahead_bytes,
             ..Retention::default()
         },
+        compacted_records: r.retention.compacted,
+        compacted_record_capacity: r.compacted_slots,
         head_fragments: 0,
         head_fragment_capacity: channels * r.limits.max_fragments_per_record,
         lookahead_fragments: 0,
@@ -150,6 +152,8 @@ pub(super) fn assert_matches(r: &Receiver) {
         record_bytes: 0,
         fragment_slots: 0,
         early_tombstones: 0,
+        compacted_records: 0,
+        compacted_record_capacity: r.compacted_slots,
         pending_bytes: r.pending.map(|pending| pending.written),
         failure: r.failure,
     };
@@ -158,9 +162,10 @@ pub(super) fn assert_matches(r: &Receiver) {
         status.record_bytes += record.bytes.len();
         status.fragment_slots += record.pieces.len();
         status.early_tombstones += usize::from(record.early_delivered);
+        status.compacted_records += usize::from(record.compacted);
         status.native_records += usize::from(
             !record.early_delivered
-                && (record.bytes.first() != Some(&0)
+                && (!matches!(record.bytes.first(), Some(0 | 8))
                     || (!record.pieces.is_empty()
                         && record.pieces.first().copied().unwrap_or(0) == 0)),
         );

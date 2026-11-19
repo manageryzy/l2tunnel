@@ -135,13 +135,21 @@ impl ReceiverPlan {
         Ok(Self {
             ip_headers: false,
             limits,
-            capacity: aligned_receiver::Receiver::reserved_bytes(limits)?,
+            capacity: aligned_receiver::Receiver::reserved_bytes(limits, false)?,
         })
     }
     /// Select native-IP header state before construction; no policy or bound is reduced.
     pub fn for_ip_limits(limits: aligned_receiver::Limits) -> Result<Self, Error> {
         let mut plan = Self::for_limits(limits)?;
         plan.ip_headers = true;
+        Ok(plan)
+    }
+    /// Provision compact replay slots alongside the native IP decoder.
+    pub fn for_ip_limits_with_early_replay(
+        limits: aligned_receiver::Limits,
+    ) -> Result<Self, Error> {
+        let mut plan = Self::for_ip_limits(limits)?;
+        plan.capacity = aligned_receiver::Receiver::reserved_bytes(limits, true)?;
         Ok(plan)
     }
     /// Whether the actual selected state is native-IP header compression.

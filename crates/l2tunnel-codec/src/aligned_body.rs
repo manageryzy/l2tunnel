@@ -54,6 +54,8 @@ impl Config {
 pub enum Encoding {
     /// Existing protocol-compatible header/context encoding.
     Headers,
+    /// Header deltas with periodic full contexts in the existing wire grammar.
+    RefreshedHeaders,
     /// Exact raw packet with no compression or context.
     Raw,
     /// Stateless LZ4 only when its complete body is smaller than raw.

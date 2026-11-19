@@ -1,4 +1,6 @@
 //! Exact native bytes and real selected codec ownership; not runtime/native proof.
+#[path = "ip_preview_tests.rs"]
+mod preview_gap;
 use super::*;
 use crate::{
     aligned_body as body, aligned_receiver as rx, aligned_sender as tx, aligned_storage as heap,
@@ -482,5 +484,65 @@ fn reserved_aligned_and_packed_ip_owners_preserve_literal_bytes_ids_fragments_an
             .capacity_bytes,
         plan.capacity_bytes()
     );
+    Ok(())
+}
+
+#[test]
+fn periodic_context_uses_legacy_ip_bytes_and_raw_fallback_keeps_the_old_base() -> Result {
+    let body = body_config(256);
+    let mut sender = tx::Sender::new_ip(
+        scope(),
+        tx::Config {
+            body,
+            channels: 1,
+            first_record: rx::RecordId(0),
+        },
+    )?;
+    let channel = rx::ChannelId(0);
+    let mut ordered = body::Decoder::new_ip(body)?;
+    let mut restarted = body::Decoder::new_ip(body)?;
+    let mut have_anchor = false;
+    let mut out = [0; 256];
+    for index in 0..22 {
+        let next = sender.next_record(channel)?.ok_or("exhausted")?.0;
+        let original = if next == 8 {
+            vec![0xff; 64]
+        } else {
+            packet(
+                false,
+                &[],
+                &options(10 + index, 20),
+                &[17; 80],
+                100 + 80 * index,
+                index as u16,
+            )
+        };
+        let (id, observation) =
+            sender.stage_selected(channel, &original, body::Encoding::RefreshedHeaders)?;
+        let refresh = next == 0 || next == 16;
+        assert_eq!(observation.context_bytes != 0, refresh);
+        assert_eq!(id.record.0, next + u64::from(refresh));
+        while sender.is_pending() {
+            let unit = sender.pending_unit()?;
+            let bytes = &unit.bytes[3..];
+            if unit.record.0 == 16 {
+                assert_eq!(bytes[0], 8);
+                have_anchor = true;
+            }
+            let decoded = ordered.decode_body(bytes, body::Padding::Exact, &mut out)?;
+            if let body::Decoded::Frame { written, .. } = decoded {
+                assert_eq!(&out[..written], original);
+            }
+            if have_anchor {
+                let result = restarted.decode_body(bytes, body::Padding::Exact, &mut out)?;
+                assert_eq!(result, decoded);
+                if let body::Decoded::Frame { written, .. } = result {
+                    assert_eq!(&out[..written], original);
+                }
+            }
+            sender.commit_unit()?;
+        }
+    }
+    assert!(have_anchor);
     Ok(())
 }

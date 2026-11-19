@@ -1225,3 +1225,11 @@ matrix records device TX drops separately from qdisc drops and accepts a
 bounded native ring depth and optional per-flow pacing on the sender TUN.
 The [same-step source handoff and measurements](modules/frame-channel-experiment.md#bounded-sender-handoff-and-native-ingress-pacing)
 cover the sender grant boundary and the independent single-flow performance gate.
+
+FIX-04 and TEST-12 now track [early native TCP delivery across a compression gap](modules/frame-channel-experiment.md#early-ip-tcp-delivery-across-a-compression-gap).
+Targeted TUN delivers independently reconstructed TCP segments across missing
+records and preserves missing-source recovery and ordered compression state.
+Linux namespace trials verified SACK, exact payload and final drain. The
+same-release light observer measured 1.035 ms P99 from all dependencies ready
+to completed TUN write. End-to-end single-flow throughput and application P99
+regressed against the FIFO control, leaving performance qualification open.

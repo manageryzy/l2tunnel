@@ -11,6 +11,8 @@ use std::{fmt, mem::size_of};
 #[path = "aligned_receiver/cache.rs"]
 mod cache;
 use cache::{DeadlineCache, Retention};
+mod preview;
+use preview::Preview;
 
 /// Absolute nonwrapping source identity, retained through retransmission/recovery.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -262,6 +264,10 @@ pub struct Status {
     pub fragment_slots: usize,
     /// Retained early-delivery markers awaiting contiguous retirement.
     pub early_tombstones: usize,
+    /// Delivered records moved into compact replay storage (included in tombstones).
+    pub compacted_records: usize,
+    /// Reserved compact replay entries; data admission retains its original limit.
+    pub compacted_record_capacity: usize,
     /// Retained not-yet-delivered native records; unknown fragment headers count conservatively.
     pub native_records: usize,
     /// One immutable prepared native frame length, if any.
@@ -296,6 +302,7 @@ struct Record {
     padding: Padding,
     deadline: Tick,
     early_delivered: bool,
+    compacted: bool,
     // Immutable classification of the original unfragmented body. Lookahead
     // can skip ordinary records without following each body slab pointer.
     independent_short: bool,
@@ -309,7 +316,7 @@ impl Record {
     }
     fn native_pending(&self) -> bool {
         !self.early_delivered
-            && (self.bytes.first() != Some(&0)
+            && (!matches!(self.bytes.first(), Some(0 | 8))
                 || (!self.pieces.is_empty() && self.pieces.first().copied().unwrap_or(0) == 0))
     }
 }
@@ -321,18 +328,24 @@ struct LegacyChannel {
 struct Channel {
     expected: Option<RecordId>,
     decoder: Decoder,
+    preview: Option<Preview>,
 }
 #[derive(Clone, Copy)]
 struct Pending {
     slot: usize,
     written: usize,
     early: bool,
+    compact_after_write: bool,
 }
 enum EarlySelection<'a> {
     Any,
     Ordered,
     Filtered(&'a mut dyn FnMut(&[u8]) -> bool),
-    Reevaluated(&'a dyn Fn(u64) -> bool, &'a dyn Fn(&[u8]) -> EarlyDecision),
+    Reevaluated {
+        changed: &'a dyn Fn(u64) -> bool,
+        decide: &'a dyn Fn(&[u8], bool) -> EarlyDecision,
+        complete_packets: bool,
+    },
 }
 /// Local eligibility of an independently decoded complete native frame.
 pub enum EarlyDecision {
@@ -360,15 +373,25 @@ impl Parsed<'_> {
     }
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum ReceiverMode {
+    Ethernet,
+    Ip,
+    IpEarlyReplay,
+}
+
 /// Finite receiver state with separate admission, preparation and actual delivery commit.
 pub struct Receiver {
     scope: Scope,
     limits: Limits,
     compact_units: bool,
+    compacted_slots: usize,
+    mode: ReceiverMode,
     channels: Vec<Channel>,
     records: Vec<Option<Record>>,
     // Only occupied slots, in (channel, absolute record) order. Valid limits
-    // allow at most 4,352 slots. The payload owners never move with this index.
+    // allow at most 8,448 slots including compacted records. Payload owners
+    // never move with this index.
     ordered_slots: Vec<u16>,
     proofs: Vec<Option<Proof>>,
     retention: Retention,
@@ -404,14 +427,53 @@ impl Receiver {
     }
     /// Validate all fixed allocation products and reserve progress independently of lookahead.
     pub fn new(scope: Scope, limits: Limits) -> Result<Self, Error> {
-        Self::new_mode(scope, limits, false)
+        Self::new_mode(scope, limits, ReceiverMode::Ethernet)
     }
     /// Native-IP contexts/deltas use the same channel/record/native ownership FSM.
     pub fn new_ip(scope: Scope, limits: Limits) -> Result<Self, Error> {
-        Self::new_mode(scope, limits, true)
+        Self::new_mode(scope, limits, ReceiverMode::Ip)
     }
-    fn new_mode(scope: Scope, limits: Limits, ip: bool) -> Result<Self, Error> {
-        limits.memory_bound_bytes()?;
+    /// Native IP with bounded compact replay slots for early physical delivery.
+    pub fn new_ip_with_early_replay(scope: Scope, limits: Limits) -> Result<Self, Error> {
+        Self::new_mode(scope, limits, ReceiverMode::IpEarlyReplay)
+    }
+    // Public scalar limits remain stable for historical configurations and
+    // digests. An allocating owner also reserves today's inline header state,
+    // occupied-slot index and compact replay metadata. Its retained bodies
+    // still share the original aggregate bytes/fragment allowance.
+    fn owned_memory_bound(
+        limits: Limits,
+        reserve_replay: bool,
+        batch: bool,
+    ) -> Result<usize, Error> {
+        let historical = limits.memory_bound_bytes()?;
+        let channels = usize::from(limits.channels);
+        let compacted = Self::compacted_capacity(limits, reserve_replay);
+        let indexed = channels + limits.lookahead_records + compacted;
+        // The validated limits admit at most 256 channels + 2 * 4096 records.
+        u16::try_from(indexed).map_err(|_| Error::Configuration)?;
+        let extra = size_of::<Self>().saturating_sub(size_of::<LegacyLayout>())
+            + channels * size_of::<Channel>().saturating_sub(size_of::<LegacyChannel>())
+            + compacted * size_of::<Option<Record>>()
+            + indexed * size_of::<u16>();
+        let single = historical.checked_add(extra).ok_or(Error::Configuration)?;
+        let bound = if batch {
+            single
+                .checked_mul(2)
+                .and_then(|n| n.checked_add(255 * size_of::<Admission>()))
+                .ok_or(Error::Configuration)?
+        } else {
+            single
+        };
+        if bound > 256 * 1024 * 1024 {
+            return Err(Error::Configuration);
+        }
+        Ok(bound)
+    }
+    fn new_mode(scope: Scope, limits: Limits, mode: ReceiverMode) -> Result<Self, Error> {
+        let ip = mode != ReceiverMode::Ethernet;
+        let reserve_replay = mode == ReceiverMode::IpEarlyReplay;
+        Self::owned_memory_bound(limits, reserve_replay, false)?;
         if scope.session == [0; 16] {
             return Err(Error::Configuration);
         }
@@ -419,6 +481,7 @@ impl Receiver {
         for _ in 0..limits.channels {
             channels.push(Channel {
                 expected: Some(limits.first_record),
+                preview: None,
                 decoder: if ip {
                     Decoder::new_ip(limits.body)
                 } else {
@@ -427,18 +490,18 @@ impl Receiver {
                 .map_err(Error::Body)?,
             });
         }
-        let mut records =
-            Vec::with_capacity(usize::from(limits.channels) + limits.lookahead_records);
-        records.resize_with(
-            usize::from(limits.channels) + limits.lookahead_records,
-            || None,
-        );
+        let compacted_slots = Self::compacted_capacity(limits, reserve_replay);
+        let slots = usize::from(limits.channels) + limits.lookahead_records + compacted_slots;
+        let mut records = Vec::with_capacity(slots);
+        records.resize_with(slots, || None);
         let mut proofs = Vec::with_capacity(limits.source_window);
         proofs.resize_with(limits.source_window, || None);
         Ok(Self {
             scope,
             limits,
             compact_units: false,
+            compacted_slots,
+            mode,
             channels,
             ordered_slots: Vec::with_capacity(records.len()),
             records,
@@ -515,7 +578,7 @@ impl Receiver {
         if !(1..=255).contains(&symbols.len()) {
             return Err(Error::Configuration);
         }
-        self.limits.batch_memory_bound_bytes()?;
+        Self::owned_memory_bound(self.limits, self.mode == ReceiverMode::IpEarlyReplay, true)?;
         self.check_time(now)?;
         let records = self.records.clone();
         let ordered_slots = self.ordered_slots.clone();
@@ -560,7 +623,7 @@ impl Receiver {
         if !(1..=255).contains(&symbols.len()) {
             return Err(Error::Configuration);
         }
-        self.limits.batch_memory_bound_bytes()?;
+        Self::owned_memory_bound(self.limits, self.mode == ReceiverMode::IpEarlyReplay, true)?;
         self.check_time(now)?;
         let mut shadow = self.validation_shadow()?;
         for symbol in symbols {
@@ -596,10 +659,11 @@ impl Receiver {
         self.admit_batch_authenticated(symbols, now)
     }
     fn validation_shadow(&self) -> Result<Self, Error> {
-        let mut shadow = Self::new(self.scope, self.limits)?;
+        let mut shadow = Self::new_mode(self.scope, self.limits, self.mode)?;
         shadow.compact_units = self.compact_units;
         for (target, source) in shadow.channels.iter_mut().zip(&self.channels) {
             target.expected = source.expected;
+            target.preview.clone_from(&source.preview);
             target.decoder.copy_context_from(&source.decoder);
         }
         shadow.records.clone_from(&self.records);
@@ -801,6 +865,7 @@ impl Receiver {
                         padding: parsed.padding,
                         deadline,
                         early_delivered: false,
+                        compacted: false,
                         independent_short: parsed
                             .independent_short(self.limits.body.independent_short_frame_bytes),
                         defer_early: 0,
@@ -871,7 +936,34 @@ impl Receiver {
             channel,
             now,
             max_records,
-            EarlySelection::Reevaluated(&changed, &decide),
+            EarlySelection::Reevaluated {
+                changed: &changed,
+                decide: &|frame, _| decide(frame),
+                complete_packets: false,
+            },
+        )
+    }
+    /// Consider complete raw or stateless LZ4 bodies, including reassembled
+    /// fragments, and deltas with a complete contiguous chain from an explicit
+    /// native IP context. The predicate also receives the original independent-
+    /// short classification. The ordered codec frontier advances separately.
+    pub fn prepare_with_independent_packets(
+        &mut self,
+        channel: ChannelId,
+        now: Tick,
+        max_records: usize,
+        changed: impl Fn(u64) -> bool,
+        decide: impl Fn(&[u8], bool) -> EarlyDecision,
+    ) -> Result<Prepared, Error> {
+        self.prepare_selected(
+            channel,
+            now,
+            max_records,
+            EarlySelection::Reevaluated {
+                changed: &changed,
+                decide: &decide,
+                complete_packets: true,
+            },
         )
     }
     /// Preserve channel FIFO even when independent short bodies are enabled.
@@ -897,7 +989,8 @@ impl Receiver {
         if self.pending.is_some() {
             return Ok(Prepared::Ready);
         }
-        for _ in 0..max_records {
+        let mut remaining = max_records;
+        while remaining > 0 {
             if self.retention.records == 0 {
                 return Ok(Prepared::Idle);
             }
@@ -905,69 +998,40 @@ impl Receiver {
                 Some(id) => id,
                 None => return Ok(Prepared::Idle),
             };
-            // Each channel retains only records at or beyond its expected
-            // watermark. A binary search skips every other channel and every
-            // unused payload reservation. The first eligible short is oldest.
-            let position = self
-                .record_position(channel, expected)
-                .unwrap_or_else(|i| i);
-            let slots = &self.ordered_slots[position..];
-            let mut selected = None;
-            for &indexed in slots {
-                let slot = usize::from(indexed);
-                let record = self.records[slot].as_ref().ok_or(Error::Malformed)?;
-                if record.channel != channel {
-                    break;
-                }
-                if record.id == expected && record.complete() {
-                    selected = Some(slot);
-                    break;
-                }
-                if matches!(selection, EarlySelection::Ordered)
-                    || self.limits.body.independent_short_frame_bytes == 0
-                {
-                    break;
-                }
-                if record.id > expected
-                    && record.independent_short
-                    && !record.early_delivered
-                    && (record.defer_early == 0
-                        || match &selection {
-                            EarlySelection::Any => true,
-                            EarlySelection::Reevaluated(changed, _)
-                                if record.defer_early != u64::MAX =>
-                            {
-                                changed(record.defer_early)
-                            }
-                            _ => false,
-                        })
-                {
-                    selected = Some(slot);
-                    break;
-                }
-            }
-            let Some(slot) = selected else {
+            let Some((position, anchor)) = self.select_record(channel, expected, &selection)?
+            else {
                 return Ok(Prepared::Idle);
             };
+            let slot = usize::from(self.ordered_slots[position]);
+            let index = usize::from(channel.0);
+            if let Some(anchor) = anchor {
+                if !self.stage_prefix(index, anchor, position, &mut remaining)? {
+                    return Ok(Prepared::Progress);
+                }
+            } else {
+                self.staged.copy_context_from(&self.channels[index].decoder);
+            }
+            remaining -= 1;
             let entry = self.records[slot].as_ref().ok_or(Error::Malformed)?;
-            if entry.early_delivered {
+            let early = entry.id != expected;
+            let independent_short = entry.independent_short;
+            let delivered = entry.early_delivered;
+            if delivered && independent_length(&entry.bytes).is_some() {
                 self.retire(slot)?;
                 continue;
             }
-            let early = entry.id != expected;
-            self.staged
-                .copy_context_from(&self.channels[usize::from(channel.0)].decoder);
-            let decoded =
-                match self
-                    .staged
-                    .decode_body(&entry.bytes, entry.padding, &mut self.native)
-                {
-                    Ok(decoded) => decoded,
-                    Err(error) => {
-                        self.failure = Some(Error::Body(error));
-                        return Err(Error::Body(error));
-                    }
-                };
+            let decoded = self.decode_slot(slot)?;
+            if let Some(anchor) = anchor {
+                self.cache_preview(index, anchor, position)?;
+            }
+            if delivered {
+                // Linux already accepted this frame. Its ordered header transition
+                // must still reach the canonical decoder for the next delta.
+                self.touch_channel(index)?;
+                self.channels[index].decoder.copy_context_from(&self.staged);
+                self.retire(slot)?;
+                continue;
+            }
             match decoded {
                 aligned_body::Decoded::Context { .. } => {
                     self.touch_channel(usize::from(channel.0))?;
@@ -986,8 +1050,8 @@ impl Receiver {
                                     u64::MAX
                                 }
                             }
-                            EarlySelection::Reevaluated(_, decide) => {
-                                match decide(&self.native[..written]) {
+                            EarlySelection::Reevaluated { decide, .. } => {
+                                match decide(&self.native[..written], independent_short) {
                                     EarlyDecision::Allow => 0,
                                     EarlyDecision::Ordered => u64::MAX,
                                     EarlyDecision::Wait(token) => {
@@ -1016,6 +1080,14 @@ impl Receiver {
                         slot,
                         written,
                         early,
+                        compact_after_write: early
+                            && matches!(
+                                selection,
+                                EarlySelection::Reevaluated {
+                                    complete_packets: true,
+                                    ..
+                                }
+                            ),
                     });
                     return Ok(Prepared::Ready);
                 }
@@ -1057,6 +1129,9 @@ impl Receiver {
             self.retention.native_records -= usize::from(record.native_pending());
             self.retention.tombstones += usize::from(!record.early_delivered);
             record.early_delivered = true;
+            if pending.compact_after_write {
+                self.compact_delivered(pending.slot)?;
+            }
         } else {
             let channel = usize::from(
                 self.records[pending.slot]
@@ -1104,6 +1179,8 @@ impl Receiver {
             record_bytes: self.retention.record_bytes,
             fragment_slots: self.retention.fragment_slots,
             early_tombstones: self.retention.tombstones,
+            compacted_records: self.retention.compacted,
+            compacted_record_capacity: self.compacted_slots,
             pending_bytes: self.pending.map(|p| p.written),
             failure: self.failure,
         }
@@ -1129,6 +1206,8 @@ impl Receiver {
                 byte_capacity: self.limits.lookahead_bytes,
                 ..Retention::default()
             },
+            compacted_records: self.retention.compacted,
+            compacted_record_capacity: self.compacted_slots,
             head_fragments: 0,
             head_fragment_capacity: channels * self.limits.max_fragments_per_record,
             lookahead_fragments: 0,
@@ -1144,13 +1223,14 @@ impl Receiver {
                     && let Ok(position) = self.record_position(ChannelId(index as u8), id)
                     && let Some(record) = &self.records[usize::from(self.ordered_slots[position])]
                 {
-                    result.heads.items += 1;
+                    result.heads.items += usize::from(!record.compacted);
                     result.heads.bytes += record.bytes.len();
                     result.head_fragments += record.pieces.len();
                 }
             }
         }
-        result.lookahead.items = self.retention.records - result.heads.items;
+        result.lookahead.items =
+            self.retention.records - self.retention.compacted - result.heads.items;
         result.lookahead.bytes = self.retention.record_bytes - result.heads.bytes;
         result.lookahead_fragments = self.retention.fragment_slots - result.head_fragments;
         result
@@ -1214,7 +1294,7 @@ impl Receiver {
         }
         // Totals include all reserved channel heads. When even that upper
         // bound fits, excluding the heads cannot change the decision.
-        if self.retention.records < self.limits.lookahead_records
+        if self.retention.records - self.retention.compacted < self.limits.lookahead_records
             && self
                 .retention
                 .record_bytes
@@ -1228,20 +1308,13 @@ impl Receiver {
         {
             return Ok(());
         }
-        let (mut count, mut total, mut slots) = (1usize, bytes, fragments);
-        for &index in &self.ordered_slots {
-            let entry = self.records[usize::from(index)]
-                .as_ref()
-                .ok_or(Error::Malformed)?;
-            if Some(entry.id) != self.channels[usize::from(entry.channel.0)].expected {
-                count += 1;
-                total += entry.bytes.len();
-                slots += entry.pieces.len();
-            }
-        }
-        if count > self.limits.lookahead_records
-            || total > self.limits.lookahead_bytes
-            || slots > self.limits.lookahead_fragments
+        // At saturation the same source may be retried for every receive turn.
+        // The indexed head reservations are also the ones excluded by the
+        // public occupancy counters. Never walk every retained payload here.
+        let snapshot = self.buffer_snapshot();
+        if snapshot.lookahead.items >= self.limits.lookahead_records
+            || bytes > self.limits.lookahead_bytes - snapshot.lookahead.bytes
+            || fragments > self.limits.lookahead_fragments - snapshot.lookahead_fragments
         {
             Err(Error::Capacity)
         } else {

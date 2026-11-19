@@ -140,11 +140,11 @@ impl Edge {
             last: now,
         }
     }
-    fn permits(self, t: &Tcp) -> bool {
+    fn permits(self, t: &Tcp, native_reorders: bool) -> bool {
         self.proven
             && t.seq.wrapping_sub(self.next) != HALF_SPACE
             && t.end.wrapping_sub(self.next) != HALF_SPACE
-            && !after(t.seq, self.next)
+            && (native_reorders || !after(t.seq, self.next))
     }
     fn commit(&mut self, t: &Tcp, now: u64) {
         self.last = now;
@@ -217,13 +217,38 @@ impl Guard {
         bytes: &[u8],
         now: u64,
     ) -> super::receiver::EarlyDecision {
+        self.decide_packet(packet(policy, bytes), now, false, true)
+    }
+
+    /// Linux can SACK a complete future TCP segment. Keep handshake, close,
+    /// uncertain flow identity, and feedback covering a local FIN ordered.
+    pub(super) fn independent_ip_decision(
+        &self,
+        policy: NativePolicy,
+        bytes: &[u8],
+        now: u64,
+        short: bool,
+    ) -> super::receiver::EarlyDecision {
+        self.decide_packet(packet(policy, bytes), now, true, short)
+    }
+
+    fn decide_packet(
+        &self,
+        packet: Packet,
+        now: u64,
+        native_reorders: bool,
+        short: bool,
+    ) -> super::receiver::EarlyDecision {
         use super::receiver::EarlyDecision;
-        let packet = packet(policy, bytes);
         if self.active() && !self.fin_permits(&packet) {
             return EarlyDecision::Ordered;
         }
         match packet {
-            Packet::Tcp(t) if t.flags & SYN != 0 => EarlyDecision::Ordered,
+            Packet::Tcp(t)
+                if t.flags & SYN != 0 || (native_reorders && t.flags & (FIN | RST) != 0) =>
+            {
+                EarlyDecision::Ordered
+            }
             Packet::Tcp(t) if t.payload != 0 => {
                 let idx = self.bucket(&t);
                 let bucket = &self.edges[idx];
@@ -232,7 +257,9 @@ impl Guard {
                     if let Some(edge) = s.edge
                         && edge.key == t.source
                     {
-                        if now.saturating_sub(edge.last) < self.lifetime && edge.permits(&t) {
+                        if now.saturating_sub(edge.last) < self.lifetime
+                            && edge.permits(&t, native_reorders && t.flags & ACK != 0)
+                        {
                             return EarlyDecision::Allow;
                         }
                         return self.wait(base + i, s.version);
@@ -241,7 +268,8 @@ impl Guard {
                 self.wait(base + WAYS, bucket.version)
             }
             Packet::Unclassified => EarlyDecision::Ordered,
-            _ => EarlyDecision::Allow,
+            _ if short => EarlyDecision::Allow,
+            _ => EarlyDecision::Ordered,
         }
     }
     pub(super) fn native_commit(
@@ -314,7 +342,8 @@ pub(super) struct Guard {
 impl Guard {
     fn slots<P: RecoveryPolicy>(direction: DirectionConfig<P>) -> usize {
         if direction.scheduler.targeted()
-            && direction.receiver.body.independent_short_frame_bytes > 0
+            && (direction.native_policy.is_ip()
+                || direction.receiver.body.independent_short_frame_bytes > 0)
         {
             usize::from(direction.receiver.channels).max(16)
         } else {

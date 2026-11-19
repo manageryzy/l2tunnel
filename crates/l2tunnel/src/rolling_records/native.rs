@@ -37,7 +37,7 @@ impl PreparedNative {
     pub fn bytes(self) -> usize {
         self.bytes
     }
-    /// Actual codec indication of independent-short out-of-order delivery.
+    /// Actual codec indication of out-of-order native delivery.
     pub fn early(self) -> bool {
         self.early
     }
@@ -101,16 +101,25 @@ impl<P: RecoveryPolicy> Endpoint<P> {
         let cursor =
             receiver::ChannelId(u8::try_from(self.next_channel).map_err(|_| Error::Identity)?);
         let channel = self.records.next_retained_channel(cursor).unwrap_or(cursor);
-        let result = if self.fin_order.tracks_payload() {
+        let policy = self.receive_config.native_policy;
+        let result = if self.fin_order.tracks_payload() && policy.is_ip() {
+            self.records.prepare_with_independent_packets(
+                channel,
+                receiver_tick(now),
+                work,
+                |token| self.fin_order.changed(token),
+                |frame, short| {
+                    self.fin_order
+                        .independent_ip_decision(policy, frame, now.0, short)
+                },
+            )
+        } else if self.fin_order.tracks_payload() {
             self.records.prepare_with_early_dependencies(
                 channel,
                 receiver_tick(now),
                 work,
                 |token| self.fin_order.changed(token),
-                |frame| {
-                    self.fin_order
-                        .decision(self.receive_config.native_policy, frame, now.0)
-                },
+                |frame| self.fin_order.decision(policy, frame, now.0),
             )
         } else {
             self.records.prepare(channel, receiver_tick(now), work)

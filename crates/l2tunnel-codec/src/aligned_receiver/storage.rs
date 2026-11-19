@@ -15,6 +15,7 @@ enum Undo<T> {
 struct ChannelCheckpoint {
     expected: Option<RecordId>,
     header: DecoderState,
+    preview: Option<Preview>,
 }
 struct Globals {
     floor: Option<SourceId>,
@@ -69,6 +70,7 @@ impl Journal {
 }
 pub(super) struct Reserved {
     records: Vec<RecordBuffer>,
+    compacted: Vec<RecordBuffer>,
     proofs: Vec<Vec<u8>>,
     journals: [Journal; 2],
     active: Option<usize>,
@@ -78,22 +80,47 @@ pub(super) struct Reserved {
 }
 
 impl Receiver {
-    pub(crate) fn reserved_bytes(l: Limits) -> Result<usize, heap::Error> {
+    pub(super) fn compacted_capacity(l: Limits, reserve_replay: bool) -> usize {
+        if reserve_replay {
+            l.lookahead_records.min(usize::from(l.record_window))
+        } else {
+            0
+        }
+    }
+
+    fn compacted_width(l: Limits) -> usize {
+        // The ordinary pool also accepts longer encodings; those retain their
+        // original slot if they cannot fit this smaller replay representation.
+        (l.body.max_frame_bytes + 3).min(65_535)
+    }
+
+    pub(crate) fn reserved_bytes(l: Limits, reserve_replay: bool) -> Result<usize, heap::Error> {
         let c = usize::from(l.channels);
         let r = c
             .checked_add(l.lookahead_records)
             .ok_or(heap::Error::Layout)?;
         let s = l.source_window;
+        let compacted = Self::compacted_capacity(l, reserve_replay);
+        let indexed = r + compacted;
+        let small = heap::product(compacted, 3)?;
         let rr = heap::product(r, 3)?;
         let ss = heap::product(s, 3)?;
         heap::sum(&[
             heap::array_bytes::<Channel>(c)?,
-            heap::array_bytes::<Option<Record>>(r)?,
-            heap::array_bytes::<u16>(r)?,
+            heap::array_bytes::<Option<Record>>(indexed)?,
+            heap::array_bytes::<u16>(indexed)?,
             heap::array_bytes::<Option<Proof>>(s)?,
             heap::product(c + 1, Decoder::reserved_bytes(l.body)?)?,
             heap::array_bytes::<u8>(l.body.max_frame_bytes)?,
             heap::array_bytes::<RecordBuffer>(rr)?,
+            heap::array_bytes::<RecordBuffer>(small)?,
+            heap::product(
+                small,
+                heap::sum(&[
+                    heap::array_bytes::<u8>(Self::compacted_width(l))?,
+                    heap::array_bytes::<u8>(l.max_fragments_per_record)?,
+                ])?,
+            )?,
             heap::array_bytes::<Vec<u8>>(ss)?,
             heap::product(
                 rr,
@@ -103,7 +130,7 @@ impl Receiver {
                 ])?,
             )?,
             heap::product(ss, heap::array_bytes::<u8>(l.body.symbol_bytes)?)?,
-            heap::product(2, Journal::bytes(r, s, c)?)?,
+            heap::product(2, Journal::bytes(indexed, s, c)?)?,
             heap::array_bytes::<u8>(65_535)?,
             heap::array_bytes::<u8>(l.body.max_frame_bytes)?,
         ])
@@ -114,7 +141,7 @@ impl Receiver {
         limits: Limits,
         budget: heap::Limits,
     ) -> Result<Self, heap::Error> {
-        Self::new_reserved_mode(scope, limits, budget, false)
+        Self::new_reserved_mode(scope, limits, budget, ReceiverMode::Ethernet)
     }
     /// Fallibly reserve the actual selected IP context and transaction journals.
     pub fn new_reserved_ip(
@@ -122,24 +149,34 @@ impl Receiver {
         limits: Limits,
         budget: heap::Limits,
     ) -> Result<Self, heap::Error> {
-        Self::new_reserved_mode(scope, limits, budget, true)
+        Self::new_reserved_mode(scope, limits, budget, ReceiverMode::Ip)
+    }
+    /// Reserve the selected native IP codec with early-write replay storage.
+    pub fn new_reserved_ip_with_early_replay(
+        scope: Scope,
+        limits: Limits,
+        budget: heap::Limits,
+    ) -> Result<Self, heap::Error> {
+        Self::new_reserved_mode(scope, limits, budget, ReceiverMode::IpEarlyReplay)
     }
     fn new_reserved_mode(
         scope: Scope,
         limits: Limits,
         budget: heap::Limits,
-        ip: bool,
+        mode: ReceiverMode,
     ) -> Result<Self, heap::Error> {
-        let plan = if ip {
-            heap::ReceiverPlan::for_ip_limits(limits)?
-        } else {
-            heap::ReceiverPlan::for_limits(limits)?
+        let plan = match mode {
+            ReceiverMode::Ethernet => heap::ReceiverPlan::for_limits(limits)?,
+            ReceiverMode::Ip => heap::ReceiverPlan::for_ip_limits(limits)?,
+            ReceiverMode::IpEarlyReplay => {
+                heap::ReceiverPlan::for_ip_limits_with_early_replay(limits)?
+            }
         };
         if scope.session == [0; 16] {
             return Err(heap::Error::Receiver(Error::Configuration));
         }
         let mut allocation = heap::Allocation::new(plan.capacity_bytes(), budget)?;
-        let mut result = Self::new_in_mode(scope, limits, &mut allocation, ip)?;
+        let mut result = Self::new_in_mode(scope, limits, &mut allocation, mode)?;
         result
             .reserved
             .as_mut()
@@ -157,26 +194,30 @@ impl Receiver {
         l: Limits,
         a: &mut heap::Allocation,
     ) -> Result<Self, heap::Error> {
-        Self::new_in_mode(scope, l, a, false)
+        Self::new_in_mode(scope, l, a, ReceiverMode::Ethernet)
     }
     fn new_in_mode(
         scope: Scope,
         l: Limits,
         a: &mut heap::Allocation,
-        ip: bool,
+        mode: ReceiverMode,
     ) -> Result<Self, heap::Error> {
+        let ip = mode != ReceiverMode::Ethernet;
         let c = usize::from(l.channels);
         let r = c + l.lookahead_records;
+        let compacted_slots = Self::compacted_capacity(l, mode == ReceiverMode::IpEarlyReplay);
+        let indexed = r + compacted_slots;
         let s = l.source_window;
         let mut channels = a.vec(c)?;
         for _ in 0..c {
             channels.push(Channel {
                 expected: Some(l.first_record),
+                preview: None,
                 decoder: Decoder::new_in_mode(l.body, a, ip)?,
             });
         }
-        let mut records = a.vec(r)?;
-        records.resize_with(r, || None);
+        let mut records = a.vec(indexed)?;
+        records.resize_with(indexed, || None);
         let mut proofs = a.vec(s)?;
         proofs.resize_with(s, || None);
         let staged = Decoder::new_in_mode(l.body, a, ip)?;
@@ -190,20 +231,32 @@ impl Receiver {
                 pieces: a.vec(l.max_fragments_per_record)?,
             });
         }
+        let mut compacted = a.vec(3 * compacted_slots)?;
+        for _ in 0..3 * compacted_slots {
+            compacted.push(RecordBuffer {
+                bytes: a.vec(Self::compacted_width(l))?,
+                pieces: a.vec(l.max_fragments_per_record)?,
+            });
+        }
         let mut free_proofs = a.vec(3 * s)?;
         for _ in 0..3 * s {
             // proof_buffer and transaction copies initialize the whole live
             // extent with extend_from_slice; unused capacity is never read.
             free_proofs.push(a.vec(l.body.symbol_bytes)?);
         }
-        let journals = [Journal::new(r, s, c, a)?, Journal::new(r, s, c, a)?];
+        let journals = [
+            Journal::new(indexed, s, c, a)?,
+            Journal::new(indexed, s, c, a)?,
+        ];
         Ok(Self {
             scope,
             limits: l,
             compact_units: false,
+            compacted_slots,
+            mode,
             channels,
             records,
-            ordered_slots: a.vec(r)?,
+            ordered_slots: a.vec(indexed)?,
             proofs,
             retention: Retention::default(),
             deadlines: DeadlineCache::default(),
@@ -215,6 +268,7 @@ impl Receiver {
             failure: None,
             reserved: Some(Reserved {
                 records: free_records,
+                compacted,
                 proofs: free_proofs,
                 journals,
                 active: None,
@@ -243,6 +297,33 @@ impl Receiver {
         b.pieces.fill(0);
         Ok((b.bytes, b.pieces))
     }
+    // The caller has journaled the original row and physically committed its
+    // packet. Retain the exact encoded bytes, bitmap, deadline and identity in
+    // the same indexed row, returning its full record slab to live admission.
+    pub(super) fn compact_delivered(&mut self, slot: usize) -> Result<(), Error> {
+        if self.retention.compacted >= self.compacted_slots {
+            return Ok(());
+        }
+        let row = self.records[slot].as_mut().ok_or(Error::Malformed)?;
+        if row.bytes.len() > Self::compacted_width(self.limits) {
+            return Ok(());
+        }
+        if let Some(reserved) = &mut self.reserved {
+            let mut spare = reserved.compacted.pop().ok_or(Error::Storage)?;
+            spare.bytes.clear();
+            spare.pieces.clear();
+            spare.bytes.extend_from_slice(&row.bytes);
+            spare.pieces.extend_from_slice(&row.pieces);
+            std::mem::swap(&mut row.bytes, &mut spare.bytes);
+            std::mem::swap(&mut row.pieces, &mut spare.pieces);
+            spare.bytes.clear();
+            spare.pieces.clear();
+            reserved.records.push(spare);
+        }
+        row.compacted = true;
+        self.retention.compacted += 1;
+        Ok(())
+    }
     pub(super) fn proof_buffer(&mut self, symbol: &[u8]) -> Result<Vec<u8>, Error> {
         let Some(r) = &mut self.reserved else {
             return Ok(symbol.to_vec());
@@ -257,7 +338,12 @@ impl Receiver {
     }
     pub(super) fn recycle_record(&mut self, record: Record) -> Result<(), Error> {
         if let Some(r) = &mut self.reserved {
-            if r.records.len() == r.records.capacity() {
+            let pool = if record.compacted {
+                &mut r.compacted
+            } else {
+                &mut r.records
+            };
+            if pool.len() == pool.capacity() {
                 return Err(Error::Storage);
             }
             let mut b = RecordBuffer {
@@ -266,7 +352,7 @@ impl Receiver {
             };
             b.bytes.clear();
             b.pieces.clear();
-            r.records.push(b);
+            pool.push(b);
         }
         Ok(())
     }
@@ -318,11 +404,16 @@ impl Receiver {
             return Err(Error::Storage);
         }
         let replacement = if copy && let Some(old) = &self.records[slot] {
-            let b = r.records.last().ok_or(Error::Storage)?;
+            let pool = if old.compacted {
+                &mut r.compacted
+            } else {
+                &mut r.records
+            };
+            let b = pool.last().ok_or(Error::Storage)?;
             if b.bytes.capacity() < old.bytes.len() || b.pieces.capacity() < old.pieces.len() {
                 return Err(Error::Storage);
             }
-            let mut b = r.records.pop().ok_or(Error::Storage)?;
+            let mut b = pool.pop().ok_or(Error::Storage)?;
             b.bytes.clear();
             b.bytes.extend_from_slice(&old.bytes);
             b.pieces.clear();
@@ -337,6 +428,7 @@ impl Receiver {
                 padding: old.padding,
                 deadline: old.deadline,
                 early_delivered: old.early_delivered,
+                compacted: old.compacted,
                 independent_short: old.independent_short,
                 defer_early: old.defer_early,
             })
@@ -397,6 +489,7 @@ impl Receiver {
         j.channels[channel] = Some(ChannelCheckpoint {
             expected: self.channels[channel].expected,
             header: self.channels[channel].decoder.checkpoint(),
+            preview: self.channels[channel].preview.clone(),
         });
         j.channel_order.push(channel);
         Ok(())
@@ -520,6 +613,7 @@ impl Receiver {
             if !commit {
                 self.channels[channel].expected = old.expected;
                 self.channels[channel].decoder.restore(old.header);
+                self.channels[channel].preview = old.preview;
             }
         }
         let r = self.reserved.as_mut().ok_or(Error::Storage)?;

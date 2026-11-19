@@ -352,7 +352,7 @@ impl Sender {
     ) -> Result<(RecordIdentity, aligned_body::NativeEncodingObservation), Error> {
         self.stage_selected(channel, frame, aligned_body::Encoding::Lz4)
     }
-    fn stage_selected(
+    pub(crate) fn stage_selected(
         &mut self,
         channel: ChannelId,
         frame: &[u8],
@@ -367,8 +367,17 @@ impl Sender {
             .ok_or(Error::Configuration)?;
         let record = state.next.ok_or(Error::Exhausted)?;
         self.staged.copy_context_from(&state.encoder);
+        // A full context also has its own record serial. Keeping a serial-based
+        // cadence needs no timer or per-flow state and survives failed admission.
+        let refresh =
+            encoding == aligned_body::Encoding::RefreshedHeaders && record.0.is_multiple_of(8);
+        if refresh {
+            self.staged.reset();
+        }
         let encoded = match encoding {
-            aligned_body::Encoding::Headers => self.staged.encode(frame, &mut self.bodies)?,
+            aligned_body::Encoding::Headers | aligned_body::Encoding::RefreshedHeaders => {
+                self.staged.encode(frame, &mut self.bodies)?
+            }
             aligned_body::Encoding::Raw => self.staged.encode_raw(frame, &mut self.bodies)?,
             aligned_body::Encoding::Lz4 => self.staged.encode_lz4(frame, &mut self.bodies)?,
         };
@@ -388,7 +397,10 @@ impl Sender {
         };
         let mut observation = encoded.observation();
         observation.framing_bytes = framing(encoded.context_len) + framing(encoded.body_len);
-        state.encoder.copy_context_from(&self.staged);
+        // A raw fallback at a refresh boundary carries no replacement context.
+        if !refresh || encoded.context_len != 0 {
+            state.encoder.copy_context_from(&self.staged);
+        }
         state.next = last.checked_add(1).map(RecordId);
         self.pending = Some(Pending {
             channel,

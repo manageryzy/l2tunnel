@@ -330,7 +330,9 @@ impl<P: RecoveryPolicy> Endpoint<P> {
             copies.local(context.role),
         )
         .map_err(Error::Storage)?;
-        let records = (if receive_config.native_policy == NativePolicy::IpHeaders {
+        let records = (if receive_config.uses_ip_early_replay() {
+            receiver::Receiver::new_reserved_ip_with_early_replay
+        } else if receive_config.native_policy == NativePolicy::IpHeaders {
             receiver::Receiver::new_reserved_ip
         } else {
             receiver::Receiver::new_reserved
@@ -526,6 +528,9 @@ impl<P: RecoveryPolicy> Endpoint<P> {
         self.advance(now)?;
         let channel = receiver::ChannelId(u8::try_from(channel).map_err(|_| Error::Configuration)?);
         let result = match self.send_config.native_policy {
+            NativePolicy::IpHeaders if self.send_config.scheduler.targeted() => self
+                .packing
+                .stage_refreshed_headers_observed(channel, frame, now.0),
             NativePolicy::EthernetHeaders | NativePolicy::IpHeaders => {
                 self.packing.stage_observed(channel, frame, now.0)
             }

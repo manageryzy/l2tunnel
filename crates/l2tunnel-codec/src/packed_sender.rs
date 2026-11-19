@@ -373,6 +373,27 @@ impl Sender {
     > {
         self.stage_selected(channel, frame, now, crate::aligned_body::Encoding::Headers)
     }
+    /// Stage TCP header deltas with periodic full contexts for targeted TUN
+    /// recovery. Each refresh is a normal, charged context record.
+    pub fn stage_refreshed_headers_observed(
+        &mut self,
+        channel: ChannelId,
+        frame: &[u8],
+        now: u64,
+    ) -> Result<
+        (
+            RecordIdentity,
+            crate::aligned_body::NativeEncodingObservation,
+        ),
+        Error,
+    > {
+        self.stage_selected(
+            channel,
+            frame,
+            now,
+            crate::aligned_body::Encoding::RefreshedHeaders,
+        )
+    }
     /// Observe successful raw native staging without attributing packing containers.
     pub fn stage_raw_observed(
         &mut self,
@@ -428,12 +449,10 @@ impl Sender {
         if self.next_unit.is_none() {
             return Err(Error::Exhausted);
         }
-        let identity = match encoding {
-            crate::aligned_body::Encoding::Headers => self.aligned.stage_observed(channel, frame),
-            crate::aligned_body::Encoding::Raw => self.aligned.stage_raw_observed(channel, frame),
-            crate::aligned_body::Encoding::Lz4 => self.aligned.stage_lz4_observed(channel, frame),
-        }
-        .map_err(Error::Aligned)?;
+        let identity = self
+            .aligned
+            .stage_selected(channel, frame, encoding)
+            .map_err(Error::Aligned)?;
         self.staged_at = Some(now);
         self.poll(now)?;
         Ok(identity)

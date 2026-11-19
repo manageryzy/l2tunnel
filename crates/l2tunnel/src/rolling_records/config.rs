@@ -24,8 +24,13 @@ impl<P: RecoveryPolicy> DirectionConfig<P> {
         })(self.packing)
         .map_err(Error::Storage)
     }
+    pub(super) fn uses_ip_early_replay(self) -> bool {
+        self.scheduler.targeted() && self.native_policy.is_ip()
+    }
     pub(super) fn receiver_plan(self) -> Result<codec::aligned_storage::ReceiverPlan, Error> {
-        (if self.native_policy == NativePolicy::IpHeaders {
+        (if self.uses_ip_early_replay() {
+            codec::aligned_storage::ReceiverPlan::for_ip_limits_with_early_replay
+        } else if self.native_policy == NativePolicy::IpHeaders {
             codec::aligned_storage::ReceiverPlan::for_ip_limits
         } else {
             codec::aligned_storage::ReceiverPlan::for_limits

@@ -11,6 +11,7 @@ pub(super) struct Retention {
     pub record_bytes: usize,
     pub fragment_slots: usize,
     pub tombstones: usize,
+    pub compacted: usize,
 }
 impl Retention {
     // Every record/source has already passed the original finite reservation.
@@ -29,6 +30,7 @@ impl Retention {
         self.record_bytes += record.bytes.len();
         self.fragment_slots += record.pieces.len();
         self.tombstones += usize::from(record.early_delivered);
+        self.compacted += usize::from(record.compacted);
     }
     pub fn remove_record(&mut self, record: &Record) {
         self.records -= 1;
@@ -36,6 +38,7 @@ impl Retention {
         self.record_bytes -= record.bytes.len();
         self.fragment_slots -= record.pieces.len();
         self.tombstones -= usize::from(record.early_delivered);
+        self.compacted -= usize::from(record.compacted);
     }
     pub fn is_empty(self) -> bool {
         self.sources == 0 && self.records == 0

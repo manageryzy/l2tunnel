@@ -1848,3 +1848,136 @@ unconfirmed after drain. The higher native rate did not close the throughput
 or latency gap in these samples.
 [76 Mbit/s offer](../../work/c48-parity-20261119/native/single-gap-custody-20261119/rate8576/measured.json)
 and [90 Mbit/s offer](../../work/c48-parity-20261119/native/single-gap-custody-20261119/rate8590/measured.json).
+
+## Early IP TCP delivery across a compression gap
+
+The earlier 246.944 ms P99 measured the time from admission of a TCP record's
+last aligned unit to preparation for native delivery. The original sender
+capture replayed byte-exactly through the ordered Rust codec for 47,846
+packets. All 99 followers of record 126 were header deltas. Decoding each from
+the last good context at record 125 produced 99 incorrect TCP sequences and
+IPv4 IDs. For record 127 that would have placed the payload at sequence
+2456914852 instead of 2456916300. The source 143 hole therefore blocked real
+header state even after both of a follower's own fragments were present.
+[Capture and per-record byte comparison](../../work/early-tun-20261119/diagnostic/historical-body-replay.json).
+
+The normal Linux TUN and CUBIC trials used one connection, a 4 MiB outstanding
+application payload cap, 512-byte application writes, a 768-slot sender TUN and
+85 Mbit/s local FQ. The emulated underlay supplied 100/10 Mbit/s, 70 ms RTT
+and 15% independent loss in each direction. Goodput is receiver application
+payload over seconds 2 through 12. First-write latency includes sender socket
+queuing. Scheduled latency also includes waiting to issue a write. Each run
+draws live packet losses independently, including runs with identical link
+parameters. Outer source recovery, Linux retransmissions and application
+payload verification are separate measurements.
+
+With an ordinary full IP context every eight channel record serials, the first
+production pair exposed 16,809 and 23,285 out-of-order segments carrying new
+bytes to the receiver. In the 76 Mbit/s arm all 1,547,912 retransmitted bytes
+were already present when the retransmissions arrived. In the 90 Mbit/s arm
+2,479,488 of 2,533,064 retransmitted bytes were already present. Both streams
+had correct hashes and bilateral drain. The heavy diagnostic for the 76 Mbit/s
+arm matched 40,984 segments. The P99 from all dependencies admitted to native
+preparation was 0.860 ms. Its P99 from the record's own units to preparation
+was 611.624 ms. Its receiver exhausted all 1,024 lookahead slots, including
+482 already delivered records at one observed saturation point. The two
+uninstrumented production runs with this configuration had zero record-capacity handoff
+refusals. Run-specific wait times and saturation observations belong to their
+individual traces.
+[Native measurements](../../work/c48-parity-20261119/native/tun-early-sack-20261119/comparison.json),
+[stage join](../../work/early-tun-20261119/diagnostic/candidate-stage-join.json)
+and [lookahead reconstruction](../../work/early-tun-20261119/diagnostic/candidate-lookahead-witness.json).
+
+The frozen Python FIFO reference reached 75.99 and 77.46 Mbit/s at 76 and
+90 Mbit/s offered. In the same seeded model, adding periodic Ethernet header
+contexts with FIFO delivery produced 67.15 and 67.21 Mbit/s and zero inner
+retransmissions. Allowing immediate delivery of complete anchored chains in
+that model produced 0.372 and 0.413 Mbit/s, 33 and 36 inner retransmissions
+and a median congestion window below ten 512-byte segments. The model uses
+cumulative ACK and duplicate-ACK fast retransmit. Linux uses real MSS-sized
+segments and SACK. These are separate comparisons of ordering and TCP
+feedback. [Three-way Python control](../../work/c48-parity-20261119/python/tun-early-anchor-seed1/comparison.json).
+
+A five-site observer then used one writer across the historical sender, the
+new anchored sender/receiver, and the receiver with a bounded replay store
+for delivered records. For the 76 Mbit/s offer, P50/P99 from the record's own
+units to native preparation were 90.133/459.748, 0.175/175.785 and
+0.191/116.861 ms respectively. These are separate draws. In the last arm all
+41,527 timed TCP payloads matched between native captures and 19,898 were
+delivered early. Complete compression chain to native preparation P99 was
+0.745 ms. Of its slowest 416 records, 411 waited for a preceding body and
+five for the full context. The independent RawIp control matched all 28,851
+segments. Every one needed two fragments. Last fragment to completed device
+write P99 was 0.667 ms, with 21,258 early writes and a maximum of 1.704 ms.
+The RawIp control selected its own authenticated header policy.
+[Matched observer cohorts](../../work/early-tun-20261119/diagnostic/light-comparison.json)
+and [RawIp case](../../work/c48-parity-20261119/native/tun-early-sack-20261119/rawip76/run.json).
+
+The final scoped implementation allocates the additional replay store only
+for targeted TUN, including configurations with a zero short-packet threshold.
+In a fresh 76 Mbit/s trace of that release all 16,307 native segments matched,
+and Linux received 3,974 early. Own aligned units to native preparation P99
+was 61.762 ms, and own units to completed TUN write P99 was 61.784 ms. From
+the last aligned unit of the full dependency chain to the completed write P99
+was 1.035 ms, computed from per-record intervals. All 164 records in the
+slowest one percent waited for a prior body in their compression group.
+[Exact release stage join](../../work/early-tun-20261119/diagnostic/light-deployed-stages.json).
+
+The following Linux runs used the normal release without stage tracing. Each
+repetition has its own live loss draw. Retransmissions are the sender namespace
+TCPFastRetrans delta across the phase, cross-checked against repeated payload
+bytes in the TUN captures.
+
+| Linux case | Offered Mbit/s | Received Mbit/s | First-write P99 ms | Scheduled P99 ms | TCP retransmitted segments |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Original FIFO | 76 | 65.56 | 851 | 2,719 | 0 |
+| Final, first draw | 76 | 35.39 | 1,047 | 7,004 | 389 |
+| Final, repeat | 76 | 24.41 | 1,651 | 8,931 | 192 |
+| Original FIFO | 90 | 59.21 | 1,061 | 4,959 | 0 |
+| Final, first draw | 90 | 35.06 | 1,212 | 7,709 | 1,364 |
+| Final, repeat | 90 | 40.72 | 957 | 7,121 | 999 |
+
+All four final runs completed with matched payload, bilateral drain and zero
+remaining TCP holes. All four had zero TCP timeouts. The 76 Mbit/s repeats
+sent 561,912 and 278,016 retransmitted payload bytes respectively. In both
+runs all those bytes were already present by the time the repeat arrived.
+Sender median cwnd fell from 1,842 MSS in the 76 Mbit/s FIFO run to 325 and
+204 MSS. Median socket bytes waiting to be sent increased from 2.08 MB to
+3.68 and 3.90 MB. In the two 90 Mbit/s runs retransmissions delivered
+34,752 and 5,792 bytes ahead of the corresponding originals. Earlier trials
+of the anchor-only build include authenticated liveness and ingress deadline
+failures. FIX-04 and TEST-12 single-flow performance qualification remain open.
+[Uninstrumented trials and controls](../../work/c48-parity-20261119/native/tun-early-sack-20261119/comparison.json),
+[final 76 Mbit/s TCP sequence evidence](../../work/c48-parity-20261119/native/tun-early-sack-20261119/final76/tcp-custody.json)
+and [90 Mbit/s repeat](../../work/c48-parity-20261119/native/tun-early-sack-20261119/finalrepeat90/tcp-custody.json).
+
+The first inner retransmission appeared 148–377 ms after data start in the
+four final trials. Reverse post-qdisc IP averaged 3.22–5.49 Mbit/s over the
+measurement interval. The 90 Mbit/s repeat exceeded 9 Mbit/s in two of its
+100 consecutive 100 ms intervals. SACKs and short-packet copies added reverse
+traffic while the sender remained congestion-window-limited. These measurements
+do not establish persistent saturation of the 10 Mbit/s return path.
+[Socket progression and capture timing](../../work/c48-parity-20261119/native/tun-early-sack-20261119/socket-progress.json)
+and [reverse path byte accounting](../../work/c48-parity-20261119/native/tun-early-sack-20261119/reverse-path.json).
+
+A documentation build overlapped some of the earlier production measurements
+and later reached about 54 GiB resident memory. After stopping that build, a
+fresh series alternated FIFO and final releases at each offer. Each workload
+had 19–21 one-second host samples, zero observed rustdoc processes and a
+maximum reported 10-second memory pressure average of 0.00%. This controls
+for the observed build pressure. The four runs still draw independent losses.
+
+| Offered Mbit/s | Release | Received Mbit/s | First-write P99 ms | Scheduled P99 ms | Inner fast retransmissions | Median cwnd, MSS |
+| ---: | --- | ---: | ---: | ---: | ---: | ---: |
+| 76 | FIFO | 43.35 | 2,583 | 6,132 | 0 | 697 |
+| 76 | Final | 11.97 | 4,231 | 11,333 | 24 | 87 |
+| 90 | FIFO | 53.43 | 1,495 | 5,711 | 0 | 1,201 |
+| 90 | Final | 44.16 | 1,061 | 6,643 | 3,518 | 574 |
+
+The final 76/90 runs exposed 2,868/21,931 segments carrying new out-of-order
+bytes. Every run verified the application hash, closed all TCP sequence holes,
+and observed two consecutive 0/0 recovery-debt pairs. All had zero TCP
+timeouts. The original interrupted attempt is retained separately. These
+samples confirm that the throughput regression can occur under low observed
+memory pressure. They do not estimate its typical size.
+[Interleaved low-pressure comparison](../../work/c48-parity-20261119/native/tun-early-sack-20261119/clean-interleaved-0910.json).

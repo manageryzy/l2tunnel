@@ -61,6 +61,10 @@ pub enum SendBuffers {
 /// Receiver head reserves remain separate from shared future-record quotas.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ReceiverBuffers {
+    /// Physically delivered records retained in compact replay slots.
+    pub compacted_records: usize,
+    /// Maximum number of compact replay slots, independent of native lookahead.
+    pub compacted_record_capacity: usize,
     /// Exact source bytes retained above an unresolved contiguous floor.
     pub source_proofs: Retention,
     /// Current channel-head records with independent reserves.
