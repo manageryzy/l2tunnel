@@ -1,6 +1,109 @@
 use super::*;
 
 #[test]
+fn sealed_targeted_source_uses_only_the_residual_grant_at_a_freed_fifo_slot() -> TestResult {
+    for continuation in [false, true] {
+        for (missing_byte, metadata) in [(false, 2), (true, 2), (false, 1)] {
+            let enough = !missing_byte && metadata == 2;
+            let mut cfg = config(true, rolling::wire::SourceWire::TargetedExact);
+            cfg.forward.scheduler.repair_numerator = 0;
+            let mut endpoint = endpoint(cfg, Role::Client)?;
+            endpoint.enable_compact_wire(41)?;
+            endpoint.enable_queue_aware_repair_budget(1500)?;
+            let created = Tick(17);
+            let now = Tick(29);
+            let at = rolling_tick(now);
+            let limit = endpoint.sender_status().fresh_queue_limit;
+            let first = endpoint
+                .sender
+                .admit_source(b"first", rolling_tick(created))?;
+            for _ in 0..limit {
+                endpoint
+                    .sender
+                    .admit_source(b"queued", rolling_tick(created))?;
+            }
+            endpoint
+                .enqueue_admitted_identified(created, 0, &packet(true, 7, 64))?
+                .ok_or("stage")?;
+            endpoint.flush(created)?;
+            assert_eq!(endpoint.sender_status().queued_fresh, limit);
+            let id = endpoint.sender_status().next_source;
+            let mut expected = [0; 512];
+            let n = endpoint.packing.write_pending_compact(&mut expected)?;
+            endpoint
+                .sender
+                .confirm_output(scheduler::OutputId::Source(first), at)?;
+            endpoint.tick(now)?;
+            let select = cfg.forward.scheduler.recovery.width()? + 2 + b"queued".len();
+            let grant = rolling::WorkBudget {
+                copies: select + n - usize::from(missing_byte),
+                metadata,
+                ..work()
+            };
+            let used = if continuation {
+                endpoint.continue_targeted_send(now, grant)?
+            } else {
+                endpoint.step(now, grant)?.send
+            };
+            assert_eq!(
+                endpoint.sender_status().queued_fresh,
+                limit - usize::from(!enough)
+            );
+            assert_eq!(endpoint.packing.has_pending_source(), !enough);
+            assert_eq!(used.copies, select + if enough { n } else { 0 });
+            assert_eq!(used.metadata, 1 + usize::from(enough));
+            let selected = endpoint
+                .sender
+                .pending_output()
+                .ok_or("physical original")?
+                .id();
+            assert_eq!(
+                selected,
+                scheduler::OutputId::Source(rolling::SourceId(first.0 + 1))
+            );
+            // The same physical owner cannot admit or charge the sealed source twice.
+            assert_eq!(
+                endpoint.continue_targeted_send(now, grant)?,
+                rolling::WorkUsed::default()
+            );
+            if !enough {
+                endpoint.step(now, work())?;
+            }
+            for next in first.0 + 1..id {
+                assert_eq!(
+                    endpoint
+                        .sender
+                        .pending_output()
+                        .ok_or("queued output")?
+                        .id(),
+                    scheduler::OutputId::Source(rolling::SourceId(next))
+                );
+                endpoint
+                    .sender
+                    .confirm_output(scheduler::OutputId::Source(rolling::SourceId(next)), at)?;
+                endpoint.step(now, work())?;
+            }
+            let Some(scheduler::Output::Source {
+                id: actual,
+                original,
+                ..
+            }) = endpoint.sender.pending_output()
+            else {
+                return Err("sealed source missing".into());
+            };
+            assert_eq!((actual.0, original), (id, &expected[..n]));
+            let deadline =
+                endpoint.sender.expiry_snapshot().candidates[3].ok_or("output deadline")?;
+            assert_eq!(
+                deadline.at.0,
+                created.0 + cfg.forward.scheduler.recovery.job_ticks
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn targeted_physical_continuation_charges_exact_fifo_transfer_once() -> TestResult {
     let mut cfg = config(true, rolling::wire::SourceWire::TargetedExact);
     cfg.forward.scheduler.repair_numerator = 0;

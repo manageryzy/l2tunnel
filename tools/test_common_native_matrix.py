@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Unprivileged contract checks for the Common native matrix harness."""
 import argparse
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from contextlib import ExitStack
 import io
 import json
@@ -51,6 +51,81 @@ def pcap(packets):
 
 
 class MatrixTests(unittest.TestCase):
+    def test_fq_duplicate_auxiliary_statistics_preserve_kernel_drop_evidence(self):
+        link = '[{"ifname":"tun0","txqlen":768,"stats64":{"tx":{"packets":17,"bytes":1024,"dropped":2,"errors":0}}}]'
+        raw = '[{"kind":"fq","drops":3,"throttled":4,"throttled":18}]'
+        case = SimpleNamespace(value={'requested_native_tun_txqueuelen': 768},
+                               command=lambda _, tool, *args: link if tool == 'ip' else raw)
+        actual = matrix.native_tun_snapshot(case, 'endpoint_a')
+        self.assertEqual(actual['qdisc'], [{'kind': 'fq', 'drops': 3}])
+        raw = '[{"kind":"fq","drops":3,"drops":4}]'
+        with self.assertRaisesRegex(ValueError, 'duplicate native tun0 qdisc field'):
+            matrix.native_tun_snapshot(case, 'endpoint_a')
+
+    def test_owned_tun_txqueuelen_and_distinct_device_qdisc_drops(self):
+        tx = {'bytes': 42000, 'packets': 31, 'errors': 0, 'dropped': 27}
+        native_qdisc = [{'kind': 'fq', 'handle': '1:', 'root': True, 'drops': 0}]
+        for requested, effective in ((None, 500), (640, 640), (640, 500)):
+            with self.subTest(requested=requested, effective=effective), ExitStack() as stack:
+                commands = []
+                maxrate = 82 if requested is not None else None
+
+                def command(role, *argv):
+                    commands.append((role, argv))
+                    if argv == ('ip', '-j', '-s', 'link', 'show', 'dev', 'tun0'):
+                        return json.dumps([{'ifname': 'tun0', 'txqlen': effective, 'stats64': {'tx': tx}}])
+                    if argv == ('tc', '-s', '-d', '-j', 'qdisc', 'show', 'dev', 'tun0'):
+                        if maxrate is not None and role == 'endpoint_a':
+                            return json.dumps([dict(native_qdisc[0], options={'maxrate': 10250000, 'limit': 10240, 'flow_limit': 1024})])
+                        return json.dumps(native_qdisc)
+                    if argv == ('tc', '-d', 'qdisc', 'show', 'dev', 'wan0'):
+                        return 'delay 35ms loss 15%'
+                    return ''
+
+                case = SimpleNamespace(spec=matrix.lab.LabSpec('tun-test'), deadline=0, command=command,
+                                       value={'requested_native_tun_txqueuelen': requested,
+                                              'requested_native_forward_tun_maxrate_mbit': maxrate}, save=lambda: None)
+                for target, name, value in ((matrix.bounded, 'bounded_lab', None), (matrix.bounded, 'offloads', {}),
+                                             (matrix, 'read_json', {}), (matrix, 'parse_tc_class', ([], 'test')),
+                                             (matrix, 'parse_tc_qdisc', [])):
+                    stack.enter_context(patch.object(target, name, return_value=value))
+                if requested and effective != requested:
+                    with self.assertRaisesRegex(ValueError, 'differs from request'):
+                        matrix.topology(case, Path('/unused'))
+                else:
+                    matrix.topology(case, Path('/unused'))
+                changes = [role for role, argv in commands if 'txqueuelen' in argv]
+                self.assertEqual(changes, [] if requested is None else ['endpoint_a', 'endpoint_b'])
+                replacements = [(role, cmd) for role, cmd in commands if cmd[:3] == ('tc', 'qdisc', 'replace')]
+                self.assertEqual(replacements, [] if maxrate is None else [('endpoint_a', ('tc', 'qdisc', 'replace',
+                    'dev', 'tun0', 'root', 'fq', 'limit', '10240', 'flow_limit', '1024', 'maxrate', '82mbit'))])
+                for side, report in case.value['qdisc_before'].items():
+                    snap = report['native_tun']
+                    self.assertEqual((snap['requested_txqueuelen'], snap['effective_txqueuelen']), (requested, effective))
+                    self.assertEqual((snap['tx'], snap['qdisc']), (tx, native_qdisc))
+                    shaped = side == 'a' and maxrate is not None
+                    self.assertEqual(snap['requested_fq_maxrate_mbit'], 82 if shaped else None)
+                    self.assertEqual(snap['effective_root_fq'], {'limit': 10240, 'flow_limit': 1024,
+                                     'maxrate_bytes_per_second': 10250000, 'maxrate_bits_per_second': 82000000} if shaped else {})
+                if maxrate is not None:
+                    fq = case.value['qdisc_before']['a']['native_tun']['effective_root_fq']
+                    for key in ('maxrate_bits_per_second', 'flow_limit', 'limit'):
+                        with patch.dict(fq, {key: fq[key] - 1}), self.assertRaisesRegex(ValueError, 'differ from request'):
+                            matrix.check_forward_tun_fq(case, case.value['qdisc_before'])
+                for side in ('a', 'b'):
+                    if requested is not None:
+                        self.assertIn(('endpoint_' + side, ('ip', 'link', 'set', 'tun0', 'mtu', '1500',
+                                                            'txqueuelen', str(requested), 'up')), commands)
+        for invalid in ('0', str(matrix.MAX_TUN_TXQUEUELEN + 1)):
+            with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                matrix.main(['--manifest', '/unused', '--binary', '/unused', '--output', '/unused',
+                             '--native-tun-txqueuelen', invalid])
+
+        for invalid in ('0', '101'):
+            with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                matrix.main(['--manifest', '/unused', '--binary', '/unused', '--output', '/unused',
+                             '--native-forward-tun-maxrate-mbit', invalid])
+
     def deferred_case(self, root, failure=None):
         """Exercise the actual case coordinator with owned-I/O test doubles."""
         output, secrets, state = root / 'output', root / 'secrets', root / 'state'
@@ -326,8 +401,12 @@ class MatrixTests(unittest.TestCase):
             with patch.object(matrix.os, 'sched_getaffinity', return_value=set(range(32))), patch.object(matrix.os, 'sched_setaffinity') as changed:
                 output = io.StringIO()
                 with redirect_stdout(output):
-                    self.assertEqual(matrix.main([*base, '--parallel-lane', 'udp', '--lab-id', 'cm-udp']), 0)
-                self.assertEqual(json.loads(output.getvalue())['cpu_affinity'], list(range(8)))
+                    self.assertEqual(matrix.main([*base, '--parallel-lane', 'udp', '--lab-id', 'cm-udp',
+                                                  '--native-tun-txqueuelen', '640', '--native-forward-tun-maxrate-mbit', '82']), 0)
+                plan = json.loads(output.getvalue())
+                self.assertEqual(plan['cpu_affinity'], list(range(8)))
+                self.assertEqual(plan['requested_native_tun_txqueuelen'], 640)
+                self.assertEqual(plan['requested_native_forward_tun_maxrate_mbit'], 82)
                 changed.assert_not_called()
                 self.assertFalse((root / 'output').exists())
                 with self.assertRaisesRegex(ValueError, 'only its carrier'):

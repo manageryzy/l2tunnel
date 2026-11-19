@@ -43,6 +43,8 @@ PHASES = ('forward', 'reverse', 'simultaneous')
 BOUNDS = {'case_seconds': 300, 'startup_seconds': 40, 'command_seconds': 10,
           'phase_seconds': 60, 'cleanup_seconds': 30, 'log_bytes': 16 * 1024 * 1024}
 MANIFEST_BYTES = 4 * 1024 * 1024
+MAX_TUN_TXQUEUELEN = 8192
+MAX_FORWARD_TUN_MBIT = 100
 FIXED_CLI = {'--carrier', '--record-profile', '--duplex', '--compression', '--layer',
              '--max-packet', '--max-path-mtu', '--noise-profile', '--udp-bind', '--udp-peer',
              '--udp-cover', '--raw-mark'}
@@ -190,13 +192,15 @@ def exclusive_lab(lane=None):
 
 
 class Case:
-    def __init__(self, row, spec, output):
+    def __init__(self, row, spec, output, *, native_tun_txqueuelen=None, native_forward_tun_maxrate_mbit=None):
         self.row, self.spec, self.output = row, spec, output
         self.deadline = time.monotonic() + BOUNDS['case_seconds']
         self.children, self.commands = [], []
         self.command_index = 0
         self.value = {'version': 1, 'id': row['id'], 'row': row, 'status': 'running', 'stage': 'preflight',
-                      'bounds': BOUNDS, 'phases': [], 'started_wall_ns': time.time_ns(), 'commands': self.commands}
+                      'bounds': BOUNDS, 'phases': [], 'started_wall_ns': time.time_ns(), 'commands': self.commands,
+                      'requested_native_tun_txqueuelen': native_tun_txqueuelen,
+                      'requested_native_forward_tun_maxrate_mbit': native_forward_tun_maxrate_mbit}
         self.save()
 
     def save(self):
@@ -320,6 +324,8 @@ def topology(case, state_dir):
     bounded.bounded_lab(lab.apply, case.spec, state_dir, case.deadline)
     case.value['namespace_journal'] = read_json(state_dir / (case.spec.lab_id + '.json'), MANIFEST_BYTES)
     offloads = {}
+    requested = case.value['requested_native_tun_txqueuelen']
+    options = [] if requested is None else ['txqueuelen', str(requested)]
     for role in case.spec.namespaces:
         case.command(role, 'sysctl', '-q', '-w', 'net.ipv6.conf.all.disable_ipv6=1', 'net.ipv6.conf.default.disable_ipv6=1')
     for side in ('a', 'b'):
@@ -330,12 +336,80 @@ def topology(case, state_dir):
         case.command('host_' + side, 'ip', 'link', 'set', 'eth0', 'down')
         case.command(role, 'ip', 'tuntap', 'add', 'dev', 'tun0', 'mode', 'tun')
         case.command(role, 'ip', 'address', 'add', NATIVE[side] + '/24', 'dev', 'tun0')
-        case.command(role, 'ip', 'link', 'set', 'tun0', 'mtu', '1500', 'up')
+        case.command(role, 'ip', 'link', 'set', 'tun0', 'mtu', '1500', *options, 'up')
+    maxrate = case.value.get('requested_native_forward_tun_maxrate_mbit')
+    if maxrate is not None:
+        case.command('endpoint_a', 'tc', 'qdisc', 'replace', 'dev', 'tun0', 'root', 'fq', 'limit', '10240',
+                     'flow_limit', '1024', 'maxrate', f'{maxrate}mbit')
     for role, interface in [('endpoint_a', 'wan0'), ('endpoint_b', 'wan0'), ('router', 'a0'), ('router', 'b0'), ('endpoint_a', 'tun0'), ('endpoint_b', 'tun0')]:
         offloads[role + '/' + interface] = bounded.offloads(case.spec.namespaces[role], interface, case.deadline)
     case.value['offloads'] = offloads
     case.value['qdisc_before'] = qdisc(case)
     case.save()
+    check_forward_tun_fq(case, case.value['qdisc_before'])
+    if requested is not None:
+        require(all(side['native_tun']['effective_txqueuelen'] == requested
+                    for side in case.value['qdisc_before'].values()),
+                'effective owned tun0 txqueuelen differs from request')
+
+
+def check_forward_tun_fq(case, sides):
+    requested = case.value.get('requested_native_forward_tun_maxrate_mbit')
+    if requested is not None:
+        fq = sides['a']['native_tun']['effective_root_fq']
+        require(fq is not None and fq.get('maxrate_bits_per_second') == requested * 1_000_000
+                and fq.get('limit') == 10240 and fq.get('flow_limit') == 1024,
+                'effective endpoint_a tun0 root fq limits or maxrate differ from request')
+
+
+def qdisc_fields(pairs, fields):
+    require(isinstance(pairs, tuple), 'invalid native tun0 qdisc object')
+    selected = {}
+    for key, value in pairs:
+        if key in fields:
+            require(key not in selected, 'duplicate native tun0 qdisc field: ' + key)
+            selected[key] = value
+    return selected
+
+
+def native_tun_snapshot(case, role):
+    begin = time.time_ns()
+    links = bounded.strict_json(case.command(role, 'ip', '-j', '-s', 'link', 'show', 'dev', 'tun0'))
+    require(isinstance(links, list) and len(links) == 1 and links[0].get('ifname') == 'tun0',
+            'expected the owned tun0 link')
+    link = links[0]
+    tx = link.get('stats64', link.get('stats', {})).get('tx', {})
+    require(type(link.get('txqlen')) is int and link['txqlen'] >= 0
+            and all(type(tx.get(k)) is int and tx[k] >= 0 for k in ('packets', 'bytes', 'dropped', 'errors')),
+            'missing native tun0 queue length or TX counters')
+    raw_qdisc = case.command(role, 'tc', '-s', '-d', '-j', 'qdisc', 'show', 'dev', 'tun0')
+    # Some iproute2 FQ versions emit two distinct statistics as "throttled".
+    # Select the fields used for queue counters and FQ configuration. The raw output stays in the command log.
+    rows = json.loads(raw_qdisc, object_pairs_hook=tuple)
+    require(isinstance(rows, list), 'invalid native tun0 qdisc list')
+    qdiscs = []
+    root_fq = None
+    fields = {'kind', 'handle', 'parent', 'root', 'options', 'drops', 'packets', 'bytes',
+              'overlimits', 'requeues', 'backlog', 'qlen'}
+    for pairs in rows:
+        row = qdisc_fields(pairs, fields)
+        options = row.pop('options', ())
+        if row.get('root') is True and row.get('kind') == 'fq':
+            require(root_fq is None, 'multiple root fq qdiscs on native tun0')
+            root_fq = qdisc_fields(options, {'limit', 'flow_limit', 'maxrate'})
+            require(all(type(v) is int and v >= 0 for v in root_fq.values()), 'invalid native tun0 fq option')
+            if 'maxrate' in root_fq:
+                # iproute2 emits its numeric JSON rate in bytes per second.
+                root_fq['maxrate_bytes_per_second'] = root_fq.pop('maxrate')
+                root_fq['maxrate_bits_per_second'] = root_fq['maxrate_bytes_per_second'] * 8
+        qdiscs.append(row)
+    require(isinstance(qdiscs, list) and qdiscs and all(isinstance(q, dict) and q.get('kind')
+            and type(q.get('drops')) is int and q['drops'] >= 0 for q in qdiscs), 'missing native tun0 qdisc counters')
+    return {'interface': 'tun0', 'requested_txqueuelen': case.value['requested_native_tun_txqueuelen'],
+            'effective_txqueuelen': link['txqlen'], 'tx': tx, 'qdisc': qdiscs,
+            'requested_fq_maxrate_mbit': case.value.get('requested_native_forward_tun_maxrate_mbit') if role == 'endpoint_a' else None,
+            'effective_root_fq': root_fq,
+            'begin_wall_ns': begin, 'end_wall_ns': time.time_ns()}
 
 
 def qdisc(case):
@@ -360,7 +434,7 @@ def qdisc(case):
             'end_wall_ns': time.time_ns(),
         }
         result[side] = {'class': classes, 'class_format': class_format, 'qdisc': qdiscs,
-                        'qdisc_text': text, 'kernel_buffers': kernel_buffers}
+                        'qdisc_text': text, 'kernel_buffers': kernel_buffers, 'native_tun': native_tun_snapshot(case, role)}
     return result
 
 
@@ -621,6 +695,7 @@ def phase(case, name, binary, secrets, daemons):
     sample_wall = None
     try:
         result['qdisc_before'] = qdisc(case)
+        check_forward_tun_fq(case, result['qdisc_before'])
         for side in ('a', 'b'):
             for kind, interface, addresses in [('wan', 'wan0', list(WAN.values())), ('native', 'tun0', list(NATIVE.values()))]:
                 label = name + '-' + side + '-' + kind
@@ -717,6 +792,7 @@ def phase(case, name, binary, secrets, daemons):
         stop_captures(case, result, captures, sample_wall, cleanup_deadline)
         try:
             result['qdisc_after'] = qdisc(case)
+            check_forward_tun_fq(case, result['qdisc_after'])
         except Exception as error:
             result['qdisc_error'] = str(error)
             if result['status'] == 'passed':
@@ -748,7 +824,8 @@ def run_case(row, ordinal, args, binary, inputs, secrets, state_dir):
     spec = lab.LabSpec(args.lab_id + '-' + str(ordinal))
     output = args.output / row['id']
     output.mkdir()
-    case = Case(row, spec, output)
+    case = Case(row, spec, output, native_tun_txqueuelen=getattr(args, 'native_tun_txqueuelen', None),
+                native_forward_tun_maxrate_mbit=getattr(args, 'native_forward_tun_maxrate_mbit', None))
     case.paced_c48 = getattr(args, 'packed_c48_workload', False)
     case.value['selected_phases'] = args.phases
     created = False
@@ -849,12 +926,20 @@ def main(argv=None):
     parser.add_argument('--case', action='append', default=[])
     parser.add_argument('--phase', action='append', choices=PHASES, help='Run only these independent phases; default all three')
     parser.add_argument('--lab-id', default='cmatrix')
+    parser.add_argument('--native-tun-txqueuelen', type=int, metavar='PACKETS',
+                        help=f'Set transmit queue length on both owned tun0 interfaces (1..{MAX_TUN_TXQUEUELEN} packets); default uses the system setting')
+    parser.add_argument('--native-forward-tun-maxrate-mbit', type=int, metavar='MBIT',
+                        help=f'Set root fq per-flow maxrate on owned endpoint_a/tun0 (1..{MAX_FORWARD_TUN_MBIT} Mbit/s)')
     parser.add_argument('--parallel-lane', choices=('udp', 'raw', 'tls', 'quic'),
                         help='Explicit concurrent carrier lane; fixed eight-CPU affinity and distinct owned lab prefix required')
     parser.add_argument('--apply', action='store_true')
     parser.add_argument('--packed-c48-workload', action='store_true',
                         help='Offer 512-byte timestamped application records at aggregate 76 Mbit/s on 16 CUBIC flows')
     args = parser.parse_args(argv)
+    if args.native_tun_txqueuelen is not None and not 1 <= args.native_tun_txqueuelen <= MAX_TUN_TXQUEUELEN:
+        parser.error(f'--native-tun-txqueuelen must be within 1..{MAX_TUN_TXQUEUELEN} packets')
+    if args.native_forward_tun_maxrate_mbit is not None and not 1 <= args.native_forward_tun_maxrate_mbit <= MAX_FORWARD_TUN_MBIT:
+        parser.error(f'--native-forward-tun-maxrate-mbit must be within 1..{MAX_FORWARD_TUN_MBIT} Mbit/s')
     args.phases = list(dict.fromkeys(args.phase or PHASES))
     require(not args.packed_c48_workload or args.phases == ['forward'], 'paced C48 probe requires --phase forward')
     require(re.fullmatch('[a-z][a-z0-9-]{0,14}', args.lab_id), 'lab prefix must fit owned namespace names')
@@ -873,6 +958,8 @@ def main(argv=None):
         if args.apply:
             os.sched_setaffinity(0, chosen)
     plan = {'version': 1, 'status': 'planned', 'manifest': str(args.manifest), 'manifest_sha256': file_hash(args.manifest),
+            'requested_native_tun_txqueuelen': args.native_tun_txqueuelen,
+            'requested_native_forward_tun_maxrate_mbit': args.native_forward_tun_maxrate_mbit,
             'binary': str(args.binary), 'rows': rows, 'bounds': BOUNDS, 'phases': args.phases,
             'flows_per_phase': 16, 'warmup_seconds': 2, 'sample_seconds': 10,
             'workload': 'paced 512-byte TCP application records, 76 Mbit/s aggregate' if args.packed_c48_workload else 'saturating native TCP',

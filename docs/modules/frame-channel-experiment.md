@@ -1659,3 +1659,176 @@ This run demonstrates that removing the probe cap alone does not guarantee
 80 Mbit/s. The samples do not establish an optimal credit setting.
 [Socket observations, checksums and per-attempt lifecycle results](../../work/c48-parity-20261119/native/near8-single-tcp-credit-20261119/single-flow-summary.json)
 and [sender gap with its adjacent socket observations](../../work/c48-parity-20261119/native/near8-single-tcp-credit-20261119/nonbinding-sender-gap.json).
+
+### Sender TUN loss before Packed source assignment
+
+The two original single-flow gaps can be identified by TCP sequence number,
+IPv4 ID, TCP timestamp and payload hash. Times are milliseconds from the
+start of the ten-second measurement on the common capture clock. The
+out-of-order hold starts when B first saw later bytes.
+
+| Offer (Mbit/s) | TCP sequence | IPv4 ID | Original at A | TCP retry at A | Matching retry at B | Covering ACK at A | Out-of-order hold at B |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 76 | 22,847,427 | 60,000 | 6,932.121 | 7,356.007 | 7,664.582 | 7,707.428 | 347.550 |
+| 90 | 4,172,841,251 | 31,246 | 6,171.802 | 6,547.690 | 6,855.734 | 6,893.417 | 441.506 |
+
+A full comparison finds 59 and 119 original 1,448-byte TCP transmissions
+missing at B. Every missing payload arrived on a later TCP transmission.
+All other forward data transmissions match in order. A's count of accepted
+native packets, B's count of written native packets and the complete
+forward B capture including control are equal at 56,244 and 53,082.
+A's native captures have 59 and 119 more packets than those counts.
+A reported zero oversize, refused or outstanding native input at shutdown.
+These totals and packet identities locate the loss before A's recovery layer.
+A missing native input has no Packed source ID, equation membership or named
+retry timer. Higher TCP sequence numbers can still traverse the tunnel under
+consecutive outer source numbers. The surviving inner TCP retry takes a new
+trip through the sender. The original encrypted captures cannot identify
+which outer copy carried that retry. [Original packet, payload and admission
+reconciliation](../../work/c48-parity-20261119/native/near8-single-tcp-credit-20261119/original-custody.json).
+
+On the Ubuntu 6.8.0-60.63 kernel the packet tap sees a transmitted packet
+before the TUN driver enqueues it for the userspace reader. A full reader
+ring increments the device TX drop counter and frees the packet with reason
+`FULL_RING`. The two original runs did not record this kernel reason. In a
+separate reproduction with a deliberately small 64-slot ring, the sender
+namespace trace recorded 257 such drops, with zero lost trace events. Each
+sequence and length matched an A-only packet fingerprint. All 257 payloads
+subsequently arrived at B on an inner retransmission. The device counted
+257 drops and its qdisc counted zero. A separate reader-paused fixture sent
+619 numbered datagrams in a private namespace. A 500-slot ring lost the last
+119 and a 640-slot ring delivered all 619. [Kernel TUN enqueue and drop
+path](https://github.com/torvalds/linux/blob/v6.8/drivers/net/tun.c#L1133-L1155),
+[per-segment kernel trace](../../work/c48-parity-20261119/native/single-gap-custody-20261119/trace76/sender-drop-join.json)
+and [controlled reader fixture](../../work/c48-parity-20261119/native/single-gap-custody-20261119/ring-fixture.json).
+
+An independent bottleneck was visible in two same-release controls with the
+system's 500-slot ring. Device drops and inner TCP retransmissions were zero
+in both. Linux CUBIC recorded one delay-triggered HyStart exit per connection,
+at 73 and 75 MSS, within the first half-second. The corresponding effective
+congestion windows after two seconds were 208,512 and 230,232 bytes. The
+Python seed-one controller reached 4 MiB in both arms. Forward TUN-to-TUN
+median latency during the first half-second was 109.6 and 111.9 ms.
+At B, the median delay from delivery to the covering TCP ACK was 0.028 and
+0.021 ms. That ACK then took 36.7 and 36.6 ms to return. A change in the
+4 MiB application credit would not remove this measured forward delay.
+[76 Mbit/s control](../../work/c48-parity-20261119/native/single-gap-custody-20261119/base76/measured.json)
+and [90 Mbit/s control](../../work/c48-parity-20261119/native/single-gap-custody-20261119/base90/measured.json).
+
+In the uninstrumented 768-slot control at 90 Mbit/s offered, 96 original
+1,448-byte payloads each matched a sender `FULL_RING` event. All 96 matched
+a retransmission at B, with no unmatched B payload and zero qdisc drops.
+A bounded larger ring moves the overflow threshold. For one 640-slot trial,
+the 50 ms before the first drop already contained 414 packets at 99.36 Mbit/s.
+The thread ran for 87.2 ms of the enclosing 100.2 ms. These samples cannot
+attribute a particular drop to a scheduler stall.
+[768-slot per-segment join](../../work/c48-parity-20261119/native/single-gap-custody-20261119/owned90/sender-drop-join.json)
+and [640-slot burst and admission accounting](../../work/c48-parity-20261119/native/single-gap-custody-20261119/paced90/burst-accounting.json).
+
+A separate instrumented 76 Mbit/s transfer joined all 395 forward startup
+segments in the first 500 ms. The P99 from A TUN to the physical handoff of
+all sources of a segment was 2.669 ms. A TUN to B TUN P99 was 117.839 ms.
+Two examples distinguish paid forward repair from actual possession of
+enough independent equations at B.
+
+| TCP sequence / IPv4 ID | Packed sources | Earliest event that made the last source recoverable at B |
+| --- | --- | --- |
+| 2,456,959,740 / 14,807 | 181, 183 | Source 181 arrived on its first handoff. Source 183's first handoff was absent at both WAN taps. B named it at +340.801 ms. A received the request at +375.947 ms and handed off packet 382 at +375.994 ms. B could solve at +411.076 ms and committed 46 µs later. |
+| 2,456,914,852 / 14,776 | 143, 144 | Source 144 arrived first. Source 143's first two handoffs were absent at both WAN taps. Sixteen ordinary rows covering 143 arrived. An exact GF(256) replay first uniquely determined 143 when the named retry of source 190 arrived at +411.318 ms. The decoder committed 143 41 µs later. |
+
+Times in these two examples are relative to the new workload's start.
+Neither eight-source group emitted an optional near8 row. Each lacked
+only its named source on first transmission. A timely received group row
+would have supplied the missing degree of freedom. A different group lost
+four first transmissions. The first near8 handoff in this run was for group
+38 at +411.923 ms. The current gate requires four qualifying 100 ms intervals.
+Of the 395 startup segments, 179 spent at least 50 ms waiting for native
+preparation after all of their own Aligned units had arrived. During the
+ten-second measurement, the corresponding wait was 246.944 ms at P99 and
+the time to hand off all original sources was 157.732 ms at P99. These
+percentiles describe different distributions and cannot be added.
+[Source identities, physical packet numbers, named requests, replay and clock checks](../../work/c48-parity-20261119/native/single-gap-custody-20261119/diag76/source-custody.json).
+
+### Bounded sender handoff and native ingress pacing
+
+The Rust sender now retries an already encoded source when its full fresh
+FIFO gains a slot during the same sender step and the remaining work grant
+can pay for the copy. The same rule applies after a physical receipt. The
+original source deadline, byte contents, retry priority and FIFO order are
+retained. A focused regression reproduces the old one-slot delay and checks
+both call sites at the exact byte and metadata boundaries.
+[Sender implementation](../../crates/l2tunnel/src/rolling_records/endpoint.rs)
+and [grant and ordering regression](../../crates/l2tunnel/src/rolling_records/targeted_scheduling_tests.rs).
+
+The following Linux results used one CUBIC connection, 4 MiB of outstanding
+application credit, 512-byte writes, two seconds of warmup and ten seconds of
+measurement at 100/10 Mbit/s, 70 ms propagation RTT and 15% loss per
+direction. Each cell is one draw. The two P99 columns include the drain and
+start at first attempted application write and at scheduled offer, respectively.
+The 82 Mbit/s setting paced the TCP flow at the sender's native TUN, upstream
+of the separate 100 Mbit/s WAN qdisc. This is an explicit local intervention.
+
+| Binary and native TUN settings | Offer Mbit/s | Goodput Mbit/s | First-write P99 ms | Scheduled P99 ms | A TUN TX drops |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Prior release, system ring (500) | 76 | 43.09 | 2,215.95 | 6,297.36 | 0 |
+| Prior release, system ring (500) | 90 | 44.29 | 2,256.47 | 6,996.22 | 0 |
+| Prior release, 768 slots | 76 | 54.00 | 1,373.28 | 4,432.85 | 0 |
+| Prior release, 768 slots | 90 | 58.19 | 1,192.03 | 5,093.68 | 96 |
+| Same-step handoff, 768 slots | 76 | 62.40 | 870.74 | 3,134.33 | 541 |
+| Same-step handoff, 768 slots | 90 | 34.07 | 3,646.17 | 8,299.00 | 0 |
+| Prior release, 768 slots and 82 Mbit/s native pacing | 76 | 54.10 | 1,416.04 | 4,439.21 | 0 |
+| Prior release, 768 slots and 82 Mbit/s native pacing | 90 | 65.64 | 716.29 | 3,917.16 | 0 |
+| Same-step handoff, 768 slots and 82 Mbit/s native pacing | 76 | 62.93 | 850.85 | 2,936.67 | 0 |
+| Same-step handoff, 768 slots and 82 Mbit/s native pacing | 90 | 59.43 | 1,005.23 | 4,837.46 | 0 |
+| Python v6/v5 seed one | 76 | 75.99 | 285.82 | 877.72 | N/A |
+| Python v6/v5 seed one | 90 | 77.46 | 482.82 | 2,435.79 | N/A |
+
+All ten Linux workload cells above verified the stream hashes and drained to
+two consecutive 0/0 source counts. The 541 dropped transmission attempts in
+the 76 Mbit/s unpaced candidate all correspond to kernel full-ring events.
+B received 539 payloads with identical segment boundaries. Linux combined
+the other two adjacent 512-byte payloads into a single 1,024-byte retry.
+The two scheduling entry points pass their functional regression. These
+measurements do not establish a repeatable gain in single-flow goodput.
+All four 82 Mbit/s paced cells had zero device drops and zero sampled inner
+TCP retransmitted bytes. Single-flow throughput and latency parity remain
+open. [Byte-exact resegmentation check](../../work/c48-parity-20261119/native/single-gap-custody-20261119/edge76/resegmentation.json).
+
+A repeat using the matrix's normal `--native-tun-txqueuelen 768
+--native-forward-tun-maxrate-mbit 82` entry verified the effective sender
+rate of 10,250,000 bytes/s in the kernel. It delivered 67.26 and 55.82 Mbit/s
+at the 76 and 90 Mbit/s offers, with first-write P99s of 843.38 and
+1,213.80 ms and scheduled P99s of 2,320.41 and 5,449.69 ms. Both native TUN
+captures matched the opposite endpoint's data with zero missing packets and
+zero kernel full-ring events. Two earlier observation attempts failed before
+measurement because the installed iproute2 emits two unrelated FQ statistics
+under the name `throttled`. The matrix now obtains the generic counters and
+the effective root FQ parameters separately and rejects duplicated drop
+counts. [All attempts, release hashes, effective settings and drain](../../work/c48-parity-20261119/native/single-gap-custody-20261119/comparison.json).
+
+A research-only sender also allowed short forward repair for the first
+400 ms after the first complete group of eight original physical handoffs.
+Starting at the session's very first physical source would have ended the
+window 264.830 ms before bulk traffic in the diagnostic transfer. Group one
+completed 1.252 ms into bulk traffic. The temporary rule retained the
+instantaneous eight-MTU backlog check, paid repair budget, physical confirmation
+and old-gap priorities. Both Linux arms below used the same owned FQ and ring
+settings as the repeat above. Python used its existing single-flow controller
+and seed one. Each startup-only byte total counts accepted IP bytes.
+
+| Research sender | Offer Mbit/s | Goodput Mbit/s | First-write P99 ms | Scheduled P99 ms | Startup-only rows / IP bytes |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Linux, isolated release | 76 | 51.49 | 1,589.92 | 4,823.15 | 11 / 14,397 |
+| Linux, isolated release | 90 | 63.49 | 827.85 | 4,603.62 | 11 / 14,397 |
+| Python | 76 | 75.86 | 271.13 | 746.53 | 35 / 38,242 |
+| Python | 90 | 77.79 | 460.20 | 2,362.43 | 24 / 26,219 |
+
+Both Linux trials had zero device drops, zero sampled inner retransmitted bytes,
+matched stream hashes and bilateral drain. Early repair improved native latency
+and throughput in the 90 Mbit/s draw and worsened both in the 76 Mbit/s draw.
+This does not qualify a new default or negotiated production profile. The
+build, tests and measurements remain an isolated research result.
+[Research source and release](../../work/c48-parity-20261119/native/single-gap-custody-20261119/startup-rust/build.json),
+[Linux startup charges at 76](../../work/c48-parity-20261119/native/single-gap-custody-20261119/grp76/startup-paid.json)
+and [90 Mbit/s](../../work/c48-parity-20261119/native/single-gap-custody-20261119/grp90/startup-paid.json),
+and [matched Python experiment](../../work/c48-parity-20261119/python/single-flow-near8-first-group-400ms-seed1/gate-comparison.json).

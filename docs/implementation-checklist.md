@@ -1219,3 +1219,9 @@ FIX-04 and TEST-12 also require forward application goodput on one inner TCP
 connection at the 80 Mbit/s target. The sixteen-flow aggregate remains a
 separate comparison. The [single-connection credit study](modules/frame-channel-experiment.md#single-tcp-connection-and-outstanding-payload-credit)
 tracks the payload credit, kernel TCP windows and recovery behavior for this gate.
+The [sender TUN loss and single-flow retest](modules/frame-channel-experiment.md#sender-tun-loss-before-packed-source-assignment)
+locates both historical gaps before source assignment. The owned Linux
+matrix records device TX drops separately from qdisc drops and accepts a
+bounded native ring depth and optional per-flow pacing on the sender TUN.
+The [same-step source handoff and measurements](modules/frame-channel-experiment.md#bounded-sender-handoff-and-native-ingress-pacing)
+cover the sender grant boundary and the independent single-flow performance gate.

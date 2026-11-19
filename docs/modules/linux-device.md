@@ -33,3 +33,23 @@ native device support. Native privileges are verified by the caller at runtime.
 - [ ] [MOD-LNX-05] Implement runtime device lifecycle, cancellation, multiqueue policy and native cleanup receipts.
 
 Reference: [Linux TUN/TAP](https://docs.kernel.org/networking/tuntap.html).
+
+For a Linux TUN transmitting local IP packets to its userspace reader,
+Linux can drop packets at a full device TX ring after a TUN packet capture
+has seen them. The interface owner controls this bounded ring with
+`ip link set dev <name> txqueuelen <packets>`. Size is in packets.
+The Common native matrix accepts `--native-tun-txqueuelen` when provisioning
+its two owned devices. The receipt records the requested and effective sizes,
+the device TX packet and drop counts, and the separate TUN qdisc statistics
+before and after the workload. Omitting the option uses the system setting.
+A greater depth can absorb a larger burst and can increase residence time.
+[Single-flow packet and latency evidence](frame-channel-experiment.md#sender-tun-loss-before-packed-source-assignment).
+
+The optional `--native-forward-tun-maxrate-mbit 82` in the Common native
+matrix installs Linux FQ on the owned sender TUN with a per-flow maximum of
+82 Mbit/s. The matrix verifies the requested rate against the kernel's
+numeric bytes/s readback, as well as the total and per-flow queue limits.
+Each phase retains the effective settings for both TUN interfaces. In the
+single-flow experiment this paced the producer before the TUN reader ring
+while the WAN remained at 100/10 Mbit/s. Actual throughput and the resulting
+queue delay depend on service at the downstream tunnel.

@@ -94,6 +94,13 @@ pub(super) struct ConstructionOptions {
     pub(super) framing: Option<OutputFraming>,
 }
 
+#[derive(Clone, Copy)]
+struct EncodedSource {
+    id: rolling::SourceId,
+    bytes: usize,
+    blocked_on_full_fresh_fifo: bool,
+}
+
 /// One actual directional sender, receiver, compact record stage and record ledger.
 ///
 /// Functional construction preserves the existing conservative contracts.
@@ -121,7 +128,7 @@ pub struct Endpoint<P: RecoveryPolicy = scheduler::Policy> {
     pub(super) source: Vec<u8>,
     // Only pump_send writes this slab. The packer keeps the sealed units
     // immutable until their exact recovery source is admitted and committed.
-    encoded_source: Option<(rolling::SourceId, usize)>,
+    encoded_source: Option<EncodedSource>,
     pub(super) symbols: Vec<u8>,
     pub(super) overhead: usize,
     pub(super) compact_feedback_overhead: Option<usize>,
@@ -579,21 +586,18 @@ impl<P: RecoveryPolicy> Endpoint<P> {
         if !self.packing.has_pending_source() {
             return Ok(());
         }
-        let expected = rolling::SourceId(P::send_state(&self.sender).next_source);
+        let state = P::send_state(&self.sender);
+        let expected = rolling::SourceId(state.next_source);
         let length = match self.encoded_source {
-            Some((id, length)) if id == expected => length,
+            Some(source) if source.id == expected => source.bytes,
             Some(_) => return self.fail(Error::Identity),
-            None => {
-                let length = if self.compact_feedback_overhead.is_some() {
-                    self.packing.write_pending_compact(&mut self.source)
-                } else {
-                    self.packing
-                        .write_pending(receiver::SourceId(u64::from(expected.0)), &mut self.source)
-                }
-                .map_err(Error::Sender)?;
-                self.encoded_source = Some((expected, length));
-                length
+            None => if self.compact_feedback_overhead.is_some() {
+                self.packing.write_pending_compact(&mut self.source)
+            } else {
+                self.packing
+                    .write_pending(receiver::SourceId(u64::from(expected.0)), &mut self.source)
             }
+            .map_err(Error::Sender)?,
         };
         let copies = self.packing.pending_copies().map_err(Error::Sender)?;
         let admitted = self
@@ -634,6 +638,13 @@ impl<P: RecoveryPolicy> Endpoint<P> {
             }
             Ok(_) => self.fail(Error::Identity),
             Err(error @ (rolling::Error::Busy | rolling::Error::Capacity)) => {
+                self.encoded_source = Some(EncodedSource {
+                    id: expected,
+                    bytes: length,
+                    blocked_on_full_fresh_fifo: error == rolling::Error::Busy
+                        && self.send_config.scheduler.targeted()
+                        && state.queued_fresh == state.fresh_queue_limit,
+                });
                 if let Some(waits) = self.waits.first_mut() {
                     let reason = if error == rolling::Error::Busy {
                         waits::Reason::RecoveryBusy
@@ -994,7 +1005,7 @@ impl<P: RecoveryPolicy> Endpoint<P> {
         self.advance(now)?;
         self.pump_send(now)?;
         self.service_ingress(now)?;
-        let send = self.step_sender(now, send_work)?;
+        let send = self.step_sender_with_fresh_handoff(now, send_work)?;
         let (receive, source_handed, native_progress) = self.receive_turn(now, receive_work)?;
         Ok(Step {
             send,
@@ -1022,7 +1033,42 @@ impl<P: RecoveryPolicy> Endpoint<P> {
         if !state.work_pending || P::feedback(&self.incoming).is_some() {
             return Ok(idle);
         }
-        self.step_sender(now, work)
+        self.step_sender_with_fresh_handoff(now, work)
+    }
+
+    fn step_sender_with_fresh_handoff(
+        &mut self,
+        now: Tick,
+        work: rolling::WorkBudget,
+    ) -> Result<rolling::WorkUsed, Error> {
+        let mut used = self.step_sender(now, work)?;
+        let Some(source) = self.encoded_source.as_mut() else {
+            return Ok(used);
+        };
+        // A nonzero copy grant is required to transfer any fresh FIFO head.
+        if !source.blocked_on_full_fresh_fifo || used.copies == 0 {
+            return Ok(used);
+        }
+        let state = P::send_state(&self.sender);
+        if state.queued_fresh == state.fresh_queue_limit {
+            return Ok(used);
+        }
+        source.blocked_on_full_fresh_fifo = false;
+        let bytes = source.bytes;
+        // Admission behind a queued or prepared predecessor copies just the
+        // immutable serialized bytes into a preallocated FIFO slot. An idle
+        // encoder has a different admission cost and keeps its ordinary turn.
+        if (state.queued_fresh > 0 || state.output_ready)
+            && used.metadata < work.metadata
+            && bytes <= work.copies.saturating_sub(used.copies)
+        {
+            self.pump_send(now)?;
+            used.metadata += 1;
+            if self.encoded_source.is_none() {
+                used.copies += bytes;
+            }
+        }
+        Ok(used)
     }
 
     /// Consume queued targeted inputs with this turn's remaining receive grant.
