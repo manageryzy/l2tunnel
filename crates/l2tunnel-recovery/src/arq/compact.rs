@@ -1,5 +1,7 @@
 //! Selected CompactARQ behavior over the same payload and physical-custody owner.
 use super::*;
+mod kcp_like;
+pub use kcp_like::KcpLikeConfig;
 
 /// Explicit v2 source prefix, including the common context.
 pub const COMPACT_DATA_HEADER_BYTES: usize = 52;
@@ -19,6 +21,8 @@ pub enum CompactRecovery {
         /// Positive minimum since any previous feedback output.
         min_interval: Duration,
     },
+    /// Compact framing with explicit KCP-like fast-ACK and timeout rules.
+    KcpLike(KcpLikeConfig),
 }
 impl CompactRecovery {
     fn code(self) -> u8 {
@@ -26,6 +30,7 @@ impl CompactRecovery {
             Self::Guarded => 1,
             Self::FirstFlight => 2,
             Self::BoundedGap { .. } => 3,
+            Self::KcpLike(_) => 4,
         }
     }
 }
@@ -127,6 +132,9 @@ impl CompactArqConfig {
             || matches!(self.recovery, CompactRecovery::BoundedGap { min_interval } if min_interval.is_zero())
         {
             return Err(RecoveryError::InvalidConfig);
+        }
+        if let CompactRecovery::KcpLike(config) = self.recovery {
+            return config.validate();
         }
         seconds_duration(
             (2.0 * self.timing.nominal_rtt.as_secs_f64()
@@ -275,6 +283,7 @@ pub fn inspect_compact_packet<'a>(
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct History {
     serial: u64,
+    source: SourceId,
     accepted: Option<Duration>,
 }
 #[derive(Clone, Copy, Debug, Default)]
@@ -283,6 +292,7 @@ pub(crate) struct Meta {
     serial: u64,
     accepted: Option<Duration>,
     fast: bool,
+    fast_reports: u16,
 }
 #[derive(Debug)]
 pub(crate) struct State {
@@ -292,6 +302,7 @@ pub(crate) struct State {
     metadata: Vec<Meta>,
     history: Vec<Option<History>>,
     sampled: u64,
+    sampled_payment: Option<History>,
     srtt: Option<f64>,
     rttvar: f64,
     last_received_serial: u64,
@@ -356,6 +367,9 @@ impl State {
         [first..first + first_count, 0..count - first_count]
     }
     fn rto_with(&self, srtt: Option<f64>, rttvar: f64) -> Result<Duration, RecoveryError> {
+        if let CompactRecovery::KcpLike(config) = self.send.recovery {
+            return config.estimated_rto(srtt, rttvar);
+        }
         let feedback = 2.0 * self.send.timing.feedback_interval.as_secs_f64();
         seconds_duration(match srtt {
             None => (2.0 * self.send.timing.nominal_rtt.as_secs_f64() + feedback).max(0.02),
@@ -471,6 +485,7 @@ impl CompactRepeat {
             metadata,
             history,
             sampled: 0,
+            sampled_payment: None,
             srtt: None,
             rttvar: 0.0,
             last_received_serial: 0,
@@ -1073,11 +1088,21 @@ impl Engine {
         } else {
             None
         };
-        let srtt = sample.map(|value| value.0).or(state.srtt).unwrap_or(0.0);
-        let guard = seconds_duration(
-            state.send.timing.nominal_rtt.as_secs_f64().max(srtt)
-                + 2.0 * state.send.timing.feedback_interval.as_secs_f64(),
-        )?;
+        let kcp = matches!(state.send.recovery, CompactRecovery::KcpLike(_));
+        let echo_payment = if feedback.echo == state.sampled {
+            state.sampled_payment
+        } else {
+            state.history(feedback.echo)
+        };
+        let guard = if kcp {
+            Duration::ZERO
+        } else {
+            let srtt = sample.map(|value| value.0).or(state.srtt).unwrap_or(0.0);
+            seconds_duration(
+                state.send.timing.nominal_rtt.as_secs_f64().max(srtt)
+                    + 2.0 * state.send.timing.feedback_interval.as_secs_f64(),
+            )?
+        };
         // Preflight every potentially failing guard addition before ACK/RTT mutation.
         for (source, flight) in self.sent.iter() {
             if flight.transmission == 0
@@ -1093,6 +1118,7 @@ impl Engine {
             state.srtt = Some(srtt);
             state.rttvar = variance;
             state.sampled = feedback.echo;
+            state.sampled_payment = echo_payment;
             for range in retired {
                 for entry in &mut state.history[range] {
                     if entry.is_some_and(|entry| entry.serial <= feedback.echo) {
@@ -1124,39 +1150,54 @@ impl Engine {
             .unwrap_or(self.next_source);
         if feedback.serial > state.received_feedback_serial {
             state.received_feedback_serial = feedback.serial;
-            let mut later = feedback
-                .bitmap
-                .iter()
-                .map(|byte| byte.count_ones() as usize)
-                .sum::<usize>();
-            for offset in 0..usize::from(feedback.count) {
-                if feedback.bit(offset) {
-                    later -= 1;
-                    continue;
+            if let CompactRecovery::KcpLike(config) = state.send.recovery {
+                if let Some(payment) = echo_payment.filter(|p| feedback.acknowledges(p.source)) {
+                    for (source, flight) in self.sent.iter() {
+                        if *source < payment.source
+                            && !flight.acknowledged
+                            && flight.transmission == 0
+                        {
+                            state
+                                .meta_mut(*source)
+                                .observe_fast_ack(config, payment, arrival);
+                        }
+                    }
                 }
-                if later < 3 {
-                    continue;
-                }
-                let source = SourceId(feedback.start + offset as u64);
-                let Some(flight) = self.sent.get(&source) else {
-                    continue;
-                };
-                let meta = state.meta(source);
-                if flight.transmission != 0
-                    || flight.acknowledged
-                    || flight.attempts == 0
-                    || feedback.echo <= meta.serial
-                {
-                    continue;
-                }
-                let expedited = !matches!(state.send.recovery, CompactRecovery::Guarded)
-                    && flight.attempts == 1;
-                if expedited
-                    || meta
-                        .accepted
-                        .is_some_and(|at| at.checked_add(guard).is_some_and(|due| arrival >= due))
-                {
-                    state.meta_mut(source).fast = true;
+            } else {
+                let mut later = feedback
+                    .bitmap
+                    .iter()
+                    .map(|byte| byte.count_ones() as usize)
+                    .sum::<usize>();
+                for offset in 0..usize::from(feedback.count) {
+                    if feedback.bit(offset) {
+                        later -= 1;
+                        continue;
+                    }
+                    if later < 3 {
+                        continue;
+                    }
+                    let source = SourceId(feedback.start + offset as u64);
+                    let Some(flight) = self.sent.get(&source) else {
+                        continue;
+                    };
+                    let meta = state.meta(source);
+                    if flight.transmission != 0
+                        || flight.acknowledged
+                        || flight.attempts == 0
+                        || feedback.echo <= meta.serial
+                    {
+                        continue;
+                    }
+                    let expedited = !matches!(state.send.recovery, CompactRecovery::Guarded)
+                        && flight.attempts == 1;
+                    if expedited
+                        || meta.accepted.is_some_and(|at| {
+                            at.checked_add(guard).is_some_and(|due| arrival >= due)
+                        })
+                    {
+                        state.meta_mut(source).fast = true;
+                    }
                 }
             }
         }
@@ -1436,7 +1477,16 @@ impl Engine {
             .checked_add(1)
             .ok_or(RecoveryError::CounterExhausted)?;
         let history_index = state.history_slot(serial)?;
-        let rto = state.rto()?;
+        let rto = match state.send.recovery {
+            CompactRecovery::KcpLike(config) if flight.attempts > 0 => {
+                if flight.retry_at.is_some_and(|due| now >= due) {
+                    config.timeout_backoff(flight.rto)
+                } else {
+                    flight.rto
+                }
+            }
+            _ => state.rto()?,
+        };
         now.checked_add(rto).ok_or(RecoveryError::TimeOverflow)?;
         let view = CompactPacketView::Data {
             source,
@@ -1464,6 +1514,7 @@ impl Engine {
         let state = self.compact.as_mut().ok_or(RecoveryError::InvalidConfig)?;
         state.history[history_index] = Some(History {
             serial,
+            source,
             accepted: None,
         });
         let old = *state.meta(source);
@@ -1476,6 +1527,7 @@ impl Engine {
                 None
             },
             fast: false,
+            fast_reports: 0,
         };
         self.next_transmission = serial;
         self.pending_transmissions += 1;

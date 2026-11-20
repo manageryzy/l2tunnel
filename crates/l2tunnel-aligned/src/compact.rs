@@ -147,13 +147,23 @@ impl Config {
             w.size(n)?;
         }
         w.number(u64::from(arq.maximum_attempts()))?;
-        let (mode, gap) = match arq.recovery() {
-            CompactRecovery::Guarded => (1, Duration::ZERO),
-            CompactRecovery::FirstFlight => (2, Duration::ZERO),
-            CompactRecovery::BoundedGap { min_interval } => (3, min_interval),
-        };
-        w.byte(mode)?;
-        w.duration(gap)?;
+        match arq.recovery() {
+            CompactRecovery::KcpLike(policy) => {
+                w.byte(4)?;
+                w.bytes(&policy.encode().map_err(|_| Error::Configuration)?)?;
+                w.number(0)?;
+            }
+            policy => {
+                let (mode, gap) = match policy {
+                    CompactRecovery::Guarded => (1, Duration::ZERO),
+                    CompactRecovery::FirstFlight => (2, Duration::ZERO),
+                    CompactRecovery::BoundedGap { min_interval } => (3, min_interval),
+                    CompactRecovery::KcpLike(_) => return Err(Error::Configuration),
+                };
+                w.byte(mode)?;
+                w.duration(gap)?;
+            }
+        }
         w.size(self.recovery.outer_overhead_bytes())?;
         w.size(self.max_recovery_packet_bytes)?;
         let threshold =
@@ -215,12 +225,23 @@ impl Config {
         let history_entries = r.size()?;
         let maximum_attempts = r.number()?.try_into().map_err(|_| Error::Configuration)?;
         let mode = r.byte()?;
-        let gap = r.duration()?;
-        let recovery = match mode {
-            1 if gap.is_zero() => CompactRecovery::Guarded,
-            2 if gap.is_zero() => CompactRecovery::FirstFlight,
-            3 => CompactRecovery::BoundedGap { min_interval: gap },
-            _ => return Err(Error::Configuration),
+        let recovery = if mode == 4 {
+            let bytes = r.take(8)?.try_into().map_err(|_| Error::Configuration)?;
+            if r.number()? != 0 {
+                return Err(Error::Configuration);
+            }
+            CompactRecovery::KcpLike(
+                l2tunnel_recovery::KcpLikeConfig::decode(bytes)
+                    .map_err(|_| Error::Configuration)?,
+            )
+        } else {
+            let gap = r.duration()?;
+            match mode {
+                1 if gap.is_zero() => CompactRecovery::Guarded,
+                2 if gap.is_zero() => CompactRecovery::FirstFlight,
+                3 => CompactRecovery::BoundedGap { min_interval: gap },
+                _ => return Err(Error::Configuration),
+            }
         };
         let arq = CompactArqConfig::new(
             bounds,

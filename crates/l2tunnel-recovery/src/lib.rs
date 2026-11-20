@@ -13,8 +13,8 @@ pub use arq::{
     CompactBounds, CompactFeedback, CompactPacketKind, CompactPacketView,
     CompactPeerFeedbackSnapshot, CompactPollError, CompactRecovery, CompactRepeat,
     CompactRetryFailureSnapshot, CompactTiming, CompactTimingSnapshot, DATA_HEADER_BYTES,
-    EndpointRole, PacketView, PhysicalTransmission, RecoveryContext, RecoveryError, Retained,
-    SelectiveRepeat, SourceId, Statistics, inspect_body, inspect_compact_body,
+    EndpointRole, KcpLikeConfig, PacketView, PhysicalTransmission, RecoveryContext, RecoveryError,
+    Retained, SelectiveRepeat, SourceId, Statistics, inspect_body, inspect_compact_body,
     inspect_compact_packet, inspect_packet,
 };
 

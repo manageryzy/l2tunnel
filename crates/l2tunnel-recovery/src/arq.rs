@@ -15,7 +15,7 @@ pub use compact::{
     COMPACT_DATA_HEADER_BYTES, COMPACT_FEEDBACK_HEADER_BYTES, CompactArqConfig, CompactBounds,
     CompactFeedback, CompactPacketKind, CompactPacketView, CompactPeerFeedbackSnapshot,
     CompactPollError, CompactRecovery, CompactRepeat, CompactRetryFailureSnapshot, CompactTiming,
-    CompactTimingSnapshot, inspect_compact_body, inspect_compact_packet,
+    CompactTimingSnapshot, KcpLikeConfig, inspect_compact_body, inspect_compact_packet,
 };
 pub(crate) use compact::{History as CompactHistory, Meta as CompactMeta, State as CompactState};
 
