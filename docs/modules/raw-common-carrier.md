@@ -54,6 +54,23 @@ TCP-shaped packet traffic is not ordinary ACK-driven
 TCP/TLS data.
 Raw physical observations do not increment UDP-byte counters.
 
+Setup writes drive the original packet owner and collect physical completion
+without promoting concurrent inbound bootstrap tails into the adapter's upper
+input slot. Otherwise a final Joining write can succeed while that slot remains
+occupied, and the immediate final-record handoff correctly refuses the retained
+upper custody. The lower bounded queue keeps these tails for the existing
+bootstrap-format handoff checks and subsequent receive processing; no input is
+discarded and no handoff guard is relaxed.
+
+A deterministic real PacketLink fixture reproduced that refusal with the prior
+prefetch behavior. With prefetch removed, it validates preceding authenticated
+bootstrap tails and observes two injected FIFO markers exactly once after the
+handoff. The actual shared-service explicit reconnect case also passes. This is
+finite Linux-hosted runtime evidence, not a new kernel or platform qualification.
+[Prior failure](../../work/fec-native-order-20261121/fair-low-load-v2/raw-prefetch-before.log),
+[corrected fixture and reconnect](../../work/fec-native-order-20261121/fair-low-load-v2/followup-commands.json).
+The [full local workspace gate 07](../../work/c48-parity-20261119/native/tun-ring-fix-20261119/inner-retrans-analysis/kcp-fec-scheduler-gate-20261121-07/result.json) passed with this correction.
+
 Only the maintained sent-record token and acceptance timestamp confirm physical
 completion. Encoding, bounded admission and a pending send do not confirm it.
 Both occupied lanes are observed before a terminal cause propagates. Original

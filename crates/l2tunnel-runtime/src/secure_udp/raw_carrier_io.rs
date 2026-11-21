@@ -1177,7 +1177,10 @@ impl<I: PacketIo + Send + 'static> RawBacking for RawAdapter<I> {
             )));
         }
         self.begin_turn();
-        if let Err(e) = self.progress(cx, true) {
+        // A setup write may finish immediately before the final-record handoff.
+        // Keep concurrent inbound tails with the carrier, which validates its
+        // bounded queue at that handoff. The next receive owns their promotion.
+        if let Err(e) = self.progress(cx, false) {
             return Poll::Ready(Err(e));
         }
         match self.take_control() {
