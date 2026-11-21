@@ -305,11 +305,13 @@ pub(crate) struct State {
     sampled_payment: Option<History>,
     srtt: Option<f64>,
     rttvar: f64,
-    last_received_serial: u64,
-    last_received_at: Duration,
+    feedback_echo_source: SourceId,
+    feedback_echo_serial: u64,
+    feedback_echo_at: Duration,
     highest_received: Option<u64>,
     feedback_serial: u64,
     received_feedback_serial: u64,
+    fast_ack_echo: u64,
     last_peer_feedback: Option<CompactPeerFeedbackSnapshot>,
     retry_failure: Option<CompactRetryFailureSnapshot>,
     bitmap_cursor: u64,
@@ -488,11 +490,13 @@ impl CompactRepeat {
             sampled_payment: None,
             srtt: None,
             rttvar: 0.0,
-            last_received_serial: 0,
-            last_received_at: Duration::ZERO,
+            feedback_echo_source: SourceId(0),
+            feedback_echo_serial: 0,
+            feedback_echo_at: Duration::ZERO,
             highest_received: None,
             feedback_serial: 0,
             received_feedback_serial: 0,
+            fast_ack_echo: 0,
             last_peer_feedback: None,
             retry_failure: None,
             bitmap_cursor: 0,
@@ -982,8 +986,17 @@ impl Engine {
                 }
                 self.receive_source(source, payload, observed)?;
                 let state = self.compact.as_mut().ok_or(RecoveryError::InvalidConfig)?;
-                state.last_received_serial = serial;
-                state.last_received_at = received;
+                // KCP's conservative batch representative advances only for a higher
+                // source with a newer send attempt. Compact carries attempt serials
+                // rather than a peer clock. Keep its corresponding arrival for RTT.
+                if !matches!(state.receive.recovery, CompactRecovery::KcpLike(_))
+                    || state.feedback_events == 0
+                    || (source > state.feedback_echo_source && serial > state.feedback_echo_serial)
+                {
+                    state.feedback_echo_source = source;
+                    state.feedback_echo_serial = serial;
+                    state.feedback_echo_at = received;
+                }
                 state.highest_received = Some(
                     state
                         .highest_received
@@ -1151,7 +1164,12 @@ impl Engine {
         if feedback.serial > state.received_feedback_serial {
             state.received_feedback_serial = feedback.serial;
             if let CompactRecovery::KcpLike(config) = state.send.recovery {
-                if let Some(payment) = echo_payment.filter(|p| feedback.acknowledges(p.source)) {
+                // Positive receipts may be repeated on idle timers or another bitmap
+                // page. Credit the first report actually proving this echoed attempt.
+                if let Some(payment) = echo_payment
+                    .filter(|p| p.serial > state.fast_ack_echo && feedback.acknowledges(p.source))
+                {
+                    state.fast_ack_echo = payment.serial;
                     for (source, flight) in self.sent.iter() {
                         if *source < payment.source
                             && !flight.acknowledged
@@ -1312,14 +1330,14 @@ impl Engine {
                     .checked_add(1)
                     .ok_or(RecoveryError::CounterExhausted)?;
                 let delay = delay_micros(
-                    now.checked_sub(state.last_received_at)
+                    now.checked_sub(state.feedback_echo_at)
                         .ok_or(RecoveryError::NonMonotonicTime)?,
                 )?;
                 Ok(Some(body::feedback_body_len(
                     self.receive_prefix,
                     start,
                     count,
-                    state.last_received_serial,
+                    state.feedback_echo_serial,
                     delay,
                     serial,
                 )))
@@ -1399,7 +1417,7 @@ impl Engine {
                 .checked_add(1)
                 .ok_or(RecoveryError::CounterExhausted)?;
             let delay = delay_micros(
-                now.checked_sub(state.last_received_at)
+                now.checked_sub(state.feedback_echo_at)
                     .ok_or(RecoveryError::NonMonotonicTime)?,
             )?;
             let next_feedback = if state.feedback_repeats > 0 {
@@ -1423,7 +1441,7 @@ impl Engine {
                 prefix: self.receive_prefix,
                 start,
                 count,
-                echo: state.last_received_serial,
+                echo: state.feedback_echo_serial,
                 receiver_delay_us: delay,
                 serial,
                 bitmap,
