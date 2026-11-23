@@ -12,6 +12,29 @@ pub(crate) use header::DecoderState;
 use header::EncoderHeader;
 pub use stateless::{LZ4_TAG, lz4_available};
 
+/// Explicit native-IP delta referring to a full context by record backdistance.
+pub const FIXED_ANCHOR_TAG: u8 = 11;
+/// Maximum record distance from a fixed-anchor body to its context.
+pub const MAX_ANCHOR_DISTANCE: u8 = 8;
+
+/// Validate the wrapper and borrow its single existing native-IP delta body.
+/// Payload length and delta fields are validated by the corresponding body parser.
+pub fn fixed_anchor_parts(body: &[u8]) -> Result<(u8, &[u8]), Error> {
+    let [
+        FIXED_ANCHOR_TAG,
+        distance @ 1..=MAX_ANCHOR_DISTANCE,
+        inner @ ..,
+    ] = body
+    else {
+        return Err(Error::InvalidRecord);
+    };
+    match inner.first() {
+        Some(6 | 9) => Ok((*distance, inner)),
+        Some(tag) if tag & 7 == 5 || tag & 7 == 7 => Ok((*distance, inner)),
+        _ => Err(Error::InvalidRecord),
+    }
+}
+
 const ECHO_DELTAS: [u32; 16] = [
     0, 1, 17, 18, 19, 20, 36, 37, 38, 55, 56, 74, 75, 92, 93, 111,
 ];
@@ -56,6 +79,8 @@ pub enum Encoding {
     Headers,
     /// Header deltas with periodic full contexts in the existing wire grammar.
     RefreshedHeaders,
+    /// Native-IP deltas independently derived from an explicitly named full context.
+    FixedAnchorHeaders,
     /// Exact raw packet with no compression or context.
     Raw,
     /// Stateless LZ4 only when its complete body is smaller than raw.
@@ -292,18 +317,32 @@ impl Encoder {
     /// Encode context plus one body into disjoint consecutive output ranges.
     /// Any error leaves caller output and prior header context unchanged.
     pub fn encode(&mut self, frame: &[u8], output: &mut [u8]) -> Result<EncodedBodies, Error> {
-        self.encode_selected(frame, output, false)
+        self.encode_selected(frame, output, false, None)
     }
     /// Encode an explicitly selected raw native packet as kind 2, preserving context.
     /// Raw length plus three bytes must fit the u16 body limit; failure is atomic.
     pub fn encode_raw(&mut self, frame: &[u8], output: &mut [u8]) -> Result<EncodedBodies, Error> {
-        self.encode_selected(frame, output, true)
+        self.encode_selected(frame, output, true, None)
+    }
+    pub(crate) fn encode_fixed_anchor(
+        &mut self,
+        frame: &[u8],
+        output: &mut [u8],
+        distance: u8,
+    ) -> Result<EncodedBodies, Error> {
+        if !matches!(self.header, EncoderHeader::Ip(_))
+            || !(1..=MAX_ANCHOR_DISTANCE).contains(&distance)
+        {
+            return Err(Error::Configuration);
+        }
+        self.encode_selected(frame, output, false, Some(distance))
     }
     fn encode_selected(
         &mut self,
         frame: &[u8],
         output: &mut [u8],
         raw: bool,
+        fixed_distance: Option<u8>,
     ) -> Result<EncodedBodies, Error> {
         if frame.len() > self.config.max_frame_bytes {
             return Err(tcp_header::Error::FrameTooLarge.into());
@@ -330,7 +369,8 @@ impl Encoder {
             return Err(Error::RecordTooLarge);
         }
         let previous = self.header.view();
-        let body_capacity = self.config.symbol_bytes - 3;
+        let body_capacity =
+            self.config.symbol_bytes - 3 - usize::from(fixed_distance.is_some()) * 2;
         if self.config.predictive
             && context_len == 0
             && self.scratch[0] == self.header.delta_tag()
@@ -398,14 +438,30 @@ impl Encoder {
             self.scratch[context_len] = 6;
             body_len -= 2;
         }
+        let kind = kind(self.scratch[context_len])?;
+        let wrapper = fixed_distance.filter(|_| kind != BodyKind::Raw);
+        let wrapped_len = body_len + usize::from(wrapper.is_some()) * 2;
+        if wrapped_len > usize::from(u16::MAX) {
+            return Err(Error::RecordTooLarge);
+        }
         let result = EncodedBodies {
             original_native_bytes: frame.len(),
             context_len,
-            body_len,
-            kind: kind(self.scratch[context_len])?,
+            body_len: wrapped_len,
+            kind,
         };
         require_output(output, result.written())?;
-        output[..result.written()].copy_from_slice(&self.scratch[..result.written()]);
+        if let Some(distance) = wrapper {
+            output[..context_len].copy_from_slice(&self.scratch[..context_len]);
+            output[context_len..context_len + 2].copy_from_slice(&[
+                FIXED_ANCHOR_TAG,
+                if context_len == 0 { distance } else { 1 },
+            ]);
+            output[context_len + 2..result.written()]
+                .copy_from_slice(&self.scratch[context_len..context_len + body_len]);
+        } else {
+            output[..result.written()].copy_from_slice(&self.scratch[..result.written()]);
+        }
         self.header = staged;
         Ok(result)
     }
@@ -502,8 +558,45 @@ impl Decoder {
         padding: Padding,
         output: &mut [u8],
     ) -> Result<Decoded, Error> {
+        self.decode_inner(input, padding, 0, output)
+    }
+
+    /// The caller installs the named full context before decoding this body.
+    pub(crate) fn decode_fixed_anchor_body(
+        &mut self,
+        wrapped: &[u8],
+        padding: Padding,
+        output: &mut [u8],
+    ) -> Result<Decoded, Error> {
+        if !matches!(self.header, DecoderState::Ip(_)) {
+            return Err(Error::Configuration);
+        }
+        if wrapped.len() > usize::from(u16::MAX) {
+            return Err(Error::RecordTooLarge);
+        }
+        let (_, inner) = fixed_anchor_parts(wrapped)?;
+        match self.decode_inner(inner, padding, 2, output)? {
+            Decoded::Frame {
+                consumed,
+                written,
+                kind,
+            } => Ok(Decoded::Frame {
+                consumed: consumed + 2,
+                written,
+                kind,
+            }),
+            Decoded::Context { .. } => Err(Error::InvalidRecord),
+        }
+    }
+    fn decode_inner(
+        &mut self,
+        input: &[u8],
+        padding: Padding,
+        prefix_bytes: usize,
+        output: &mut [u8],
+    ) -> Result<Decoded, Error> {
         let body_capacity = self.config.symbol_bytes - 3;
-        if padding == Padding::ZeroExtended && input.len() != body_capacity {
+        if padding == Padding::ZeroExtended && input.len() != body_capacity - prefix_bytes {
             return Err(Error::Padding);
         }
         if input.len() > 65_535 {

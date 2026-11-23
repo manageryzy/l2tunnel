@@ -6,6 +6,7 @@ fn compact_direction(old: aligned::Config, reverse: bool) -> Result<aligned::Com
     use l2tunnel_recovery::{CompactArqConfig, CompactBounds, CompactRecovery, CompactTiming};
     let arq = old.recovery.arq;
     Ok(aligned::CompactConfig {
+        native_delivery: aligned::NativeDelivery::ProfileDefault,
         native_policy: old.native_policy,
         receiver: old.receiver,
         recovery: l2tunnel_reliable::CompactReliableConfig::new(

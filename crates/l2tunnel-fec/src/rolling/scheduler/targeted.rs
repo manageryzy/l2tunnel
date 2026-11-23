@@ -266,6 +266,9 @@ pub(in crate::rolling) struct GapTracker {
     queues: Queues,
     custody: Vec<Custody>,
     seen: u32,
+    // An authenticated original in the input FIFO proves that earlier IDs
+    // were issued. Only the decoder can advance cumulative confirmation.
+    queued_end: u32,
     prefer_old: bool,
     next_batch: Tick,
     prefix: u32,
@@ -292,6 +295,7 @@ impl GapTracker {
             queues: Queues::new(policy)?,
             custody: slots(Queues::count(policy), Custody::default())?,
             seen: 0,
+            queued_end: 0,
             prefer_old: false,
             next_batch: Tick(0),
             prefix: 0,
@@ -307,13 +311,19 @@ impl GapTracker {
         self.queues.entries[slot].list = PARKED + candidate.list;
         self.queues.entries[slot].stamp = candidate.due;
     }
+    pub(super) fn holds(&self, id: u32) -> bool {
+        let held = &self.custody[self.queues.slot(id)];
+        held.id == id && held.copies != 0
+    }
     pub(super) fn hold(&mut self, id: u32) -> Result<(), Error> {
+        let end = id.checked_add(1).ok_or(Error::Identity)?;
         let slot = self.queues.slot(id);
         let held = &mut self.custody[slot];
         if held.id != id {
             *held = Custody { id, copies: 0 };
         }
         held.copies = held.copies.checked_add(1).ok_or(Error::Capacity)?;
+        self.queued_end = self.queued_end.max(end);
         if let Some(i) = self.ids[..self.count].iter().position(|v| v.id == id) {
             self.park_due(self.ids[i]);
             self.ids.copy_within(i + 1..self.count, i);
@@ -352,10 +362,11 @@ impl GapTracker {
             return None;
         }
         let state = decoder.status();
-        if self.count > 0 || self.seen < state.observed_end {
+        let end = state.observed_end.max(self.queued_end);
+        if self.count > 0 || self.seen < end {
             return Some(now);
         }
-        if state.decoded_prefix == state.observed_end {
+        if state.decoded_prefix >= end {
             return None;
         }
         (0..2)
@@ -374,7 +385,8 @@ impl GapTracker {
         }
         let status = decoder.status();
         self.seen = self.seen.max(status.decoded_prefix);
-        while self.seen < status.observed_end && spend(&mut budget.metadata) {
+        let end = status.observed_end.max(self.queued_end);
+        while self.seen < end && spend(&mut budget.metadata) {
             let index = self.seen;
             if decoder.decoded_source(SourceId(index))?.is_none() {
                 self.queues.push(index, 0, deadline(now, GAP)?.0);
@@ -395,6 +407,7 @@ impl GapTracker {
             return Ok(None);
         }
         let status = decoder.status();
+        let recheck = self.count != 0;
         if self.count == 0 && now >= self.next_batch {
             let again = deadline(now, REPEAT)?;
             while self.count < MAX_IDS {
@@ -440,14 +453,31 @@ impl GapTracker {
         if self.count == 0 {
             return Ok(None);
         }
-        let start = self.ids[0].id;
-        let n = self.ids[..self.count].partition_point(|v| v.id - start < 32);
-        let mask = self.ids[..n]
-            .iter()
-            .fold(0, |m, v| m | (1 << (v.id - start)));
-        self.ids.copy_within(n..self.count, 0);
-        self.count -= n;
-        Ok(Some(GapRequest {
+        let mut first = None;
+        let mut mask = 0;
+        let mut visited = 0;
+        for entry in &self.ids[..self.count] {
+            if first.is_some_and(|start| entry.id - start >= 32) {
+                break;
+            }
+            // An unpublished span can outlive a decoder commit while the prior
+            // span is frozen. New selections already paid for this lookup above.
+            if recheck && !spend(&mut budget.metadata) {
+                break;
+            }
+            visited += 1;
+            if recheck
+                && (entry.id < status.decoded_prefix
+                    || decoder.decoded_source(SourceId(entry.id))?.is_some())
+            {
+                continue;
+            }
+            let start = *first.get_or_insert(entry.id);
+            mask |= 1 << (entry.id - start);
+        }
+        self.ids.copy_within(visited..self.count, 0);
+        self.count -= visited;
+        Ok(first.map(|start| GapRequest {
             scope,
             id,
             prefix: self.prefix,

@@ -1,5 +1,6 @@
 //! Explicit, bounded scalar diagnostics; never protocol custody or retry policy.
-use l2tunnel::record_configuration::{DirectionProfile, LocalView};
+use l2tunnel::{record_configuration::DirectionProfile, record_engine::Engine};
+use l2tunnel_management::Role;
 use l2tunnel_recovery::{CompactArqConfig, CompactPacketKind, CompactPacketView};
 use std::{
     fs::OpenOptions,
@@ -11,8 +12,38 @@ use std::{
 const MAX_EVENTS: usize = 512;
 static NEXT_TRACE: AtomicU64 = AtomicU64::new(1);
 
+#[derive(Clone, Copy)]
+enum Selection {
+    Compact,
+    RollingGap,
+}
+
+impl Selection {
+    fn limit(self) -> usize {
+        match self {
+            Self::Compact => MAX_EVENTS,
+            Self::RollingGap => 65_536,
+        }
+    }
+
+    fn description(self) -> &'static str {
+        match self {
+            Self::Compact => {
+                "source0 and all feedback of unfragmented AlignedCompact/PackedCompact"
+            }
+            Self::RollingGap => "named feedback of unfragmented targeted Packed/Rolling",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(in crate::secure_udp) enum Packet {
+    Gap {
+        serial: u64,
+        prefix: u32,
+        start: u32,
+        mask: u32,
+    },
     Source {
         serial: u64,
     },
@@ -53,6 +84,7 @@ struct Event {
 /// quota. It has no packet payload, clock, queue or completion authority.
 pub(in crate::secure_udp) struct Observer {
     path: PathBuf,
+    selection: Selection,
     events: Vec<Event>,
     dropped: u64,
     parse_errors: u64,
@@ -62,29 +94,35 @@ pub(in crate::secure_udp) struct Observer {
 
 impl Observer {
     pub(in crate::secure_udp) fn from_environment() -> io::Result<Option<Self>> {
-        let Some(mut prefix) = std::env::var_os("L2TUNNEL_COMPACT_ARQ_TRACE") else {
-            return Ok(None);
-        };
+        let (mut prefix, selection) =
+            if let Some(path) = std::env::var_os("L2TUNNEL_COMPACT_ARQ_TRACE") {
+                (path, Selection::Compact)
+            } else if let Some(path) = std::env::var_os("L2TUNNEL_ROLLING_GAP_TRACE") {
+                (path, Selection::RollingGap)
+            } else {
+                return Ok(None);
+            };
         if prefix.is_empty() || prefix.as_encoded_bytes().len() > 4096 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "Compact ARQ trace path",
+                "recovery trace path",
             ));
         }
         let id = NEXT_TRACE
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
             .map_err(|_| io::Error::other("Compact ARQ trace owner exhausted"))?;
         prefix.push(format!(".{}.{}.json", std::process::id(), id));
-        Self::new(PathBuf::from(prefix)).map(Some)
+        Self::new(PathBuf::from(prefix), selection).map(Some)
     }
 
-    fn new(path: PathBuf) -> io::Result<Self> {
+    fn new(path: PathBuf, selection: Selection) -> io::Result<Self> {
         let mut events = Vec::new();
         events
-            .try_reserve_exact(MAX_EVENTS)
+            .try_reserve_exact(selection.limit())
             .map_err(io::Error::other)?;
         Ok(Self {
             path,
+            selection,
             events,
             dropped: 0,
             parse_errors: 0,
@@ -93,15 +131,33 @@ impl Observer {
         })
     }
 
-    /// Inspect only the existing selected Compact union using its exact
-    /// directional policy. Other families and sources are outside this trace.
+    /// Decode diagnostic fields with the negotiated family's own parser.
     pub(in crate::secure_udp) fn inspect(
         &mut self,
-        local: LocalView<'_>,
+        engine: &Engine,
+        role: Role,
         outgoing: bool,
         bytes: &[u8],
     ) -> Option<Packet> {
         let kind = bytes.first().copied()?;
+        if let Selection::RollingGap = self.selection {
+            if kind != 5 {
+                return None;
+            }
+            return match engine.inspect_rolling_gap(outgoing, bytes) {
+                Ok(request) => request.map(|r| Packet::Gap {
+                    serial: r.id.0,
+                    prefix: r.prefix,
+                    start: r.start,
+                    mask: r.mask,
+                }),
+                Err(_) => {
+                    self.parse_errors = self.parse_errors.saturating_add(1);
+                    None
+                }
+            };
+        }
+        let local = engine.configuration().descriptor().local(role);
         let direction = if (kind == 1) == outgoing {
             local.send()
         } else {
@@ -193,7 +249,7 @@ impl Observer {
     }
 
     fn push(&mut self, event: Event) {
-        if self.events.len() == MAX_EVENTS {
+        if self.events.len() == self.selection.limit() {
             self.dropped = self.dropped.saturating_add(1);
         } else {
             self.events.push(event);
@@ -203,8 +259,9 @@ impl Observer {
     fn write_report(&self, writer: &mut impl Write) -> io::Result<()> {
         write!(
             writer,
-            "{{\"schema\":1,\"scope\":\"source0 and all feedback of unfragmented AlignedCompact/PackedCompact\",\"time_unit\":\"runtime-relative microseconds\",\"original_time_definition\":\"accepted stage uses carrier acceptance; input/apply/retry use original authenticated arrival\",\"acceptance_definition\":\"local carrier boundary only; never peer delivery\",\"storage_definition\":\"opt-in diagnostic allocation outside protocol quota; no packet payload or per-event IO\",\"max_events\":{},\"diagnostic_heap_bytes\":{},\"dropped_events\":{},\"parse_errors\":{},\"acceptance_mismatches\":{},\"pending_selection\":{},\"events\":[",
-            MAX_EVENTS,
+            "{{\"schema\":1,\"scope\":\"{}\",\"time_unit\":\"runtime-relative microseconds\",\"original_time_definition\":\"accepted stage uses carrier acceptance; input/apply/retry use original authenticated arrival\",\"acceptance_definition\":\"local carrier boundary only; never peer delivery\",\"storage_definition\":\"opt-in diagnostic allocation outside protocol quota; no packet payload or per-event IO\",\"max_events\":{},\"diagnostic_heap_bytes\":{},\"dropped_events\":{},\"parse_errors\":{},\"acceptance_mismatches\":{},\"pending_selection\":{},\"events\":[",
+            self.selection.description(),
+            self.selection.limit(),
             self.events.capacity() * std::mem::size_of::<Event>() + self.path.as_os_str().len(),
             self.dropped,
             self.parse_errors,
@@ -232,6 +289,15 @@ impl Observer {
                 None => write!(writer, "null")?,
             }
             match event.packet {
+                Packet::Gap {
+                    serial,
+                    prefix,
+                    start,
+                    mask,
+                } => write!(
+                    writer,
+                    ",\"kind\":\"gap\",\"feedback_serial\":{serial},\"prefix\":{prefix},\"start\":{start},\"mask\":{mask}}}"
+                )?,
                 Packet::Source { serial } => write!(
                     writer,
                     ",\"kind\":\"source\",\"source\":0,\"attempt_serial\":{serial}}}"
@@ -430,13 +496,47 @@ mod tests {
     }
 
     #[test]
+    fn rolling_gap_trace_retains_feedback_identity_across_physical_acceptance() -> Result {
+        let id = NEXT_TRACE.fetch_add(1, Ordering::Relaxed);
+        let path =
+            std::env::temp_dir().join(format!("l2t-rolling-gap-{}-{id}.json", std::process::id()));
+        let mut trace = Observer::new(path.clone(), Selection::RollingGap)?;
+        let gap = Packet::Gap {
+            serial: 19,
+            prefix: 41,
+            start: 51,
+            mask: 9,
+        };
+        trace.selected(2, 113, 501, Some(gap));
+        trace.accepted(
+            2,
+            113,
+            534,
+            Some(530),
+            crate::secure_udp::SendBoundary::SocketAccepted,
+        );
+        let mut bytes = Vec::new();
+        trace.write_report(&mut bytes)?;
+        let report = String::from_utf8(bytes)?;
+        assert!(report.contains("\"max_events\":65536"));
+        assert!(report.contains("\"acceptance_mismatches\":0"));
+        assert!(report.contains("\"observed_us\":534,\"original_us\":530"));
+        let fields =
+            "\"kind\":\"gap\",\"feedback_serial\":19,\"prefix\":41,\"start\":51,\"mask\":9";
+        assert_eq!(report.matches(fields).count(), 2);
+        drop(trace);
+        std::fs::remove_file(path)?;
+        Ok(())
+    }
+
+    #[test]
     fn compact_arq_trace_bounds_events_and_separates_selection_from_acceptance() -> Result {
         let id = NEXT_TRACE.fetch_add(1, Ordering::Relaxed);
         let path = std::env::temp_dir().join(format!(
             "l2t-compact-arq-trace-{}-{id}.json",
             std::process::id()
         ));
-        let mut observer = Observer::new(path.clone())?;
+        let mut observer = Observer::new(path.clone(), Selection::Compact)?;
         let packet = Packet::Source { serial: 2 };
         observer.selected(7, 4, 100, Some(packet));
         assert_eq!(observer.events.len(), 1);

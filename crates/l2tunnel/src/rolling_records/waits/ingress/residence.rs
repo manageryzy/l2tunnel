@@ -70,6 +70,8 @@ pub struct Snapshot {
     pub immediate_outcomes: [u64; 3],
     /// Queued outcomes in Staged, Duplicate, Stale order.
     pub queued_outcomes: [u64; 3],
+    /// Queued systematic inputs committed independently of the pending repair.
+    pub independent_commits: u64,
     /// Age of each still-queued data input at the exact snapshot tick.
     pub retained_ages: Option<Distribution>,
     /// Exact age snapshot tick; terminal population is censored only when frozen here.
@@ -90,7 +92,11 @@ impl Snapshot {
             (&mut self.immediate, &mut self.immediate_outcomes)
         };
         population.record(elapsed, overflow);
-        increment(&mut outcomes[outcome.index()], overflow);
+        if let Some(index) = outcome.index() {
+            increment(&mut outcomes[index], overflow);
+        } else {
+            increment(&mut self.independent_commits, overflow);
+        }
     }
 }
 

@@ -89,6 +89,9 @@ class Strategy:
     tcp_rto_min_ms: float = 200.0
     tcp_rto_initial_ms: float = 1000.0
     quic_l2: bool = True
+    tcp_data_paws: bool = False
+    tcp_partial_timestamp_undo: bool = False
+    tcp_newreno_ack_heuristic: bool = False
 
     def __post_init__(self):
         if not isinstance(self.name, str) or not self.name.strip():
@@ -97,6 +100,12 @@ class Strategy:
             raise ValueError(f"unknown strategy mode: {self.mode!r}")
         if self.tcp_cc not in ("reno", "cubic"):
             raise ValueError(f"unknown TCP congestion controller: {self.tcp_cc!r}")
+        if type(self.tcp_data_paws) is not bool or (self.tcp_data_paws and self.mode != "tcp"):
+            raise ValueError("tcp_data_paws requires a boolean and a modeled TCP endpoint")
+        if type(self.tcp_partial_timestamp_undo) is not bool or (self.tcp_partial_timestamp_undo and self.mode != "tcp"):
+            raise ValueError("tcp_partial_timestamp_undo requires a boolean and a modeled TCP endpoint")
+        if type(self.tcp_newreno_ack_heuristic) is not bool or (self.tcp_newreno_ack_heuristic and self.mode != "tcp"):
+            raise ValueError("tcp_newreno_ack_heuristic requires a boolean and a modeled TCP endpoint")
         _number("tcp_path", self.tcp_path, 0, integer=True)
         _number("tcp_initial_cwnd", self.tcp_initial_cwnd, 1, integer=True)
         _number("tcp_rto_min_ms", self.tcp_rto_min_ms, 1, 60000)

@@ -585,6 +585,27 @@ impl<R: RawBacking> IoOwner<R> {
         };
         Ok((bytes, None, framing))
     }
+    /// A send-side kernel peek can precede Tokio's readiness notification.
+    /// Drain that same socket under the original caller's receive quota.
+    pub(super) async fn receive_after_selection(
+        &mut self,
+        output: &mut [u8],
+        observed_udp: &mut bool,
+    ) -> io::Result<(usize, Option<Instant>, Option<InputFraming>)> {
+        if *observed_udp && let Self::Udp(socket) = self {
+            let socket = socket2::SockRef::from(&*socket);
+            match std::io::Read::read(&mut &*socket, output) {
+                Ok(length) => return Ok((length, None, None)),
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => *observed_udp = false,
+                Err(error) => {
+                    *observed_udp = false;
+                    return Err(error);
+                }
+            }
+        }
+        self.try_receive_at_ready(output).await
+    }
+
     /// Promote at most one ready maintained input during the caller's bounded
     /// receive batch. Pending remains WouldBlock: this never waits for new input
     /// or consumes the separately retained send-completion receipts.

@@ -18,6 +18,19 @@ pub enum CodecCoverage {
     NotApplicable,
     /// Complete source-free native bytes, without the selected recovery/codec.
     UnencodedNative,
+    /// One mixed packet carrying both its own systematic bytes and other sources' parity.
+    StripedMixed,
+}
+
+/// Exact physical constituents of a mixed data member after protection overhead is removed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StripedOutputExtent {
+    /// Shape, optional split length, generation, ordinal and physical original length.
+    pub header_bytes: usize,
+    /// The physical packet's own original or split half, excluding its length.
+    pub systematic_bytes: usize,
+    /// Complete parity cells on this same physical packet.
+    pub parity_bytes: usize,
 }
 
 /// Scalar partition of a selected output, before Records protection and carrier.
@@ -42,6 +55,38 @@ pub struct OutputExtent {
 }
 
 impl Engine {
+    /// Inspect a local mixed data member under the exact outgoing profile.
+    pub fn inspect_striped_output_extent(
+        &self,
+        bytes: &[u8],
+    ) -> Result<StripedOutputExtent, Error> {
+        let profile = self
+            .configuration
+            .descriptor()
+            .local(self.context.role)
+            .send()
+            .profile();
+        let configuration::DirectionProfile::Striped(direction) = profile else {
+            return Err(Error::Configuration);
+        };
+        let (_, packet) = direction.profile.inspect(bytes).map_err(Error::Striped)?;
+        let systematic_bytes = packet.original().len();
+        let geometry = packet.geometry();
+        let parity_bytes = usize::from(geometry.parity_cells())
+            .checked_mul(geometry.cell_bytes())
+            .ok_or(Error::Arithmetic)?;
+        let header_bytes = bytes
+            .len()
+            .checked_sub(systematic_bytes)
+            .and_then(|n| n.checked_sub(parity_bytes))
+            .ok_or(Error::Invariant)?;
+        Ok(StripedOutputExtent {
+            header_bytes,
+            systematic_bytes,
+            parity_bytes,
+        })
+    }
+
     /// Inspect locally emitted bytes with their retained producing metadata.
     /// `fragmented` must come from the actual fragment emission, never content
     /// sniffing. Fragment results validate only the existing structural header;
@@ -72,6 +117,48 @@ impl Engine {
             return Ok(value);
         }
         let nested = match &self.owner {
+            Owner::Striped(_) => {
+                match kind {
+                    EmissionKind::Source(SourceForm::SystematicFec) => {
+                        self.inspect_striped_output_extent(bytes)?;
+                        value.codec_coverage = CodecCoverage::StripedMixed;
+                    }
+                    EmissionKind::Feedback => {
+                        // This feedback acknowledges the opposite direction.
+                        let incoming = self
+                            .configuration
+                            .descriptor()
+                            .local(self.context.role)
+                            .receive()
+                            .profile();
+                        let configuration::DirectionProfile::Striped(config) = incoming else {
+                            return Err(Error::Configuration);
+                        };
+                        let scope = receiver::Scope {
+                            session: self.context.session.to_be_bytes(),
+                            epoch: crate::core::Epoch(self.context.epoch),
+                            direction: match self.context.role {
+                                Role::Client => receiver::Direction::ResponderToInitiator,
+                                Role::Server => receiver::Direction::InitiatorToResponder,
+                            },
+                        };
+                        crate::fec::striped_group::feedback::Feedback::decode(
+                            config.context(scope),
+                            bytes,
+                        )
+                        .map_err(Error::Striped)?;
+                        value.recovery = Some(RecoveryExtent {
+                            kind: RecordKind::Feedback,
+                            bytes: bytes.len(),
+                            header_bytes: bytes.len(),
+                            payload_bytes: 0,
+                            systematic_coded_fill_bytes: 0,
+                        });
+                    }
+                    _ => return Err(Error::Kind),
+                }
+                None
+            }
             Owner::Aligned(owner) => {
                 Some(owner.inspect_output_extent(bytes).map_err(Error::Aligned)?)
             }

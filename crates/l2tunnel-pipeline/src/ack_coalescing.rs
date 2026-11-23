@@ -207,6 +207,19 @@ pub struct Pending {
     pub expires: Duration,
 }
 
+/// Observed service for one uninterrupted hold, including its replacements.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct HeldService {
+    /// First service invocation at or after this candidate's soft deadline.
+    pub first_due_service: Option<Duration>,
+    /// Due flush attempts in service refused by downstream capacity.
+    pub blocked: u64,
+    /// First such downstream refusal.
+    pub first_blocked: Option<Duration>,
+    /// Latest such downstream refusal.
+    pub last_blocked: Option<Duration>,
+}
+
 #[derive(Clone, Copy)]
 struct State {
     key: Key,
@@ -214,6 +227,7 @@ struct State {
     last_ack: u32,
     signature: Option<Signature>,
     pending: Option<Pending>,
+    service: HeldService,
 }
 
 /// Successful consumption of the caller's exact original packet.
@@ -257,6 +271,7 @@ pub struct Ingress {
     usage: Usage,
     statistics: Statistics,
     now: Duration,
+    last_completed_service: Option<Duration>,
     cursor: usize,
     failure: Option<Error>,
 }
@@ -294,6 +309,7 @@ impl Ingress {
             },
             statistics: Statistics::default(),
             now: Duration::ZERO,
+            last_completed_service: None,
             cursor: 0,
             failure: None,
         })
@@ -321,6 +337,41 @@ impl Ingress {
             .flatten()
             .filter_map(|state| state.pending)
             .take(self.usage.held.packets)
+    }
+    /// Earliest retained hard cap, its actual service and the owner's last completed pass.
+    pub fn earliest_held_service(&self) -> Option<(Pending, HeldService, Option<Duration>)> {
+        self.slots
+            .iter()
+            .flatten()
+            .filter_map(|slot| {
+                slot.pending
+                    .map(|pending| (pending, slot.service, self.last_completed_service))
+            })
+            .take(self.usage.held.packets)
+            .min_by_key(|(pending, _, _)| pending.expires)
+    }
+
+    /// Sample the injected clock for a service call and check retained hard caps.
+    /// An enclosing owner may detect expiry before ordinary service can run.
+    pub fn observe_service_time(&mut self, now: Duration) -> bool {
+        let mut expired = false;
+        for (pending, service) in self
+            .slots
+            .iter_mut()
+            .flatten()
+            .filter_map(|slot| {
+                slot.pending
+                    .as_ref()
+                    .map(|pending| (pending, &mut slot.service))
+            })
+            .take(self.usage.held.packets)
+        {
+            if now >= pending.deadline {
+                service.first_due_service.get_or_insert(now);
+            }
+            expired |= now >= pending.expires;
+        }
+        expired
     }
     /// Whether a connection still has unsent ingress custody.
     pub fn retains_flow(&self, key: &FlowKey) -> bool {
@@ -393,7 +444,7 @@ impl Ingress {
         now: Duration,
         original_cap: Duration,
     ) -> Result<Admission, Error> {
-        self.check(pipeline, now)?;
+        self.check(pipeline, now, false)?;
         if received > now || original_cap <= now {
             return Err(Error::Time);
         }
@@ -413,7 +464,7 @@ impl Ingress {
             let admitted = self.forward(
                 pipeline,
                 bytes,
-                classification.key,
+                &classification,
                 timing,
                 Forward::Bypass(false),
             )?;
@@ -442,7 +493,7 @@ impl Ingress {
                 let admitted = self.forward(
                     pipeline,
                     bytes,
-                    ack.key.flow,
+                    &classification,
                     timing,
                     Forward::First(ack.signature.is_some()),
                 )?;
@@ -455,6 +506,7 @@ impl Ingress {
                     last_ack: ack.acknowledged,
                     signature: ack.signature,
                     pending: None,
+                    service: HeldService::default(),
                 });
                 self.usage.histories = self
                     .usage
@@ -484,7 +536,7 @@ impl Ingress {
             let admitted = self.forward(
                 pipeline,
                 bytes,
-                ack.key.flow,
+                &classification,
                 timing,
                 if duplicate {
                     Forward::Duplicate(ack.signature.is_some())
@@ -539,7 +591,13 @@ impl Ingress {
             .get_mut(start..start + bytes.len())
             .ok_or(Error::Invariant)?
             .copy_from_slice(bytes);
+        if self.is_empty() {
+            self.cursor = index;
+        }
         let state = self.slots[index].as_mut().ok_or(Error::Invariant)?;
+        if previous.is_none() {
+            state.service = HeldService::default();
+        }
         state.pending = Some(pending);
         state.last_ack = ack.acknowledged;
         state.signature = ack.signature;
@@ -561,31 +619,47 @@ impl Ingress {
         draining: bool,
         work: usize,
     ) -> Result<Progress, Error> {
-        self.check(pipeline, now)?;
+        self.check(pipeline, now, true)?;
         if work == 0 {
             return Err(Error::Work);
         }
         let mut progress = Progress::default();
         for _ in 0..work.min(self.slots.len()) {
+            if self.is_empty() {
+                break;
+            }
             let index = self.cursor;
-            self.cursor = (index + 1) % self.slots.len();
             progress.visited += 1;
-            if self.slots[index]
-                .and_then(|state| state.pending)
-                .is_some_and(|pending| draining || pending.deadline <= now)
-            {
+            let pending = self.slots[index].and_then(|state| state.pending);
+            let lone_candidate = self.usage.held.packets == 1 && pending.is_some();
+            if pending.is_some_and(|pending| draining || pending.deadline <= now) {
                 match self.emit(pipeline, index, now) {
                     Ok(true) => progress.forwarded += 1,
                     Ok(false) => {}
                     Err(Error::Pipeline(
                         PipelineError::Budget(_)
                         | PipelineError::Flow(l2tunnel_packet::FlowError::Capacity),
-                    )) => progress.blocked += 1,
+                    )) => {
+                        progress.blocked += 1;
+                        if pending.is_some_and(|p| p.deadline <= now) {
+                            let service =
+                                &mut self.slots[index].as_mut().ok_or(Error::Invariant)?.service;
+                            service.blocked = service.blocked.saturating_add(1);
+                            service.first_blocked.get_or_insert(now);
+                            service.last_blocked = Some(now);
+                        }
+                    }
                     Err(error) => return Err(error),
                 }
             }
+            // Keep the only remaining candidate ready for its deadline or retry.
+            if lone_candidate {
+                break;
+            }
+            self.cursor = (index + 1) % self.slots.len();
         }
         self.now = now;
+        self.last_completed_service = Some(now);
         Ok(progress)
     }
     /// Caller first proves downstream drain. Pending ingress refuses retirement;
@@ -610,7 +684,7 @@ impl Ingress {
         self.usage.histories = self.slots.iter().flatten().count();
         Ok(binding)
     }
-    fn check(&mut self, pipeline: &Pipeline, now: Duration) -> Result<(), Error> {
+    fn check(&mut self, pipeline: &Pipeline, now: Duration, service: bool) -> Result<(), Error> {
         if pipeline.config != self.plan.config {
             return Err(Error::Policy);
         }
@@ -620,7 +694,12 @@ impl Ingress {
         if now < self.now {
             return Err(Error::Time);
         }
-        if self.pending().any(|pending| now >= pending.expires) {
+        let expired = if service {
+            self.observe_service_time(now)
+        } else {
+            self.pending().any(|pending| now >= pending.expires)
+        };
+        if expired {
             self.failure = Some(Error::Expired);
             return Err(Error::Expired);
         }
@@ -711,21 +790,12 @@ impl Ingress {
         }
         Ok(next)
     }
-    fn forward(
-        &mut self,
-        pipeline: &mut Pipeline,
-        bytes: &[u8],
-        key: FlowKey,
-        timing: super::PacketTiming,
-        disposition: Forward,
-    ) -> Result<Admission, Error> {
-        let now = timing.admitted;
+    fn forwarded_statistics(&self, disposition: Forward) -> Result<Statistics, Error> {
         let (eligible, first, duplicate) = match disposition {
             Forward::First(eligible) => (eligible, true, false),
             Forward::Duplicate(eligible) => (eligible, false, true),
             Forward::Bypass(eligible) => (eligible, false, false),
         };
-        self.admission_budget(pipeline, key, bytes.len(), None)?;
         let mut next = self.statistics;
         next.received = increment(next.received)?;
         if eligible {
@@ -739,16 +809,50 @@ impl Ingress {
         } else {
             next.bypassed = increment(next.bypassed)?;
         }
+        Ok(next)
+    }
+    fn forward(
+        &mut self,
+        pipeline: &mut Pipeline,
+        bytes: &[u8],
+        classification: &l2tunnel_packet::Classification,
+        timing: super::PacketTiming,
+        disposition: Forward,
+    ) -> Result<Admission, Error> {
+        // Combined custody needs an extra check only while this owner holds
+        // originals outside Pipeline. Keep budget refusals ahead of counters.
+        if !self.is_empty() {
+            self.admission_budget(pipeline, classification.key, bytes.len(), None)?;
+        }
+        let usage = pipeline
+            .preflight(classification.key, bytes.len(), 1)
+            .map_err(|error| match error {
+                // Combined-custody arithmetic has always distinguished overflow
+                // from a representable global limit refusal.
+                PipelineError::Budget(Budget::Bytes)
+                    if pipeline.usage().bytes.checked_add(bytes.len()).is_none() =>
+                {
+                    Error::Layout
+                }
+                PipelineError::Budget(Budget::Packets)
+                    if pipeline.usage().packets == usize::MAX =>
+                {
+                    Error::Layout
+                }
+                _ => Error::Pipeline(error),
+            })?;
+        let next = self.forwarded_statistics(disposition)?;
         let metadata = pipeline
-            .enqueue_borrowed_capped(
-                bytes,
-                timing.received,
-                now,
-                timing.original_deadline.ok_or(Error::Invariant)?,
+            .enqueue_preflighted(
+                super::Input::Borrowed(bytes),
+                1,
+                timing,
+                *classification,
+                usage,
             )
-            .map_err(Error::Pipeline)?;
+            .map_err(|(error, _)| Error::Pipeline(error))?;
         self.statistics = next;
-        self.now = now;
+        self.now = timing.admitted;
         Ok(Admission::Forwarded(metadata))
     }
     fn flush_matching(

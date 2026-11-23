@@ -25,10 +25,12 @@ impl<const N: usize> Plan<N> {
 pub(super) struct Buffers {
     pub(super) wire: Vec<u8>,
     pub(super) seal: Vec<u8>,
+    /// Receive workspace, reusable after the opener publishes its plaintext.
     pub(super) open: Vec<u8>,
     pub(super) plain: Vec<u8>,
     pub(super) control_wire: Vec<u8>,
     pub(super) control_input: Vec<u8>,
+    /// Transmit body retained until sealed, including a deferred raw handoff.
     pub(super) frame: Vec<u8>,
 }
 impl Buffers {

@@ -268,6 +268,23 @@ an ACK burst followed by a pacing wait preserves the prior full-flight signal.
 Its slow-start utilization rule follows the Linux window-validation design.
 [Linux v6.12 TCP output](https://github.com/torvalds/linux/blob/v6.12/net/ipv4/tcp_output.c)
 
+The single-flow stream-writer profile in `studies/packed_spare_c48.py` accepts
+`--tcp-sack-recovery wire` and `--tcp-sack-recovery scoreboard`. Both encode
+up to three SACK blocks beside timestamps and submit each ACK through the
+charged reverse MUX. The sender parses the reconstructed IPv4/TCP bytes. The
+`wire` setting uses cumulative NewReno recovery. The `scoreboard` setting
+allows additional retransmissions during an active recovery when the received
+SACK ranges mark a hole under the RFC 6675 IsLost thresholds. It counts
+unsacked originals and outstanding retransmissions against the modeled
+segment window and clears selective knowledge on timeout. The first additional
+retry invalidates the timestamp undo evidence for a single fast retransmission.
+The model retains NewReno recovery entry and exit, with no PRR or RACK.
+The additional `scoreboard-dsack` policy can undo a window reduction when
+received duplicate reports and cumulative coverage prove the entire recovery
+episode redundant. Repeated or ambiguous loss retains its congestion response.
+The two-seed comparison records each direction's mixed-group costs and final
+confirmation debt. [Fixed-anchor 5/4 results](../work/c48-parity-20261119/native/tun-ring-fix-20261119/inner-retrans-analysis/maintained-sack-comparison.json).
+
 `studies/compact_tcp_goal.py` exports both the full traffic interval and a
 post-warmup interval. The latter uses packet counts and delivered payload from
 the same interval. A successful target observation requires complete application

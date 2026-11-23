@@ -208,6 +208,15 @@ tombstone. Recovery handoff completion alone is not that native cursor service.
 Pending native bytes/tokens remain immutable, and their original record,
 first-prepare and external caps are not renewed by preview, duplicates or rescan.
 
+In Targeted mode, a successful ordered handoff can leave the ordered unit
+cursor behind an entire run of previously admitted units. With remaining
+work in the same turn, the endpoint verifies contiguous Packed unit ranges
+in committed sources starting at that cursor. It may admit the source
+containing the first missing unit before the ordered handoff reaches it.
+Only ordinary handoff confirms recovery custody. Each scan debits the
+remaining metadata and symbol-copy allowance and retains its position
+across turns. A pending feedback scan retains priority over both operations.
+
 Four focused protocol cases passed: decoder committed/shadow visibility using a real GF repair;
 actual missing-source bypass, later deduplication and tombstone retirement with
 work1 under both source formats/backing modes; retained native original expiry;

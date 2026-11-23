@@ -321,12 +321,13 @@ impl Driver {
                     self.counters.native_backpressure_drops.saturating_add(1);
                 continue;
             }
-            if bytes > self.buffers.frame.capacity() {
-                return Err(protocol("raw ACK retry scratch capacity"));
-            }
-            // The sole synchronous poll uses this scratch only until sealing;
-            // physically held ciphertext has separate immutable Runtime.wire custody.
-            self.buffers.frame.resize(bytes, 0);
+            // Opening is complete before this synchronous retry. The current
+            // incoming plaintext and any unsealed outgoing body have separate owners.
+            let scratch = self
+                .buffers
+                .open
+                .get_mut(..bytes)
+                .ok_or_else(|| protocol("raw ACK retry scratch capacity"))?;
             let runtime = self
                 .common
                 .as_deref_mut()
@@ -335,7 +336,7 @@ impl Driver {
                 .connection_input
                 .as_mut()
                 .ok_or_else(|| protocol("raw ACK queue missing"))?;
-            self.buffers.frame.copy_from_slice(
+            scratch.copy_from_slice(
                 input
                     .queue
                     .front()
@@ -351,7 +352,7 @@ impl Driver {
                 engine::Tick(pending.deadline),
                 pending.number,
                 engine::EmissionKind::UnreliableNative,
-                &mut self.buffers.frame,
+                scratch,
             ) {
                 Ok(()) => {
                     input.queue.complete_front()?;
@@ -369,7 +370,7 @@ impl Driver {
                         .queue
                         .acquire()
                         .ok_or_else(|| protocol("raw ACK rotation lost its slab"))?;
-                    lease.copy(pending, pending.received, &self.buffers.frame)?;
+                    lease.copy(pending, pending.received, scratch)?;
                 }
                 Err(error) => return Err(protocol(error)),
             }

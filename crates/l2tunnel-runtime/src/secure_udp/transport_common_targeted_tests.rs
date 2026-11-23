@@ -55,16 +55,138 @@ fn ingest(fixture: &mut Fixture, side: usize, wire: &[u8]) -> Result {
         .receive_selected(wire, fixture.now, e.driver.origin + duration(fixture.now))?;
     Ok(())
 }
+
+#[tokio::test]
+async fn udp_burst_uses_the_exact_credit_earned_before_its_source_poll() -> Result {
+    let kind = cover::Appearance::QuicLike;
+    let mut fixture = Fixture::from_contracts(kind, contracts_targeted(kind)?).await?;
+    for i in 0..3 {
+        fixture.admit(0, &frame(40_000, i)).await?;
+    }
+    let now = fixture.now;
+    let endpoint = &mut fixture.endpoints[0];
+    let driver = &mut endpoint.driver;
+    let epoch = driver.common_state()?.epoch();
+    driver.service_common_rolling(now)?;
+    driver.bucket.refill(now)?;
+    driver
+        .bucket
+        .charge(driver.bucket.allowance() - driver.reserve)?;
+    assert!(!driver.send_common_user_with(now, |_| Err(io::ErrorKind::InvalidData.into()))?);
+    let cost = driver
+        .common_state()?
+        .engine(epoch)?
+        .ready_rolling_data_wire_bytes()?
+        .ok_or("ready Packed original")?;
+    let eligible = driver.bucket.ready_at(cost + driver.reserve)?;
+    assert!(eligible > now);
+    let origin = driver.origin;
+    let accepted = driver.counters.socket_accepted_ip_bytes;
+    let start = origin + duration(now);
+    driver.send_sampled(&endpoint.socket, now, start, || {
+        origin + duration(eligible - 1)
+    })?;
+    assert_eq!(driver.counters.socket_accepted_ip_bytes, accepted);
+    driver.send_sampled(&endpoint.socket, now, start, || origin + duration(eligible))?;
+    assert_eq!(
+        driver.counters.socket_accepted_ip_bytes - accepted,
+        cost as u64
+    );
+    let wire = read_datagram(&fixture, 1).await?;
+    assert_eq!(wire.len() + fixture.endpoints[0].driver.ip, cost);
+    Ok(())
+}
+
+#[tokio::test]
+async fn udp_read_pressure_returns_to_the_existing_targeted_receive_grant() -> Result {
+    let kind = cover::Appearance::QuicLike;
+    let old = contracts_targeted(kind)?;
+    let limits = rolling_records::IngressLimits {
+        slots: 4,
+        capacity_bytes: 100_000,
+    };
+    let contracts = contracts_with_catalog_and_options(
+        kind,
+        old[0].catalog().clone(),
+        16,
+        Some(work()),
+        Some(limits),
+    )?;
+    let mut fixture = Fixture::from_contracts(kind, contracts).await?;
+    let mut wires = Vec::new();
+    for id in 0..5 {
+        fixture.admit(0, &frame(40_000, 82 + id as u8)).await?;
+        wires.push(transmit_source(&mut fixture, rolling::SourceId(id))?);
+    }
+    let mut check = 1;
+    for (id, expected) in wires.iter().take(4).enumerate() {
+        let actual = read_datagram(&fixture, 1).await?;
+        assert_eq!(&actual, expected);
+        ingest(&mut fixture, 1, &actual)?;
+        assert_eq!(
+            fixture.endpoints[1]
+                .driver
+                .yield_targeted_udp_batch(id as u64 + 1, 16, &mut check)?,
+            id == 3
+        );
+    }
+    // A fifth physical packet is still readable. The first four have each
+    // spent one read. The normal outer-loop grant advances the real decoder.
+    let now = fixture.now;
+    let driver = &mut fixture.endpoints[1].driver;
+    let before = driver
+        .common_state()?
+        .engine(driver.common_state()?.epoch())?
+        .rolling_ingress_status()
+        .ok_or("queue")?;
+    assert_eq!(before.packets, 3);
+    assert_eq!(driver.performance.counters.udp_rolling_pressure_yields, 1);
+    driver.service_common_rolling(now)?;
+    assert!(
+        driver
+            .common_state()?
+            .engine(driver.common_state()?.epoch())?
+            .rolling_ingress_status()
+            .ok_or("serviced queue")?
+            .packets
+            < before.packets
+    );
+    let last = read_datagram(&fixture, 1).await?;
+    assert_eq!(last, wires[4]);
+    ingest(&mut fixture, 1, &last)?;
+    assert_eq!(
+        fixture.endpoints[1]
+            .driver
+            .counters
+            .native_backpressure_drops,
+        0
+    );
+    Ok(())
+}
 async fn early_native(fixture: &mut Fixture) -> Result<Vec<u8>> {
     let now = fixture.now;
     let e = &mut fixture.endpoints[1];
+    drop(
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            e.device.ready_mut(Interest::WRITABLE),
+        )
+        .await??,
+    );
+    let written = e.driver.counters.native_written;
     for _ in 0..256 {
         e.driver.progress_common(now)?;
         e.driver.service_common_rolling(now)?;
-        e.driver.collect_native(now)?;
-        if !e.driver.native.is_empty() {
-            let mut ready = e.device.ready_mut(Interest::WRITABLE).await?;
-            assert!(e.driver.write_native(&mut ready, || Ok(now))?);
+        // The loop's initial collection precedes this decoder grant. A newly
+        // restored record must reach the writable device before selecting again.
+        assert!(e.driver.native.is_empty());
+        let spent = e
+            .driver
+            .flush_native_ready(&mut e.device, || Ok(now))
+            .await?;
+        assert!(spent <= e.driver.config.work.native_write_batch);
+        if e.driver.counters.native_written > written {
+            assert_eq!(e.driver.counters.native_written, written + 1);
             let mut buf = [0; 256];
             let n = e.host.recv(&mut buf)?;
             return Ok(buf[..n].to_vec());

@@ -377,6 +377,46 @@ impl Profile {
     #[allow(clippy::too_many_arguments)]
     fn new_selected_for(
         connection: ConnectionConfig,
+        settings: Settings,
+        peers: establish::Peers,
+        initiator: transport::Config,
+        responder: transport::Config,
+        catalog: Catalog,
+        parameters: transport::TransactionSettings,
+        raw_policy: Option<l2tunnel_raw_io::handoff::pairing::packet::PacketPolicy>,
+        proxy: Option<l2tunnel_runtime::proxy::Config>,
+        compact_wire: Option<l2tunnel::secure_record::compact::Selection>,
+        maintained: Option<super::maintained::Settings>,
+    ) -> io::Result<Self> {
+        // Finish constructing the catalog before validating either role's
+        // runtime inventory. Each operation holds large concrete profile values.
+        let result = Self::build_selected(
+            connection,
+            settings,
+            peers,
+            initiator,
+            responder,
+            catalog,
+            parameters,
+            raw_policy,
+            proxy,
+            compact_wire,
+            maintained,
+        )?;
+        if let Some(settings) = maintained {
+            return result.select_maintained(settings);
+        }
+        if let Some(policy) = raw_policy {
+            return result.select_raw(policy);
+        }
+        result.runtime_contract(security::Role::Initiator)?;
+        result.runtime_contract(security::Role::Responder)?;
+        Ok(result)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build_selected(
+        connection: ConnectionConfig,
         mut settings: Settings,
         peers: establish::Peers,
         initiator: transport::Config,
@@ -555,7 +595,7 @@ impl Profile {
         selection.update(catalog.root().as_bytes());
         selection.update(&data.0);
         settings.application = ConfigDigest(super::finish(selection));
-        let result = Self {
+        Ok(Self {
             connection,
             peers,
             settings,
@@ -576,16 +616,7 @@ impl Profile {
             proxy_measured: None,
             connection_reuse: false,
             compact_wire,
-        };
-        if let Some(settings) = maintained {
-            return result.select_maintained(settings);
-        }
-        if let Some(policy) = raw_policy {
-            return result.select_raw(policy);
-        }
-        result.runtime_contract(security::Role::Initiator)?;
-        result.runtime_contract(security::Role::Responder)?;
-        Ok(result)
+        })
     }
     /// Exact requested directional ACK policies, unchanged by genuine outer binding.
     pub fn ack_coalescing(&self) -> [Option<l2tunnel::pipeline::ack_coalescing::Policy>; 2] {

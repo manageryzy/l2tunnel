@@ -103,7 +103,10 @@ class MultiFlow:
         if self.strategy.mode == "quic":
             for name in ("quic_retransmitted_stream_bytes", "quic_cwnd_bytes"):
                 setattr(aggregate, name, sum(getattr(flow, name) for flow in self.flows))
-        row = measure(aggregate)
+        segmented_payload = None
+        if any(getattr(flow, "segment_offsets", None) is not None for flow in self.flows):
+            segmented_payload = sum(flow.byte_offset(flow.tcp_received) for flow in self.flows)
+        row = measure(aggregate, segmented_payload=segmented_payload)
         goodputs = [flow.tcp_payload_bytes for flow in self.flows]
         squares = sum(value * value for value in goodputs)
         row.update(

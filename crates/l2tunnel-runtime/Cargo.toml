@@ -42,8 +42,17 @@ socket2 = "=0.6.5"
 zeroize = "=1.9.0"
 tokio = { version = "=1.53.1", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+rustix = { version = "=1.1.4", features = ["time"] }
+
 [dev-dependencies]
 serde_json = "=1.0.151"
 tokio = { version = "=1.53.1", features = ["test-util"] }
 l2tunnel-raw-tcp = { path = "../l2tunnel-raw-tcp" }
 rcgen = { version = "=0.14.10", default-features = false, features = ["ring"] }
+serde = { version = "=1.0.229", features = ["derive"] }
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+l2tunnel-platform-linux = { path = "../l2tunnel-platform-linux" }
+nix = { version = "=0.31.3", features = ["signal"] }
+rustix = { version = "=1.1.4", features = ["event", "thread"] }

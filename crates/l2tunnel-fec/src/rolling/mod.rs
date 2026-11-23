@@ -122,6 +122,25 @@ impl Config {
             tail,
         })
     }
+    /// Freeze a global or tail row after excluding cumulatively confirmed sources.
+    /// Local repairs keep their canonical span, seed and serial. A completely
+    /// confirmed global span has no source left to encode.
+    pub fn confirmed_prefix_support(
+        self,
+        end: u32,
+        id: RepairId,
+        tail: bool,
+        confirmed_prefix: u32,
+    ) -> Result<Support, Error> {
+        let mut support = self.support(end, id, tail)?;
+        if tail || ((id.0 & 0x7fff) as u16).is_multiple_of(self.global_every) {
+            support.start = support.start.max(confirmed_prefix);
+            if support.start >= end {
+                return Err(Error::Identity);
+            }
+        }
+        Ok(support)
+    }
 }
 /// Canonical immutable support; the decoder derives and checks every field.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

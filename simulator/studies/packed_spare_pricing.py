@@ -13,6 +13,8 @@ def install(sim, services):
     transports = {bool(service.transport.reverse):service.transport for service in services.values()}
     classes = collections.Counter()
     maximum = collections.Counter()
+    offered = {direction: {"ip_bytes": collections.Counter(), "max_ip_bytes": collections.Counter()}
+               for direction in ("forward", "reverse")}
     feedback_sequence = collections.Counter()
     def price(kind, size):
         assert size <= 1500 and size >= fixed
@@ -20,15 +22,24 @@ def install(sim, services):
         maximum[kind] = max(maximum[kind], size)
         return size
     def patch_transport(t):
-        assert t.ip_header_bytes == 20 and t.crc_bytes == 4
-        # Outside an exact selected emission, account fixed costs as 45 + 4 old opaque CRC bytes.
-        t.ip_header_bytes = fixed - 4
+        if t.c48_union:
+            assert t.ip_header_bytes == fixed and t.crc_bytes == 0
+        else:
+            assert t.ip_header_bytes == 20 and t.crc_bytes == 4
+            # Outside an exact selected emission, account fixed costs as 45 + 4 old opaque CRC bytes.
+            t.ip_header_bytes = fixed - 4
         old_wire = t._send_wire
         def emit(wire, kind, header_bytes):
+            if t.c48_union:
+                price(kind, fixed + len(wire))
+                return old_wire(wire, kind, header_bytes)
             body_size = len(wire)-t.crc_bytes-header_bytes
             if kind in ("source","retry"):
                 source = _unwrap(int.from_bytes(wire[:2],"big") & ID_MASK,len(t.sources)-1)
                 union = 1 + vlen(source)
+                if t.source_wire_codec is not None:
+                    t.source_wire_codec.account(kind, fixed + union + t.sources[source].size,
+                                                fixed + union + body_size)
             else:
                 assert kind == "repair"
                 union = 1 + vlen(t.repair_serial) + vlen(len(t.sources)) + 2
@@ -40,6 +51,8 @@ def install(sim, services):
             finally:
                 t.ip_header_bytes = prior
         t._send_wire = emit
+        if t.source_wire_codec is not None:
+            t.source_ip_bytes = lambda index, wire: fixed + 1 + vlen(index) + len(wire) - 2 - t.crc_bytes
         old_retry = t._resend
         def retry(source,reason):
             t.source_header = fixed + 1 + vlen(source)
@@ -71,8 +84,11 @@ def install(sim, services):
                     observed = t.highest_received + 1
                     hdr = 1 + sum(map(vlen,(identity,prefix,observed,deficit)))
                 size = price(kind,fixed+hdr)
+            direction = offered["reverse" if reverse else "forward"]
+            direction["ip_bytes"][kind] += size
+            direction["max_ip_bytes"][kind] = max(direction["max_ip_bytes"][kind], size)
             return original(reverse,size,kind,receive)
         net.send = send
     for net in {id(t.sim):t.sim for t in transports.values()}.values():
         install_link(net)
-    return classes, maximum
+    return classes, maximum, offered

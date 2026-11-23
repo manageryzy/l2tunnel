@@ -59,13 +59,13 @@ impl Engine {
             .ok_or(Error::Arithmetic)?;
         // Refuse before extraction/device submission if a later whole-write
         // receipt cannot be represented. One pending slot prevents a competing
-        // successful commit from consuming this counter capacity.
+        // successful commit from consuming this counter capacity. Every channel
+        // receipt also increments the corresponding total, so this reserves
+        // counter capacity even when the owner selects a different channel.
         self.statistics
             .committed
             .checked_add(1)
             .ok_or(Error::Arithmetic)?;
-        self.native_counts
-            .preflight_prepare(self.receive_channels)?;
         let channel =
             receiver::ChannelId(u8::try_from(self.next_channel).map_err(|_| Error::Invariant)?);
         let next_channel = if self.next_channel + 1 == self.receive_channels {

@@ -1,6 +1,331 @@
 use super::*;
 
 #[test]
+fn committed_anchor_and_delta_preview_while_ordered_sources_continue() -> TestResult {
+    let mut config = short_config(128, rolling::wire::SourceWire::TargetedExact);
+    config.forward.native_policy = NativePolicy::FixedAnchorIpHeaders;
+    config.forward.receiver.lookahead_records = 16;
+    config.forward.scheduler.recovery.handoff_sources = 16;
+    config.forward.packing.work_limit = 32;
+    let mut rx = make_receiver(config, true)?;
+    rx.enable_compact_wire(73)?;
+    rx.enable_queue_aware_repair_budget(1500)?;
+    let scope = rx.receive_scope;
+    let wire_scope = rolling::Scope {
+        direction: 0,
+        session: scope.session,
+        epoch: scope.epoch.0,
+        stream: 17,
+    };
+    // Byte-exact timestamp-bearing IPv4/TCP fixture shared with the codec tests.
+    let hex = "45000037ffff4000400626bf0a0000010a00000201bb1388fffffffe000000098018ffff5c5b00000101080affffffff000000070102f0";
+    let ip: Vec<_> = (0..hex.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16))
+        .collect::<Result<_, _>>()?;
+    let mut header = [0; 256];
+    codec::tcp_header::IpHeaderEncoder::new(4096)?.encode(&ip, &mut header)?;
+    assert_eq!(header[0], 8);
+    let context_len = 3 + usize::from(u16::from_be_bytes([header[1], header[2]]));
+    let first = config.forward.receiver.first_record.0;
+    let mut data = Vec::new();
+    for serial in 0..8u32 {
+        let rec = receiver::RecordId(first + u64::from(serial));
+        let mut unit = vec![0, 0, u8::try_from(rec.0)?];
+        match serial {
+            6 => unit.extend_from_slice(&header[..context_len]),
+            7 => unit.extend_from_slice(&[11, 1, 9, 0, 3, 0, 1, 2, 0xf0]),
+            _ => {
+                let mut bytes = ip.clone();
+                if serial == 0 {
+                    bytes[33] = 2;
+                    // Changing ACK|PSH to SYN subtracts 0x16 from that
+                    // TCP header word; adjust this fixture's checksum.
+                    bytes[36..38].copy_from_slice(&0x5c71u16.to_be_bytes());
+                }
+                unit.extend([2, 0, u8::try_from(bytes.len())?]);
+                unit.extend(bytes);
+            }
+        }
+        let mut original = [0; 256];
+        let n = packed_envelope::encode_compact(
+            config.forward.packing.envelope(),
+            packed_envelope::Identity {
+                scope,
+                source: receiver::SourceId(serial.into()),
+                first_unit: receiver::SourceId(
+                    config.forward.receiver.first_source.0 + u64::from(serial),
+                ),
+            },
+            &[rec],
+            &unit,
+            &mut original,
+        )?;
+        let mut wire = [0; 512];
+        let n = rolling::wire::compact::encode_data(
+            scheduler::Output::Source {
+                scope: wire_scope,
+                id: rolling::SourceId(serial),
+                original: &original[..n],
+            },
+            &mut wire,
+        )?;
+        data.push(wire[..n].to_vec());
+    }
+    let now = Tick(1);
+    // Prime only the real recovery owner to separate FEC publication from
+    // the Packed/Aligned service under test. S5 remains physically absent.
+    for (n, bytes) in data.iter().enumerate().filter(|(n, _)| *n != 5) {
+        rx.accept_authenticated(now, rx.inspect_peer(bytes)?, bytes)?;
+        for _ in 0..64 {
+            rx.incoming.step(rolling_tick(now), work())?;
+            if !rx.receiver_status().decoder.pending_job {
+                break;
+            }
+        }
+        assert!(
+            rx.incoming
+                .decoded_source(rolling::SourceId(u32::try_from(n)?))?
+                .is_some()
+        );
+    }
+    let status = rx.receiver_status().decoder;
+    assert_eq!(
+        (
+            status.handoff_prefix,
+            status.decoded_prefix,
+            status.observed_end
+        ),
+        (0, 5, 8)
+    );
+    let mut seen = std::collections::BTreeSet::new();
+    let mut target_handoff = None;
+    let mut buf = [0; 1024];
+    for turn in 0..16 {
+        if turn == 5 {
+            assert_eq!(rx.receiver_status().decoder.handoff_prefix, 5);
+            assert_eq!(
+                target_handoff,
+                Some(2),
+                "fixed-anchor delta stayed behind ordered handoffs"
+            );
+            rx.accept_authenticated(now, rx.inspect_peer(&data[5])?, &data[5])?;
+        }
+        let grant = work();
+        let step = rx.step(now, grant)?;
+        assert!(
+            step.receive.work.copies <= grant.copies
+                && step.receive.work.metadata <= grant.metadata
+                && step.receive.work.field <= grant.field
+        );
+        for _ in 0..16 {
+            match rx.prepare_native(now, 16, Tick(10_000), &mut buf)? {
+                NativePreparation::Ready(p) => {
+                    let n = p.identity().record.0 - first;
+                    assert!(seen.insert(n));
+                    if n == 7 {
+                        assert_eq!(&buf[..p.bytes()], ip);
+                        assert!(p.early());
+                        target_handoff = Some(rx.receiver_status().decoder.handoff_prefix);
+                    }
+                    rx.commit_native(now, p.token())?;
+                }
+                NativePreparation::Progress | NativePreparation::Idle => {}
+                NativePreparation::AlreadyPending(_) => {
+                    return Err("unexpected retained token".into());
+                }
+            }
+        }
+    }
+    assert_eq!(seen, [0, 1, 2, 3, 4, 5, 7].into_iter().collect());
+    assert_eq!(rx.receiver_status().decoder.handoff_prefix, 8);
+    assert_eq!(rx.record_status().retained_records, 0);
+    Ok(())
+}
+
+#[test]
+fn solved_missing_unit_can_deliver_while_older_previewed_sources_handoff() -> TestResult {
+    use rolling::wire::compact;
+
+    let mut config = short_config(128, rolling::wire::SourceWire::TargetedExact);
+    config.forward.native_policy = NativePolicy::FixedAnchorIpHeaders;
+    config.forward.receiver.lookahead_records = 16;
+    config.forward.scheduler.recovery.handoff_sources = 16;
+    let scope = rolling::Scope {
+        direction: 0,
+        session: context(Role::Client).session.to_be_bytes(),
+        epoch: context(Role::Client).epoch,
+        stream: 17,
+    };
+    let codec_scope = receiver::Scope {
+        session: scope.session,
+        epoch: crate::core::Epoch(scope.epoch),
+        direction: receiver::Direction::InitiatorToResponder,
+    };
+    let policy = config.forward.scheduler;
+    let mut encoder = rolling::Encoder::new(policy.recovery, scope, rolling::Tick(0))?;
+    let mut frames = Vec::new();
+    let mut sources = Vec::new();
+    let mut wire = [0; 1024];
+    for serial in 0..12 {
+        let id = rolling::SourceId(serial);
+        let rec = receiver::RecordId(config.forward.receiver.first_record.0 + u64::from(serial));
+        let mut frame = packet(true, 0, 40);
+        frame[5] = serial as u8;
+        let mut unit = vec![0, 0, rec.0 as u8, 2, 0, 40];
+        unit.extend_from_slice(&frame);
+        let mut original = [0; 256];
+        let len = packed_envelope::encode_compact(
+            config.forward.packing.envelope(),
+            packed_envelope::Identity {
+                scope: codec_scope,
+                source: receiver::SourceId(serial.into()),
+                first_unit: receiver::SourceId(
+                    config.forward.receiver.first_source.0 + u64::from(serial),
+                ),
+            },
+            &[rec],
+            &unit,
+            &mut original,
+        )?;
+        let original = &original[..len];
+        assert_eq!(encoder.admit_source(original, rolling::Tick(0))?, id);
+        let len = compact::encode_data(
+            scheduler::Output::Source {
+                scope,
+                id,
+                original,
+            },
+            &mut wire,
+        )?;
+        sources.push(wire[..len].to_vec());
+        frames.push(frame);
+    }
+    encoder.begin_repair(true, rolling::Tick(0))?;
+    while encoder.pending_repair().is_none() {
+        encoder.step(rolling::Tick(0), work())?;
+    }
+    let len = compact::encode_data(
+        scheduler::Output::Repair(encoder.pending_repair().ok_or("repair")?),
+        &mut wire,
+    )?;
+    let row = &wire[..len];
+    let now = Tick(1);
+    for visits in [1, 32] {
+        config.forward.packing.work_limit = visits;
+        let mut rx = make_receiver(config, true)?;
+        rx.enable_compact_wire(73)?;
+        rx.enable_queue_aware_repair_budget(1500)?;
+        let mut delivered = std::collections::BTreeSet::new();
+        let mut output = [0; 1024];
+        let mut collect = |rx: &mut Endpoint| -> TestResult<Vec<usize>> {
+            let mut new = Vec::new();
+            for _ in 0..32 {
+                match rx.prepare_native(now, 16, Tick(9_000), &mut output)? {
+                    NativePreparation::Ready(p) => {
+                        let index = usize::try_from(
+                            p.identity().record.0 - config.forward.receiver.first_record.0,
+                        )?;
+                        assert_eq!(&output[..p.bytes()], &frames[index]);
+                        assert!(delivered.insert(index));
+                        rx.commit_native(now, p.token())?;
+                        new.push(index);
+                    }
+                    NativePreparation::Progress => {}
+                    NativePreparation::Idle => return Ok(new),
+                    NativePreparation::AlreadyPending(_) => return Err("unexpected pending".into()),
+                }
+            }
+            Err("native work did not settle".into())
+        };
+        for index in (1..12).filter(|id| *id != 7) {
+            rx.accept_authenticated(now, rx.inspect_peer(&sources[index])?, &sources[index])?;
+            settle(&mut rx, now)?;
+            assert_eq!(collect(&mut rx)?, [index]);
+        }
+        rx.accept_authenticated(now, rx.inspect_peer(row)?, row)?;
+        settle(&mut rx, now)?;
+        assert_eq!(rx.receiver_status().decoder.rank, 1);
+        rx.accept_authenticated(now, rx.inspect_peer(&sources[0])?, &sources[0])?;
+        let grant = work();
+        let mut target_at = None;
+        for expected in 1..=12 {
+            let step = rx.step(now, grant)?;
+            let used = step.receive.work;
+            assert!(
+                used.copies <= grant.copies
+                    && used.metadata <= grant.metadata
+                    && used.field <= grant.field
+            );
+            let status = rx.receiver_status().decoder;
+            assert_eq!(
+                (status.known_sources, status.rank, status.handoff_prefix),
+                (12, 0, expected)
+            );
+            if collect(&mut rx)?.contains(&7) {
+                target_at = Some(expected);
+            }
+        }
+        assert!(target_at.is_some_and(|at| at <= 8));
+        if visits == 32 {
+            assert_eq!(target_at, Some(1));
+        }
+        assert_eq!(delivered.len(), 12);
+        assert_eq!(rx.record_status().retained_records, 0);
+    }
+    Ok(())
+}
+
+#[test]
+fn targeted_full_fifo_suppresses_duplicate_admission_until_original_deadline() -> TestResult {
+    let mut cfg = config(true, rolling::wire::SourceWire::TargetedExact);
+    cfg.forward.scheduler.repair_numerator = 0;
+    cfg.forward.scheduler.recovery.job_ticks = 1000;
+    let plan = storage::Plan::for_endpoint(cfg, context(Role::Client), 17, Tick(0))?
+        .with_wait_diagnostics()?;
+    let mut endpoint = Endpoint::new_reserved(
+        plan,
+        storage::Limits {
+            capacity_bytes: plan.capacity_bytes(),
+        },
+    )?;
+    endpoint.enable_compact_wire(41)?;
+    endpoint.enable_queue_aware_repair_budget(1500)?;
+    let created = Tick(1);
+    endpoint
+        .enqueue_admitted_identified(created, 0, &packet(true, 7, 64))?
+        .ok_or("staged original")?;
+    let occupied = Tick(20);
+    let limit = endpoint.sender_status().fresh_queue_limit;
+    for _ in 0..=limit {
+        endpoint
+            .sender
+            .admit_source(b"queued", rolling_tick(occupied))?;
+    }
+    endpoint.flush(occupied)?;
+    let due = Tick(created.0 + cfg.forward.scheduler.recovery.job_ticks);
+    for tick in [21, 22, due.0 - 1] {
+        endpoint.step(Tick(tick), rolling::WorkBudget::default())?;
+    }
+    let site = endpoint.wait_snapshot(due).ok_or("observed sender")?.sites[0];
+    assert_eq!(site.refusals[0], 1);
+    assert_eq!(site.pending.ok_or("first real refusal")?.since, occupied);
+    assert_eq!(endpoint.sender_status().queued_fresh, limit);
+    assert_eq!(
+        endpoint.step(due, rolling::WorkBudget::default()),
+        Err(Error::Rolling(rolling::Error::Expired))
+    );
+    let failure = endpoint
+        .sender
+        .expiry_snapshot()
+        .failure
+        .ok_or("original incoming expiry")?;
+    assert_eq!(failure.selected.kind, rolling::expiry::Kind::IncomingCap);
+    assert_eq!(failure.selected.at, rolling_tick(due));
+    Ok(())
+}
+
+#[test]
 fn sealed_targeted_source_uses_only_the_residual_grant_at_a_freed_fifo_slot() -> TestResult {
     for continuation in [false, true] {
         for (missing_byte, metadata) in [(false, 2), (true, 2), (false, 1)] {
@@ -620,5 +945,70 @@ fn targeted_fresh_channel_is_served_during_named_retries_and_oldest_loss_repeats
             .unconfirmed_sources,
         0
     );
+    Ok(())
+}
+
+#[test]
+fn near8_gap_request_survives_a_lost_first_copy_without_a_second_named_retry() -> TestResult {
+    let mut cfg = short_config(0, rolling::wire::SourceWire::TargetedExact);
+    cfg.forward.scheduler.source_wire = rolling::wire::SourceWire::TargetedNear8;
+    let mut a = endpoint(cfg, Role::Client)?;
+    let mut b = endpoint(cfg, Role::Server)?;
+    a.enable_compact_wire(41)?;
+    b.enable_compact_wire(73)?;
+    a.enable_queue_aware_repair_budget(1500)?;
+    b.enable_queue_aware_repair_budget(1500)?;
+    a.configure_near8(1500, 100_000_000)?;
+    let mut data_pn = 1;
+    let mut request_pn = 1;
+    for index in 0..2 {
+        let frame = packet(true, 0x30 + index, 140);
+        a.enqueue_admitted_identified(Tick(0), 0, &frame)?
+            .ok_or("admit")?;
+        a.flush(Tick(0))?;
+        a.step(Tick(0), work())?;
+        let (_, packet) = emit(&mut a, Tick(0), &mut data_pn, true)?.ok_or("source")?;
+        if index == 1 {
+            b.accept_authenticated(Tick(0), packet.kind, &packet.bytes)?;
+        }
+    }
+    settle(&mut b, Tick(0))?;
+    let now = Tick(2_010);
+    let (issued, lost) = loop {
+        b.step(now, work())?;
+        let named = b.incoming.pending_request().is_some();
+        let (issued, wire) = emit(&mut b, now, &mut request_pn, false)?.ok_or("feedback")?;
+        if named {
+            break (issued, wire);
+        }
+    };
+    let mut out = [0; 128];
+    let mut empty = OutboundBudget {
+        packets: 0,
+        wire_bytes: 0,
+    };
+    assert!(
+        b.prepare_output(now, request_pn, false, &mut out, &mut empty, &mut [])?
+            .is_none()
+    );
+    let (copy, received) = emit(&mut b, now, &mut request_pn, false)?.ok_or("second request")?;
+    assert_eq!(copy.id, issued.id);
+    assert_ne!(copy.security_number, issued.security_number);
+    assert_eq!(copy.wire_bytes, issued.wire_bytes);
+    assert_eq!(received.bytes, lost.bytes);
+    assert_eq!(b.confirm_output(now, issued), Err(Error::Token));
+    assert!(emit(&mut b, now, &mut request_pn, false)?.is_none());
+    a.accept_authenticated(now, received.kind, &received.bytes)?;
+    a.step(now, work())?;
+    let (retry, wire) = emit(&mut a, now, &mut data_pn, true)?.ok_or("named retry")?;
+    assert_eq!(
+        retry.id,
+        OutputId::Data(scheduler::OutputId::Source(rolling::SourceId(0)))
+    );
+    a.accept_authenticated(now, lost.kind, &lost.bytes)?;
+    assert!(!a.sender.requested_retry_waiting());
+    b.accept_authenticated(now, wire.kind, &wire.bytes)?;
+    settle(&mut b, now)?;
+    assert_eq!(b.receiver_status().decoder.decoded_prefix, 2);
     Ok(())
 }

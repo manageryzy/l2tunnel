@@ -7,6 +7,12 @@ pub(super) fn maximums(
 ) -> Result<(usize, usize), Error> {
     use configuration::DirectionProfile as D;
     let result = match (profile, opposite) {
+        (D::Striped(send), D::Striped(_)) => {
+            return Ok((
+                send.profile.max_wire_bytes,
+                crate::fec::striped_group::feedback::MAX_WIRE_BYTES,
+            ));
+        }
         (D::Swift(send), D::Swift(_)) => {
             return Ok((send.codec.datagram_bytes, send.codec.datagram_bytes));
         }
@@ -104,6 +110,16 @@ impl Engine {
         }
         match &mut self.owner {
             Owner::Swift(_) => {}
+            Owner::Striped(_) => {
+                let descriptor = self.configuration.descriptor();
+                let local = descriptor.direction(self.context.role);
+                let maximum = crate::fec::striped_group::feedback::MAX_WIRE_BYTES
+                    .checked_add(feedback_overhead)
+                    .ok_or(Error::Geometry)?;
+                if maximum > descriptor.path_mtu() || maximum > local.common().burst_bytes() {
+                    return Err(Error::Geometry);
+                }
+            }
             Owner::Aligned(endpoint) => endpoint
                 .enable_compact_wire(feedback_overhead)
                 .map_err(Error::Aligned)?,
@@ -163,6 +179,8 @@ impl Engine {
     /// granting feedback or authenticated-liveness authority. No state commits.
     pub fn inspect_peer(&self, body: &[u8]) -> Result<EmissionKind, Error> {
         match &self.owner {
+            // The mixed shape octet overlaps the feedback discriminator.
+            Owner::Striped(_) => Err(Error::Kind),
             Owner::Aligned(endpoint) => endpoint
                 .inspect_peer(body)
                 .map(owner::emission_kind)
@@ -175,6 +193,16 @@ impl Engine {
             Owner::Swift(_) => self.inspect_swift_peer(body),
             Owner::Rolling(endpoint) => endpoint.inspect_peer(body).map_err(Error::Rolling),
             Owner::Research(endpoint) => endpoint.inspect_peer(body).map_err(Error::Rolling),
+        }
+    }
+
+    /// Inspect peer plaintext using its authenticated outer feedback class.
+    /// Other grammars retain their existing route and stronger protection rules.
+    pub fn inspect_peer_class(&self, body: &[u8], feedback: bool) -> Result<EmissionKind, Error> {
+        if let Owner::Striped(endpoint) = &self.owner {
+            endpoint.inspect_peer(body, feedback)
+        } else {
+            self.inspect_peer(body)
         }
     }
 

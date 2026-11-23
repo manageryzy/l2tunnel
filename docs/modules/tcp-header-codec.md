@@ -55,6 +55,17 @@ acceptance of arbitrary 66-byte context bodies is intentionally not a hostile-in
 contract. Context TCP checksum cannot be independently verified without its
 original payload; reconstructed frame checksum is calculated from actual output.
 
+The shared encoder first tries to reconstruct the incoming header from its
+existing context. A byte-exact reconstruction verifies the IP and TCP checksums
+once. A changed context still requires independent validation before replacing
+the original. The checksum implementation preserves odd bytes across slice
+boundaries and sums bounded blocks of complete network-order words. An offline
+replay compared both revisions on 34,889 captured native packets. Both emitted
+identical record streams, and both decoded every input byte. Over eight
+interleaved runs per version, median elapsed encoder time per packet fell from
+1,916 ns to 341 ns on this host.
+[Packet replay and per-run times](../../work/c48-parity-20261119/native/tun-ring-fix-20261119/inner-retrans-analysis/header-cost-pair-1ee5ce3.json).
+
 This legacy inner format has no epoch, context ID, integrity or replay field.
 A valid-looking stale delta can decode against the wrong context. The adapter
 therefore requires authenticated ordered delivery within one isolated channel and

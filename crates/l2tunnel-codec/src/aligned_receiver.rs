@@ -13,6 +13,8 @@ mod cache;
 use cache::{DeadlineCache, Retention};
 mod preview;
 use preview::Preview;
+mod fixed_anchor;
+use fixed_anchor::AnchorHistory;
 
 /// Absolute nonwrapping source identity, retained through retransmission/recovery.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -227,6 +229,12 @@ pub enum Admission {
     /// Absolute record already retired; a fresh source cannot redeliver it.
     StaleRecord,
 }
+
+#[derive(Clone, Copy)]
+enum BatchValidation {
+    Ordered,
+    IndependentPackets,
+}
 /// Result of bounded per-channel preparation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Prepared {
@@ -309,6 +317,8 @@ struct Record {
     // Filtered delivery rejected this complete short frame until its ordinary turn.
     // Zero is eligible, MAX waits for channel order, other values are owner recheck tokens.
     defer_early: u64,
+    // Only a time-bounded native byte-order policy may defer the channel head.
+    defer_head: bool,
 }
 impl Record {
     fn complete(&self) -> bool {
@@ -343,8 +353,9 @@ enum EarlySelection<'a> {
     Filtered(&'a mut dyn FnMut(&[u8]) -> bool),
     Reevaluated {
         changed: &'a dyn Fn(u64) -> bool,
-        decide: &'a dyn Fn(&[u8], bool) -> EarlyDecision,
+        decide: &'a dyn Fn(&[u8], bool, bool) -> EarlyDecision,
         complete_packets: bool,
+        check_head: bool,
     },
 }
 /// Local eligibility of an independently decoded complete native frame.
@@ -378,6 +389,12 @@ enum ReceiverMode {
     Ethernet,
     Ip,
     IpEarlyReplay,
+    FixedIpAnchors,
+}
+impl ReceiverMode {
+    fn compact_replay(self) -> bool {
+        matches!(self, Self::IpEarlyReplay | Self::FixedIpAnchors)
+    }
 }
 
 /// Finite receiver state with separate admission, preparation and actual delivery commit.
@@ -388,6 +405,7 @@ pub struct Receiver {
     compacted_slots: usize,
     mode: ReceiverMode,
     channels: Vec<Channel>,
+    anchors: Vec<AnchorHistory>,
     records: Vec<Option<Record>>,
     // Only occupied slots, in (channel, absolute record) order. Valid limits
     // allow at most 8,448 slots including compacted records. Payload owners
@@ -437,25 +455,30 @@ impl Receiver {
     pub fn new_ip_with_early_replay(scope: Scope, limits: Limits) -> Result<Self, Error> {
         Self::new_mode(scope, limits, ReceiverMode::IpEarlyReplay)
     }
+    /// Select the native-IP grammar whose deltas name a same-channel context record.
+    pub fn new_ip_with_fixed_anchors(scope: Scope, limits: Limits) -> Result<Self, Error> {
+        Self::new_mode(scope, limits, ReceiverMode::FixedIpAnchors)
+    }
     // Public scalar limits remain stable for historical configurations and
     // digests. An allocating owner also reserves today's inline header state,
     // occupied-slot index and compact replay metadata. Its retained bodies
     // still share the original aggregate bytes/fragment allowance.
-    fn owned_memory_bound(
-        limits: Limits,
-        reserve_replay: bool,
-        batch: bool,
-    ) -> Result<usize, Error> {
+    fn owned_memory_bound(limits: Limits, mode: ReceiverMode, batch: bool) -> Result<usize, Error> {
         let historical = limits.memory_bound_bytes()?;
         let channels = usize::from(limits.channels);
-        let compacted = Self::compacted_capacity(limits, reserve_replay);
+        let compacted = Self::compacted_capacity(limits, mode.compact_replay());
         let indexed = channels + limits.lookahead_records + compacted;
         // The validated limits admit at most 256 channels + 2 * 4096 records.
         u16::try_from(indexed).map_err(|_| Error::Configuration)?;
         let extra = size_of::<Self>().saturating_sub(size_of::<LegacyLayout>())
             + channels * size_of::<Channel>().saturating_sub(size_of::<LegacyChannel>())
             + compacted * size_of::<Option<Record>>()
-            + indexed * size_of::<u16>();
+            + indexed * size_of::<u16>()
+            + if mode == ReceiverMode::FixedIpAnchors {
+                channels * size_of::<AnchorHistory>()
+            } else {
+                0
+            };
         let single = historical.checked_add(extra).ok_or(Error::Configuration)?;
         let bound = if batch {
             single
@@ -472,8 +495,7 @@ impl Receiver {
     }
     fn new_mode(scope: Scope, limits: Limits, mode: ReceiverMode) -> Result<Self, Error> {
         let ip = mode != ReceiverMode::Ethernet;
-        let reserve_replay = mode == ReceiverMode::IpEarlyReplay;
-        Self::owned_memory_bound(limits, reserve_replay, false)?;
+        Self::owned_memory_bound(limits, mode, false)?;
         if scope.session == [0; 16] {
             return Err(Error::Configuration);
         }
@@ -490,7 +512,7 @@ impl Receiver {
                 .map_err(Error::Body)?,
             });
         }
-        let compacted_slots = Self::compacted_capacity(limits, reserve_replay);
+        let compacted_slots = Self::compacted_capacity(limits, mode.compact_replay());
         let slots = usize::from(limits.channels) + limits.lookahead_records + compacted_slots;
         let mut records = Vec::with_capacity(slots);
         records.resize_with(slots, || None);
@@ -503,6 +525,11 @@ impl Receiver {
             compacted_slots,
             mode,
             channels,
+            anchors: if mode == ReceiverMode::FixedIpAnchors {
+                vec![AnchorHistory::default(); usize::from(limits.channels)]
+            } else {
+                Vec::new()
+            },
             ordered_slots: Vec::with_capacity(records.len()),
             records,
             proofs,
@@ -548,11 +575,15 @@ impl Receiver {
         Ok(())
     }
     fn parse_unit<'a>(&self, symbol: &'a [u8], record: RecordId) -> Result<Parsed<'a>, Error> {
-        if self.compact_units {
+        let parsed = if self.compact_units {
             parse_compact(symbol, record, self.limits)
         } else {
             parse(symbol, record, self.limits)
+        }?;
+        if parsed.offset == 0 {
+            fixed_anchor::validate_tag(self.mode, record, parsed.body, parsed.fragments == 0)?;
         }
+        Ok(parsed)
     }
     /// Expected absolute record; None means this channel consumed its last u64 ID.
     pub fn expected(&self, channel: ChannelId) -> Result<Option<RecordId>, Error> {
@@ -560,6 +591,23 @@ impl Receiver {
             .get(usize::from(channel.0))
             .map(|c| c.expected)
             .ok_or(Error::Malformed)
+    }
+    /// A consumed context, retired record or physically committed early frame.
+    /// A complete or prepared native frame alone does not grant delivery credit.
+    pub fn record_consumed(&self, identity: RecordIdentity) -> Result<bool, Error> {
+        if self
+            .expected(identity.channel)?
+            .is_none_or(|next| identity.record < next)
+        {
+            return Ok(true);
+        }
+        Ok(self
+            .find(identity.channel, identity.record)
+            .is_some_and(|slot| {
+                self.records[slot]
+                    .as_ref()
+                    .is_some_and(|record| record.early_delivered)
+            }))
     }
     /// Admit 1..=255 authenticated symbols as one bounded ledger transaction.
     ///
@@ -573,12 +621,12 @@ impl Receiver {
         now: Tick,
     ) -> Result<Vec<Admission>, Error> {
         if self.reserved.is_some() {
-            return self.reserved_owned_batch(symbols, now, false);
+            return self.reserved_owned_batch(symbols, now, None);
         }
         if !(1..=255).contains(&symbols.len()) {
             return Err(Error::Configuration);
         }
-        Self::owned_memory_bound(self.limits, self.mode == ReceiverMode::IpEarlyReplay, true)?;
+        Self::owned_memory_bound(self.limits, self.mode, true)?;
         self.check_time(now)?;
         let records = self.records.clone();
         let ordered_slots = self.ordered_slots.clone();
@@ -617,49 +665,36 @@ impl Receiver {
         symbols: &[AuthenticatedSymbol<'_>],
         now: Tick,
     ) -> Result<Vec<Admission>, Error> {
+        self.validated_batch(symbols, now, BatchValidation::Ordered)
+    }
+
+    fn validated_batch(
+        &mut self,
+        symbols: &[AuthenticatedSymbol<'_>],
+        now: Tick,
+        policy: BatchValidation,
+    ) -> Result<Vec<Admission>, Error> {
         if self.reserved.is_some() {
-            return self.reserved_owned_batch(symbols, now, true);
+            return self.reserved_owned_batch(symbols, now, Some(policy));
         }
         if !(1..=255).contains(&symbols.len()) {
             return Err(Error::Configuration);
         }
-        Self::owned_memory_bound(self.limits, self.mode == ReceiverMode::IpEarlyReplay, true)?;
+        Self::owned_memory_bound(self.limits, self.mode, true)?;
         self.check_time(now)?;
         let mut shadow = self.validation_shadow()?;
         for symbol in symbols {
             shadow.admit_authenticated(symbol.identity, symbol.bytes, now)?;
         }
-        if shadow.pending.is_some() {
-            shadow.commit_delivery(now)?;
-        }
-        let mut work = shadow.records.len() + shadow.channels.len();
-        for channel in 0..shadow.limits.channels {
-            loop {
-                if work == 0 {
-                    return Err(Error::UnresolvedContext);
-                }
-                work -= 1;
-                match shadow.prepare(ChannelId(channel as u8), now, 1)? {
-                    Prepared::Idle => break,
-                    Prepared::Progress => {}
-                    Prepared::Ready => shadow.commit_delivery(now)?,
-                }
-            }
-        }
-        if shadow
-            .records
-            .iter()
-            .flatten()
-            .any(|record| record.complete() && !record.early_delivered)
-        {
-            return Err(Error::UnresolvedContext);
-        }
+        shadow.validate_pending_batch(now, policy)?;
         // Do not overlap this full shadow with the existing ledger rollback copy.
         drop(shadow);
         self.admit_batch_authenticated(symbols, now)
     }
     fn validation_shadow(&self) -> Result<Self, Error> {
         let mut shadow = Self::new_mode(self.scope, self.limits, self.mode)?;
+        let live = shadow.anchors.len();
+        shadow.anchors.clone_from_slice(&self.anchors[..live]);
         shadow.compact_units = self.compact_units;
         for (target, source) in shadow.channels.iter_mut().zip(&self.channels) {
             target.expected = source.expected;
@@ -869,6 +904,7 @@ impl Receiver {
                         independent_short: parsed
                             .independent_short(self.limits.body.independent_short_frame_bytes),
                         defer_early: 0,
+                        defer_head: false,
                     };
                     self.retention.add_record(&record);
                     self.deadlines.insert(record.deadline);
@@ -938,8 +974,9 @@ impl Receiver {
             max_records,
             EarlySelection::Reevaluated {
                 changed: &changed,
-                decide: &|frame, _| decide(frame),
+                decide: &|frame, _, _| decide(frame),
                 complete_packets: false,
+                check_head: false,
             },
         )
     }
@@ -961,11 +998,35 @@ impl Receiver {
             max_records,
             EarlySelection::Reevaluated {
                 changed: &changed,
-                decide: &decide,
+                decide: &|frame, short, _| decide(frame, short),
                 complete_packets: true,
+                check_head: false,
             },
         )
     }
+    /// Apply a bounded native dependency to complete packets, including the channel head.
+    /// The caller must arrange a wake and invalidate the dependency when its hold expires.
+    pub fn prepare_with_native_ordering(
+        &mut self,
+        channel: ChannelId,
+        now: Tick,
+        max_records: usize,
+        changed: impl Fn(u64) -> bool,
+        decide: impl Fn(&[u8], bool, bool) -> EarlyDecision,
+    ) -> Result<Prepared, Error> {
+        self.prepare_selected(
+            channel,
+            now,
+            max_records,
+            EarlySelection::Reevaluated {
+                changed: &changed,
+                decide: &decide,
+                complete_packets: true,
+                check_head: true,
+            },
+        )
+    }
+
     /// Preserve channel FIFO even when independent short bodies are enabled.
     /// Already exposed native bytes retain custody until their original commit.
     pub fn prepare_ordered(
@@ -1004,7 +1065,11 @@ impl Receiver {
             };
             let slot = usize::from(self.ordered_slots[position]);
             let index = usize::from(channel.0);
-            if let Some(anchor) = anchor {
+            if self.mode == ReceiverMode::FixedIpAnchors {
+                if !self.stage_fixed_anchor(slot, &mut remaining)? {
+                    return Ok(Prepared::Progress);
+                }
+            } else if let Some(anchor) = anchor {
                 if !self.stage_prefix(index, anchor, position, &mut remaining)? {
                     return Ok(Prepared::Progress);
                 }
@@ -1016,7 +1081,10 @@ impl Receiver {
             let early = entry.id != expected;
             let independent_short = entry.independent_short;
             let delivered = entry.early_delivered;
-            if delivered && independent_length(&entry.bytes).is_some() {
+            if delivered
+                && (self.mode == ReceiverMode::FixedIpAnchors
+                    || independent_length(&entry.bytes).is_some())
+            {
                 self.retire(slot)?;
                 continue;
             }
@@ -1035,13 +1103,23 @@ impl Receiver {
             match decoded {
                 aligned_body::Decoded::Context { .. } => {
                     self.touch_channel(usize::from(channel.0))?;
+                    if self.mode == ReceiverMode::FixedIpAnchors {
+                        self.anchors[index].remember(expected, self.staged.checkpoint());
+                    }
                     self.channels[usize::from(channel.0)]
                         .decoder
                         .copy_context_from(&self.staged);
                     self.retire(slot)?;
                 }
                 aligned_body::Decoded::Frame { written, .. } => {
-                    let hold = if early {
+                    let hold = if early
+                        || matches!(
+                            selection,
+                            EarlySelection::Reevaluated {
+                                check_head: true,
+                                ..
+                            }
+                        ) {
                         match &mut selection {
                             EarlySelection::Filtered(allow) => {
                                 if allow(&self.native[..written]) {
@@ -1051,7 +1129,7 @@ impl Receiver {
                                 }
                             }
                             EarlySelection::Reevaluated { decide, .. } => {
-                                match decide(&self.native[..written], independent_short) {
+                                match decide(&self.native[..written], independent_short, early) {
                                     EarlyDecision::Allow => 0,
                                     EarlyDecision::Ordered => u64::MAX,
                                     EarlyDecision::Wait(token) => {
@@ -1070,10 +1148,9 @@ impl Receiver {
                     };
                     if hold != 0 {
                         self.touch_record(slot, true)?;
-                        self.records[slot]
-                            .as_mut()
-                            .ok_or(Error::Malformed)?
-                            .defer_early = hold;
+                        let record = self.records[slot].as_mut().ok_or(Error::Malformed)?;
+                        record.defer_early = hold;
+                        record.defer_head = !early;
                         continue;
                     }
                     self.pending = Some(Pending {
@@ -1162,11 +1239,17 @@ impl Receiver {
             return None;
         }
         self.deadlines.get(
-            self.records
+            self.ordered_slots
                 .iter()
-                .flatten()
+                .filter_map(|&slot| self.records[usize::from(slot)].as_ref())
                 .map(|record| record.deadline)
-                .chain(self.proofs.iter().flatten().map(|proof| proof.deadline)),
+                .chain(
+                    self.proofs
+                        .iter()
+                        .flatten()
+                        .take(self.retention.sources)
+                        .map(|proof| proof.deadline),
+                ),
         )
     }
     /// Inspect payload/count retention without advancing receipt or native delivery.
@@ -1256,7 +1339,6 @@ impl Receiver {
                     .map(|r| (r.channel.0, r.id))
             })
     }
-    #[cfg(test)]
     fn find(&self, channel: ChannelId, record: RecordId) -> Option<usize> {
         self.record_position(channel, record)
             .ok()
@@ -1475,7 +1557,11 @@ fn parse(symbol: &[u8], record: RecordId, limits: Limits) -> Result<Parsed<'_>, 
             capacity,
             padding: Padding::Exact,
         })
-    } else if body[0] == 6 || body[0] & 7 == 5 || body[0] & 7 == 7 {
+    } else if implicit_body(body[0])
+        || (body[0] == aligned_body::FIXED_ANCHOR_TAG
+            && aligned_body::fixed_anchor_parts(body)
+                .is_ok_and(|(_, inner)| implicit_body(inner[0])))
+    {
         Ok(Parsed {
             channel,
             body,
@@ -1518,6 +1604,13 @@ pub(crate) fn explicit_length(body: &[u8]) -> Result<usize, Error> {
     let size = usize::from(u16::from_be_bytes([body[1], body[2]]));
     let mut cursor = 3usize;
     match body[0] {
+        aligned_body::FIXED_ANCHOR_TAG => {
+            let (_, inner) =
+                aligned_body::fixed_anchor_parts(body).map_err(|_| Error::Malformed)?;
+            return explicit_length(inner)?
+                .checked_add(2)
+                .ok_or(Error::Malformed);
+        }
         0 if size == 66 => {}
         8 if (40..=crate::tcp_header::MAX_IP_HEADER_BYTES).contains(&size) => {}
         1 => cursor += 23,
@@ -1556,6 +1649,10 @@ pub(crate) fn explicit_length(body: &[u8]) -> Result<usize, Error> {
         .checked_add(size)
         .filter(|end| *end <= body.len())
         .ok_or(Error::Malformed)
+}
+
+fn implicit_body(tag: u8) -> bool {
+    tag == 6 || matches!(tag & 7, 5 | 7)
 }
 
 #[cfg(test)]

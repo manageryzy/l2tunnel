@@ -274,6 +274,9 @@ impl<T> Queue<T> {
     pub fn front(&self) -> Option<&Packet<T>> {
         self.ready.front()
     }
+    pub(crate) fn get(&self, index: usize) -> Option<&Packet<T>> {
+        self.ready.get(index)
+    }
     /// Observe at most P retained packets in FIFO order without mutation.
     pub fn iter(&self) -> impl Iterator<Item = &Packet<T>> {
         self.ready.iter()
@@ -290,7 +293,11 @@ impl<T> Queue<T> {
     /// Recycle exactly one complete packet after caller-observed physical acceptance.
     /// Every fallible accounting check precedes FIFO/free-pool mutation.
     pub fn complete_front(&mut self) -> Result<(), Error> {
-        let packet = self.ready.front().ok_or(Error::Invariant)?;
+        self.complete_at(0)
+    }
+    /// Recycle one independently completed packet and preserve the order of every other one.
+    pub(crate) fn complete_at(&mut self, index: usize) -> Result<(), Error> {
+        let packet = self.ready.get(index).ok_or(Error::Invariant)?;
         let bytes = self
             .bytes
             .checked_sub(packet.payload.len())
@@ -305,7 +312,7 @@ impl<T> Queue<T> {
         {
             return Err(Error::Invariant);
         }
-        let packet = self.ready.pop_front().ok_or(Error::Invariant)?;
+        let packet = self.ready.remove(index).ok_or(Error::Invariant)?;
         let mut payload = packet.payload;
         payload.clear();
         self.free.push(payload);

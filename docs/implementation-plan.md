@@ -1,5 +1,12 @@
 # Implementation plan and source projects
 
+The owner requested implementation and testing of an explicit KCP-like mode for
+raw or compressed Ethernet. The [KCP-like L2 design](modules/kcp-like-l2.md)
+tracks the recovery policy, native delivery, shared API selection, local runtime
+checks and separately qualified upstream comparisons. `P-kcp-like-l2` is additive;
+existing FEC modes, the pinned `P-kcp-baseline`, management, platforms and the
+single-flow throughput target retain their original requirements.
+
 Status: finish the current-format cutover, resolve affected regression failures,
 and run the required aggregate check before calling this batch complete. Current
 runtime integration and remaining capability work are separate deliverables;
@@ -356,6 +363,88 @@ offered traffic to exercise the 80 Mbit/s target. Keep the sixteen-connection
 aggregate comparison for the existing FIX-04 workload. Report the socket-level
 outstanding payload cap, send and receive buffers, congestion window and peer
 advertised window alongside the tunnel's recovery settings.
+
+For the physical-path bundle, compare one inner TCP connection over multiple
+connected UDP tuples sharing one directional service budget. Use identical
+N/K, byte limits, path holds, lossy feedback, gap timers and endpoint workload
+in the Python model and Linux lab. Distinguish an accepted socket send,
+observed arrival, successful TUN write and cumulative inner TCP ACK. Report
+single-flow goodput, application P99, native TCP retransmissions, per-direction
+IP bytes and final debt. Production integration needs authenticated association
+of each path with a parent session, slot, epoch and negotiated geometry,
+bounded rejoin/drain, and service-visible effective settings under CONN-04.
+[Experiment and readiness](modules/frame-channel-experiment.md#independent-physical-paths-for-one-inner-flow).
+
+The [native order and pacing comparison](modules/frame-channel-experiment.md#native-delivery-order-and-sender-pacing-in-the-linux-path-bundle)
+records the established-path Linux results for PBL-01 through PBL-03. PBL-04
+compares actual original payment progress across physical paths at 12/8 and
+6/5. Retain the one-frame control, source custody, old-gap probes and original
+deadlines, and report payment spread separately from receiver rank delay.
+
+Compare physical-ACK-driven retries against named requests at identical
+geometry and credit, with loss on both feedback and DATA. Collect the
+sender's paid packet number, reported ACK window and ranges, timeout,
+replacement handoff and native cumulative ACK. Evaluate how N/K changes
+first-flight rank, redundancy bytes and the fraction of paid retransmission
+bytes. Keep first-flight group failures, retransmitted datagrams and
+retransmitted member bytes as separate measurements when datagrams mix
+several records.
+
+For the optional shared-member scheduler, measure first-flight service age,
+repair entries paid before their natural first flights, pending intent merges
+and physical bytes alongside throughput. Compare at fixed geometry and credit.
+Do not equate fewer inner retransmissions or shorter first-flight queues with
+improved goodput. Keep an independent physical retry obligation when another
+path holds an unpaid copy, and check recovery through a healthy path when the
+original path remains blocked. Same-turn assembly may combine overdue entries
+without postponing their original send deadline.
+
+The first Linux shared-member arm removes delayed duplicate first flights but
+increases timeout-driven physical repairs and inner TCP retransmissions.
+Audit physical ACK repetition after a lost ACK page, logical delivery arriving
+below an active pagination cursor, and actual socket-to-wire queue time before
+selecting an RTO or an adaptive coding geometry. A timeout count is not an
+independent estimate of link erasure probability. Preserve bounded path-local
+recovery, original packet delivery and logical cancellation in any correction.
+
+Compare the optional paced-recovery policy with a same-binary control on an
+explicit shaper-then-loss topology. Preserve the historical topology receipts.
+Use the same N/K, source credit, endpoint workload, lossy feedback and directional
+rates. Reconcile sender payment, source-side post-shaper capture and peer-side
+post-loss capture so erased bytes are charged before loss in both implementations.
+Report actual byte-pacing waits and physical RTT, and distinguish shorter kernel
+queues from debt merely moved into the native admission or batch queues.
+
+The completed 05b/06 pair reduces measurable socket-to-wire queueing but fails
+the throughput and application-latency criteria. Before another runtime change,
+join the early warmup congestion-window divergence to original native sequences,
+distinct shard arrivals and returning ACK/SACK packets. Extend the offline
+geometry model with measured loss, retry-byte goals and the probability of a
+hole across a consecutive TCP window. Preserve the distinction between a small
+repair-byte fraction and infrequent endpoint loss recovery; do not select a
+default geometry from one seed or hide an infeasible bandwidth/latency target.
+
+The single-flow study identified a dependency on earlier TCP-header deltas
+after all of a record's fragments had arrived. A research candidate encodes
+each delta relative to its channel's latest full context. Evaluate the
+complete cost of identifying that context, repacking fragments, recovering a
+missing context and retiring it safely across an epoch change. Compare
+throughput, application P99 and inner retransmissions with the current
+chained-delta profile. The implemented fixed-anchor policy uses an explicit
+record distance and a separately reserved receiver history. The matched UDP
+experiment selects it only in the forward direction. Record same-release TUN
+and application measurements separately from receiver replay.
+[Header dependency experiment](modules/frame-channel-experiment.md#fixed-anchor-ip-header-compression).
+
+Keep two independent near8 comparisons. The bounded-reordering comparison
+changes the receiver's TCP delivery timing and keeps the repair grammar and
+sender recovery schedule fixed. The confirmed-prefix comparison keeps immediate
+TCP delivery and negotiates a distinct repair grammar. It excludes sources
+already cumulatively confirmed at the sender when a global equation is frozen.
+Keep the 8192-source maximum, 128-source local repairs, global cadence and named
+recovery for old holes. Check equation residuals against captured original
+bytes, then measure single-flow goodput, delivery P99 and inner retransmissions
+on the same native workload.
 
 Run independent implementation lanes in parallel: actual CompactARQ serial/RTT/
 receiver-delay/guarded-retry behavior; flow ownership, learned reverse affinity
@@ -758,6 +847,108 @@ M6 is required for complete research parity, but does not block an honestly scop
 M1–M5 release that identifies its supported modes.
 
 ## Release and progress rules
+
+For FIX-04 and TEST-12 qualify the reverse `TargetedExactAckLz4` experiment
+against the same fixed-anchor Linux UDP control, on one TCP flow with 4 MiB
+of application credit. Verify the physical reverse sizes of all copies, the
+original bytes recovered after loss, the ACK return time, application goodput,
+write-to-read P99, inner retransmissions and terminal recovery. Report the
+corresponding FIFO and early-release model results with their TCP semantics.
+The original Packed parity and platform gates remain separate.
+
+For the same single-flow comparison, preserve both the historical one-write
+TCP segment and stream segmentation up to the observed Linux MSS. Price each
+physical copy after Packed fragmentation. Compare MUX admission to physical
+send, receiver admission to first solvability, native delivery, and the first
+covering TCP ACK for each steady retransmission. Treat authenticated inputs
+refused by the recovery FIFO as local losses in the same-event replay.
+Keep the original throughput target and validate out-of-order delivery and
+old-hole recovery under the same capacity bounds.
+
+For FIX-04 and TEST-12 distinguish a missing source at B from the wait
+between FEC input, record admission and native preparation. Compare
+application credit with actual TCP unsent bytes, congestion window, SRTT
+and flight on the same samples. Trace the first named gap request from B
+selection to physical acceptance, A authenticated input and application,
+and the first corresponding named data send. Keep request losses and
+ambiguous request-to-retry matches visible.
+
+For the same Linux flow, compare the old receiver schedule with the candidate
+under identical observation. Trace the first sustained TCP recovery episode
+from its original outer sources to the first covering cumulative ACK at both
+endpoints. Include startup congestion-window changes and duplicate SACK reports
+when interpreting steady goodput. Keep receiver service time paired with its
+offered load.
+
+For the independently selected near8 headroom profile, compare the existing
+forward selector 6 and selector 10 with the same reverse ACK compression.
+Account for additional equations at physical IP acceptance, preserve the
+ordinary source, repair and named-retry schedules, and inspect the effective
+selector and its counters before attributing a throughput difference to FEC.
+
+For FIX-04 and TEST-12, qualify the optional simulated TCP endpoint against
+captured DATA arrivals and ACKs at both TUNs. Validate the cumulative edge,
+ordinary SACK blocks, duplicate SACK blocks, their order and their actual
+option bytes with timestamps enabled. For the closed-loop comparison, carry
+those bytes through the selected reverse MUX and Packed codec. Count feedback
+only after receiver-side reconstruction. The sender study must bound how many
+holes it retransmits by its congestion window and estimated outstanding data.
+Record data still missing when PAWS rejects an older copy, real and redundant
+retransmissions, paid reverse bytes and final confirmation. Keep the historical
+FIFO reference, immediate TUN delivery and old-gap recovery as distinct checks.
+
+Compare record splitting and actual Packed source counts separately at MSS
+1,448. In the frozen Linux input all full-sized data segments still required
+two aligned units at the largest symbol that fits the current advertised
+worst-case union in one datagram. Use the Rust 500 µs tail-packing rule in
+the matched Python control. For repetitions whose full byte prefix appeared
+at the receiver TUN, correlate the first uncovered byte with the kernel's
+receive cursor, individual packet verdict and first returning cumulative ACK.
+Count repeated ranges separately from distinct blocking gaps.
+
+At fixed application credit, compare socket-accepted forward IP bytes
+with inner TCP acknowledged bytes at the same steady snapshot boundaries.
+Price regular FEC, named retries and copies separately. Before changing
+the default request policy, compare repeated gap masks with identical
+directional physical copies and per-source deduplication in both model
+arms. Include serialization, actual retries, control service and final
+drain in the experiment.
+
+For the mixed-packet profile, compare every admissible erasure subset at
+representative group sizes against actual-byte Rust and Python codecs.
+Exercise loss above the threshold followed by a late member, early direct
+delivery, the oldest input's deadline and shortened groups under the physical
+MTU. Report useful, parity, metadata and repeated bytes independently for
+both directions. In the single-flow workload measure time to seal, kth distinct
+arrival, first decodability, actual native delivery and cumulative TCP ACK.
+Keep authentication, named recovery, application credit and independent
+delivery in the normal carrier integration gate.
+
+The authenticated UDP fixture exercises full-width named feedback and
+inclusive confirmation through the last possible source. Tag 10 binds both
+directional policies and the functional Common Engine uses the mixed owners,
+physical completions, timers and actual native codec. The Bank now supports
+the mixed owner's complete reserved storage. UDP, raw TCP, TLS and QUIC
+pass normal service resource preflight. Two impaired Linux UDP/TUN single-flow
+runs transferred every application record. The second arm also drained all
+directional source custody. The single-flow goal above 70 Mbit/s remains
+open. Compare paid bytes at matched native input times as well as the
+closed-loop response of the inner TCP sender.
+Use the sender's cwnd, effective flight and ACK progress across the entire
+measurement. Join late retries to their direct or recovered data, required
+header context and both native TCP timestamp histories. The 12/10 run
+shows separate failures at each of these boundaries.
+[Linux window and retry evidence](modules/frame-channel-experiment.md#single-flow-congestion-window-and-header-dependency).
+Qualify shortened groups by physical membership as well as negotiated
+geometry. Check a double loss from the same source, submit time, seal
+eligibility and MTU against the six original sends. Compare any cross-source
+alternative at the same offered application load, with serialized repair
+bytes and a second loss seed, before selecting a Rust wire profile.
+[Short-group measurements](modules/frame-channel-experiment.md#erasure-protection-at-the-short-group-deadline).
+For TCP parity, report whether the sending endpoint consumes SACK ranges,
+how it reenters recovery after a partial ACK, and how the connection starts.
+Use the exact native record codec and a common event trace when attributing
+a difference to receiver scheduling.
 
 Every catalog item progresses from `planned` to `implemented` only with an actual
 algorithm and focused tests, then to `integration-tested` with a receipt naming

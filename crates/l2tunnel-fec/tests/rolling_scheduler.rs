@@ -153,7 +153,11 @@ fn full_wire_two_owners_recover_eight_windows_with_data_repair_and_feedback_loss
                                     SourceWire::Padded => full,
                                     SourceWire::Exact
                                     | SourceWire::TargetedExact
-                                    | SourceWire::TargetedNear8 =>
+                                    | SourceWire::TargetedExactAckLz4
+                                    | SourceWire::TargetedNear8
+                                    | SourceWire::TargetedNear8Headroom
+                                    | SourceWire::TargetedNear8Hold35
+                                    | SourceWire::TargetedNear8ConfirmedPrefix =>
                                         rolling::wire::HEADER_BYTES + 2 + original.len(),
                                 }
                             );

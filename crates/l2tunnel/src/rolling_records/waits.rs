@@ -272,6 +272,29 @@ impl Snapshot {
             );
         }
     }
+    pub(super) fn independent_ingress_completed(
+        &mut self,
+        input: ingress::Input,
+        head: bool,
+        now: Tick,
+    ) {
+        if head {
+            self.ingress_completed(input, ingress::Outcome::Independent, None, now);
+        } else if self.observe(now)
+            && let Some(value) = &mut self.ingress_admission
+        {
+            if let Some(elapsed) = now.0.checked_sub(input.received.0) {
+                value.residence.removed(
+                    elapsed,
+                    true,
+                    ingress::Outcome::Independent,
+                    &mut self.overflow,
+                );
+            } else {
+                self.clock_regression = true;
+            }
+        }
+    }
     /// Copy at caller-supplied observation time without advancing any protocol owner.
     pub fn observed(mut self, now: Tick) -> Self {
         self.observe(now);

@@ -28,9 +28,9 @@ def validate(flows: int, maximum: int) -> None:
 def decode_tcp_info(raw: bytes) -> dict:
     """Linux UAPI offsets; nullable suffix fields preserve older kernel support."""
     value = {'raw_hex': raw.hex(), 'length': len(raw), 'domain': 'application endpoint kernel TCP'}
-    for name, offset in [('snd_mss', 16), ('unacked', 24), ('rtt_us', 68),
+    for name, offset in [('snd_mss', 16), ('unacked', 24), ('rcv_ssthresh_bytes', 64), ('rtt_us', 68),
                          ('rtt_variance_us', 72), ('snd_ssthresh_segments', 76), ('snd_cwnd_segments', 80),
-                         ('rcv_space_bytes', 96), ('total_retransmitted_segments', 100)]:
+                         ('advmss_bytes', 84), ('rcv_space_bytes', 96), ('total_retransmitted_segments', 100)]:
         value[name] = struct.unpack_from('=I', raw, offset)[0] if len(raw) >= offset + 4 else None
     value['snd_cwnd_bytes'] = (value['snd_cwnd_segments'] * value['snd_mss']
                                if value['snd_cwnd_segments'] is not None and value['snd_mss'] is not None else None)

@@ -3,6 +3,8 @@ use super::*;
 mod feedback_custody;
 #[path = "physical_tests.rs"]
 mod physical;
+#[path = "retry_enrichment_tests.rs"]
+mod retry_enrichment;
 #[path = "selected_wire_tests.rs"]
 mod selected_wire;
 

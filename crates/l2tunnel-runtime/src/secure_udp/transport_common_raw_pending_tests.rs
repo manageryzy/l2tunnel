@@ -134,7 +134,8 @@ async fn compact_raw_pending_plaintext_keeps_native_body_without_nonce_or_repeat
         pending.cost,
         pending.deadline,
     );
-    let body = runtime.wire[..pending.bytes].to_vec();
+    let body = pair.ad.buffers.frame[..pending.bytes].to_vec();
+    assert!(body.iter().any(|&byte| byte != 0));
     assert!(runtime.sealed.is_none());
     assert_eq!(pending.number, number);
     assert_eq!(pair.ad.records.next_number(Class::User), number);
@@ -160,7 +161,7 @@ async fn compact_raw_pending_plaintext_keeps_native_body_without_nonce_or_repeat
             ),
             identity
         );
-        assert_eq!(&runtime.wire[..pending.bytes], body);
+        assert_eq!(&pair.ad.buffers.frame[..pending.bytes], body);
         assert!(runtime.sealed.is_none());
         assert_eq!(pair.ad.records.next_number(Class::User), number);
         assert_eq!(pair.ad.bucket.tokens, tokens);

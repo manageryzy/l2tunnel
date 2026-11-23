@@ -152,7 +152,9 @@ pub struct Sender {
     parked_regular: Option<(RepairId, Tick)>,
     // Physical copies still available above the usual two-regular-debt gate.
     global_extra_copies: u8,
-    near8: Option<near8::State>,
+    // At most one selected owner. Other record engines share the enclosing
+    // enum and do not need the near8 gate and counters on their setup stacks.
+    near8: Vec<near8::State>,
     source_copy: Option<SourceCopy>,
     sent: u32,
     credit: u32,
@@ -190,9 +192,10 @@ impl Sender {
             .join(self.retry_queue.usage()?)?
             .join(self.fresh.usage()?)?
             .join(storage::Usage::vector(&self.earned)?)?
+            .join(storage::Usage::vector(&self.near8)?)?
             .join(
                 self.near8
-                    .as_ref()
+                    .first()
                     .map(near8::State::usage)
                     .transpose()?
                     .unwrap_or_default(),
@@ -202,13 +205,20 @@ impl Sender {
     pub(in crate::rolling) fn earned_storage_plan(
         policy: Policy,
     ) -> Result<storage::Usage, storage::Error> {
-        storage::requested::<earned::Queue>(usize::from(policy.source_wire.is_targeted()))?.join(
-            storage::requested::<u8>(if policy.source_wire.is_near8() {
-                policy.recovery.width()?
-            } else {
-                0
-            })?,
-        )
+        storage::requested::<earned::Queue>(usize::from(policy.source_wire.is_targeted()))?
+            .join(storage::requested::<near8::State>(usize::from(
+                policy.source_wire.is_near8(),
+            ))?)?
+            .join(storage::requested::<u8>(
+                if policy.source_wire.is_near8() {
+                    policy.recovery.width()?
+                } else {
+                    0
+                },
+            )?)?
+            .join(storage::requested::<near8::Headroom>(usize::from(
+                policy.source_wire == wire::SourceWire::TargetedNear8Headroom,
+            ))?)
     }
     /// Conservative total retained reservation, excluding caller buffers/allocator overhead.
     pub fn memory_bound(policy: Policy) -> Result<usize, Error> {
@@ -229,9 +239,19 @@ impl Sender {
                 )?,
             )?,
             add(
-                std::mem::size_of::<Self>(),
+                add(
+                    std::mem::size_of::<Self>(),
+                    if policy.source_wire == wire::SourceWire::TargetedNear8Headroom {
+                        std::mem::size_of::<near8::Headroom>()
+                    } else {
+                        0
+                    },
+                )?,
                 if policy.source_wire.is_near8() {
-                    policy.recovery.width()?
+                    add(
+                        std::mem::size_of::<near8::State>(),
+                        policy.recovery.width()?,
+                    )?
                 } else {
                     0
                 },
@@ -247,6 +267,17 @@ impl Sender {
         let mut earned = Vec::new();
         if policy.source_wire.is_targeted() {
             earned.try_reserve_exact(1).map_err(|_| Error::Capacity)?;
+        }
+        let mut near8 = Vec::new();
+        if policy.source_wire.is_near8() {
+            if scope.direction != 0 {
+                return Err(Error::Scope);
+            }
+            near8.try_reserve_exact(1).map_err(|_| Error::Capacity)?;
+            near8.push(near8::State::new(
+                policy.recovery.width()?,
+                policy.source_wire == wire::SourceWire::TargetedNear8Headroom,
+            )?);
         }
         Ok(Self {
             encoder: if policy.source_wire.is_targeted() {
@@ -272,14 +303,7 @@ impl Sender {
             output_end: None,
             parked_regular: None,
             global_extra_copies: 0,
-            near8: if policy.source_wire.is_near8() {
-                if scope.direction != 0 {
-                    return Err(Error::Scope);
-                }
-                Some(near8::State::new(policy.recovery.width()?)?)
-            } else {
-                None
-            },
+            near8,
             source_copy: None,
             sent: 0,
             credit: 0,
@@ -303,12 +327,10 @@ impl Sender {
         if self.status().next_source != 0 {
             return Err(Error::Busy);
         }
-        self.near8.as_mut().ok_or(Error::Configuration)?.configure(
-            mtu,
-            overhead,
-            send_rate_bytes_per_sec,
-            self.last,
-        )
+        self.near8
+            .first_mut()
+            .ok_or(Error::Configuration)?
+            .configure(mtu, overhead, send_rate_bytes_per_sec, self.last)
     }
     /// Observe a local cumulative all-class IP counter and both local queued byte counts.
     pub fn observe_near8_capacity(
@@ -318,15 +340,37 @@ impl Sender {
         ordinary_backlog_bytes: usize,
         serial_backlog_bytes: usize,
     ) -> Result<(), Error> {
-        if self.near8.is_none() {
-            return Ok(());
-        }
-        self.time(now)?;
-        self.near8.as_mut().ok_or(Error::Configuration)?.observe(
+        self.observe_near8_capacity_with_mux(
             now,
             accepted_ip_total,
             ordinary_backlog_bytes,
             serial_backlog_bytes,
+            None,
+        )
+    }
+    /// Sample the same physical counter with the native MUX component of ordinary backlog.
+    /// A missing MUX observation permits only the original spare-capacity policy.
+    pub fn observe_near8_capacity_with_mux(
+        &mut self,
+        now: Tick,
+        accepted_ip_total: u64,
+        ordinary_backlog_bytes: usize,
+        serial_backlog_bytes: usize,
+        native_mux_bytes: Option<usize>,
+    ) -> Result<(), Error> {
+        if self.near8.is_empty() {
+            return Ok(());
+        }
+        if native_mux_bytes.is_some_and(|v| v > ordinary_backlog_bytes) {
+            return Err(Error::Configuration);
+        }
+        self.time(now)?;
+        self.near8.first_mut().ok_or(Error::Configuration)?.observe(
+            now,
+            accepted_ip_total,
+            ordinary_backlog_bytes,
+            serial_backlog_bytes,
+            native_mux_bytes,
         )
     }
     /// Exact owned originals still awaiting their first physical receipt; repeats are excluded.
@@ -343,7 +387,7 @@ impl Sender {
     }
     /// Actual selected gate and confirmed charged-byte accounting.
     pub fn near8_status(&self) -> Option<near8::Status> {
-        self.near8.as_ref().map(|n| n.status)
+        self.near8.first().map(|n| n.status)
     }
     /// Bind future regular equations to the original which earned them. Configure once
     /// before source admission; priced copy receipts settle displacement at that boundary.
@@ -421,8 +465,7 @@ impl Sender {
         now: Tick,
         copies: u8,
     ) -> Result<SourceId, Error> {
-        if self.near8.as_ref().is_some_and(|near| !near.configured()) || !(1..=4).contains(&copies)
-        {
+        if self.near8.first().is_some_and(|near| !near.configured()) || !(1..=4).contains(&copies) {
             return Err(Error::Configuration);
         }
         self.time(now)?;
@@ -557,7 +600,15 @@ impl Sender {
         if self.pending.is_none() && spend(&mut budget.metadata) {
             let state = self.encoder.status();
             let targeted = self.policy.source_wire.is_targeted();
-            let outstanding = state.confirmed_prefix != state.next_source;
+            let trim = self.policy.source_wire.trims_confirmed_prefix();
+            let confirmed = if trim {
+                self.requested_prefix
+                    .max(self.feedback.map_or(0, |value| value.prefix))
+            } else {
+                0
+            };
+            let outstanding =
+                state.confirmed_prefix != state.next_source && confirmed < state.next_source;
             if !outstanding {
                 self.clear_regular();
                 self.tail_remaining = 0;
@@ -606,7 +657,7 @@ impl Sender {
                 if !tail || self.tail_remaining != 0 {
                     self.last_named = false;
                     if self.earned.is_empty() && !tail && self.policy.source_wire.is_targeted() {
-                        let (id, support) = self.encoder.next_regular()?;
+                        let (id, support) = self.encoder.next_regular(confirmed)?;
                         if displace(id, support)? {
                             self.regular_due -= 1;
                             return Ok(used(before, budget));
@@ -617,6 +668,7 @@ impl Sender {
                         let id = self.encoder.begin_earned_regular(
                             entry.id,
                             entry.support,
+                            confirmed,
                             entry.deadline,
                             now,
                         )?;
@@ -624,7 +676,8 @@ impl Sender {
                         (id, entry.deadline)
                     } else {
                         (
-                            self.encoder.begin_repair(tail, now)?,
+                            self.encoder
+                                .begin_repair_with_prefix(tail, confirmed, now)?,
                             self.later(now, self.policy.recovery.job_ticks)?,
                         )
                     };
@@ -659,7 +712,7 @@ impl Sender {
             && self.fresh.len == 0
             && self.regular_due == 0
             && !self.retry_queue.has_retries()
-            && let Some(near) = &mut self.near8
+            && let Some(near) = self.near8.first_mut()
             && let Some((id, cap)) = near.service(&self.encoder, now, &mut budget)?
         {
             self.pending = Some(Pending::Near8(id));
@@ -832,7 +885,7 @@ impl Sender {
                 original: self.encoder.source(id)?,
             }),
             Pending::Repair { .. } => self.encoder.pending_repair().map(Output::Repair),
-            Pending::Near8(_) => self.near8.as_ref()?.pending(self.scope).map(Output::Near8),
+            Pending::Near8(_) => self.near8.first()?.pending(self.scope).map(Output::Near8),
         }
     }
     /// Encode the immutable pending output into caller-reserved storage, without consuming it.
@@ -890,7 +943,7 @@ impl Sender {
     /// Confirm an ordinary one-copy source or repair. Explicit repeated-source
     /// groups require their ordinal-bearing witness and cannot use this method.
     pub fn confirm_output(&mut self, id: OutputId, now: Tick) -> Result<(), Error> {
-        if self.near8.is_some() {
+        if !self.near8.is_empty() {
             return Err(Error::Configuration);
         }
         let bytes = self.pending_wire_len()?.unwrap_or_default();
@@ -907,7 +960,7 @@ impl Sender {
             return Err(Error::Identity);
         }
         if let Some(copy) = self.source_copy
-            && self.near8.is_some()
+            && !self.near8.is_empty()
         {
             if id != OutputId::Source(copy.source) {
                 return Err(Error::Identity);
@@ -926,7 +979,7 @@ impl Sender {
         accepted: Tick,
         copy: SourceCopy,
     ) -> Result<(), Error> {
-        if self.near8.is_some() {
+        if !self.near8.is_empty() {
             return Err(Error::Configuration);
         }
         let bytes = self.pending_wire_len()?.unwrap_or_default();
@@ -965,7 +1018,7 @@ impl Sender {
         }
         self.time(observed)?;
         if copy.ordinal == 1
-            && let Some(near) = &mut self.near8
+            && let Some(near) = self.near8.first_mut()
         {
             let length = self
                 .encoder
@@ -1032,9 +1085,15 @@ impl Sender {
                             .requested_prefix
                             .max(self.feedback.map_or(0, |f| f.prefix));
                         if prefix < self.sent {
-                            let (id, support) = self
-                                .encoder
-                                .following_regular(self.regular_due, self.sent)?;
+                            let (id, support) = self.encoder.following_regular(
+                                self.regular_due,
+                                self.sent,
+                                if self.policy.source_wire.trims_confirmed_prefix() {
+                                    prefix
+                                } else {
+                                    0
+                                },
+                            )?;
                             if !displace(id, support)? {
                                 let cap = deadline(accepted, self.policy.recovery.job_ticks)?;
                                 queue.push(earned::Entry {
@@ -1088,10 +1147,14 @@ impl Sender {
             }
             Pending::Near8(id) => self
                 .near8
-                .as_mut()
+                .first_mut()
                 .ok_or(Error::Identity)?
                 .confirm(id, wire_bytes)?,
             Pending::Repair { id, tail } => {
+                let Output::Repair(row) = output else {
+                    return Err(Error::Identity);
+                };
+                let support = row.support;
                 let needs_timer = tail
                     && self.tail_remaining <= 1
                     && self.encoder.status().confirmed_prefix != self.encoder.status().next_source;
@@ -1101,6 +1164,10 @@ impl Sender {
                     self.tail_due
                 };
                 self.encoder.confirm_repair(id, now)?;
+                if let Some(near) = self.near8.first_mut() {
+                    near.status
+                        .accepted_repair(self.policy.recovery, id, support);
+                }
                 if tail {
                     self.tail_remaining = self.tail_remaining.saturating_sub(1);
                     self.tail_due = next;
@@ -1316,7 +1383,7 @@ impl Sender {
             tail_remaining: self.tail_remaining,
             tail_due: self.tail_due,
             output_ready: self.pending_output().is_some(),
-            near8_work_pending: self.near8.as_ref().is_some_and(near8::State::has_job),
+            near8_work_pending: self.near8.first().is_some_and(near8::State::has_job),
             feedback: self.feedback.map(|f| f.id),
             terminal: self.terminal,
         }

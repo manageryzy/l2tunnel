@@ -170,6 +170,42 @@ impl Receiver {
                 .checked_sub(prefix)
                 .is_some_and(|offset| (offset as usize) < self.policy.recovery.window)
     }
+    /// Earliest disjoint source ID that can be committed during a regular or tail repair.
+    pub fn independent_source_floor(&self) -> Option<u32> {
+        self.policy
+            .source_wire
+            .is_targeted()
+            .then(|| self.decoder.independent_source_floor())
+            .flatten()
+    }
+    /// Spend the caller's remaining receive budget to commit a disjoint original.
+    /// Its receipt never advances the oldest missing source or completes the repair.
+    pub fn commit_independent_source(
+        &mut self,
+        id: SourceId,
+        original: &[u8],
+        received: Tick,
+        now: Tick,
+        cap: Tick,
+        budget: &mut WorkBudget,
+    ) -> Result<bool, Error> {
+        if self.independent_source_floor().is_none() {
+            return Ok(false);
+        }
+        self.time(now)?;
+        if !self
+            .decoder
+            .commit_independent_source(id, original, received, now, cap, budget)?
+        {
+            return Ok(false);
+        }
+        self.notice(now)?;
+        Ok(true)
+    }
+    /// Whether an authenticated copy of this source is still held by the ingress FIFO.
+    pub fn holds_queued_source(&self, id: SourceId) -> bool {
+        self.policy.source_wire.is_targeted() && self.gaps.holds(id.0)
+    }
     /// Record one successful authenticated local FIFO acquisition. This grants
     /// neither cumulative receipt nor decoder publication.
     pub fn hold_queued_source(&mut self, id: SourceId) -> Result<(), Error> {
@@ -238,10 +274,13 @@ impl Receiver {
                 now,
                 original_deadline,
             )?,
-            wire::View::Repair(value) => {
-                self.decoder
-                    .begin_repair_until(value, received, now, original_deadline)?
-            }
+            wire::View::Repair(value) => self.decoder.begin_regular_repair_until(
+                value,
+                received,
+                now,
+                original_deadline,
+                self.policy.source_wire.trims_confirmed_prefix(),
+            )?,
         };
         if result != Begin::Staged {
             self.notice(now)?;
@@ -308,10 +347,13 @@ impl Receiver {
             self.notice(now)?;
         }
         self.gaps.observe(&self.decoder, now, &mut budget)?;
+        // The committed receipt remains readable while a repair is in flight.
+        // A staged systematic input may itself fill a gap as soon as it commits.
+        let decoding = self.decoder.status().pending_job;
         if self.scan.is_none()
             && self.feedback.is_none()
             && self.request.is_none()
-            && !self.decoder.status().pending_job
+            && (!decoding || self.decoder.repair_in_progress())
             && budget.metadata > 0
         {
             self.request = self.gaps.poll(
@@ -324,10 +366,10 @@ impl Receiver {
         }
         if self.scan.is_none()
             && self.feedback.is_none()
-            && !self.decoder.status().pending_job
             && (self.request.is_some()
-                || self.events >= self.policy.feedback_packets
-                || self.due.is_some_and(|due| now >= due))
+                || (!decoding
+                    && (self.events >= self.policy.feedback_packets
+                        || self.due.is_some_and(|due| now >= due))))
             && spend(&mut budget.metadata)
         {
             if self.next_feedback == u64::MAX {

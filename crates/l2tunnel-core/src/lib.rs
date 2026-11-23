@@ -1,5 +1,8 @@
 //! Runtime-independent policy contracts. Algorithm variants are roadmap entries.
 
+/// Preallocated ordered indexes for bounded protocol custody and timer queues.
+pub mod bounded_index;
+
 /// Planned device-layer, TCP ownership and QoS selection.
 pub mod traffic;
 

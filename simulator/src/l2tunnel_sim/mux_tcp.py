@@ -1,6 +1,7 @@
 """TCP endpoints and fresh SYN probes entering the same duplex L2 mux."""
 
-from collections import defaultdict, deque
+from bisect import bisect_left
+from collections import Counter, defaultdict, deque
 from types import SimpleNamespace
 
 from .compact import CompactHeaderCodec, tcp_profile_frame
@@ -10,6 +11,9 @@ from .packed_wire import PACKED_CHANNEL, PackedWireTransport
 from .multiflow import MultiFlow
 from .mux import DuplexMux, frame_tuple
 from .tcp_syn_probe import EVENT_HEADER, SYNProbeConfig, TCPHandshakeProbe, handshake_frame
+from .tcp_dsack import DuplicateUndo
+from .tcp_rack import RackScoreboard
+from . import tcp_sack
 
 
 def bulk_connection_frame(frame, port, reverse):
@@ -31,6 +35,7 @@ class MuxTCPEndpoint:
     def __init__(self, mux, reverse, port):
         self.mux, self.reverse, self.port = mux, reverse, port
         self.transport = mux.transports[reverse]
+        self.after_decoded = None
         self.records = defaultdict(deque)
         frame = bulk_connection_frame(tcp_profile_frame(payload_bytes=0), port, reverse)
         mux.register_endpoint(reverse, frame_tuple(frame), self.receive)
@@ -50,6 +55,8 @@ class MuxTCPEndpoint:
         if not callbacks:
             del self.records[frame]
         deliver()
+        if self.after_decoded is not None:
+            self.after_decoded(frame)
 
     def __getattr__(self, name):
         return getattr(self.transport, name)
@@ -64,8 +71,17 @@ class MuxTCP(CoalescedACKTCP):
             raise ValueError("unified mux applies copies in its shared L2 transport")
 
     def transmit_ack(self, packet):
+        if self.sack_receiver is not None:
+            frame = tcp_sack.ack_frame(self.byte_offset(packet.acknowledged), self.ack_packet_id,
+                                       int(packet.created_at * 1000), int((packet.echoed_timestamp or 0)*1000),
+                                       packet.sack_blocks)
+            self.compact_reverse.submit(len(frame), 0, lambda: None, ack=True, frame=frame)
+            self.sack_frame_bytes_sent[len(frame)] += 1
+            self.ack_packet_id += 1
+            self.ack_transmitted += 1
+            return
         frame = tcp_profile_frame(
-            acknowledged=packet.acknowledged * self.traffic.payload_bytes,
+            acknowledged=self.byte_offset(packet.acknowledged),
             identification=self.ack_packet_id, timestamp=int(packet.created_at * 1000),
             echoed_timestamp=int((packet.echoed_timestamp or 0) * 1000),
             payload_bytes=0, flags=0x10)
@@ -79,6 +95,60 @@ class MuxTCP(CoalescedACKTCP):
         self.compact_reverse.submit(len(frame), 0, receive_ack, ack=True, frame=frame)
         self.ack_packet_id += 1
         self.ack_transmitted += 1
+
+    def enable_sack(self, policy, writer):
+        if (policy not in tcp_sack.POLICIES or self.sent_times or self.sack_receiver is not None
+                or self.segment_offsets is None or writer.flow is not self):
+            raise ValueError("select a supported SACK policy before single-flow TCP stream data")
+        if policy != "wire":
+            observe_reordering = policy == "scoreboard-dsack-reordering-observer"
+            capacity = min(self.window_limit, writer.issue_limit)
+            if policy == "rack-dsack":
+                self.rack = self.sack_sender = RackScoreboard(self, capacity)
+            else:
+                self.sack_sender = tcp_sack.Scoreboard(capacity, reordering_smss=self.smss_bytes if observe_reordering else None)
+            if policy in ("scoreboard-dsack", "rack-dsack") or observe_reordering:
+                self.dsack_undo = DuplicateUndo(self.sack_sender.capacity, self.sack_sender.stats)
+        self.sack_receiver = tcp_sack.Receiver()
+        self.sack_frame_bytes_sent, self.sack_frame_bytes_received = Counter(), Counter()
+        self.compact_reverse.after_decoded = self.receive_sack
+
+    def receive_sack(self, frame):
+        ack = tcp_sack.parse_ack(frame, self.byte_offset(self.tcp_acked))
+        index = bisect_left(self.segment_offsets, ack.cumulative)
+        if index >= len(self.segment_offsets) or self.byte_offset(index) != ack.cumulative:
+            raise ValueError("ACK is outside issued TCP segment boundaries")
+        if self.dsack_undo is not None:
+            self.dsack_undo.observe(ack, self.segment_offsets, self.sack_sender, self.tcp_acked)
+        if self.sack_sender is not None:
+            self.sack_sender.observe(ack, index, self.segment_offsets)
+        self.sack_frame_bytes_received[len(frame)] += 1
+        now = int(self.now*1000)
+        sent_at = tcp_sack.unwrap(ack.tsval, now)/1000
+        echo = tcp_sack.unwrap(ack.tsecr, now)/1000 if ack.tsecr else None
+        self.peer_timestamp = max(self.peer_timestamp, sent_at)
+        self.reverse.delivered_bytes += len(frame)
+        self.reverse.delays.append((self.now-sent_at)*1000)
+        self.on_ack(index, echo)
+        if self.sack_sender is not None:
+            self.sack_sender.service(self)
+            self.sack_sender.fresh = False
+        if self.dsack_undo is not None and self.dsack_undo.finish(self):
+            if self.rack is not None:
+                self.rack.persistence = min(16, self.rack.persistence + 1)
+            if self.source_timer is None:
+                self.produce()
+
+    def transmit_segment(self, index):
+        if self.sack_sender is not None and (prior := self.forward.pending[index].attempts):
+            if not self.sack_sender.mark_retry(index, self.recover if self.in_recovery else None,
+                                               int(self.now * 1000) & 0xffffffff):
+                return
+            if self.dsack_undo is not None:
+                self.dsack_undo.retry(index, prior)
+        super().transmit_segment(index)
+        if self.rack is not None:
+            self.rack.sent(index)
 
 
 class UnifiedMuxMultiFlow(MultiFlow):

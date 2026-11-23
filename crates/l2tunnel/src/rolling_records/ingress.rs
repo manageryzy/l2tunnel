@@ -40,6 +40,8 @@ pub struct IngressStatus {
     pub oldest_records_number: Option<u64>,
     /// Full-slot refusals for systematic sources, repairs and deferred feedback, respectively.
     pub full_refusals: [u64; 3],
+    /// Byte-identical authenticated sources already held in the FIFO.
+    pub coalesced_sources: u64,
     /// Earliest original queued job/operation/session cap.
     pub deadline: Option<Tick>,
 }
@@ -71,7 +73,11 @@ pub(super) struct Ingress {
     minimum: Option<Tick>,
     feedback: usize,
     full_refusals: [u64; 3],
+    coalesced_sources: u64,
     pub(super) waiting_on_decoder: bool,
+    pub(super) independent_cursor: usize,
+    /// Exclusive maximum repair support passed by the current FIFO scan.
+    pub(super) independent_repair_end: u32,
     pub(super) queue: queue::Queue<Input>,
 }
 impl Ingress {
@@ -90,7 +96,10 @@ impl Ingress {
             minimum: None,
             feedback: 0,
             full_refusals: [0; 3],
+            coalesced_sources: 0,
             waiting_on_decoder: false,
+            independent_cursor: 0,
+            independent_repair_end: 0,
         })
     }
     pub(super) fn status(&self) -> IngressStatus {
@@ -107,10 +116,20 @@ impl Ingress {
                 .and_then(|packet| packet.metadata().number),
             deadline: self.deadline(),
             full_refusals: self.full_refusals,
+            coalesced_sources: self.coalesced_sources,
         }
     }
     pub(super) fn deadline(&self) -> Option<Tick> {
         self.minimum
+    }
+    pub(super) fn held_source(&self, id: rolling::SourceId) -> Option<(&[u8], Input)> {
+        self.queue
+            .iter()
+            .find(|packet| packet.metadata().held_source == Some(id))
+            .map(|packet| (packet.bytes(), *packet.metadata()))
+    }
+    pub(super) fn note_coalesced_source(&mut self) {
+        self.coalesced_sources = self.coalesced_sources.saturating_add(1);
     }
     pub(super) fn push(&mut self, input: Input, bytes: &[u8]) -> Result<(), Error> {
         let Some(slot) = self.queue.acquire() else {
@@ -138,9 +157,35 @@ impl Ingress {
     pub(super) fn has_data(&self) -> bool {
         self.queue.len() > self.feedback
     }
+    pub(super) fn under_pressure(&self) -> bool {
+        self.queue.len() >= self.limits.slots - self.limits.slots / 4
+    }
+    pub(super) fn full_with_data_head(&self) -> bool {
+        self.queue.len() == self.limits.slots
+            && !self.waiting_on_decoder
+            && self
+                .queue
+                .front()
+                .is_some_and(|head| head.metadata().kind != EmissionKind::Feedback)
+    }
     pub(super) fn complete_front(&mut self) -> Result<(), Error> {
-        let input = *self.queue.front().ok_or(Error::Identity)?.metadata();
-        self.queue.complete_front().map_err(Error::Ingress)?;
+        self.complete_at(0)
+    }
+    pub(super) fn rotate_front(&mut self) -> Result<(), Error> {
+        self.queue.rotate_front().map_err(Error::Ingress)?;
+        self.independent_cursor = 0;
+        self.independent_repair_end = 0;
+        Ok(())
+    }
+    pub(super) fn complete_at(&mut self, index: usize) -> Result<(), Error> {
+        let input = *self.queue.get(index).ok_or(Error::Identity)?.metadata();
+        self.queue.complete_at(index).map_err(Error::Ingress)?;
+        if index == 0 {
+            self.independent_cursor = 0;
+            self.independent_repair_end = 0;
+        } else if index < self.independent_cursor {
+            self.independent_cursor -= 1;
+        }
         self.feedback -= usize::from(input.kind == record_engine::EmissionKind::Feedback);
         if self.minimum == Some(input.deadline) {
             self.minimum = self
@@ -150,6 +195,18 @@ impl Ingress {
                 .min();
         }
         Ok(())
+    }
+    /// Bound descriptor moves and a possible rescan of the remaining original deadlines.
+    pub(super) fn completion_visits(&self, index: usize, deadline: Tick) -> Result<usize, Error> {
+        let remaining = self.queue.len().checked_sub(1).ok_or(Error::Identity)?;
+        let moves = index.min(remaining.checked_sub(index).ok_or(Error::Identity)?);
+        moves
+            .checked_add(if self.minimum == Some(deadline) {
+                remaining
+            } else {
+                0
+            })
+            .ok_or(Error::Arithmetic)
     }
     pub(super) fn usage(&self) -> queue::Usage {
         self.queue.storage_usage()

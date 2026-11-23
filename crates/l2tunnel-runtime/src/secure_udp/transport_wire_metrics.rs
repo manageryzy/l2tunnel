@@ -51,7 +51,7 @@ pub(in crate::secure_udp) struct Observer {
     invalid: u64,
     overflow: u64,
     extent_errors: u64,
-    coverage: [u64; 6],
+    coverage: [u64; 7],
     native: native::Native,
 }
 
@@ -116,7 +116,7 @@ impl Observer {
             invalid: 0,
             overflow: 0,
             extent_errors: 0,
-            coverage: [0; 6],
+            coverage: [0; 7],
             native: native::Native::default(),
         })
     }
@@ -194,6 +194,7 @@ impl Observer {
             CodecCoverage::FragmentedRecord => 3,
             CodecCoverage::NotApplicable => 4,
             CodecCoverage::UnencodedNative => 5,
+            CodecCoverage::StripedMixed => 6,
         };
         increment(&mut self.coverage[coverage], &mut self.overflow);
         if let Some(codec) = extent.codec {
@@ -287,14 +288,15 @@ impl Observer {
         )?;
         writeln!(
             writer,
-            "\"extent_errors\":{},\"codec_coverage\":{{\"envelope_only\":{},\"fragmented_units\":{},\"swift_stream\":{},\"fragmented_record\":{},\"not_applicable\":{},\"unencoded_native\":{}}},",
+            "\"extent_errors\":{},\"codec_coverage\":{{\"envelope_only\":{},\"fragmented_units\":{},\"swift_stream\":{},\"fragmented_record\":{},\"not_applicable\":{},\"unencoded_native\":{},\"striped_mixed\":{}}},",
             self.extent_errors,
             self.coverage[0],
             self.coverage[1],
             self.coverage[2],
             self.coverage[3],
             self.coverage[4],
-            self.coverage[5]
+            self.coverage[5],
+            self.coverage[6]
         )?;
         writeln!(
             writer,
@@ -553,7 +555,7 @@ mod tests {
         assert_eq!(observer.quantile(5, 99), Some(5));
         assert_eq!(observer.quantile(6, 99), Some(0));
         assert_eq!(observer.quantile(7, 99), None);
-        assert_eq!(observer.coverage, [0, 0, 1, 0, 0, 0]);
+        assert_eq!(observer.coverage, [0, 0, 1, 0, 0, 0, 0]);
         assert_eq!(observer.extent_errors, 0);
         observer.accepted(
             Sample {

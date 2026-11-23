@@ -15,6 +15,10 @@ pub struct CarrierOutputToken {
 }
 
 impl CarrierOutputToken {
+    /// Observe the scheduler selection without granting physical handoff authority.
+    pub fn rolling_data_label(&self) -> Option<engine::RollingDataLabel> {
+        self.token.rolling_data_label()
+    }
     /// Exact issuing Bank, slot and nonreusable generation.
     pub const fn generation(&self) -> GenerationId {
         self.generation

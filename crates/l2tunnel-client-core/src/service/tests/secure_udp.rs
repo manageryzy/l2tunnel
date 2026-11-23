@@ -14,6 +14,7 @@ use zeroize::Zeroizing;
 struct Pipe {
     socket: UnixDatagram,
     host: Arc<Host>,
+    layer: PacketLayer,
 }
 impl AsRawFd for Pipe {
     fn as_raw_fd(&self) -> std::os::fd::RawFd {
@@ -28,7 +29,7 @@ impl Drop for Pipe {
 impl PacketDevice for Pipe {
     type Error = io::Error;
     fn layer(&self) -> PacketLayer {
-        PacketLayer::Ip
+        self.layer
     }
     fn receive(&mut self, bytes: &mut [u8]) -> io::Result<Option<usize>> {
         match self.socket.recv(bytes) {
@@ -52,8 +53,11 @@ struct Host {
 }
 impl Host {
     fn attachment(self: &Arc<Self>) -> Attachment {
+        self.attachment_for(PacketLayer::Ip)
+    }
+    fn attachment_for(self: &Arc<Self>, layer: PacketLayer) -> Attachment {
         let host = self.clone();
-        Attachment::readable(PacketLayer::Ip, move || {
+        Attachment::readable(layer, move || {
             let (socket, application) = UnixDatagram::pair()?;
             socket.set_nonblocking(true)?;
             application.set_nonblocking(true)?;
@@ -66,6 +70,7 @@ impl Host {
             Ok(crate::native::Native::new(Pipe {
                 socket,
                 host: host.clone(),
+                layer,
             }))
         })
     }

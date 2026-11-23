@@ -151,8 +151,9 @@ fn data_wait<P: RecoveryPolicy>(config: Config<P>, duplicate: bool) -> TestResul
     assert_eq!(resolved.pending.input, pending.input);
     assert_eq!(resolved.pending.serial, pending.serial);
     assert_eq!(resolved.pending.since, Tick(10));
-    assert_eq!(done.populations[outcome.index()].elapsed_us, 10);
-    assert_eq!(done.populations[outcome.index()].episodes, 1);
+    let index = outcome.index().ok_or("ordinary decoder completion")?;
+    assert_eq!(done.populations[index].elapsed_us, 10);
+    assert_eq!(done.populations[index].episodes, 1);
     assert_eq!(done.next_head, 2);
     if duplicate {
         assert!(resolved.admitted_job.is_none());

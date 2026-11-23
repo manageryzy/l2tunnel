@@ -17,6 +17,7 @@ fn arq_only_descriptor(value: common::Descriptor) -> Result<common::Descriptor> 
         | common::Profile::AlignedCompact { .. }
         | common::Profile::PackedCompact { .. }
         | common::Profile::PerConnectionCompact { .. }
+        | common::Profile::Striped { .. }
         | common::Profile::Research { .. }
         | common::Profile::Rolling { .. }
         | common::Profile::RollingCopies { .. } => return Ok(value),
@@ -133,6 +134,7 @@ fn assert_arq_only(value: common::Configuration) {
         | common::Profile::AlignedCompact { .. }
         | common::Profile::PackedCompact { .. }
         | common::Profile::PerConnectionCompact { .. }
+        | common::Profile::Striped { .. }
         | common::Profile::Research { .. }
         | common::Profile::Rolling { .. }
         | common::Profile::RollingCopies { .. } => {}

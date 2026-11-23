@@ -106,9 +106,30 @@ pub struct GateCounts {
     pub backlogged_groups: u64,
 }
 
+/// Observations for the independent overflow-credit selection.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct HeadroomStatus {
+    /// Unspent first-original credit discarded by the regular near8 account, in eighths of an IP byte.
+    pub credit_eighths: u64,
+    /// Groups whose fresh MUX backlog independently exceeded the ordinary near8 threshold.
+    pub qualifying_groups: u64,
+    /// Qualifying groups too expensive for the overflow account.
+    pub unfunded: u64,
+    /// Qualified opportunities refused for missing or insufficient measured carrier headroom.
+    pub wire_busy: u64,
+    /// Overflow jobs discarded before physical confirmation.
+    pub abandoned: u64,
+    /// Extra rows physically accepted, also within the total near8 row count.
+    pub sent_rows: u64,
+    /// Actual IP bytes charged for the overflow rows.
+    pub sent_ip_bytes: u64,
+}
+
 /// Local capacity gate and actual extra transmission accounting.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct Status {
+    /// Present only for the independently negotiated overflow-credit selection.
+    pub headroom: Option<HeadroomStatus>,
     /// True only after four consecutive nonempty low-utilization intervals.
     pub spare: bool,
     /// Observed reasons for capacity decisions.
@@ -127,8 +148,31 @@ pub struct Status {
     pub sent_rows: u64,
     /// Exact external IP bytes charged on successful row receipts.
     pub sent_ip_bytes: u64,
+    /// Regular global or tail rows confirmed at this sender's physical handoff.
+    pub global_sent_rows: u64,
+    /// Confirmed global rows which omitted at least one nominal source column.
+    pub global_trimmed_rows: u64,
+    /// Total nominal source columns across confirmed global rows, including startup ramps.
+    pub global_nominal_columns: u64,
+    /// Total source columns actually covered by those rows' immutable supports.
+    pub global_sent_columns: u64,
     /// Residual original-byte budget expressed in eighths of one IP byte.
     pub credit_eighths: u64,
+}
+impl Status {
+    pub(super) fn accepted_repair(&mut self, config: Config, id: RepairId, support: Support) {
+        if !support.tail && !((id.0 & 0x7fff) as u16).is_multiple_of(config.global_every) {
+            return;
+        }
+        let nominal = u64::from(support.end.min(config.window as u32));
+        let sent = u64::from(support.end - support.start);
+        self.global_sent_rows = self.global_sent_rows.saturating_add(1);
+        self.global_trimmed_rows = self
+            .global_trimmed_rows
+            .saturating_add(u64::from(sent < nominal));
+        self.global_nominal_columns = self.global_nominal_columns.saturating_add(nominal);
+        self.global_sent_columns = self.global_sent_columns.saturating_add(sent);
+    }
 }
 #[derive(Clone, Copy)]
 struct Gate {
@@ -219,7 +263,64 @@ struct Job {
     source: u32,
     column: usize,
     price: usize,
+    overflow: bool,
 }
+
+// Each snapshot is the cumulative count preceding the first observation in a
+// 10 ms bucket. Eleven buckets bound a trailing 100 ms interval conservatively.
+#[derive(Clone, Default)]
+pub(super) struct Headroom {
+    buckets: [(u64, u64); 11],
+    previous: Option<(Tick, u64)>,
+    first_sample: u64,
+    queued_microbytes: u128,
+    mux_bytes: Option<usize>,
+}
+
+impl Headroom {
+    fn observe(&mut self, now: Tick, total: u64, mux: Option<usize>, rate: u64) {
+        let bucket = now.0 / 10_000;
+        if self.previous.is_none() {
+            self.first_sample = now.0;
+        }
+        let (at, before) = self.previous.unwrap_or((now, total));
+        self.queued_microbytes = self
+            .queued_microbytes
+            .saturating_sub(u128::from(now.0 - at.0) * u128::from(rate))
+            + u128::from(total - before) * 1_000_000;
+        let i = (bucket % 11) as usize;
+        if self.buckets[i].0 != bucket + 1 {
+            self.buckets[i] = (bucket + 1, before);
+        }
+        self.previous = Some((now, total));
+        self.mux_bytes = mux;
+    }
+
+    fn available(&self, now: Tick, rate: u64, mtu: usize, price: usize) -> bool {
+        let Some((observed, total)) = self.previous else {
+            return false;
+        };
+        if now.0.saturating_sub(self.first_sample) < 100_000 {
+            return false;
+        }
+        // A physical acceptance may precede the caller's observed clock. An
+        // unavailable or stale sample never authorizes extra transmission.
+        let Some(elapsed) = now.0.checked_sub(observed.0).filter(|v| *v <= 1_000) else {
+            return false;
+        };
+        let Some(first) = (now.0 / 10_000).checked_sub(10) else {
+            return false;
+        };
+        let (tag, before) = self.buckets[(first % 11) as usize];
+        let queue = self
+            .queued_microbytes
+            .saturating_sub(u128::from(elapsed) * u128::from(rate));
+        tag == first + 1
+            && queue <= (mtu as u128) * 1_000_000
+            && (u128::from(total - before) + price as u128) * 1000 <= u128::from(rate) * 75
+    }
+}
+
 pub(super) struct State {
     pub(super) status: Status,
     output: Vec<u8>,
@@ -229,11 +330,15 @@ pub(super) struct State {
     extent: usize,
     group_cap: Tick,
     job: Option<Job>,
+    headroom: Vec<Headroom>,
 }
 impl State {
-    pub(super) fn new(width: usize) -> Result<Self, Error> {
+    pub(super) fn new(width: usize, overflow: bool) -> Result<Self, Error> {
         Ok(Self {
-            status: Status::default(),
+            status: Status {
+                headroom: overflow.then(HeadroomStatus::default),
+                ..Status::default()
+            },
             output: bytes(width)?,
             gate: None,
             mtu: 0,
@@ -241,10 +346,11 @@ impl State {
             extent: 0,
             group_cap: Tick(u64::MAX),
             job: None,
+            headroom: slots(usize::from(overflow), Headroom::default())?,
         })
     }
     pub(super) fn usage(&self) -> Result<storage::Usage, storage::Error> {
-        storage::Usage::vector(&self.output)
+        storage::Usage::vector(&self.output)?.join(storage::Usage::vector(&self.headroom)?)
     }
     pub(super) fn configured(&self) -> bool {
         self.gate.is_some()
@@ -282,22 +388,33 @@ impl State {
         total: u64,
         ordinary: usize,
         serial: usize,
+        mux: Option<usize>,
     ) -> Result<(), Error> {
-        self.gate.as_mut().ok_or(Error::Configuration)?.observe(
+        let gate = self.gate.as_mut().ok_or(Error::Configuration)?;
+        gate.observe(
             now,
             total,
             ordinary.saturating_add(serial),
             self.mtu,
             &mut self.status,
-        )
+        )?;
+        if let Some(extra) = self.headroom.first_mut() {
+            extra.observe(now, total, mux, gate.rate);
+        }
+        Ok(())
     }
     fn spare(&self, now: Tick) -> bool {
         self.gate
             .is_some_and(|g| g.eligible(now, self.mtu, self.status.spare))
     }
     pub(super) fn discard(&mut self) {
-        if self.job.take().is_some() {
+        if let Some(job) = self.job.take() {
             self.status.abandoned = self.status.abandoned.saturating_add(1);
+            if job.overflow
+                && let Some(status) = self.status.headroom.as_mut()
+            {
+                status.abandoned = status.abandoned.saturating_add(1);
+            }
         }
     }
     pub(super) fn first(
@@ -312,11 +429,15 @@ impl State {
             return Err(Error::Configuration);
         }
         let end = id.0.checked_add(1).ok_or(Error::Identity)?;
-        self.status.credit_eighths = self
-            .status
-            .credit_eighths
-            .saturating_add(price as u64)
-            .min(8 * self.mtu as u64);
+        let earned = self.status.credit_eighths.saturating_add(price as u64);
+        let cap_credit = 8 * self.mtu as u64;
+        self.status.credit_eighths = earned.min(cap_credit);
+        if let Some(status) = self.status.headroom.as_mut() {
+            status.credit_eighths = status
+                .credit_eighths
+                .saturating_add(earned.saturating_sub(cap_credit))
+                .min(cap_credit);
+        }
         self.extent = self.extent.max(2 + source_len);
         self.group_cap = self.group_cap.min(cap);
         if end % 8 != 0 {
@@ -328,10 +449,13 @@ impl State {
         let cap = std::mem::replace(&mut self.group_cap, Tick(u64::MAX));
         let id = Id(end / 8);
         let price = add(length(id, extent)?, self.overhead)?;
+        let mut overflow = false;
         if accepted >= cap {
             self.status.abandoned = self.status.abandoned.saturating_add(1);
+            return Ok(());
         } else if price > self.mtu {
             self.status.oversized = self.status.oversized.saturating_add(1);
+            return Ok(());
         } else if !self.spare(accepted) {
             self.status.gated = self.status.gated.saturating_add(1);
             let gate = self.gate.ok_or(Error::Configuration)?;
@@ -345,19 +469,37 @@ impl State {
             counts.backlogged_groups = counts
                 .backlogged_groups
                 .saturating_add(u64::from(gate.ordinary > 8 * self.mtu));
+            let Some(head) = self.headroom.first() else {
+                return Ok(());
+            };
+            if head.mux_bytes.is_none_or(|bytes| bytes <= 8 * self.mtu) {
+                return Ok(());
+            }
+            let status = self.status.headroom.as_mut().ok_or(Error::Configuration)?;
+            status.qualifying_groups = status.qualifying_groups.saturating_add(1);
+            if status.credit_eighths < 8 * price as u64 {
+                status.unfunded = status.unfunded.saturating_add(1);
+                return Ok(());
+            }
+            if !head.available(accepted, gate.rate, self.mtu, price) {
+                status.wire_busy = status.wire_busy.saturating_add(1);
+                return Ok(());
+            }
+            overflow = true;
         } else if self.status.credit_eighths < 8 * price as u64 {
             self.status.unfunded = self.status.unfunded.saturating_add(1);
-        } else {
-            self.job = Some(Job {
-                id,
-                cap,
-                extent,
-                price,
-                source: end - 8,
-                column: 0,
-                cleared: 0,
-            });
+            return Ok(());
         }
+        self.job = Some(Job {
+            id,
+            cap,
+            extent,
+            price,
+            overflow,
+            source: end - 8,
+            column: 0,
+            cleared: 0,
+        });
         Ok(())
     }
     pub(super) fn pending(&self, scope: Scope) -> Option<Row<'_>> {
@@ -381,7 +523,21 @@ impl State {
             return Ok(None);
         };
         let end = j.id.end()?;
-        if now >= j.cap || !self.spare(now) || encoder.status().confirmed_prefix >= end {
+        let capacity = if j.overflow {
+            self.headroom
+                .first()
+                .zip(self.gate)
+                .is_some_and(|(head, gate)| head.available(now, gate.rate, self.mtu, j.price))
+        } else {
+            self.spare(now)
+        };
+        if now >= j.cap || !capacity || encoder.status().confirmed_prefix >= end {
+            if j.overflow
+                && !capacity
+                && let Some(status) = self.status.headroom.as_mut()
+            {
+                status.wire_busy = status.wire_busy.saturating_add(1);
+            }
             self.discard();
             return Ok(None);
         }
@@ -437,11 +593,21 @@ impl State {
         if j.id != id || j.source != id.end()? || j.price != ip {
             return Err(Error::Identity);
         }
-        self.status.credit_eighths = self
-            .status
-            .credit_eighths
-            .checked_sub(8 * ip as u64)
-            .ok_or(Error::Identity)?;
+        if j.overflow {
+            let status = self.status.headroom.as_mut().ok_or(Error::Configuration)?;
+            status.credit_eighths = status
+                .credit_eighths
+                .checked_sub(8 * ip as u64)
+                .ok_or(Error::Identity)?;
+            status.sent_rows = status.sent_rows.saturating_add(1);
+            status.sent_ip_bytes = status.sent_ip_bytes.saturating_add(ip as u64);
+        } else {
+            self.status.credit_eighths = self
+                .status
+                .credit_eighths
+                .checked_sub(8 * ip as u64)
+                .ok_or(Error::Identity)?;
+        }
         self.status.sent_rows = self.status.sent_rows.saturating_add(1);
         self.status.sent_ip_bytes = self.status.sent_ip_bytes.saturating_add(ip as u64);
         self.job = None;

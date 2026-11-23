@@ -30,7 +30,7 @@ pub mod staged_wait;
 pub mod storage;
 /// Read-only exact selected recovery and codec-envelope byte extents.
 pub mod wire_extent;
-pub use compact::{CONFIG_BYTES as COMPACT_CONFIG_BYTES, Config as CompactConfig};
+pub use compact::{CONFIG_BYTES as COMPACT_CONFIG_BYTES, Config as CompactConfig, NativeDelivery};
 
 pub use l2tunnel_codec::aligned_receiver::{
     ChannelId, Delivery, Prepared, RecordIdentity, UnitWitness,
@@ -292,6 +292,8 @@ pub struct Endpoint {
     // Ordered packed-source framing is independent of out-of-order short-unit
     // proofs. Only actual ordered recovery handoff advances this cursor.
     receive_unit: Option<receiver::SourceId>,
+    // Stateless KCP-like Packed receivers prefix their symbol scratch with one
+    // completion bit per live ARQ source slot. Both share the prepaid slab.
     packed_symbols: Vec<u8>,
     recovery: Reliable,
     receiver: receiver::Receiver,
@@ -384,7 +386,7 @@ impl Endpoint {
         }
         let (sender, sender_usage) = if let Some(packed) = plan.send_packed() {
             let mut cell = allocation.vec(1)?;
-            let make = if config.native_policy == NativePolicy::IpHeaders {
+            let make = if config.native_policy.uses_ip_headers() {
                 l2tunnel_codec::packed_sender::Sender::new_reserved_ip
             } else {
                 l2tunnel_codec::packed_sender::Sender::new_reserved
@@ -402,7 +404,7 @@ impl Endpoint {
             (packed::SenderOwner::Packed(cell), usage)
         } else {
             let mut cell = allocation.vec(1)?;
-            let make = if config.native_policy == NativePolicy::IpHeaders {
+            let make = if config.native_policy.uses_ip_headers() {
                 sender::Sender::new_reserved_ip
             } else {
                 sender::Sender::new_reserved
@@ -436,20 +438,17 @@ impl Endpoint {
             )
             .map_err(storage::Error::Reliable)?,
         );
-        let make_receiver = if receive_config.native_policy == NativePolicy::IpHeaders {
-            receiver::Receiver::new_reserved_ip
-        } else {
-            receiver::Receiver::new_reserved
-        };
         construction.receiver = Some(
-            make_receiver(
-                receive_scope,
-                receive_config.receiver,
-                codec::Limits {
-                    capacity_bytes: plan.receiver.capacity_bytes(),
-                },
-            )
-            .map_err(storage::Error::Codec)?,
+            receive_config
+                .native_policy
+                .reserved_receiver(
+                    receive_scope,
+                    receive_config.receiver,
+                    codec::Limits {
+                        capacity_bytes: plan.receiver.capacity_bytes(),
+                    },
+                )
+                .map_err(storage::Error::Codec)?,
         );
         construction.send_buffer = allocation.bytes(config.recovery.arq.max_source_bytes)?;
         construction.receive_buffer =
@@ -596,7 +595,7 @@ impl Endpoint {
             send_scope,
             sender: match packing {
                 Some(p) => packed::SenderOwner::Packed(vec![
-                    (if config.native_policy == NativePolicy::IpHeaders {
+                    (if config.native_policy.uses_ip_headers() {
                         l2tunnel_codec::packed_sender::Sender::new_ip
                     } else {
                         l2tunnel_codec::packed_sender::Sender::new
@@ -604,7 +603,7 @@ impl Endpoint {
                     .map_err(Error::PackedSender)?,
                 ]),
                 None => packed::SenderOwner::Aligned(vec![
-                    (if config.native_policy == NativePolicy::IpHeaders {
+                    (if config.native_policy.uses_ip_headers() {
                         sender::Sender::new_ip
                     } else {
                         sender::Sender::new
@@ -622,10 +621,10 @@ impl Endpoint {
             ],
             recovery: Reliable::new_duplex(config.recovery, receive_config.recovery, context)
                 .map_err(Error::Recovery)?,
-            receiver: (if receive_config.native_policy == NativePolicy::IpHeaders {
-                receiver::Receiver::new_ip
-            } else {
-                receiver::Receiver::new
+            receiver: (match receive_config.native_policy {
+                NativePolicy::FixedAnchorIpHeaders => receiver::Receiver::new_ip_with_fixed_anchors,
+                NativePolicy::IpHeaders => receiver::Receiver::new_ip,
+                _ => receiver::Receiver::new,
             })(receive_scope, receive_config.receiver)
             .map_err(Error::Receiver)?,
             send_buffer: vec![0; config.recovery.arq.max_source_bytes],
@@ -971,12 +970,21 @@ impl Endpoint {
         self.advance(now)?;
         self.pump_receive()?;
         let now = ticks(now)?;
-        let result = if ordered {
-            self.receiver.prepare_ordered(channel, now, max_records)
-        } else {
-            self.receiver.prepare(channel, now, max_records)
-        }
-        .map_err(Error::Receiver);
+        let result =
+            if ordered || self.receive_config.native_delivery == NativeDelivery::ChannelOrdered {
+                self.receiver.prepare_ordered(channel, now, max_records)
+            } else if self.receive_config.independent_packets {
+                self.receiver.prepare_with_independent_packets(
+                    channel,
+                    now,
+                    max_records,
+                    |_| true,
+                    |_, _| receiver::EarlyDecision::Allow,
+                )
+            } else {
+                self.receiver.prepare(channel, now, max_records)
+            }
+            .map_err(Error::Receiver);
         self.terminal_result(result)
     }
     /// Immutable native bytes; never hiddenly retired by polling or WouldBlock.
@@ -1388,6 +1396,14 @@ impl Endpoint {
                 let Some((id, length)) = self.recovery_result(result)? else {
                     break;
                 };
+                if self.receive_packing.is_some() && self.receive_config.independent_packets {
+                    // Ordered acquisition retired the ARQ slot even if native admission blocks.
+                    let seen =
+                        &mut self.packed_symbols[..self.receive_config.packed_preview_bytes()];
+                    let (byte, mask) =
+                        packed_preview_bit(seen, self.receive_config.receive_records, id);
+                    *byte &= !mask;
+                }
                 let deadline = self
                     .now
                     .checked_add(Duration::from_millis(
@@ -1456,12 +1472,13 @@ impl Endpoint {
                     self.handoff = None;
                 }
                 Ok(receiver::Admission::Duplicate | receiver::Admission::StaleSource)
-                    if self
-                        .receive_config
-                        .receiver
-                        .body
-                        .independent_short_frame_bytes
-                        != 0 =>
+                    if self.receive_config.independent_packets
+                        || self
+                            .receive_config
+                            .receiver
+                            .body
+                            .independent_short_frame_bytes
+                            != 0 =>
                 {
                     self.observe_receiver_release(
                         id,
@@ -1491,12 +1508,13 @@ impl Endpoint {
     }
 
     fn preview_receive(&mut self) -> Result<(), Error> {
-        if self
-            .receive_config
-            .receiver
-            .body
-            .independent_short_frame_bytes
-            == 0
+        if !self.receive_config.independent_packets
+            && self
+                .receive_config
+                .receiver
+                .body
+                .independent_short_frame_bytes
+                == 0
         {
             return Ok(());
         }
@@ -1573,7 +1591,7 @@ impl Endpoint {
             self.receive_scope,
             id,
             &self.receive_buffer[..length],
-            &mut self.packed_symbols,
+            &mut self.packed_symbols[self.receive_config.packed_preview_bytes()..],
             &mut inputs,
         )?;
         if Some(first) != self.receive_unit {
@@ -1582,12 +1600,13 @@ impl Endpoint {
         // The envelope parser already checked every unit's full-width ID.
         // None is the exact exhausted next ID, never wrapping back to zero.
         let next = first.0.checked_add(count as u64).map(receiver::SourceId);
-        let preview = self
-            .receive_config
-            .receiver
-            .body
-            .independent_short_frame_bytes
-            != 0;
+        let preview = self.receive_config.independent_packets
+            || self
+                .receive_config
+                .receiver
+                .body
+                .independent_short_frame_bytes
+                != 0;
         let count = if preview {
             // Previewed units can already belong to the actual contiguous
             // admission prefix, including its exhausted u64 endpoint. The
@@ -1613,14 +1632,18 @@ impl Endpoint {
             return Ok(());
         }
         let mut outcomes = [receiver::Admission::Accepted; 255];
-        let admitted = self
-            .receiver
-            .admit_validated_batch_authenticated_into(
-                &inputs[..count],
-                ticks(self.now)?,
-                &mut outcomes[..count],
-            )
-            .map_err(Error::Receiver)?;
+        let admit = if self.receive_config.independent_packets {
+            receiver::Receiver::admit_independent_validated_batch_authenticated_into
+        } else {
+            receiver::Receiver::admit_validated_batch_authenticated_into
+        };
+        let admitted = admit(
+            &mut self.receiver,
+            &inputs[..count],
+            ticks(self.now)?,
+            &mut outcomes[..count],
+        )
+        .map_err(Error::Receiver)?;
         if admitted != count
             || outcomes[..count].iter().any(|a| {
                 !(matches!(a, receiver::Admission::Accepted)
@@ -1638,8 +1661,26 @@ impl Endpoint {
     }
     fn preview_packed(&mut self, options: packed::Options) -> Result<(), Error> {
         let now = ticks(self.now)?;
+        let (seen, symbols) = self
+            .packed_symbols
+            .split_at_mut(self.receive_config.packed_preview_bytes());
         let result = (|| {
             for (id, payload) in self.recovery.received_sources().map_err(Error::Recovery)? {
+                let completion = if seen.is_empty() {
+                    None
+                } else {
+                    Some(packed_preview_bit(
+                        seen,
+                        self.receive_config.receive_records,
+                        id,
+                    ))
+                };
+                if completion
+                    .as_ref()
+                    .is_some_and(|(byte, mask)| **byte & *mask != 0)
+                {
+                    continue;
+                }
                 let mut inputs: [receiver::AuthenticatedSymbol<'_>; 255] =
                     std::array::from_fn(|_| receiver::AuthenticatedSymbol {
                         identity: receiver::SymbolIdentity {
@@ -1656,17 +1697,18 @@ impl Endpoint {
                     self.receive_scope,
                     id,
                     payload,
-                    &mut self.packed_symbols,
+                    symbols,
                     &mut inputs,
                 )?;
                 let mut selected = 0;
                 // Validate all units before one atomic eligible-ledger admission.
                 // Ordinary context-dependent frames remain recovery-owned.
                 for index in 0..count {
-                    let eligible = self
-                        .receiver
-                        .is_independent_short(inputs[index].identity, inputs[index].bytes)
-                        .map_err(Error::Receiver)?;
+                    let eligible = self.receive_config.independent_packets
+                        || self
+                            .receiver
+                            .is_independent_short(inputs[index].identity, inputs[index].bytes)
+                            .map_err(Error::Receiver)?;
                     if eligible
                         && self
                             .receiver
@@ -1681,28 +1723,39 @@ impl Endpoint {
                         selected += 1;
                     }
                 }
-                if selected == 0 {
-                    continue;
+                if selected != 0 {
+                    let mut outcomes = [receiver::Admission::Accepted; 255];
+                    match self.receiver.admit_batch_authenticated_into(
+                        &inputs[..selected],
+                        now,
+                        &mut outcomes[..selected],
+                    ) {
+                        Ok(admitted)
+                            if admitted == selected
+                                && outcomes[..selected].iter().all(|a| {
+                                    matches!(
+                                        a,
+                                        receiver::Admission::Accepted
+                                            | receiver::Admission::Duplicate
+                                            | receiver::Admission::StaleSource
+                                    )
+                                }) => {}
+                        Err(receiver::Error::Capacity | receiver::Error::RecordWindow) => break,
+                        Err(receiver::Error::SourceWindow)
+                            if self.receive_config.independent_packets =>
+                        {
+                            // Packed unit IDs can run farther ahead than recovery source IDs.
+                            // The ordered source cursor still verifies their exact range later.
+                            continue;
+                        }
+                        Ok(_) => return Err(Error::Identity),
+                        Err(error) => return Err(Error::Receiver(error)),
+                    }
                 }
-                let mut outcomes = [receiver::Admission::Accepted; 255];
-                match self.receiver.admit_batch_authenticated_into(
-                    &inputs[..selected],
-                    now,
-                    &mut outcomes[..selected],
-                ) {
-                    Ok(admitted)
-                        if admitted == selected
-                            && outcomes[..selected].iter().all(|a| {
-                                matches!(
-                                    a,
-                                    receiver::Admission::Accepted
-                                        | receiver::Admission::Duplicate
-                                        | receiver::Admission::StaleSource
-                                )
-                            }) => {}
-                    Err(receiver::Error::Capacity | receiver::Error::RecordWindow) => break,
-                    Ok(_) => return Err(Error::Identity),
-                    Err(error) => return Err(Error::Receiver(error)),
+                // Only successful transactions and immutable envelopes with no eligible
+                // units are complete. Pressure above leaves ownership and retry intact.
+                if let Some((byte, mask)) = completion {
+                    *byte |= mask;
                 }
             }
             Ok(())
@@ -1734,6 +1787,12 @@ impl Endpoint {
         self.failure = Some(error);
         Err(error)
     }
+}
+
+fn packed_preview_bit(seen: &mut [u8], window: usize, source: u64) -> (&mut u8, u8) {
+    // The ARQ window admits only [deliver_next, deliver_next + window).
+    let slot = (source % window as u64) as usize;
+    (&mut seen[slot / 8], 1 << (slot % 8))
 }
 
 // Reuse the exact ordinary packed parser and retained padded symbol slab for

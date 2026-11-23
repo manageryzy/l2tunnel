@@ -14,6 +14,7 @@ pub(super) enum Owner {
     Aligned(aligned::Endpoint),
     Packed(aligned::packed::Endpoint),
     Rolling(rolling_records::Endpoint),
+    Striped(crate::striped_records::Endpoint),
     Research(crate::research_records::Endpoint),
     Connections(Connections),
 }
@@ -63,11 +64,16 @@ impl Owner {
                     .enable_queue_aware_repair_budget(mtu)
                     .map_err(Error::Rolling)
             }
-            Self::Swift(_) | Self::Rolling(_) | Self::Research(_) | Self::Connections(_) => Ok(()),
+            Self::Swift(_)
+            | Self::Striped(_)
+            | Self::Rolling(_)
+            | Self::Research(_)
+            | Self::Connections(_) => Ok(()),
         }
     }
     pub(super) fn storage_heap(&self) -> Option<(usize, usize)> {
         match self {
+            Self::Striped(endpoint) => endpoint.heap_usage(),
             Self::Swift(owned) => {
                 let usage = owned.usage();
                 Some((usage.heap_bytes, usage.allocations))
@@ -94,6 +100,12 @@ impl Owner {
         configuration: &configuration::Configuration,
         context: Context,
     ) -> Result<Self, Error> {
+        if let configuration::Profile::Striped { forward, reverse } =
+            configuration.descriptor().profile()
+        {
+            return crate::striped_records::Endpoint::new(*forward, *reverse, context, Tick(0))
+                .map(Self::Striped);
+        }
         if let configuration::Profile::Research { config, stream } =
             configuration.descriptor().profile()
         {
@@ -257,6 +269,7 @@ impl Owner {
         bytes: &[u8],
     ) -> Result<Option<ObservedProfileIdentity>, Error> {
         match self {
+            Self::Striped(endpoint) => endpoint.enqueue_admitted_observed(now, channel, bytes),
             Self::Connections(_) => Err(Error::IngressPolicy),
             Self::Swift(owned) => {
                 let channel =
@@ -334,6 +347,15 @@ impl Owner {
         feedback_overhead: usize,
     ) -> Result<Option<Emission>, Error> {
         match self {
+            Self::Striped(endpoint) => endpoint.prepare_output(
+                now,
+                number,
+                allow_data,
+                out,
+                budget,
+                witnesses,
+                feedback_overhead,
+            ),
             Self::Connections(owner) => owner.poll(now, number, allow_data, out, budget, witnesses),
             Self::Swift(owned) => {
                 let maximum = owned.engine().send_config().codec.datagram_bytes;
@@ -464,6 +486,7 @@ impl Owner {
         body: &mut [u8],
     ) -> Result<(), Error> {
         match self {
+            Self::Striped(endpoint) => endpoint.accept_authenticated(now, kind, body),
             Self::Connections(owner) => owner.accept_recovered(received, now, kind, body),
             Self::Swift(owned) => {
                 let observed = match *body.first().ok_or(Error::PacketSize)? & swift::KIND_MASK {
@@ -550,6 +573,9 @@ impl Owner {
         out: &mut [u8],
     ) -> Result<NativeStep, Error> {
         match self {
+            Self::Striped(endpoint) => {
+                endpoint.prepare_native(now, channel, work, original_deadline, out)
+            }
             Self::Connections(owner) => owner.extract(now, channel, work, out),
             Self::Swift(owned) => {
                 let maximum = owned.engine().receive_config().max_native;
@@ -612,6 +638,7 @@ impl Owner {
 
     pub(super) fn commit(&mut self, now: Tick) -> Result<(), Error> {
         match self {
+            Self::Striped(endpoint) => endpoint.commit_native(now),
             Self::Connections(owner) => owner.commit_native_at(now, now),
             Self::Swift(_) => Ok(()),
             Self::Aligned(endpoint) => endpoint
@@ -633,6 +660,7 @@ impl Owner {
 
     pub(super) fn pending_deadline(&self) -> Option<std::time::Duration> {
         match self {
+            Self::Striped(endpoint) => endpoint.pending_native_deadline().map(duration),
             Self::Connections(owner) => owner.pending_deadline(),
             Self::Swift(_) => None,
             Self::Aligned(endpoint) => endpoint.pending_deadline(),
@@ -648,6 +676,7 @@ impl Owner {
 
     pub(super) fn tick(&mut self, now: Tick) -> Result<(), Error> {
         match self {
+            Self::Striped(endpoint) => endpoint.tick(now),
             Self::Connections(owner) => owner.tick(now),
             Self::Swift(_) => Ok(()),
             Self::Aligned(endpoint) => endpoint.tick(duration(now)).map_err(Error::Aligned),
@@ -659,6 +688,7 @@ impl Owner {
 
     pub(super) fn feedback_opportunity(&self) -> Result<Option<(Tick, usize)>, Error> {
         let (at, bytes) = match self {
+            Self::Striped(endpoint) => return endpoint.feedback_opportunity(),
             Self::Connections(owner) => {
                 let Some((_, at, bytes)) = owner
                     .collection
@@ -702,6 +732,7 @@ impl Owner {
 
     pub(super) fn custody_deadline(&self) -> Result<Option<Tick>, Error> {
         let at = match self {
+            Self::Striped(endpoint) => return Ok(endpoint.expiry_deadline()),
             Self::Connections(owner) => owner.collection.custody_deadline(),
             Self::Swift(_) => return Ok(None),
             Self::Aligned(endpoint) => endpoint.custody_deadline(),
@@ -721,6 +752,7 @@ impl Owner {
 
     pub(super) fn expiry_deadline(&self) -> Result<Option<Tick>, Error> {
         let at = match self {
+            Self::Striped(endpoint) => return Ok(endpoint.expiry_deadline()),
             Self::Connections(owner) => owner.collection.expiry_deadline(),
             Self::Swift(_) => return Ok(None),
             Self::Aligned(endpoint) => endpoint.expiry_deadline(),
@@ -738,6 +770,7 @@ impl Owner {
 
     pub(super) fn deadline(&self) -> Result<Option<Tick>, Error> {
         match self {
+            Self::Striped(endpoint) => Ok(endpoint.deadline()),
             Self::Connections(owner) => owner
                 .collection
                 .deadline()
@@ -779,6 +812,7 @@ impl Owner {
 
     pub(super) fn drained(&self) -> Result<bool, Error> {
         match self {
+            Self::Striped(endpoint) => Ok(endpoint.drained()),
             Self::Connections(owner) => Ok(owner.drained()),
             Self::Swift(owned) => {
                 let engine = owned.engine();

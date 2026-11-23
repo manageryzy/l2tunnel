@@ -1,6 +1,6 @@
 """Passive forward bulk TCP original-segment paths in the single-FIFO PackedWire study.
 
-Durations partition the lifetime of a segment along its first TCP-arriving
+Durations partition the lifetime of a segment along its first TCP-accepted
 attempt and last available required coding source. These are observed elapsed
 intervals. The interval until a solving transmission is issued may contain
 loss, retransmission and antecedent equation work; these causes can overlap.
@@ -11,7 +11,6 @@ from collections import Counter, defaultdict, deque
 from dataclasses import dataclass
 from math import ceil
 
-from .compact_wire import decode_packet
 from .packed_wire import PACKED_CHANNEL
 
 
@@ -42,6 +41,7 @@ class Attempt:
     sources: int = 0
     solved: int = 0
     last: tuple | None = None
+    paws_rejected: bool = False
 
 
 def _set_during(observer, name, value, callback, *args, **kw):
@@ -99,14 +99,21 @@ class PackedFramePath:
             def receive(index, timestamp, fid=fid, flow=flow, rx=rx):
                 before = flow.tcp_received
                 key = fid, index
+                attempt = self._dispatch
+                paws = flow.data_paws
+                rejected = paws.rejections if paws is not None else 0
+                result = rx(index, timestamp)
+                if paws is not None and paws.rejections != rejected:
+                    self.counters["data_paws_rejections"] += 1
+                    if attempt is not None:
+                        attempt.paws_rejected = True
+                    return result
                 if index >= before and key not in self.winners:
-                    attempt = self._dispatch
                     if attempt is None or attempt.key != key or attempt.issue != timestamp:
                         raise ValueError("received TCP callback does not match observed MUX attempt")
                     self.winners[key] = (attempt, flow.now)
                 else:
                     self.counters["duplicate_tcp_arrivals"] += 1
-                result = rx(index, timestamp)
                 for serial in range(before, flow.tcp_received):
                     won, arrival = self.winners.pop((fid, serial))
                     self._complete(won, arrival, flow.now)
@@ -181,7 +188,7 @@ class PackedFramePath:
         decode = service.decode if service else receive
 
         def send(wire, kind, header):
-            packet = decode_packet(wire, t.received_prefix, t.config.encapsulation)
+            packet = t.decode_data_packet(wire)
             cause = packet.kind if kind != "retry" else "retry"
             meta = PacketPath(cause, packet.index, net.now)
             return _set_during(self, "_packet", meta, send_wire, wire, kind, header)
@@ -271,6 +278,8 @@ class PackedFramePath:
                 # Receiver-visible progress is monotone within the set of observed attempts.
                 if key in self.winners:
                     state = "arrived_waiting_for_inner_tcp_order"
+                elif any(a.paws_rejected for a in attempts):
+                    state = "paws_rejected_awaiting_accepted_attempt"
                 elif any(a.sources and a.solved == a.sources for a in attempts):
                     state = "known_sources_waiting_for_channel_or_unsealed_units"
                 elif any(a.sources for a in attempts):

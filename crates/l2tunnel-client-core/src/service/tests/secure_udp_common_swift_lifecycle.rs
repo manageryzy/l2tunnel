@@ -54,7 +54,7 @@ fn common_swift_plan_retains_deferred_attachment_and_original_setup_bound() -> R
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::test]
 async fn current_swift_tls_service_preserves_switch_refusal_noop_release_and_reconnect() -> Result {
     let hosts = support::hosts();
     let ([a, b], requested) = swift_plans(&hosts)?;
@@ -83,7 +83,6 @@ async fn current_swift_tls_service_preserves_switch_refusal_noop_release_and_rec
         )
         .into()
     })?;
-    let handles = [&client, &server];
     let original = common_frame(&client)?;
     let session = original.info.binding.session;
     let epoch = original
@@ -218,8 +217,13 @@ async fn current_swift_tls_service_preserves_switch_refusal_noop_release_and_rec
         hosts[side].send(&bytes)?;
         hosts[1 - side].expect(&bytes).await?;
     }
-    for handle in handles {
-        let stop = handle.disconnect(next(handle)?).map_err(submit)?;
+    // Submit both local stops on this executor before yielding. Otherwise the
+    // first owner's TLS close can terminate its peer before the second request.
+    let stops = [
+        client.disconnect(next(&client)?).map_err(submit)?,
+        server.disconnect(next(&server)?).map_err(submit)?,
+    ];
+    for (handle, stop) in [&client, &server].into_iter().zip(stops) {
         assert_eq!(
             handle.wait(stop.operation).await.map_err(submit)?,
             Completed::Aborted

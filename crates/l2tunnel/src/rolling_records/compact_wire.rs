@@ -10,8 +10,20 @@ use rolling::wire::compact as rw;
 pub trait CompactRecovery<P: RecoveryPolicy> {
     fn maximum_data(policy: P) -> Result<usize, rolling::Error>;
     const MAXIMUM_FEEDBACK: usize;
-    fn data_len(sender: &P::Sender) -> Result<Option<usize>, rolling::Error>;
-    fn encode_data(sender: &P::Sender, output: &mut [u8]) -> Result<usize, rolling::Error>;
+    fn data_len(policy: P, sender: &P::Sender) -> Result<Option<usize>, rolling::Error>;
+    fn encode_data(
+        policy: P,
+        sender: &P::Sender,
+        output: &mut [u8],
+    ) -> Result<usize, rolling::Error>;
+    fn repair_len(
+        _: P,
+        id: rolling::RepairId,
+        support: rolling::Support,
+        extent: usize,
+    ) -> Result<usize, rolling::Error> {
+        rw::repair_len(id, support.end, extent)
+    }
     fn feedback_len(receiver: &P::Receiver) -> Result<Option<usize>, rolling::Error>;
     fn encode_feedback(receiver: &P::Receiver, output: &mut [u8]) -> Result<usize, rolling::Error>;
     fn inspect(
@@ -57,7 +69,7 @@ fn near_row(
     if bytes.first() != Some(&rolling::near8::TAG) {
         return Ok(None);
     }
-    if policy.source_wire != rolling::wire::SourceWire::TargetedNear8 {
+    if !policy.source_wire.is_near8() {
         return Err(rolling::Error::Format);
     }
     rolling::near8::inspect(policy.recovery, scope, bytes).map(Some)
@@ -66,13 +78,36 @@ fn near_row(
 impl CompactRecovery<scheduler::Policy> for Rolling {
     const MAXIMUM_FEEDBACK: usize = rw::MAXIMUM_FEEDBACK_BYTES;
     fn maximum_data(policy: scheduler::Policy) -> Result<usize, rolling::Error> {
-        rw::maximum_data_bytes(policy.recovery)
+        rw::maximum_data_bytes_with(policy.recovery, policy.source_wire)
     }
-    fn data_len(sender: &scheduler::Sender) -> Result<Option<usize>, rolling::Error> {
-        sender.pending_output().map(rw::data_len).transpose()
+    fn data_len(
+        policy: scheduler::Policy,
+        sender: &scheduler::Sender,
+    ) -> Result<Option<usize>, rolling::Error> {
+        sender
+            .pending_output()
+            .map(|v| rw::data_len_with(policy.recovery, policy.source_wire, v))
+            .transpose()
     }
-    fn encode_data(sender: &scheduler::Sender, output: &mut [u8]) -> Result<usize, rolling::Error> {
-        rw::encode_data(sender.pending_output().ok_or(rolling::Error::Busy)?, output)
+    fn encode_data(
+        policy: scheduler::Policy,
+        sender: &scheduler::Sender,
+        output: &mut [u8],
+    ) -> Result<usize, rolling::Error> {
+        rw::encode_data_with(
+            policy.recovery,
+            policy.source_wire,
+            sender.pending_output().ok_or(rolling::Error::Busy)?,
+            output,
+        )
+    }
+    fn repair_len(
+        policy: scheduler::Policy,
+        id: rolling::RepairId,
+        support: rolling::Support,
+        extent: usize,
+    ) -> Result<usize, rolling::Error> {
+        rw::repair_len_with(policy.recovery, policy.source_wire, id, support, extent)
     }
     fn feedback_len(receiver: &scheduler::Receiver) -> Result<Option<usize>, rolling::Error> {
         Ok(if let Some(r) = receiver.pending_request() {
@@ -99,9 +134,12 @@ impl CompactRecovery<scheduler::Policy> for Rolling {
         bytes: &[u8],
     ) -> Result<recovery::View<'_>, rolling::Error> {
         if let Some(row) = near_row(policy, scope, bytes)? {
-            return Ok(recovery::View::Repair { scope: row.scope });
+            return Ok(recovery::View::Repair {
+                scope: row.scope,
+                end: row.id.end()?,
+            });
         }
-        match rw::inspect(policy.recovery, scope, bytes)? {
+        match rw::inspect_with(policy.recovery, policy.source_wire, scope, bytes)? {
             rw::View::Data(rolling::wire::View::Source {
                 scope,
                 id,
@@ -111,9 +149,10 @@ impl CompactRecovery<scheduler::Policy> for Rolling {
                 id,
                 original,
             }),
-            rw::View::Data(rolling::wire::View::Repair(value)) => {
-                Ok(recovery::View::Repair { scope: value.scope })
-            }
+            rw::View::Data(rolling::wire::View::Repair(value)) => Ok(recovery::View::Repair {
+                scope: value.scope,
+                end: value.support.end,
+            }),
             rw::View::Feedback(_) | rw::View::Gap(_) => Err(rolling::Error::Format),
         }
     }
@@ -125,15 +164,17 @@ impl CompactRecovery<scheduler::Policy> for Rolling {
         if near_row(policy, scope, bytes)?.is_some() {
             return Ok(EmissionKind::Repair);
         }
-        Ok(match rw::inspect(policy.recovery, scope, bytes)? {
-            rw::View::Data(rolling::wire::View::Source { .. }) => {
-                EmissionKind::Source(SourceForm::SystematicFec)
-            }
-            rw::View::Data(rolling::wire::View::Repair(_)) => EmissionKind::Repair,
-            rw::View::Feedback(_) => EmissionKind::Feedback,
-            rw::View::Gap(_) if policy.source_wire.is_targeted() => EmissionKind::Feedback,
-            rw::View::Gap(_) => return Err(rolling::Error::Format),
-        })
+        Ok(
+            match rw::inspect_with(policy.recovery, policy.source_wire, scope, bytes)? {
+                rw::View::Data(rolling::wire::View::Source { .. }) => {
+                    EmissionKind::Source(SourceForm::SystematicFec)
+                }
+                rw::View::Data(rolling::wire::View::Repair(_)) => EmissionKind::Repair,
+                rw::View::Feedback(_) => EmissionKind::Feedback,
+                rw::View::Gap(_) if policy.source_wire.is_targeted() => EmissionKind::Feedback,
+                rw::View::Gap(_) => return Err(rolling::Error::Format),
+            },
+        )
     }
     fn extent(
         policy: scheduler::Policy,
@@ -144,17 +185,18 @@ impl CompactRecovery<scheduler::Policy> for Rolling {
         if let Some(row) = near_row(policy, scope, bytes)? {
             return recovery_extent(bytes.len(), row.bytes.len(), RecordKind::Repair);
         }
-        let (kind, payload) = match rw::inspect(policy.recovery, scope, bytes)? {
-            rw::View::Data(rolling::wire::View::Source { original, .. }) => {
-                (RecordKind::Systematic, original.len())
-            }
-            rw::View::Data(rolling::wire::View::Repair(value)) => {
-                (RecordKind::Repair, value.bytes.len())
-            }
-            rw::View::Feedback(_) => (RecordKind::Feedback, 0),
-            rw::View::Gap(_) if policy.source_wire.is_targeted() => (RecordKind::Feedback, 0),
-            rw::View::Gap(_) => return Err(rolling::Error::Format),
-        };
+        let (kind, payload) =
+            match rw::inspect_with(policy.recovery, policy.source_wire, scope, bytes)? {
+                rw::View::Data(rolling::wire::View::Source { original, .. }) => {
+                    (RecordKind::Systematic, original.len())
+                }
+                rw::View::Data(rolling::wire::View::Repair(value)) => {
+                    (RecordKind::Repair, value.bytes.len())
+                }
+                rw::View::Feedback(_) => (RecordKind::Feedback, 0),
+                rw::View::Gap(_) if policy.source_wire.is_targeted() => (RecordKind::Feedback, 0),
+                rw::View::Gap(_) => return Err(rolling::Error::Format),
+            };
         recovery_extent(bytes.len(), payload, kind)
     }
     fn receive_feedback(
@@ -165,7 +207,7 @@ impl CompactRecovery<scheduler::Policy> for Rolling {
         _: rolling::Tick,
         now: rolling::Tick,
     ) -> Result<(), rolling::Error> {
-        match rw::inspect(policy.recovery, scope, bytes)? {
+        match rw::inspect_with(policy.recovery, policy.source_wire, scope, bytes)? {
             rw::View::Feedback(value) => sender.receive_feedback(value, now),
             rw::View::Gap(request) => sender.receive_request(request, now),
             _ => return Err(rolling::Error::Format),
@@ -184,7 +226,9 @@ impl CompactRecovery<scheduler::Policy> for Rolling {
         if let Some(row) = near_row(policy, scope, bytes)? {
             return receiver.receive_near8_until(row, received, now, cap);
         }
-        let rw::View::Data(value) = rw::inspect(policy.recovery, scope, bytes)? else {
+        let rw::View::Data(value) =
+            rw::inspect_with(policy.recovery, policy.source_wire, scope, bytes)?
+        else {
             return Err(rolling::Error::Format);
         };
         receiver.receive_view_until(value, received, now, cap)
@@ -210,10 +254,17 @@ impl CompactRecovery<research::Config> for Research {
     fn maximum_data(policy: research::Config) -> Result<usize, rolling::Error> {
         rs::maximum_data_bytes(policy)
     }
-    fn data_len(sender: &research::Sender) -> Result<Option<usize>, rolling::Error> {
+    fn data_len(
+        _: research::Config,
+        sender: &research::Sender,
+    ) -> Result<Option<usize>, rolling::Error> {
         sender.pending_output().map(rs::data_len).transpose()
     }
-    fn encode_data(sender: &research::Sender, output: &mut [u8]) -> Result<usize, rolling::Error> {
+    fn encode_data(
+        _: research::Config,
+        sender: &research::Sender,
+        output: &mut [u8],
+    ) -> Result<usize, rolling::Error> {
         rs::encode_data(sender.pending_output().ok_or(rolling::Error::Busy)?, output)
     }
     fn feedback_len(receiver: &research::Receiver) -> Result<Option<usize>, rolling::Error> {
@@ -245,6 +296,7 @@ impl CompactRecovery<research::Config> for Research {
             }),
             research::wire::View::Repair(value) => Ok(recovery::View::Repair {
                 scope: value.equation.scope,
+                end: value.equation.support.end,
             }),
             research::wire::View::Feedback(_) => Err(rolling::Error::Format),
         }
@@ -302,6 +354,38 @@ fn recovery_extent(
     })
 }
 impl Endpoint<scheduler::Policy> {
+    pub(crate) fn inspect_gap_request(
+        &self,
+        outgoing: bool,
+        bytes: &[u8],
+    ) -> Result<Option<scheduler::GapRequest>, rolling::Error> {
+        if self.compact_feedback_overhead.is_none() || bytes.first() != Some(&5) {
+            return Ok(None);
+        }
+        let (policy, scope) = if outgoing {
+            (self.receive_config.scheduler, self.peer_rolling_scope())
+        } else {
+            (self.send_config.scheduler, self.send_rolling_scope)
+        };
+        if !policy.source_wire.is_targeted() {
+            return Ok(None);
+        }
+        match rw::inspect_with(policy.recovery, policy.source_wire, scope, bytes)? {
+            rw::View::Gap(request) => Ok(Some(request)),
+            _ => Ok(None),
+        }
+    }
+
+    pub(crate) fn prepared_repair_support(
+        &self,
+        id: rolling::RepairId,
+    ) -> Option<rolling::Support> {
+        match self.sender.pending_output()? {
+            scheduler::Output::Repair(row) if row.id == id => Some(row.support),
+            _ => None,
+        }
+    }
+
     pub(crate) fn configure_near8(&mut self, mtu: usize, rate: u64) -> Result<(), Error> {
         if self.sender.near8_status().is_some() {
             let (_, unit_cost) = wire_charge(self.framing, 1, self.overhead)?;
@@ -326,7 +410,13 @@ impl Endpoint<scheduler::Policy> {
             .saturating_add(buffers.packing.source.bytes)
             .saturating_add(self.sender.ordinary_backlog_bytes(primary_in_carrier));
         self.sender
-            .observe_near8_capacity(rolling_tick(now), accepted, ordinary, serial)
+            .observe_near8_capacity_with_mux(
+                rolling_tick(now),
+                accepted,
+                ordinary,
+                serial,
+                Some(pipeline_bytes),
+            )
             .map_err(Error::Rolling)
     }
 
@@ -369,15 +459,25 @@ impl<P: RecoveryPolicy> Endpoint<P> {
             else {
                 return Err(Error::Identity);
             };
-            Some(
+            let mut extent = self.with_plain_output(id, original, |plain| {
                 l2tunnel_aligned::wire_extent::inspect_packed(
                     self.send_config.packing.envelope(),
                     self.send_scope,
                     receiver::SourceId(u64::from(id.0)),
-                    original,
+                    plain,
                 )
-                .map_err(Error::Envelope)?,
-            )
+                .map_err(Error::Envelope)
+            })?;
+            if original.first() == Some(&0) {
+                // The marker and original length are the only visible envelope
+                // fields. All unit headers and bodies share one compressed block.
+                extent.bytes = original.len();
+                extent.envelope_bytes = 3;
+                extent.container_bytes = 0;
+                extent.unit_header_bytes = 0;
+                extent.body_bytes = original.len().checked_sub(3).ok_or(Error::Identity)?;
+            }
+            Some(extent)
         } else {
             None
         };

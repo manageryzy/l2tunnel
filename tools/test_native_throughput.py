@@ -183,12 +183,18 @@ class ContractTests(unittest.TestCase):
             with self.assertRaises(ValueError): h.verify_helpers({'source_sha256_after': hashes}, output)
 
     def test_tcp_info_nullable_scaled_peer_window_and_64bit_bytes(self):
+        self.assertIsNone(probe.decode_tcp_info(bytes(67))['rcv_ssthresh_bytes'])
+        self.assertIsNone(probe.decode_tcp_info(bytes(87))['advmss_bytes'])
         short = probe.decode_tcp_info(bytes(104))
         self.assertIsNone(short['peer_advertised_rwnd_bytes'])
         self.assertIsNone(short['bytes_sent'])
         raw = bytearray(236)
         struct.pack_into('=I', raw, 16, 1400)
+        struct.pack_into('=I', raw, 64, 5792)
         struct.pack_into('=I', raw, 80, 10)
+        struct.pack_into('=I', raw, 84, 1448)
+        self.assertEqual(probe.decode_tcp_info(raw[:68])['rcv_ssthresh_bytes'], 5792)
+        self.assertEqual(probe.decode_tcp_info(raw[:88])['advmss_bytes'], 1448)
         struct.pack_into('=I', raw, 96, 777)
         struct.pack_into('=I', raw, 228, 196608)
         struct.pack_into('=I', raw, 232, 131072)

@@ -251,7 +251,8 @@ impl Reliable {
                 self.ensure_restored(1, body.len(), observed)?;
                 self.advance(observed)?;
                 self.enqueue(body, false)?;
-                self.pump()
+                self.pump()?;
+                self.enrich_retry(body, observed)
             }
             RecordKind::Feedback => {
                 self.arq

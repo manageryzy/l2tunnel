@@ -198,8 +198,8 @@ is separate; summing the two would double-count delivery.
 def capture_counters(log):
     text = log.read_text()
     result = {}
-    for key, suffix in [('captured', 'packets captured'), ('filtered', 'packets received by filter'), ('dropped', 'packets dropped by kernel')]:
-        values = re.findall(r'^([0-9]+) ' + suffix + r'\s*$', text, re.MULTILINE)
+    for key, suffix in [('captured', 'captured'), ('filtered', 'received by filter'), ('dropped', 'dropped by kernel')]:
+        values = re.findall(r'^([0-9]+) packets? ' + suffix + r'\s*$', text, re.MULTILINE)
         if len(values) != 1:
             raise ValueError('missing/ambiguous tcpdump counter: ' + key)
         result[key] = int(values[0])
@@ -290,13 +290,20 @@ def validate_wire_metrics(value, carrier):
         if not unsigned(value.get('extent_errors')) or value['extent_errors'] != 0:
             raise ValueError('wire observer extent errors prevent layer attribution')
         coverage = value.get('codec_coverage')
-        if (not isinstance(coverage, dict) or set(coverage) != set(CODEC_COVERAGE)
+        known = set(CODEC_COVERAGE)
+        allowed = (known, known | {'striped_mixed'}) if value['schema'] == 3 else (known,)
+        if (not isinstance(coverage, dict) or set(coverage) not in allowed
                 or not all(unsigned(count) for count in coverage.values())
                 or sum(coverage.values()) != samples):
             raise ValueError('codec coverage differs from accepted record population')
         if coverage['fragmented_record'] != value['fragmented_records']:
             raise ValueError('outer fragment coverage differs from fragmented records')
-        recovery = samples - coverage['fragmented_record'] - coverage['unencoded_native']
+        # A mixed member has its own exact cross-packet layout. Its data and
+        # parity travel together and have no legacy source/repair envelope.
+        mixed = coverage.get('striped_mixed', 0)
+        if mixed > classes['systematic_fec_source']:
+            raise ValueError('mixed member count exceeds physical systematic records')
+        recovery = samples - coverage['fragmented_record'] - coverage['unencoded_native'] - mixed
         codec = coverage['envelope_only'] + coverage['fragmented_units']
         populations = dict(zip(EXTENT_METRICS, (samples, samples, recovery, recovery, codec, codec, codec, codec)))
         extent_totals = {name: histogram(name, count) for name, count in populations.items()}

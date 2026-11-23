@@ -229,6 +229,9 @@ impl SenderOwner {
     > {
         match self {
             Self::Aligned(s) => match policy {
+                NativePolicy::FixedAnchorIpHeaders => {
+                    s[0].stage_fixed_anchor_headers_observed(channel, frame)
+                }
                 NativePolicy::EthernetHeaders | NativePolicy::IpHeaders => {
                     s[0].stage_observed(channel, frame)
                 }
@@ -247,6 +250,9 @@ impl SenderOwner {
                 }
             }),
             Self::Packed(s) => match policy {
+                NativePolicy::FixedAnchorIpHeaders => {
+                    s[0].stage_fixed_anchor_headers_observed(channel, frame, micros(now)?)
+                }
                 NativePolicy::EthernetHeaders | NativePolicy::IpHeaders => {
                     s[0].stage_observed(channel, frame, micros(now)?)
                 }

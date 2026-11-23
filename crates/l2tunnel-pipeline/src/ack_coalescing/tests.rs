@@ -365,3 +365,25 @@ fn downstream_refusal_keeps_duplicate_input_and_original_expiry_without_false_dr
 
 #[path = "timing_tests.rs"]
 mod original_timing;
+
+#[test]
+fn forwarding_without_held_acks_checks_real_budget_before_counter_overflow() -> TestResult {
+    let (mut pipeline, mut ingress) = pair(false, 1)?;
+    let packet = ack(false, false, 100, 1, 4096, false);
+    ingress.ingest(&mut pipeline, &packet, ms(0), ms(50))?;
+    ingress.statistics.received = u64::MAX;
+    assert!(ingress.is_empty());
+    assert_eq!(
+        ingress.ingest(&mut pipeline, &packet, ms(1), ms(50)),
+        Err(Error::Pipeline(PipelineError::Budget(Budget::Packets)))
+    );
+    assert_eq!(take(&mut pipeline)?, packet);
+    assert_eq!(
+        ingress.ingest(&mut pipeline, &packet, ms(1), ms(50)),
+        Err(Error::Counter)
+    );
+    assert_eq!(pipeline.usage(), QueueUsage::default());
+    assert_eq!(ingress.statistics().refusals, 2);
+    assert_eq!(ingress.statistics().duplicates, 0);
+    Ok(())
+}

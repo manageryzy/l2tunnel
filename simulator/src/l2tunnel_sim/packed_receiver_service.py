@@ -108,6 +108,7 @@ class PackedReceiverService:
             raise ValueError("unsupported packed rank backend")
         self.waiting = deque()
         self.active = False
+        self.gap_observer = None
         self.arrivals = self.drops = self.peak_waiting = self.completed = 0
         self.waits_us = array("d")
         self.work = Counter()
@@ -116,19 +117,30 @@ class PackedReceiverService:
         # _send_wire calls this instance hook on actual delivery by the link.
         transport._receive_wire = self.receive
 
+    def observe_fifo_gaps(self):
+        """Allow this targeted owner to identify missing sources at FIFO admission."""
+        from .packed_targeted import TargetedPackedWireTransport
+        if self.arrivals or not isinstance(self.transport, TargetedPackedWireTransport):
+            raise ValueError("FIFO gap observation requires a fresh targeted receiver service")
+        self.gap_observer = self.transport
+
     def receive(self, wire):
         self.arrivals += 1
-        if not self.active:
-            self._process(wire, self.sim.now)
-        elif len(self.waiting) < self.cost.waiting_slots:
-            self.waiting.append((wire, self.sim.now))
-            self.peak_waiting = max(self.peak_waiting, len(self.waiting))
-        else:
+        if self.active and len(self.waiting) >= self.cost.waiting_slots:
             self.drops += 1
+            return
+        if not isinstance(wire, bytes):
+            wire = memoryview(wire).tobytes()
+        source = self.gap_observer.accept_fifo_source(wire) if self.gap_observer else None
+        if not self.active:
+            self._process(wire, self.sim.now, source)
+        else:
+            self.waiting.append((wire, self.sim.now, source))
+            self.peak_waiting = max(self.peak_waiting, len(self.waiting))
 
     def _service_us(self, wire):
         try:
-            packet = decode_packet(wire, self.transport.received_prefix, self.transport.config.encapsulation)
+            packet = self.transport.decode_data_packet(wire)
         except ValueError:
             return self.cost.charge(0, 0)
         width = 1
@@ -158,25 +170,29 @@ class PackedReceiverService:
         self.work[packet.kind + "_jobs"] += 1
         return self.cost.charge(gf_bytes, metadata_visits)
 
-    def _process(self, wire, arrival):
+    def _commit(self, wire, source):
+        self.decode(wire)
+        if self.gap_observer:
+            self.gap_observer.release_fifo_source(source)
+        self.completed += 1
+
+    def _process(self, wire, arrival, source):
         self.active = True
         while True:
             self.waits_us.append((self.sim.now - arrival) * 1e6)
             duration_us = self._service_us(wire)
             self.total_service_us += duration_us
             if duration_us:
-                self.sim.at(self.sim.now + duration_us / 1e6, self._finish, wire)
+                self.sim.at(self.sim.now + duration_us / 1e6, self._finish, wire, source)
                 return
-            self.decode(wire)
-            self.completed += 1
+            self._commit(wire, source)
             if not self.waiting:
                 self.active = False
                 return
-            wire, arrival = self.waiting.popleft()
+            wire, arrival, source = self.waiting.popleft()
 
-    def _finish(self, wire):
-        self.decode(wire)
-        self.completed += 1
+    def _finish(self, wire, source):
+        self._commit(wire, source)
         if self.waiting:
             self._process(*self.waiting.popleft())
         else:
@@ -187,7 +203,7 @@ class PackedReceiverService:
         return dict(
             arrivals=self.arrivals, dropped_full=self.drops, started=len(waits), completed=self.completed,
             active_at_stop=int(self.active), waiting_at_stop=len(self.waiting), peak_waiting=self.peak_waiting,
-            terminal_waiting_ages_us=[(self.sim.stop_at - arrival) * 1e6 for _, arrival in self.waiting],
+            terminal_waiting_ages_us=[(self.sim.stop_at - arrival) * 1e6 for _, arrival, _ in self.waiting],
             wait_mean_us=sum(waits) / len(waits) if waits else None,
             wait_p99_us=waits[ceil(.99 * len(waits)) - 1] if waits else None,
             wait_max_us=waits[-1] if waits else None,

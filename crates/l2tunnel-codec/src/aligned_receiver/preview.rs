@@ -3,9 +3,18 @@ use super::*;
 
 #[derive(Clone)]
 pub(super) struct Preview {
-    anchor: RecordId,
-    last: RecordId,
-    header: aligned_body::DecoderState,
+    pub(super) anchor: RecordId,
+    pub(super) last: RecordId,
+    pub(super) header: aligned_body::DecoderState,
+}
+impl Preview {
+    pub(super) fn from_anchor(anchor: RecordId, header: aligned_body::DecoderState) -> Self {
+        Self {
+            anchor,
+            last: anchor,
+            header,
+        }
+    }
 }
 
 impl Receiver {
@@ -36,12 +45,27 @@ impl Receiver {
                 break;
             }
             if entry.id == expected && entry.complete() {
+                if entry.defer_head
+                    && let EarlySelection::Reevaluated {
+                        changed,
+                        check_head: true,
+                        ..
+                    } = selection
+                    && !changed(entry.defer_early)
+                {
+                    continue;
+                }
                 return Ok(Some((position, None)));
             }
             if matches!(selection, EarlySelection::Ordered)
                 || (!packets && self.limits.body.independent_short_frame_bytes == 0)
             {
                 break;
+            }
+            // A fixed-anchor delta names its own context. A prior native commit
+            // leaves only ordered retirement work for this row at the head.
+            if self.mode == ReceiverMode::FixedIpAnchors && entry.early_delivered {
+                continue;
             }
             if !entry.complete() {
                 anchor = None;
@@ -74,7 +98,14 @@ impl Receiver {
             if entry.independent_short || (packets && independent_length(&entry.bytes).is_some()) {
                 return Ok(Some((position, None)));
             }
-            if anchor.is_some() {
+            if self.mode == ReceiverMode::FixedIpAnchors {
+                if packets
+                    && entry.bytes.first() == Some(&aligned_body::FIXED_ANCHOR_TAG)
+                    && self.fixed_anchor_available(entry)?
+                {
+                    return Ok(Some((position, None)));
+                }
+            } else if anchor.is_some() {
                 return Ok(Some((position, anchor)));
             }
         }
@@ -89,12 +120,19 @@ impl Receiver {
 
     pub(super) fn decode_slot(&mut self, slot: usize) -> Result<aligned_body::Decoded, Error> {
         let entry = self.records[slot].as_ref().ok_or(Error::Malformed)?;
-        self.staged
-            .decode_body(&entry.bytes, entry.padding, &mut self.native)
-            .map_err(|error| {
-                self.failure = Some(Error::Body(error));
-                Error::Body(error)
-            })
+        let decoded = if self.mode == ReceiverMode::FixedIpAnchors
+            && entry.bytes.first() == Some(&aligned_body::FIXED_ANCHOR_TAG)
+        {
+            self.staged
+                .decode_fixed_anchor_body(&entry.bytes, entry.padding, &mut self.native)
+        } else {
+            self.staged
+                .decode_body(&entry.bytes, entry.padding, &mut self.native)
+        };
+        decoded.map_err(|error| {
+            self.failure = Some(Error::Body(error));
+            Error::Body(error)
+        })
     }
 
     pub(super) fn cache_preview(

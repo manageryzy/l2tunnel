@@ -33,6 +33,8 @@ use tokio::{
 mod native_ready;
 pub use native_ready::NativeDevice;
 use native_ready::{NativeGuard, NativeReady};
+#[path = "transport_protocol_timer.rs"]
+mod protocol_timer;
 
 const SCALE: u128 = 1_000_000;
 const MAX_QUEUE: usize = 16 * 1024 * 1024;
@@ -49,6 +51,8 @@ mod owner;
 
 #[path = "transport_buffers.rs"]
 mod buffers;
+#[path = "transport_reverse_trace.rs"]
+mod reverse_trace;
 
 #[path = "transport_transaction.rs"]
 mod transactions;
@@ -243,6 +247,7 @@ where
     })?;
     let mut observed_transaction = driver.transaction_observation()?;
     let mut native_first = true;
+    let mut protocol_timer = protocol_timer::Timer::default();
     let result: io::Result<StopReason> = async {
         loop {
             // Previous-turn receipts must settle before the new sender grant.
@@ -352,7 +357,13 @@ where
                 driver.submit_control(now)
             })?;
             execution.measure_result(TimingStage::CommonSend, || {
-                driver.send_selected_io_sampled(&mut socket, now, instant, &mut sample)
+                driver.send_and_retry_native_ingress(
+                    &mut socket,
+                    &inputs.native,
+                    now,
+                    instant,
+                    &mut sample,
+                )
             })?;
             let native_before = driver.performance.counters.native_write_batch_packets;
             let native_spent = execution
@@ -397,6 +408,10 @@ where
                     }
                     Ok::<_, io::Error>((read_native, write_native, interest, wake))
                 })?;
+            let mixed = matches!(
+                driver.common_state()?.current().descriptor().profile(),
+                l2tunnel::record_configuration::Profile::Striped { .. }
+            );
             let selected = execution
                 .measure_selection(
                     wake.at,
@@ -407,8 +422,8 @@ where
                         &mut requests,
                         interest,
                         read_native || write_native,
-                        driver.ingress.left > 0,
-                        wake,
+                        driver.ingress.interest(),
+                        wake.wait(mixed.then_some(&mut protocol_timer)),
                         native_first,
                     ),
                     Selected::winner,
@@ -450,6 +465,15 @@ where
                             0
                         };
                         let mut batch = 0u64;
+                        let mut pressure_check = if matches!(socket, carrier::IoOwner::Udp(_))
+                            && driver.common.is_some()
+                            && driver.config.rolling_ingress.is_some()
+                            && driver.config.rolling_work.is_some()
+                        {
+                            1
+                        } else {
+                            u64::MAX
+                        };
                         for _ in 0..maximum {
                             if !execution
                                 .measure_result(TimingStage::CommonDeadlineService, || {
@@ -462,7 +486,10 @@ where
                             match execution
                                 .measure_future(
                                     TimingStage::CommonCarrierReceive,
-                                    socket.try_receive_at_ready(&mut inputs.datagram),
+                                    socket.receive_after_selection(
+                                        &mut inputs.datagram,
+                                        &mut driver.ingress.observed_udp,
+                                    ),
                                 )
                                 .await
                             {
@@ -567,6 +594,13 @@ where
                                     break;
                                 }
                                 Err(error) => return Err(error),
+                            }
+                            if driver.yield_targeted_udp_batch(
+                                batch,
+                                u64::from(maximum),
+                                &mut pressure_check,
+                            )? {
+                                break;
                             }
                         }
                     }
@@ -742,6 +776,28 @@ where
         if let Ok(state) = driver.common_state() {
             for epoch in driver.common_epochs().into_iter().flatten() {
                 if let Ok(engine) = state.engine(epoch)
+                    && let Some((held, service, last_completed)) =
+                        engine.earliest_held_ack_service()
+                {
+                    let first = service.first_due_service;
+                    let _ = writeln!(
+                        io::stderr().lock(),
+                        "Common held ACK service: role={:?} epoch={} bytes={} held_since_us={} due_us={} expires_us={} last_completed_service_us={:?} first_due_service_us={:?} first_due_service_late_us={:?} blocked={} first_blocked_us={:?} last_blocked_us={:?}",
+                        driver.role(),
+                        epoch.0,
+                        held.bytes,
+                        held.first_created.as_micros(),
+                        held.deadline.as_micros(),
+                        held.expires.as_micros(),
+                        last_completed.map(|at| at.as_micros()),
+                        first.map(|at| at.as_micros()),
+                        first.map(|at| at.saturating_sub(held.deadline).as_micros()),
+                        service.blocked,
+                        service.first_blocked.map(|at| at.as_micros()),
+                        service.last_blocked.map(|at| at.as_micros()),
+                    );
+                }
+                if let Ok(engine) = state.engine(epoch)
                     && let Some(snapshot) = engine.rolling_expiry_snapshot()
                 {
                     let _ = writeln!(
@@ -827,8 +883,8 @@ async fn next_selected<
     requests: &mut Requests,
     interest: Interest,
     native: bool,
-    udp: bool,
-    wake: SelectedWake,
+    udp: ReceiveInterest,
+    wake: impl Future<Output = bool>,
     native_first: bool,
 ) -> Selected<'a, D> {
     tokio::select! {
@@ -853,12 +909,15 @@ impl SelectedWake {
             work_ready: false,
         }
     }
-    async fn wait(self) {
+    async fn wait(self, precise: Option<&mut protocol_timer::Timer>) -> bool {
         if self.work_ready {
             tokio::task::yield_now().await;
+        } else if let Some(timer) = precise {
+            timer.wait_until(self.at).await;
         } else {
             sleep_until(self.at).await;
         }
+        self.work_ready
     }
 }
 
@@ -876,23 +935,30 @@ async fn next_io<'a, D: NativeDevice, R: raw_carrier::RawBacking>(
     device: &'a mut NativeReady<D>,
     interest: Interest,
     native: bool,
-    udp: bool,
-    wake: SelectedWake,
+    udp: ReceiveInterest,
+    wake: impl Future<Output = bool>,
     native_first: bool,
 ) -> io::Result<IoEvent<'a, D>> {
+    let carrier = async {
+        match udp {
+            ReceiveInterest::ObservedUdp => Ok(()),
+            ReceiveInterest::Poll => socket.ready(true).await,
+            ReceiveInterest::Disabled => socket.ready(false).await,
+        }
+    };
     if native_first {
         tokio::select! {
             biased;
             ready = device.ready_mut(interest), if native => ready.map(IoEvent::Native),
-            ready = socket.ready(udp) => ready.map(|()| IoEvent::Udp),
-            () = wake.wait() => Ok(if wake.work_ready { IoEvent::Work } else { IoEvent::Timer }),
+            ready = carrier => ready.map(|()| IoEvent::Udp),
+            work = wake => Ok(if work { IoEvent::Work } else { IoEvent::Timer }),
         }
     } else {
         tokio::select! {
             biased;
-            ready = socket.ready(udp) => ready.map(|()| IoEvent::Udp),
+            ready = carrier => ready.map(|()| IoEvent::Udp),
             ready = device.ready_mut(interest), if native => ready.map(IoEvent::Native),
-            () = wake.wait() => Ok(if wake.work_ready { IoEvent::Work } else { IoEvent::Timer }),
+            work = wake => Ok(if work { IoEvent::Work } else { IoEvent::Timer }),
         }
     }
 }
@@ -1567,6 +1633,24 @@ impl Bucket {
 struct IngressBudget {
     left: u32,
     refill: u64,
+    observed_udp: bool,
+}
+#[derive(Clone, Copy)]
+enum ReceiveInterest {
+    Disabled,
+    Poll,
+    ObservedUdp,
+}
+impl IngressBudget {
+    fn interest(&self) -> ReceiveInterest {
+        if self.left == 0 {
+            ReceiveInterest::Disabled
+        } else if self.observed_udp {
+            ReceiveInterest::ObservedUdp
+        } else {
+            ReceiveInterest::Poll
+        }
+    }
 }
 /// Original authenticated User generation, independent of any native flow hash.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2316,7 +2400,9 @@ impl Driver {
         device: &mut NativeReady<D>,
         mut now: impl FnMut() -> io::Result<u64>,
     ) -> io::Result<usize> {
-        if self.native.is_empty() {
+        // Rolling can publish a record after this turn's collection. A writable
+        // device can spend the existing batch grant to prepare and hand it off.
+        if self.native.is_empty() && (!self.native_room() || !self.native_deliverable()?) {
             return Ok(0);
         }
         // Observe cached writable readiness once without awaiting the device.
@@ -2528,6 +2614,8 @@ impl Driver {
             self.performance.counters.send_calls.saturating_add(1);
         self.performance.checked(now);
         let mut emitted = 0;
+        let mut receive_check = instant;
+        let mut first_send_poll = now;
         for _ in 0..self.config.work.send_batch {
             // Whole Common writes advance their actual Engine at completion.
             // The next iteration must use the same injected clock again before
@@ -2542,8 +2630,49 @@ impl Driver {
             } else {
                 now
             };
-            if self.common.is_some() && !self.check_expiry(now)? {
-                break;
+            if self.common.is_some() {
+                if !self.check_expiry(now)? {
+                    break;
+                }
+                // Eligibility and the debit must use the same physical poll time.
+                // A busy send batch can earn credit after its last progress turn.
+                self.bucket.refill(now)?;
+            }
+            if emitted == 0 {
+                first_send_poll = now;
+            }
+            // An outbound burst can span multiple receive intervals on a busy CPU.
+            // Return to the normal fair selector at a whole-datagram boundary.
+            if emitted > 0
+                && self.ingress.left > 0
+                && instant.saturating_duration_since(receive_check)
+                    >= self.config.work.receive_interval
+            {
+                receive_check = instant;
+                match socket2::SockRef::from(socket).peek_sender() {
+                    Ok(_) => {
+                        self.ingress.observed_udp = true;
+                        if let Some(trace) = self
+                            .common
+                            .as_deref_mut()
+                            .and_then(|runtime| runtime.reverse_trace.as_mut())
+                        {
+                            trace.udp_send_yield(now, emitted, now.saturating_sub(first_send_poll));
+                        }
+                        break;
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => break,
+                    // A peek can consume an asynchronous UDP error. Account for
+                    // it exactly as the normal nonblocking receive path would.
+                    Err(error) if establish::path_loss(&error) => {
+                        self.ingress.left -= 1;
+                        self.counters.socket_receive_errors =
+                            self.counters.socket_receive_errors.saturating_add(1);
+                        break;
+                    }
+                    Err(error) => return Err(error),
+                }
             }
             if let Some(bytes) = self.tail(instant)? {
                 let origin = self.origin;

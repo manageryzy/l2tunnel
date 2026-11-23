@@ -5,7 +5,7 @@
 use l2tunnel_device::{PacketDevice, PacketLayer};
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
-use std::os::fd::{AsRawFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, RawFd};
 use std::os::unix::fs::OpenOptionsExt;
 
 /// Largest packet supported by the protocol record contract.
@@ -107,6 +107,11 @@ impl AsRawFd for TunTap {
     /// Borrowed descriptor for readiness registration; the device keeps ownership.
     fn as_raw_fd(&self) -> RawFd {
         self.file.as_raw_fd()
+    }
+}
+impl AsFd for TunTap {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.file.as_fd()
     }
 }
 impl PacketDevice for TunTap {

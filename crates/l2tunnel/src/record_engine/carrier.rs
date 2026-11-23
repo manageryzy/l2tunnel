@@ -3,6 +3,7 @@ use super::*;
 
 #[derive(Debug, Eq, PartialEq)]
 enum Prepared {
+    Striped(u64),
     Swift(swift::records::PreparedOutput),
     Connections(connections::OutputWitness),
     Rolling(rolling_records::PreparedOutput),
@@ -28,7 +29,45 @@ pub struct CarrierOutputToken {
     emission: Emission,
     prepared: Prepared,
 }
+/// Scheduler labels for a prepared rolling data packet, without custody authority.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RollingDataLabel {
+    /// Systematic source, full equation, or near equation in its own namespace.
+    pub id: crate::fec::rolling::scheduler::OutputId,
+    /// One-based physical ordinal for the selected original-copy policy.
+    pub copy_ordinal: Option<u8>,
+    /// The scheduler selected this transmission from an explicit gap request.
+    pub requested: bool,
+}
+/// Local scheduler selection and actual wire identity of one physical mixed member.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StripedDataLabel {
+    /// Fresh, named or quiet selection retained by the transmit scheduler.
+    pub kind: crate::fec::striped_group::schedule::DataKind,
+    /// Start of the group's logical source interval.
+    pub generation: crate::fec::GenerationId,
+    /// Ordinal of the physical member, including split singletons.
+    pub ordinal: u8,
+    /// Count of whole inputs or the single split input's byte length.
+    pub shape: crate::fec::mixed_datagram::GroupShape,
+    /// Number of distinct received members required for complete recovery.
+    pub threshold: u16,
+}
 impl CarrierOutputToken {
+    /// Inspect the actual rolling scheduler selection before its physical handoff.
+    pub fn rolling_data_label(&self) -> Option<RollingDataLabel> {
+        let Prepared::Rolling(p) = &self.prepared else {
+            return None;
+        };
+        let rolling_records::OutputId::Data(id) = p.id else {
+            return None;
+        };
+        Some(RollingDataLabel {
+            id,
+            copy_ordinal: p.source_copy().map(|copy| copy.ordinal()),
+            requested: p.has_requested_credit(),
+        })
+    }
     /// Actual original generation labels, without authentication authority.
     pub const fn context(&self) -> Context {
         self.context
@@ -51,6 +90,48 @@ impl CarrierOutputToken {
     }
 }
 impl Engine {
+    /// Observe the pending mixed transmission. Its scheduler supplies the
+    /// attempt kind, while the member identity comes from the emitted bytes.
+    pub fn prepared_striped_data(&self, body: &[u8]) -> Option<StripedDataLabel> {
+        let Owner::Striped(endpoint) = &self.owner else {
+            return None;
+        };
+        endpoint.prepared_data_label(body)
+    }
+    /// Formation of the pending mixed group's first fresh member, if selected.
+    pub fn prepared_striped_group_seal(&self) -> Option<crate::fec::striped_group::GroupSeal> {
+        let Owner::Striped(endpoint) = &self.owner else {
+            return None;
+        };
+        endpoint.prepared_group_seal()
+    }
+    /// Observe a named gap request under the selected directional recovery policy.
+    /// Parsing this plaintext does not authenticate, apply or acknowledge it.
+    pub fn inspect_rolling_gap(
+        &self,
+        outgoing: bool,
+        bytes: &[u8],
+    ) -> Result<Option<crate::fec::rolling::scheduler::GapRequest>, crate::fec::rolling::Error>
+    {
+        if let Owner::Rolling(endpoint) = &self.owner {
+            endpoint.inspect_gap_request(outgoing, bytes)
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Frozen coefficients' support for the current ordinary rolling repair.
+    pub fn prepared_rolling_repair_support(
+        &self,
+        id: crate::fec::rolling::RepairId,
+    ) -> Option<crate::fec::rolling::Support> {
+        if let Owner::Rolling(endpoint) = &self.owner {
+            endpoint.prepared_repair_support(id)
+        } else {
+            None
+        }
+    }
+
     /// Observe actual pending custody; repeated observations do not hand off output.
     pub fn pending_carrier_output(&self) -> Option<CarrierOutputToken> {
         if self.fragments.is_some() {
@@ -60,6 +141,12 @@ impl Engine {
     }
     pub(super) fn pending_whole_carrier_output(&self) -> Option<CarrierOutputToken> {
         let (emission, prepared) = match &self.owner {
+            // A caller can reuse a security number. Equal-length mixed members
+            // still have independent, move-only physical custody.
+            Owner::Striped(endpoint) => (
+                endpoint.pending_output()?,
+                Prepared::Striped(self.statistics.emitted),
+            ),
             Owner::Rolling(endpoint) => {
                 let p = endpoint.pending_output()?;
                 (
@@ -198,6 +285,9 @@ impl Engine {
         // Actual carrier ownership already happened. Consume it exactly once
         // even when later time/deadline validation makes this Engine terminal.
         let result = match (&mut self.owner, token.prepared) {
+            (Owner::Striped(endpoint), Prepared::Striped(_)) => {
+                endpoint.confirm_output_at(now, accepted, token.emission)
+            }
             (Owner::Swift(owner), Prepared::Swift(p)) => {
                 let result = owner
                     .entry()

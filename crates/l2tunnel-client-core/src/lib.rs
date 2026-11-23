@@ -18,12 +18,16 @@ use tokio::time::{Instant, timeout_at};
 pub mod cli;
 /// Shared strict native delivery policy for versioned profile configuration.
 pub mod delivery;
+/// Explicit TAP native encodings over Common KCP-like recovery.
+pub mod kcp_like_l2;
 /// Versioned private local API shared by CLI and future GUI.
 pub mod local;
 /// Explicit fixed-credit TUN proxy with retained original TCP/TLS ownership.
 pub mod proxy;
 /// Explicit measured relay targets over retained native TUN proxy TCP/TLS lanes.
 pub mod proxy_measured;
+/// Pure selected-policy projection for source-bound Python reference diagnostics.
+pub mod python_reference;
 /// Explicit original-owner raw packet runtime; native qualification remains separate.
 pub mod raw_packet;
 /// Explicit same-carrier authentication factory; native/service integration is separate.

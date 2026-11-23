@@ -588,3 +588,161 @@ fn aggregate_ordinary_threshold_matches_at_close_and_group_completion() -> Resul
     );
     Ok(())
 }
+
+#[test]
+fn headroom_accounts_physical_overflow_and_keeps_named_old_source_first()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (strict, scope, full) = setup();
+    let p = scheduler::Policy {
+        source_wire: wire::SourceWire::TargetedNear8Headroom,
+        tail_ticks: 10_000,
+        ..strict
+    };
+    let old = storage::Plan::for_sender(strict)?;
+    let plan = storage::Plan::for_sender(p)?;
+    assert_eq!(plan.allocations(), old.allocations() + 1);
+    assert_eq!(
+        plan.capacity_bytes() - old.capacity_bytes(),
+        size_of::<Headroom>()
+    );
+    let mut s = scheduler::Sender::new_reserved(
+        p,
+        scope,
+        Tick(0),
+        storage::Limits {
+            capacity_bytes: plan.capacity_bytes(),
+        },
+    )?;
+    let mut r = scheduler::Receiver::new(p, scope, Tick(0))?;
+    assert_eq!(
+        s.near8_status().ok_or(Error::Busy)?.headroom,
+        Some(HeadroomStatus::default())
+    );
+    assert!(
+        scheduler::Sender::new(strict, scope, Tick(0))?
+            .near8_status()
+            .ok_or(Error::Busy)?
+            .headroom
+            .is_none()
+    );
+    s.configure_near8(64, 49, 1_000_000)?;
+    let mut total = 0;
+    for i in 0..10 {
+        s.observe_near8_capacity_with_mux(Tick(i * 10_000), total, 513, 0, Some(513))?;
+    }
+    for i in 0..24 {
+        let t = Tick(100_000 + i * 100);
+        let body = INPUT[i as usize % 8];
+        let id = s.admit_source(body, t)?;
+        let size = 49 + wire::compact::data_len(s.pending_output().ok_or(Error::Busy)?)?;
+        total += size as u64;
+        s.observe_near8_capacity_with_mux(t, total, 513, 0, Some(513))?;
+        s.confirm_source_copy_charged(t, t, s.pending_source_copy().ok_or(Error::Busy)?, size)?;
+        if ![0, 17].contains(&i) {
+            r.receive_view_until(
+                wire::View::Source {
+                    scope,
+                    id,
+                    original: body,
+                },
+                t,
+                t,
+                Tick(400_000),
+            )?;
+            r.step(t, full)?;
+        }
+    }
+    let now = Tick(102_301);
+    let st = s.near8_status().ok_or(Error::Busy)?;
+    assert!(!st.spare && s.status().near8_work_pending);
+    let extra = st.headroom.ok_or(Error::Busy)?;
+    assert_eq!(
+        (
+            extra.qualifying_groups,
+            extra.unfunded,
+            extra.credit_eighths,
+            extra.sent_ip_bytes
+        ),
+        (3, 2, 512, 0)
+    );
+    assert_eq!(st.credit_eighths, 512);
+    s.receive_request(
+        scheduler::GapRequest {
+            scope,
+            id: scheduler::FeedbackId(1),
+            prefix: 0,
+            start: 0,
+            mask: 1,
+        },
+        now,
+    )?;
+    s.step(now, full)?;
+    assert!(s.pending_requested_retry());
+    let Some(Output::Source { id, original, .. }) = s.pending_output() else {
+        return Err(Error::Busy.into());
+    };
+    assert_eq!((id, original), (SourceId(0), INPUT[0]));
+    r.receive_view_until(
+        wire::View::Source {
+            scope,
+            id,
+            original,
+        },
+        now,
+        now,
+        Tick(400_000),
+    )?;
+    r.step(now, full)?;
+    let size = 49 + wire::compact::data_len(s.pending_output().ok_or(Error::Busy)?)?;
+    total += size as u64;
+    s.confirm_retry_charged(s.pending_retry_token().ok_or(Error::Busy)?, now, now, size)?;
+    let now = Tick(now.0 + 100);
+    s.observe_near8_capacity_with_mux(now, total, 513, 0, Some(513))?;
+    s.step(now, full)?;
+    let Some(Output::Near8(row)) = s.pending_output() else {
+        return Err(Error::Busy.into());
+    };
+    assert_eq!(row.id, Id(3));
+    let price = 49 + wire_len(row)?;
+    r.receive_near8_until(row, now, now, Tick(400_000))?;
+    r.step(now, full)?;
+    assert_eq!(
+        s.confirm_output_charged(OutputId::Near8(Id(3)), now, price - 1),
+        Err(Error::Identity)
+    );
+    assert_eq!(s.near8_status().ok_or(Error::Busy)?.headroom, Some(extra));
+    s.confirm_output_charged(OutputId::Near8(Id(3)), now, price)?;
+    let status = s.near8_status().ok_or(Error::Busy)?;
+    assert_eq!(status.credit_eighths, 512);
+    let end = status.headroom.ok_or(Error::Busy)?;
+    assert_eq!(
+        (end.sent_rows, end.sent_ip_bytes, end.credit_eighths),
+        (1, price as u64, 512 - 8 * price as u64)
+    );
+    for i in 0..24 {
+        let (id, actual) = r.pending_source().ok_or(Error::Busy)?;
+        assert_eq!((id.0, actual), (i, INPUT[i as usize % 8]));
+        r.confirm_handoff(id, now)?;
+    }
+    Ok(())
+}
+
+#[test]
+fn headroom_requires_complete_fresh_physical_history_and_a_drained_serializer() {
+    let mut v = Headroom::default();
+    v.observe(Tick(5000), 0, None, 1_000_000);
+    v.observe(Tick(100_000), 0, Some(12_001), 1_000_000);
+    assert!(!v.available(Tick(100_000), 1_000_000, 1500, 1300));
+    v.observe(Tick(105_000), 0, Some(12_001), 1_000_000);
+    assert!(v.available(Tick(105_000), 1_000_000, 1500, 1300));
+    assert!(!v.available(Tick(106_001), 1_000_000, 1500, 1300));
+    v.observe(Tick(105_100), 2000, Some(12_001), 1_000_000);
+    assert!(!v.available(Tick(105_100), 1_000_000, 1500, 1300));
+    v.observe(Tick(106_000), 2000, Some(12_001), 1_000_000);
+    assert!(v.available(Tick(106_000), 1_000_000, 1500, 1300));
+    v.observe(Tick(106_001), 75_000, Some(12_001), 1_000_000);
+    v.observe(Tick(109_999), 75_000, Some(12_001), 1_000_000);
+    assert!(!v.available(Tick(109_999), 1_000_000, 1500, 1300));
+    v.observe(Tick(450_000), 75_000, Some(12_001), 1_000_000);
+    assert!(!v.available(Tick(450_000), 1_000_000, 1500, 1300));
+}

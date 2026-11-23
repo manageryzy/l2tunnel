@@ -114,6 +114,24 @@ pub struct Wire {
     pub replay_rejections: u64,
 }
 
+/// Counts of retained native packet admission attempts by the actual rejecting owner.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeIngressRefusals {
+    /// The ACK coalescer could not retain another flow history.
+    pub ack_history: u64,
+    /// The packet flow assignment table was full.
+    pub flow_table: u64,
+    /// The pipeline shared byte allowance was full.
+    pub shared_byte: u64,
+    /// The pipeline shared packet allowance was full.
+    pub shared_packet: u64,
+    /// The selected TUN flow exhausted its byte allowance.
+    pub flow_byte: u64,
+    /// The selected TUN flow exhausted its packet allowance.
+    pub flow_packet: u64,
+}
+
 /// Native admission, actual physical completion and retained-output pressure.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -126,6 +144,9 @@ pub struct Native {
     pub oversize: u64,
     /// User input refused under native output pressure.
     pub backpressure_drops: u64,
+    /// Capacity refusal attempts for the retained input. One packet can be retried repeatedly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ingress_refusals: Option<NativeIngressRefusals>,
     /// Actual pending complete native packets.
     pub pending_packets: u64,
     /// Actual pending native payload bytes.

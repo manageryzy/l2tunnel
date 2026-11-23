@@ -126,6 +126,51 @@ def test_lost_sources_recover_from_parsed_tail_repairs():
     assert not transport.wire_invalid_packets
 
 
+@pytest.mark.parametrize("mode,tag", [("fixed", 2), ("confirmed_prefix", 7)])
+def test_selected_c48_global_recovers_an_old_hole_with_charged_wire_extent(mode, tag):
+    transport, packets = fixture('raw_ipv4_crc32', trim=True, c48_forward_repair_support=mode)
+    delivered = []
+    expected = [submit(transport, sequence=i * 64, identification=i, delivered=delivered)
+                for i in range(160)]
+    frames = [p for p in packets if p[2] == "source"]
+    assert len(frames) == len(transport.sources) > 130
+    missing = 2
+    for index, (_, _, _, receive) in enumerate(frames):
+        if index != missing:
+            receive()
+    assert transport.received_prefix == missing
+    transport._receive_feedback(missing, 0)
+    assert transport.base == missing
+    transport.repair_serial = 15
+    seen = []
+    send = transport._send_wire
+    def observe(wire, kind, header):
+        seen.append((wire, header))
+        return send(wire, kind, header)
+    transport._send_wire = observe
+    transport._repair(False)
+    wire, header = seen[-1]
+    row = transport.decode_data_packet(wire)
+    assert (wire[0], row.start, row.end) == (tag, missing if tag == 7 else 0, len(frames))
+    assert packets[-1][1] == 49 + len(wire) == 49 + header + len(row.payload)
+    # Divide the actual transmitted residual by the withheld symbol coefficient.
+    rhs = int.from_bytes(row.payload, "little")
+    for index in range(row.start, row.end):
+        if index != missing:
+            size = transport.sources[index].size
+            body = size.to_bytes(2, "big") + transport.source_payloads[index][:size]
+            rhs ^= int.from_bytes(body.translate(PRODUCT[coefficient(row.seed, index)]), "little")
+    recovered = rhs.to_bytes(len(row.payload), "little").translate(PRODUCT[INVERSE[coefficient(row.seed, missing)]])
+    size = int.from_bytes(recovered[:2], "big")
+    assert size == transport.sources[missing].size
+    assert recovered[2:2 + size] == transport.source_payloads[missing][:size]
+    packets[-1][3]()
+    assert transport.received_prefix == len(frames)
+    assert delivered == expected
+    assert missing not in transport.received_source
+    assert not transport.wire_invalid_packets
+
+
 def test_received_source_uses_its_crc_checked_wire_payload():
     transport, packets = fixture('raw_ipv4_crc32')
     delivered = []

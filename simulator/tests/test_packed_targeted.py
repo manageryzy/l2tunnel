@@ -5,9 +5,10 @@ from heapq import heappop
 
 import pytest
 
-from l2tunnel_sim.compact_wire import CompactWireConfig, decode_packet
+from l2tunnel_sim.compact_wire import CompactWireConfig, decode_packet, encode_repair
 from l2tunnel_sim.config import PathConfig, Scenario, Strategy, Traffic
 from l2tunnel_sim.model import Simulation
+from l2tunnel_sim.packed_receiver_service import PackedReceiverService, ReceiverCost
 from l2tunnel_sim.packed_targeted import (
     TargetedPackedWireTransport, TargetedPolicy, decode_request, encode_request,
 )
@@ -46,9 +47,12 @@ def submit(tx, value, out, lane=0):
     return frame
 
 
-def test_gap_after_old_loss_is_retained_outside_small_window_and_recovers_exact_frame():
+@pytest.mark.parametrize("fifo_evidence", [False, True])
+def test_gap_after_old_loss_is_retained_outside_small_window_and_recovers_exact_frame(fifo_evidence):
     sim, tx, log = fixture({("source", 1), ("gap_request", 1), ("retry", 1)},
                            policy=TargetedPolicy(gap_ms=2, repeat_ms=80, probe_ms=500))
+    if fifo_evidence:
+        PackedReceiverService(tx, ReceiverCost(0, 0, 0, 4)).observe_fifo_gaps()
     out = []
     first = submit(tx, 0, out)
     newer = [submit(tx, i, out, 1) for i in range(1,201)]
@@ -65,6 +69,108 @@ def test_gap_after_old_loss_is_retained_outside_small_window_and_recovers_exact_
             assert rev and size == 20 + 4 + 17 + 1
         if kind == "retry":
             assert not rev and size == tx.sources[0].size + tx.source_header
+
+
+@pytest.mark.parametrize("fifo_evidence", [False, True])
+def test_fifo_gap_observation_while_repair_and_systematic_copies_are_retained(fifo_evidence, monkeypatch):
+    from l2tunnel_sim import packed_targeted
+
+    sim, tx, log = fixture({("source", i) for i in range(1, 9)})
+    service = PackedReceiverService(tx, ReceiverCost(10_000, 0, 0, 3))
+    if fifo_evidence:
+        service.observe_fifo_gaps()
+    requests = []
+    encode = packed_targeted.encode_request
+
+    def record(*args):
+        wire = encode(*args)
+        requests.append((sim.now, decode_request(wire, tx.policy, tx.config.encapsulation)[1], len(wire)))
+        return wire
+
+    monkeypatch.setattr(packed_targeted, "encode_request", record)
+    delivered = []
+    originals = [submit(tx, i, delivered) for i in range(8)]
+    step(sim, .001)
+
+    def source(index):
+        return tx.source_wire(index, tx.source_payloads[index][:tx.sources[index].size])
+
+    service.receive(encode_repair(1, 1, b"x", tx.config.encapsulation))
+    # Reusing the caller's buffer must not corrupt either admitted copy of S1.
+    buffer = bytearray(source(1))
+    service.receive(buffer)
+    service.receive(memoryview(buffer))
+    buffer[-1] ^= 1
+
+    class TaggedWire(bytes):
+        pass
+
+    tagged = TaggedWire(source(3))
+    service.receive(tagged)
+    assert service.waiting[-1][0] is tagged
+    service.receive(source(7))
+    assert service.drops == 1
+    step(sim, .0029)
+    assert not requests and not delivered
+    step(sim, .0031)
+    assert tx.received_prefix == 0 and not tx.decoder.known
+    if fifo_evidence:
+        at, ids, length = requests[0]
+        assert at == pytest.approx(.003)
+        assert ids == (0, 2) and len(requests) == 1
+        assert [(rev, size) for _, rev, size, kind, _ in log if kind == "gap_request"] == [(True, 20 + length)]
+    else:
+        assert not requests
+    step(sim, .0111)
+    assert delivered == [originals[0]] and tx.received_prefix == 1
+    # One copy of S1 is active, a second is waiting. S7 becomes evidence
+    # only after a slot is free. The committed prefix still comes from FEC.
+    service.receive(source(7))
+    step(sim, .0151)
+    if fifo_evidence:
+        assert requests[-1][1] == (4, 5, 6)
+    else:
+        assert not requests
+    step(sim, .032)
+    assert delivered == originals[:2] and tx.received_prefix == 2 and tx.wire_invalid_packets == 0
+    assert all(1 not in ids and 3 not in ids and 7 not in ids for _, ids, _ in requests)
+
+
+def test_fifo_horizon_shares_the_existing_eight_id_cadence_and_repeat_floor(monkeypatch):
+    from l2tunnel_sim import packed_targeted
+
+    erased = {("source", i) for i in range(1, 42)} | {("gap_request", i) for i in range(1, 50)}
+    sim, tx, _ = fixture(erased)
+    service = PackedReceiverService(tx, ReceiverCost(200_000, 0, 0, 2))
+    service.observe_fifo_gaps()
+    sent = []
+    encode = packed_targeted.encode_request
+
+    def record(prefix, start, offsets, policy, encapsulation):
+        wire = encode(prefix, start, offsets, policy, encapsulation)
+        sent.append((sim.now, decode_request(wire, policy, encapsulation)[1]))
+        return wire
+
+    monkeypatch.setattr(packed_targeted, "encode_request", record)
+    for index in range(41):
+        submit(tx, index, [])
+    step(sim, .001)
+    for index in (0, 40, 2):
+        service.receive(tx.source_wire(index, tx.source_payloads[index][:tx.sources[index].size]))
+    step(sim, .0829)
+    originals = set(range(1, 40)) - {2}
+    assert {index for _, ids in sent for index in ids} == originals
+    assert sum(len(ids) for _, ids in sent) == len(originals)
+    ids_per_tick = Counter()
+    for at, ids in sent:
+        ids_per_tick[at] += len(ids)
+    assert max(ids_per_tick.values()) == 8
+    ticks = list(ids_per_tick)
+    assert all(b - a >= .002 - 1e-12 for a, b in zip(ticks, ticks[1:]))
+    step(sim, .084)
+    assert set(sent[-1][1]) <= originals and len(sent[-1][1]) == 8
+    assert sent[-1][0] >= sent[0][0] + .080
+    assert tx.received_prefix == 0 and not tx.decoder.known
 
 
 def test_no_received_source_means_no_oracle_request_and_sender_retries_silent_tail():
@@ -106,6 +212,41 @@ def test_requests_with_small_budget_rotate_and_never_reach_beyond_observation():
     step(sim, .5)
     assert seen[:7:2] == [0,1,2,3] and set(seen) == {0,1,2,3}
     assert data == expected and tx.targeted_counts["peak_request_state"] == 4
+
+
+def test_early_frontier_mask_combines_two_ticks_and_keeps_repeat_custody():
+    sim, tx, log = fixture({("gap_request", 1)})
+    tx.received_prefix = 1
+    tx._fifo_sources[2] += 1
+    tx._observe_gap_horizon(3)
+    step(sim, .0002)
+    tx._fifo_sources[4] += 1
+    tx._observe_gap_horizon(5)
+    assert not tx.request_fresh_frontier(2, 5, 2)
+    assert not tx.request_fresh_frontier(0, 5, 1)
+    assert tx.request_fresh_frontier(0, 5, 2)
+    assert tx.targeted_counts["requested_ids"] == 2
+    assert list(tx._repeat) == [1, 3] and not tx._fresh
+    assert not tx.request_fresh_frontier(0, 5, 2)
+    step(sim, .006)
+    assert [entry[3] for entry in log] == ["gap_request"]
+    step(sim, .083)
+    assert [entry[3] for entry in log] == ["gap_request", "gap_request"]
+    assert list(tx._repeat) == [1, 3]
+
+
+def test_same_tick_and_outstanding_older_repeat_keep_normal_feedback_slot():
+    sim, tx, log = fixture(set())
+    tx.received_prefix = 1
+    tx._fifo_sources[2] += 1
+    tx._fifo_sources[4] += 1
+    tx._observe_gap_horizon(5)
+    assert not tx.request_fresh_frontier(0, 5, 2)
+    assert not log and list(tx._fresh) == [1, 3]
+    tx._fresh[3] += .001
+    tx._repeat[14] = sim.now
+    assert not tx.request_fresh_frontier(0, 5, 2)
+    assert not log and list(tx._fresh) == [1, 3]
 
 
 def test_wrap_stale_unsent_and_malformed_requests():

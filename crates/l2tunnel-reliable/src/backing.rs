@@ -251,12 +251,46 @@ impl RestoredMap {
         }
     }
 }
+/// Only a successfully accepted systematic establishes this range. Full decode
+/// already requires contiguous source IDs; this stores that existing constraint.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct GenerationSources {
+    pub base: u64,
+    pub count: usize,
+    pub width: usize,
+}
+impl GenerationSources {
+    pub fn from_systematic(
+        source: u64,
+        index: u32,
+        count: usize,
+        width: usize,
+    ) -> Result<Self, Error> {
+        let base = source
+            .checked_sub(u64::from(index))
+            .ok_or(Error::SourceConflict)?;
+        let last = u64::try_from(count.checked_sub(1).ok_or(Error::SourceConflict)?)
+            .map_err(|_| Error::Exhausted)?;
+        base.checked_add(last).ok_or(Error::SourceConflict)?;
+        Ok(Self { base, count, width })
+    }
+    fn contains(self, source: u64) -> bool {
+        source
+            .checked_sub(self.base)
+            .is_some_and(|index| index < self.count as u64)
+    }
+}
+#[derive(Clone, Copy)]
+pub(crate) struct Deadline {
+    at: u64,
+    sources: Option<GenerationSources>,
+}
 pub(crate) struct DeadlineSlot {
     id: Option<GenerationId>,
-    deadline: u64,
+    value: Deadline,
 }
 pub(crate) enum Deadlines {
-    Legacy(BTreeMap<GenerationId, u64>),
+    Legacy(BTreeMap<GenerationId, Deadline>),
     Reserved(Vec<DeadlineSlot>),
 }
 impl Deadlines {
@@ -268,39 +302,83 @@ impl Deadlines {
         for _ in 0..n {
             slots.push(DeadlineSlot {
                 id: None,
-                deadline: 0,
+                value: Deadline {
+                    at: 0,
+                    sources: None,
+                },
             });
         }
         Ok(Self::Reserved(slots))
     }
-    pub fn minimum(&self) -> Option<u64> {
-        match self {
-            Self::Legacy(m) => m.values().copied().min(),
-            Self::Reserved(v) => v
-                .iter()
-                .filter(|s| s.id.is_some())
-                .map(|s| s.deadline)
-                .min(),
-        }
+    fn entries(&self) -> impl Iterator<Item = (GenerationId, Deadline)> {
+        let (legacy, reserved) = match self {
+            Self::Legacy(m) => (Some(m), None),
+            Self::Reserved(v) => (None, Some(v)),
+        };
+        legacy
+            .into_iter()
+            .flat_map(|m| m.iter().map(|(&id, &value)| (id, value)))
+            .chain(
+                reserved
+                    .into_iter()
+                    .flat_map(|v| v.iter().filter_map(|s| s.id.map(|id| (id, s.value)))),
+            )
     }
-    pub fn insert(&mut self, id: GenerationId, deadline: u64) -> Result<(), Error> {
-        match self {
-            Self::Legacy(m) => {
-                m.entry(id).or_insert(deadline);
+    pub fn minimum(&self) -> Option<u64> {
+        self.entries().map(|(_, value)| value.at).min()
+    }
+    pub fn sources(&self, id: GenerationId) -> Option<GenerationSources> {
+        self.entries()
+            .find(|(key, _)| *key == id)
+            .and_then(|(_, value)| value.sources)
+    }
+    pub fn retry_generation(&self, source: u64) -> Option<(GenerationId, GenerationSources)> {
+        let mut candidates = self.entries().filter_map(|(id, value)| {
+            value
+                .sources
+                .filter(|sources| sources.contains(source))
+                .map(|sources| (id, sources))
+        });
+        let first = candidates.next()?;
+        candidates.next().is_none().then_some(first)
+    }
+    pub fn insert(
+        &mut self,
+        id: GenerationId,
+        deadline: u64,
+        sources: Option<GenerationSources>,
+    ) -> Result<(), Error> {
+        let update = |value: &mut Deadline| -> Result<(), Error> {
+            if let Some(sources) = sources {
+                if value.sources.is_some_and(|old| old != sources) {
+                    return Err(Error::SourceConflict);
+                }
+                value.sources = Some(sources);
             }
+            // An existing generation keeps its original deadline.
+            Ok(())
+        };
+        match self {
+            Self::Legacy(m) => update(m.entry(id).or_insert(Deadline {
+                at: deadline,
+                sources,
+            })),
             Self::Reserved(v) => {
-                if v.iter().any(|s| s.id == Some(id)) {
-                    return Ok(());
+                if let Some(s) = v.iter_mut().find(|s| s.id == Some(id)) {
+                    return update(&mut s.value);
                 }
                 let s = v
                     .iter_mut()
                     .find(|s| s.id.is_none())
                     .ok_or(Error::Exhausted)?;
                 s.id = Some(id);
-                s.deadline = deadline;
+                s.value = Deadline {
+                    at: deadline,
+                    sources,
+                };
+                Ok(())
             }
         }
-        Ok(())
     }
     pub fn remove(&mut self, id: &GenerationId) {
         match self {
@@ -310,6 +388,7 @@ impl Deadlines {
             Self::Reserved(v) => {
                 if let Some(s) = v.iter_mut().find(|s| s.id == Some(*id)) {
                     s.id = None;
+                    s.value.sources = None;
                 }
             }
         }

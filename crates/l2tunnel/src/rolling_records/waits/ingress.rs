@@ -35,13 +35,16 @@ pub enum Outcome {
     Duplicate,
     /// The original input is outside the useful retained horizon.
     Stale,
+    /// A disjoint original committed without starting or replacing the active repair.
+    Independent,
 }
 impl Outcome {
-    pub(crate) const fn index(self) -> usize {
+    pub(crate) const fn index(self) -> Option<usize> {
         match self {
-            Self::Staged => 0,
-            Self::Duplicate => 1,
-            Self::Stale => 2,
+            Self::Staged => Some(0),
+            Self::Duplicate => Some(1),
+            Self::Stale => Some(2),
+            Self::Independent => None,
         }
     }
 }
@@ -98,6 +101,8 @@ pub struct Snapshot {
     pub without_refusal: [u64; 3],
     /// Staged, Duplicate, Stale and terminal-censored duration populations.
     pub populations: [Population; 4],
+    /// Refused FIFO heads resolved by a disjoint source commit.
+    pub independent_population: Population,
     /// Current refused immutable data head.
     pub pending: Option<Pending>,
     /// Last resolved episode only; not a full history or maximum witness.
@@ -120,6 +125,7 @@ impl Default for Snapshot {
             completions: [0; 3],
             without_refusal: [0; 3],
             populations: [Population::default(); 4],
+            independent_population: Population::default(),
             pending: None,
             last_resolved: None,
             terminal_at: None,
@@ -172,7 +178,9 @@ impl Snapshot {
         overflow: &mut bool,
     ) {
         let index = outcome.index();
-        increment(&mut self.completions[index], overflow);
+        if let Some(index) = index {
+            increment(&mut self.completions[index], overflow);
+        }
         if (outcome == Outcome::Staged) != admitted_job.is_some() {
             *mismatch = true;
         }
@@ -189,7 +197,7 @@ impl Snapshot {
                 return;
             }
             self.resolve(now, Some(outcome), admitted_job, overflow);
-        } else {
+        } else if let Some(index) = index {
             increment(&mut self.without_refusal[index], overflow);
         }
         increment(&mut self.next_head, overflow);
@@ -204,7 +212,10 @@ impl Snapshot {
         let Some(pending) = self.pending.take() else {
             return;
         };
-        let row = &mut self.populations[outcome.map_or(3, Outcome::index)];
+        let row = match outcome.map(Outcome::index) {
+            Some(None) => &mut self.independent_population,
+            other => &mut self.populations[other.flatten().unwrap_or(3)],
+        };
         let elapsed = now.0 - pending.since.0;
         increment(&mut row.episodes, overflow);
         if let Some(sum) = row.elapsed_us.checked_add(elapsed) {

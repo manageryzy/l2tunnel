@@ -52,28 +52,18 @@ impl Counts {
             .ok_or(Error::Arithmetic)
     }
 
-    pub(super) fn preflight_prepare(&self, width: u16) -> Result<(), Error> {
-        let prepared = Self::slice(&self.prepared, width)?;
-        let committed = Self::slice(&self.committed, width)?;
-        for (&prepared, &committed) in prepared.iter().zip(committed) {
-            if committed > prepared {
-                return Err(Error::Invariant);
-            }
-            prepared.checked_add(1).ok_or(Error::Arithmetic)?;
-            committed.checked_add(1).ok_or(Error::Arithmetic)?;
-        }
-        Ok(())
-    }
-
     pub(super) fn prepare(&mut self, identity: ProfileIdentity, width: u16) -> Result<(), Error> {
         if matches!(identity, ProfileIdentity::UnreliableNative(_)) {
             return Ok(());
         }
         let channel = identity_channel(identity);
-        Self::slice(&self.prepared, width)?
+        let committed = *Self::slice(&self.committed, width)?
             .get(channel)
             .ok_or(Error::Invariant)?;
         let count = self.prepared.get_mut(channel).ok_or(Error::Invariant)?;
+        if committed > *count {
+            return Err(Error::Invariant);
+        }
         *count = count.checked_add(1).ok_or(Error::Arithmetic)?;
         Ok(())
     }
@@ -110,6 +100,7 @@ pub(super) fn identity_channel(identity: ProfileIdentity) -> usize {
         ProfileIdentity::Aligned(identity)
         | ProfileIdentity::Packed(identity)
         | ProfileIdentity::Rolling(identity)
+        | ProfileIdentity::Striped(identity)
         | ProfileIdentity::Research(identity) => usize::from(identity.channel.0),
     }
 }

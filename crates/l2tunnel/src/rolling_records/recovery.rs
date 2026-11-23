@@ -53,6 +53,7 @@ pub enum View<'a> {
     },
     Repair {
         scope: rolling::Scope,
+        end: u32,
     },
 }
 
@@ -77,7 +78,13 @@ pub trait RecoveryPolicy: sealed::Sealed + Copy + Eq {
     fn requires_compact_wire(self) -> bool {
         false
     }
+    fn compresses_packed_acks(self) -> bool {
+        false
+    }
     fn targeted(self) -> bool {
+        false
+    }
+    fn hold_native_reordering(self) -> bool {
         false
     }
     fn validate(self) -> Result<(), rolling::Error>;
@@ -158,6 +165,9 @@ pub trait RecoveryPolicy: sealed::Sealed + Copy + Eq {
     fn pending_original(_sender: &Self::Sender) -> Option<(rolling::SourceId, usize)> {
         None
     }
+    fn pending_source_bytes(_sender: &Self::Sender) -> Option<(rolling::SourceId, &[u8])> {
+        None
+    }
     fn encode_data(sender: &Self::Sender, out: &mut [u8]) -> Result<usize, rolling::Error>;
     fn confirm_data(
         sender: &mut Self::Sender,
@@ -173,6 +183,9 @@ pub trait RecoveryPolicy: sealed::Sealed + Copy + Eq {
         received: rolling::Tick,
         now: rolling::Tick,
     ) -> Result<(), rolling::Error>;
+    fn repeatable_gap(self, _receiver: &Self::Receiver) -> Option<scheduler::GapRequest> {
+        None
+    }
     fn feedback(receiver: &Self::Receiver) -> Option<scheduler::FeedbackId>;
     fn encode_feedback(receiver: &Self::Receiver, out: &mut [u8]) -> Result<usize, rolling::Error>;
     fn confirm_feedback(
@@ -194,6 +207,23 @@ pub trait RecoveryPolicy: sealed::Sealed + Copy + Eq {
     ) -> Result<(), rolling::Error>;
     fn tracks_queued_source(_receiver: &Self::Receiver, _id: rolling::SourceId) -> bool {
         false
+    }
+    fn holds_queued_source(_receiver: &Self::Receiver, _id: rolling::SourceId) -> bool {
+        false
+    }
+    fn independent_source_floor(_receiver: &Self::Receiver) -> Option<u32> {
+        None
+    }
+    fn commit_independent_source(
+        _receiver: &mut Self::Receiver,
+        _id: rolling::SourceId,
+        _original: &[u8],
+        _received: rolling::Tick,
+        _now: rolling::Tick,
+        _cap: rolling::Tick,
+        _budget: &mut rolling::WorkBudget,
+    ) -> Result<bool, rolling::Error> {
+        Ok(false)
     }
     fn hold_queued_source(
         _receiver: &mut Self::Receiver,
@@ -229,8 +259,14 @@ pub trait RecoveryPolicy: sealed::Sealed + Copy + Eq {
 }
 
 impl RecoveryPolicy for scheduler::Policy {
+    fn hold_native_reordering(self) -> bool {
+        self.source_wire == rolling::wire::SourceWire::TargetedNear8Hold35
+    }
     fn requires_compact_wire(self) -> bool {
-        self.source_wire.is_near8()
+        self.source_wire.is_near8() || self.compresses_packed_acks()
+    }
+    fn compresses_packed_acks(self) -> bool {
+        self.source_wire.compresses_packed_acks()
     }
     fn targeted(self) -> bool {
         self.source_wire.is_targeted()
@@ -284,7 +320,7 @@ impl RecoveryPolicy for scheduler::Policy {
             self.feedback_ticks,
             u64::from(self.feedback_packets),
             self.memory_bytes as u64,
-            u64::from(self.source_wire.version()),
+            u64::from(self.source_wire.policy_id()),
         ]
     }
     fn sender_plan(self) -> Result<OwnerPlan, rolling::storage::Error> {
@@ -460,8 +496,11 @@ impl RecoveryPolicy for scheduler::Policy {
         s.encode_pending(o)
     }
     fn pending_original(s: &Self::Sender) -> Option<(rolling::SourceId, usize)> {
+        Self::pending_source_bytes(s).map(|(id, bytes)| (id, bytes.len()))
+    }
+    fn pending_source_bytes(s: &Self::Sender) -> Option<(rolling::SourceId, &[u8])> {
         match s.pending_output()? {
-            scheduler::Output::Source { id, original, .. } => Some((id, original.len())),
+            scheduler::Output::Source { id, original, .. } => Some((id, original)),
             scheduler::Output::Repair(_) | scheduler::Output::Near8(_) => None,
         }
     }
@@ -495,6 +534,13 @@ impl RecoveryPolicy for scheduler::Policy {
         n: rolling::Tick,
     ) -> Result<(), rolling::Error> {
         s.receive_feedback_wire(b, n).map(|_| ())
+    }
+    fn repeatable_gap(self, receiver: &Self::Receiver) -> Option<scheduler::GapRequest> {
+        if self.source_wire.is_near8() {
+            receiver.pending_request()
+        } else {
+            None
+        }
     }
     fn feedback(r: &Self::Receiver) -> Option<scheduler::FeedbackId> {
         r.pending_feedback().map(|f| f.id)
@@ -539,6 +585,23 @@ impl RecoveryPolicy for scheduler::Policy {
     fn tracks_queued_source(r: &Self::Receiver, id: rolling::SourceId) -> bool {
         r.tracks_queued_source(id)
     }
+    fn holds_queued_source(r: &Self::Receiver, id: rolling::SourceId) -> bool {
+        r.holds_queued_source(id)
+    }
+    fn independent_source_floor(r: &Self::Receiver) -> Option<u32> {
+        r.independent_source_floor()
+    }
+    fn commit_independent_source(
+        r: &mut Self::Receiver,
+        id: rolling::SourceId,
+        original: &[u8],
+        received: rolling::Tick,
+        now: rolling::Tick,
+        cap: rolling::Tick,
+        budget: &mut rolling::WorkBudget,
+    ) -> Result<bool, rolling::Error> {
+        r.commit_independent_source(id, original, received, now, cap, budget)
+    }
     fn hold_queued_source(
         r: &mut Self::Receiver,
         id: rolling::SourceId,
@@ -578,7 +641,10 @@ impl RecoveryPolicy for scheduler::Policy {
                 id,
                 original,
             }),
-            rolling::wire::View::Repair(r) => Ok(View::Repair { scope: r.scope }),
+            rolling::wire::View::Repair(r) => Ok(View::Repair {
+                scope: r.scope,
+                end: r.support.end,
+            }),
         }
     }
     fn send_deadline(s: &Self::Sender) -> Option<rolling::Tick> {
@@ -880,6 +946,7 @@ impl RecoveryPolicy for research::Config {
             }),
             research::wire::View::Repair(r) => Ok(View::Repair {
                 scope: r.equation.scope,
+                end: r.equation.support.end,
             }),
             research::wire::View::Feedback(_) => Err(rolling::Error::Format),
         }

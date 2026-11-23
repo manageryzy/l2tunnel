@@ -52,6 +52,12 @@ pub mod rolling_records;
 /// Actual selected recursive/fallback/accumulator recovery over the shared record body.
 pub mod research_records;
 
+/// Compact native records carried by shortened mixed-data erasure groups.
+pub mod striped_records;
+
+/// Native-record custody across several externally authenticated physical carriers.
+pub mod path_bundle;
+
 /// Pure transparent-TUN packet, QoS and cumulative-credit composition.
 pub use l2tunnel_active as active;
 /// Authenticated aligned-symbol composition; clocks and native I/O stay external.

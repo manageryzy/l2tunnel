@@ -202,6 +202,29 @@ fn status_request(version: u16) -> local::Request {
         action: local::Action::Status {},
     }
 }
+
+#[test]
+fn disconnect_and_idle_runtime_exit_claim_the_same_generation_once() -> Result {
+    let fixture = fixture()?;
+    let (handle, _run) = channel();
+    install(&handle, &fixture.generic, &fixture.generic_backend, 22);
+    let key = RequestKey(1);
+    let accepted = handle.disconnect(key).map_err(|_| "disconnect refused")?;
+    assert!(!handle.0.lock().claim_runtime_exit());
+    assert_eq!(handle.disconnect(key), Ok(accepted));
+    assert_eq!(handle.snapshot().operation, Some(accepted.operation));
+
+    let (handle, _run) = channel();
+    install(&handle, &fixture.generic, &fixture.generic_backend, 22);
+    // Until the old owners finish dropping, admission cannot take over an
+    // already claimed runtime failure or consume the caller's request key.
+    assert!(handle.0.lock().claim_runtime_exit());
+    assert_eq!(handle.disconnect(key), Err(SubmitError::Busy));
+    assert_eq!(handle.next_key(), Ok(key));
+    assert_eq!(handle.snapshot().generation, Some(OperationId(22)));
+    assert_eq!(handle.snapshot().operation, None);
+    Ok(())
+}
 fn no_effects(
     handle: &Handle,
 ) -> (

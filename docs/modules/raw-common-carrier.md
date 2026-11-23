@@ -80,6 +80,23 @@ The adapter counts its actual inline owner and two buffer capacities; nested
 raw/TLS/backend heap qualification remains open and the full-preallocation flag
 stays false.
 
+## Standalone ACKs after packet handoff
+
+Select `--carrier raw-packet` for the original TCP-shaped datagram carrier.
+The maintained bootstrap consumes ordinary TCP acknowledgments until the
+authenticated handoff installs the packet fence. Thereafter the packet gate
+consumes validated empty segments without updating the send horizon, replay
+state, recovery, or native delivery. A duplicate carrying previously consumed
+bootstrap bytes may receive the existing bounded prefix response. Common still
+processes authenticated feedback and the transported inner TCP headers.
+`--carrier tcp` selects the separately measured ordered TCP/TLS carrier.
+
+The [gate regression](../../crates/l2tunnel-raw-io/src/handoff/pairing/packet/gate_tests.rs)
+exercises the same receive entry before and after the fence. The
+[Linux closeout](../../work/raw-closeout-20261122/reports/README.md) records
+the raw protocol sockets on both endpoints, per-flow measurements, and the
+scope of namespace-local reset suppression.
+
 ## Selected compact final handoff
 
 `Profile::new_raw` selects the current full-tag format; `new_raw_compact` and the

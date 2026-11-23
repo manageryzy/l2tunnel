@@ -7,9 +7,13 @@ use std::fmt;
 mod decoder;
 pub mod field;
 pub mod legacy_sliding;
+pub mod mixed_datagram;
+pub mod path_shards;
 pub mod research;
 pub mod rolling;
 pub mod storage;
+pub mod striped;
+pub mod striped_group;
 mod symbol_output;
 mod wire;
 

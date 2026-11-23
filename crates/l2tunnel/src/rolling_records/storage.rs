@@ -144,6 +144,7 @@ impl<P: RecoveryPolicy> Plan<P> {
             source_bytes,
             symbol_bytes,
             ingress_bytes,
+            ack_lz4::Storage::planned_bytes(send, receive)?,
             fin_order::Guard::planned_bytes(receive),
             previewed::Previewed::planned_bytes(receive),
             if send.scheduler.targeted() {
@@ -279,6 +280,7 @@ impl<P: RecoveryPolicy> Endpoint<P> {
             .ok_or(Error::StorageInvariant)?;
         let sender = P::sender_usage(&endpoint.sender).map_err(Error::RollingStorage)?;
         let incoming = P::receiver_usage(&endpoint.incoming).map_err(Error::RollingStorage)?;
+        let (ack_lz4_bytes, ack_lz4_allocations) = endpoint.ack_lz4.usage()?;
         if packing.capacity_bytes != plan.packing.capacity_bytes()
             || receiver.capacity_bytes != plan.receiver.capacity_bytes()
             || sender.capacity_bytes != plan.sender.capacity_bytes
@@ -302,6 +304,7 @@ impl<P: RecoveryPolicy> Endpoint<P> {
             incoming.capacity_bytes,
             endpoint.source.capacity(),
             endpoint.symbols.capacity(),
+            ack_lz4_bytes,
             endpoint.fin_order.capacity_bytes(),
             endpoint.previewed.capacity_bytes(),
             endpoint
@@ -325,6 +328,7 @@ impl<P: RecoveryPolicy> Endpoint<P> {
             incoming.allocations,
             usize::from(endpoint.source.capacity() != 0),
             usize::from(endpoint.symbols.capacity() != 0),
+            ack_lz4_allocations,
             endpoint.fin_order.allocations(),
             usize::from(endpoint.previewed.capacity_bytes() != 0),
             usize::from(endpoint.repair_budget.is_some()),

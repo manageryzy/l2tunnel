@@ -152,6 +152,15 @@ impl ReceiverPlan {
         plan.capacity = aligned_receiver::Receiver::reserved_bytes(limits, true)?;
         Ok(plan)
     }
+    /// Include bounded same-channel retired contexts and their two rollback versions.
+    pub fn for_fixed_anchor_ip_limits(limits: aligned_receiver::Limits) -> Result<Self, Error> {
+        let mut plan = Self::for_ip_limits_with_early_replay(limits)?;
+        plan.capacity = sum(&[
+            plan.capacity,
+            aligned_receiver::Receiver::fixed_anchor_history_bytes(limits)?,
+        ])?;
+        Ok(plan)
+    }
     /// Whether the actual selected state is native-IP header compression.
     pub fn ip_headers(&self) -> bool {
         self.ip_headers

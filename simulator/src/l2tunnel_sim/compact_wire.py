@@ -8,6 +8,10 @@ with optional extent-based padding removal. Decoded source bytes use the
 existing model ledger. CRC and
 metadata helpers also accept actual coded bytes for independent numeric tests.
 
+The opt-in C48 forward profiles instead emit the selected Rust union with actual
+GF-coded lengths and bytes. Their return path keeps the existing lossy feedback
+model. The rank decoder still materializes solved application bytes from its ledger.
+
 The supported path is one FIFO link. A 15-bit source identifier has half-range
 16384, exceeding the enforced 8192-source outstanding window. Bounded reorder
 within that window is decoded correctly. Larger reorder spans or cross-session
@@ -15,13 +19,17 @@ stale datagrams require an extended session format. Original unknown sources
 remain within the global repair window because admission stops at its limit.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from math import isfinite
 from struct import Struct
 from zlib import crc32
 
-from .aligned_records import AlignedRecordConfig, AlignedRecordTransport
+from .aligned_records import AlignedRecordConfig, AlignedRecordTransport, _unsigned_varint
 from .compact import CompactSource, CompactTransport, coefficient
+from .aggregate_ack import _decode_bounded_varint
+from .coding import PRODUCT
+from . import rolling_repair_wire as c48_wire
+from .packed_spare import OUTER as C48_OUTER, parse_row, row_seed
 
 
 WORD = Struct("!H")
@@ -48,6 +56,7 @@ class CompactWireConfig(AlignedRecordConfig):
     short_source_copies: int = 1
     short_source_copy_scope: str = "all_short"
     pack_sources_max_delay_ms: float = 0
+    c48_forward_repair_support: str = "legacy"
 
     def __post_init__(self):
         super().__post_init__()
@@ -55,6 +64,8 @@ class CompactWireConfig(AlignedRecordConfig):
             raise ValueError("unknown compact wire encapsulation")
         if not isinstance(self.trim_repair_padding, bool):
             raise ValueError("repair padding trimming must be boolean")
+        if self.c48_forward_repair_support not in ("legacy", "fixed", "confirmed_prefix"):
+            raise ValueError("unknown C48 forward repair support")
         if (isinstance(self.short_source_max_bytes, bool) or not isinstance(self.short_source_max_bytes, int)
                 or not 0 <= self.short_source_max_bytes <= SYMBOL_BYTES):
             raise ValueError("short source threshold must be an integer between 0 and 1460 bytes")
@@ -205,8 +216,83 @@ class CompactWireTransport(AlignedRecordTransport):
         # A shared ingress queue can recheck credit after feedback processing.
         # The callback takes no arguments and may submit more complete records.
         self.capacity_callback = None
+        self.c48_union = not reverse and config.c48_forward_repair_support != "legacy"
+        self.confirmed_support = self.c48_union and config.c48_forward_repair_support == "confirmed_prefix"
+        self.wire_confirmed_prefix_rows = 0
+        self.wire_skipped_prefix_sources = 0
+        if self.c48_union:
+            # The C48 study charges the IPv4/UDP header and authenticated envelope.
+            self.ip_header_bytes, self.crc_bytes = C48_OUTER, 0
+
+    source_wire_codec = None
+
+    def source_wire(self, index, payload):
+        if self.source_wire_codec is not None:
+            payload = self.source_wire_codec.encode(payload)
+        if self.c48_union:
+            return b"\x01" + _unsigned_varint(index) + payload
+        return encode_source(index, payload, self.config.encapsulation)
+
+    def source_wire_header_bytes(self, wire, canonical_size):
+        if self.source_wire_codec is None:
+            return len(wire) - canonical_size - self.crc_bytes
+        return WORD.size  # The selected study compresses legacy-framed reverse sources.
+
+    def source_ip_bytes(self, index, wire):
+        return self.ip_header_bytes + len(wire)
+
+    def c48_regular_charge(self, extent):
+        identity = self.repair_serial + 1
+        end = len(self.sources)
+        header = 1 + len(_unsigned_varint(identity)) + len(_unsigned_varint(end))
+        if self.confirmed_support and identity % GLOBAL_EVERY == 0:
+            skipped = self.base - max(0, end - GLOBAL_WINDOW)
+            if skipped > 0:
+                header += len(_unsigned_varint(skipped))
+        return C48_OUTER + header + 2 + extent
+
+    def decode_data_packet(self, wire):
+        if not self.c48_union:
+            packet = decode_packet(wire, self.received_prefix, self.config.encapsulation)
+            if self.source_wire_codec is not None and packet.kind == "source":
+                packet = replace(packet, payload=self.source_wire_codec.decode(packet.payload))
+            return packet
+        if not wire or C48_OUTER + len(wire) > self.sim.scenario.mtu:
+            raise ValueError("invalid C48 data length")
+        floor = self.received_prefix
+        if wire[0] == 1:
+            index, pos = _decode_bounded_varint(wire, 1, 2**32 - 2)
+            body = wire[pos:]
+            if (not 0 < len(body) <= SYMBOL_BYTES
+                    or not max(0, floor - GLOBAL_WINDOW) <= index < floor + GLOBAL_WINDOW):
+                raise ValueError("invalid C48 source")
+            return ReceivedPacket("source", index, body)
+        if wire[0] == 6:
+            end, _, body = parse_row(wire, floor, GLOBAL_WINDOW)
+            return ReceivedPacket("repair", end - 1, body, end - 8, end, end // 8, row_seed(end))
+        identity, end, start, tail, rhs = c48_wire.decode_repair(
+            wire, confirmed_prefix=self.confirmed_support, max_payload=SYMBOL_BYTES)
+        if (not max(1, floor - GLOBAL_WINDOW) <= end <= floor + GLOBAL_WINDOW
+                or (wire[0] in (7, 8) and start > floor)):
+            raise ValueError("C48 repair is outside receiver-confirmed custody")
+        seed = ((identity if tail else identity & ID_MASK) * 2654435761) & 0xffffffff
+        return ReceivedPacket("tail" if tail else "repair", end - 1, rhs, start, end, identity, seed)
+
+    def _c48_equation(self, start, end, seed, extent):
+        # Source vectors include their protected big-endian payload lengths.
+        # Integer XOR aligns short vectors on the left, with implicit zero tails.
+        value = 0
+        for index in range(start, end):
+            factor = coefficient(seed, index)
+            if factor:
+                size = self.sources[index].size
+                body = size.to_bytes(2, "big") + self.source_payloads[index][:size]
+                value ^= int.from_bytes(body.translate(PRODUCT[factor]), "little")
+        return value.to_bytes(extent + 2, "little")
 
     def _send_wire(self, wire, kind, header_bytes):
+        if self.c48_union and C48_OUTER + len(wire) > self.sim.scenario.mtu:
+            raise ValueError("selected C48 packet exceeds the configured path MTU")
         self.wire_header_bytes += header_bytes
         self.wire_crc_bytes += self.crc_bytes
         return self.sim.send(self.reverse, self.ip_header_bytes + len(wire), kind,
@@ -221,7 +307,8 @@ class CompactWireTransport(AlignedRecordTransport):
             return 1
         kind = payload[3]
         size = int.from_bytes(payload[4:6], "big")
-        if len(payload) == 6 + size and (kind == 2 or kind == 0 and size == 66):
+        native_context = kind == 8 and getattr(self, "fixed_anchor_ip", None) is not None
+        if len(payload) == 6 + size and (kind == 2 or kind == 0 and size == 66 or native_context):
             return self.config.short_source_copies
         return 1
 
@@ -229,7 +316,7 @@ class CompactWireTransport(AlignedRecordTransport):
         index = len(self.sources)
         if index - self.base >= GLOBAL_WINDOW:
             raise ValueError("source admission exceeds the global repair window")
-        wire = encode_source(index, payload, self.config.encapsulation)
+        wire = self.source_wire(index, payload)
         size = len(payload)
         self.channel_header_bytes += 3
         self.implicit_padding_bytes += SYMBOL_BYTES - size
@@ -238,13 +325,14 @@ class CompactWireTransport(AlignedRecordTransport):
         self.sources.append(CompactSource(index, size, self.sent_bytes))
         self.source_payloads.append(payload + bytes(SYMBOL_BYTES - size))
         self.wire_source_wraps += int(index > 0 and index % ID_MODULUS == 0)
-        finish, _ = self._send_wire(wire, "source", 2)
+        source_header = self.source_wire_header_bytes(wire, size)
+        finish, _ = self._send_wire(wire, "source", source_header)
         copies = self._source_copy_count(payload)
         self.wire_protected_sources += int(copies > 1)
         for _ in range(copies - 1):
-            finish, _ = self._send_wire(wire, "source", 2)
+            finish, _ = self._send_wire(wire, "source", source_header)
             self.wire_repeated_source_packets += 1
-            self.wire_repeated_source_bytes += self.ip_header_bytes + len(wire)
+            self.wire_repeated_source_bytes += self.source_ip_bytes(index, wire)
         self.wire_peak_outstanding_sources = max(self.wire_peak_outstanding_sources, index + 1 - self.base)
         self.last_source_at = finish
         self._prune_sender_payloads()
@@ -273,6 +361,9 @@ class CompactWireTransport(AlignedRecordTransport):
         local = not tail and serial % GLOBAL_EVERY != 0
         end = len(self.sources)
         start = max(0, end - (LOCAL_WINDOW if local else GLOBAL_WINDOW))
+        nominal = start
+        if self.confirmed_support and not local:
+            start = max(start, self.base)
         if any(payload is None for payload in self.source_payloads[start:end]):
             raise ValueError("repair support exceeds retained source bytes")
         extent = SYMBOL_BYTES
@@ -281,9 +372,19 @@ class CompactWireTransport(AlignedRecordTransport):
             # Only columns zero-extended by the source encoder may be omitted.
             extent = max(source.size for source in self.sources[start:end])
         seed = (self.repair_serial * 2654435761) & 0xFFFFFFFF if tail else None
-        wire = encode_repair(end, serial, ZERO_REPAIR[:extent], self.config.encapsulation, tail=tail, seed=seed)
+        if self.c48_union:
+            factor_seed = seed if tail else (serial * 2654435761) & 0xffffffff
+            rhs = self._c48_equation(start, end, factor_seed, extent)
+            wire = c48_wire.encode_repair(self.repair_serial, end, start, tail, rhs,
+                                          confirmed_prefix=self.confirmed_support, max_payload=SYMBOL_BYTES)
+            header_bytes = len(wire) - len(rhs)
+            self.wire_confirmed_prefix_rows += start > nominal
+            self.wire_skipped_prefix_sources += start - nominal
+        else:
+            wire = encode_repair(end, serial, ZERO_REPAIR[:extent], self.config.encapsulation, tail=tail, seed=seed)
+            header_bytes = TAIL.size if tail else 4
         self.wire_trimmed_repair_bytes += SYMBOL_BYTES - extent
-        self._send_wire(wire, "repair", TAIL.size if tail else 4)
+        self._send_wire(wire, "repair", header_bytes)
         self.local_repairs += bool(local)
         self.global_repairs += not local
         self.scheduled_repairs += not tail
@@ -292,7 +393,7 @@ class CompactWireTransport(AlignedRecordTransport):
 
     def _receive_wire(self, wire):
         try:
-            packet = decode_packet(wire, self.received_prefix, self.config.encapsulation)
+            packet = self.decode_data_packet(wire)
         except ValueError:
             self.wire_invalid_packets += 1
             return

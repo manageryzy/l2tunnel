@@ -395,6 +395,66 @@ fn fragment(record: u64, total: usize, offset: usize, bytes: &[u8]) -> Vec<u8> {
     out
 }
 #[test]
+fn independent_validation_keeps_gap_custody_and_rolls_back_invalid_fragments() -> Result {
+    let l = limits();
+    let mut original = vec![4; 103];
+    original[0] = 2;
+    original[1..3].copy_from_slice(&100u16.to_be_bytes());
+    let first = fragment(2, 103, 0, &original);
+    let last = fragment(2, 103, 56, &original);
+    original[1..3].copy_from_slice(&99u16.to_be_bytes());
+    let bad_first = fragment(2, 103, 0, &original);
+    let valid = [unit(2, 2, &first), unit(3, 2, &last)];
+    let invalid = [unit(2, 2, &bad_first), unit(3, 2, &last)];
+    for mut receiver in [reserved(l)?, Receiver::new(scope(), l)?] {
+        let saved = receiver.status();
+        let mut outcomes = [Admission::Duplicate; 2];
+        assert_eq!(
+            receiver.admit_validated_batch_authenticated_into(&valid, Tick(1), &mut outcomes),
+            Err(Error::UnresolvedContext)
+        );
+        assert_eq!(receiver.status(), saved);
+        assert_eq!(
+            receiver.admit_independent_validated_batch_authenticated_into(
+                &invalid,
+                Tick(1),
+                &mut outcomes
+            ),
+            Err(Error::Malformed)
+        );
+        assert_eq!(receiver.status(), saved);
+        assert_eq!(outcomes, [Admission::Duplicate; 2]);
+        assert_eq!(
+            receiver.admit_independent_validated_batch_authenticated_into(
+                &valid,
+                Tick(2),
+                &mut outcomes
+            )?,
+            2
+        );
+        assert_eq!(outcomes, [Admission::Accepted; 2]);
+        assert!(receiver.pending().is_none());
+        assert_eq!(receiver.status().source_floor, saved.source_floor);
+        assert_eq!(
+            receiver.prepare_with_independent_packets(
+                ChannelId(0),
+                Tick(3),
+                1,
+                |_| true,
+                |_, _| EarlyDecision::Allow
+            )?,
+            Prepared::Ready
+        );
+        let native = receiver
+            .pending()
+            .ok_or("missing actual early fragment delivery")?;
+        assert!(native.early);
+        assert_eq!(native.bytes, [4; 100]);
+    }
+    Ok(())
+}
+
+#[test]
 fn final_fragment_refusal_recycles_touched_versions_and_valid_retry_delivers_exact_bytes() -> Result
 {
     let l = limits();

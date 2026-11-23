@@ -112,6 +112,8 @@ fn every_actual_python_sender_symbol_matches_context_fragment_padding_and_wrap()
             let source = SourceId(parts[0].parse()?);
             let absolute = RecordId(parts[1].parse()?);
             let expected = hex(parts[2])?;
+            // Simulate a previously rendered longer unit in this reusable slab.
+            sender.symbol.fill(0xa5);
             let unit = sender.pending_unit()?;
             assert_eq!(unit.channel, ChannelId(fields[5].parse()?));
             assert_eq!(unit.record, absolute);

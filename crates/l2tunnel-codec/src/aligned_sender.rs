@@ -89,6 +89,9 @@ struct LegacyChannel {
 struct Channel {
     encoder: Encoder,
     next: Option<RecordId>,
+    // Distance of the next serial to the retained full fixed anchor; zero
+    // means there is no fixed anchor and values above the bound are expired.
+    anchor_distance: u8,
 }
 #[derive(Clone, Copy)]
 struct Pending {
@@ -206,6 +209,7 @@ impl Sender {
             channels.push(Channel {
                 encoder: Encoder::new_in_mode(config.body, allocation, ip)?,
                 next: Some(config.first_record),
+                anchor_distance: 0,
             });
         }
         Ok(Self {
@@ -241,6 +245,7 @@ impl Sender {
                     Encoder::new(config.body)?
                 },
                 next: Some(config.first_record),
+                anchor_distance: 0,
             });
         }
         Ok(Self {
@@ -336,6 +341,14 @@ impl Sender {
     ) -> Result<(RecordIdentity, aligned_body::NativeEncodingObservation), Error> {
         self.stage_selected(channel, frame, aligned_body::Encoding::Headers)
     }
+    /// Stage a native-IP body derived only from its named full context.
+    pub fn stage_fixed_anchor_headers_observed(
+        &mut self,
+        channel: ChannelId,
+        frame: &[u8],
+    ) -> Result<(RecordIdentity, aligned_body::NativeEncodingObservation), Error> {
+        self.stage_selected(channel, frame, aligned_body::Encoding::FixedAnchorHeaders)
+    }
     /// Return exact raw-body and complete generated unit framing after staging.
     pub fn stage_raw_observed(
         &mut self,
@@ -369,12 +382,24 @@ impl Sender {
         self.staged.copy_context_from(&state.encoder);
         // A full context also has its own record serial. Keeping a serial-based
         // cadence needs no timer or per-flow state and survives failed admission.
-        let refresh =
-            encoding == aligned_body::Encoding::RefreshedHeaders && record.0.is_multiple_of(8);
+        let fixed = encoding == aligned_body::Encoding::FixedAnchorHeaders;
+        let leaving_fixed = !fixed && state.anchor_distance != 0;
+        let valid_anchor = (1..=aligned_body::MAX_ANCHOR_DISTANCE).contains(&state.anchor_distance);
+        let boundary = record
+            .0
+            .is_multiple_of(u64::from(aligned_body::MAX_ANCHOR_DISTANCE));
+        let refresh = leaving_fixed
+            || (fixed && !valid_anchor)
+            || ((fixed || encoding == aligned_body::Encoding::RefreshedHeaders) && boundary);
         if refresh {
             self.staged.reset();
         }
         let encoded = match encoding {
+            aligned_body::Encoding::FixedAnchorHeaders => self.staged.encode_fixed_anchor(
+                frame,
+                &mut self.bodies,
+                if refresh { 1 } else { state.anchor_distance },
+            )?,
             aligned_body::Encoding::Headers | aligned_body::Encoding::RefreshedHeaders => {
                 self.staged.encode(frame, &mut self.bodies)?
             }
@@ -397,10 +422,20 @@ impl Sender {
         };
         let mut observation = encoded.observation();
         observation.framing_bytes = framing(encoded.context_len) + framing(encoded.body_len);
-        // A raw fallback at a refresh boundary carries no replacement context.
-        if !refresh || encoded.context_len != 0 {
+        // A fixed data delta is disposable. Only a full context can replace
+        // the retained header. A failed stage advances neither serial nor age.
+        if encoded.context_len != 0 || leaving_fixed || (!refresh && !fixed) {
             state.encoder.copy_context_from(&self.staged);
         }
+        state.anchor_distance = if !fixed {
+            0
+        } else if encoded.context_len != 0 {
+            2 // Context and native body consumed one serial each.
+        } else if state.anchor_distance != 0 {
+            state.anchor_distance.saturating_add(1)
+        } else {
+            0
+        };
         state.next = last.checked_add(1).map(RecordId);
         self.pending = Some(Pending {
             channel,
@@ -434,7 +469,8 @@ impl Sender {
     /// Write immutable pending bytes using the recovery owner's source-ID snapshot.
     /// Failure or success here never consumes a pending symbol.
     pub fn write_pending(&mut self, source: SourceId, output: &mut [u8]) -> Result<usize, Error> {
-        let (pending, _, _) = self.build_symbol()?;
+        let (pending, length, _) = self.build_symbol()?;
+        self.symbol[length..].fill(0);
         Ok(aligned_envelope::encode(
             SymbolIdentity {
                 scope: self.scope,
@@ -499,7 +535,6 @@ impl Sender {
             (pending.context_len, pending.body_len)
         };
         let body = &self.bodies[start..start + length];
-        self.symbol.fill(0);
         self.symbol[0] = pending.channel.0;
         self.symbol[1..3].copy_from_slice(&(pending.record.0 as u16).to_be_bytes());
         let (written, complete) = if length <= self.config.body.symbol_bytes - 3 {

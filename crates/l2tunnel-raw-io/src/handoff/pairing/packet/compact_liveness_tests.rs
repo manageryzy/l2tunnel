@@ -7,6 +7,7 @@ const CONTROL_WIRE_BYTES: usize = 40 + CONTROL_BYTES;
 
 fn stage_control(
     sender: &mut PacketCarrier<Link>,
+    fault: &Fault,
     lane: PairLane,
     control: FinalControl,
 ) -> R<(FinalMetadata, Vec<u8>, RecordToken)> {
@@ -33,7 +34,41 @@ fn stage_control(
         .bytes
         .clone();
     assert_eq!(packet.len(), CONTROL_WIRE_BYTES);
+    // Keep entries after observing a send so an accidental duplicate still
+    // counts. WouldBlock bypasses the counter until actual link acceptance.
+    fault
+        .staged_final_controls
+        .lock()
+        .map_err(|_| "test lock")?
+        .push(packet.clone());
     Ok((metadata, packet, receipt))
+}
+
+#[test]
+fn unstaged_raw_tcp_payload_with_control_route_remains_on_the_link() -> R {
+    let (RawInputs::Full(sender), RawInputs::Full(mut peer), _) = support::inputs(false) else {
+        return Err("expected full-duplex link".into());
+    };
+    let fault = Arc::new(Fault::default());
+    fault.drop_final_controls.store(true, Ordering::SeqCst);
+    let mut link = Link {
+        inner: sender.io,
+        fault: fault.clone(),
+    };
+    // The observed false positive had 86 TCP payload bytes (126 IP bytes).
+    // Also check a same-length lookalike: length plus route is insufficient.
+    for payload_len in [86, CONTROL_BYTES] {
+        let mut body = vec![0x64; payload_len];
+        body[0] = 1;
+        let mut packet = vec![0; 40 + payload_len];
+        l2tunnel_raw_tcp::packet::encode(sender.config, 123, 456, 1000, &body, &mut packet)?;
+        assert_eq!(packet.get(40), Some(&1));
+        link.send(&packet)?;
+        assert_eq!(peer.io.incoming.try_recv()?, packet);
+    }
+    assert_eq!(fault.final_control_packets.load(Ordering::SeqCst), 0);
+    assert_eq!(fault.final_control_bytes.load(Ordering::SeqCst), 0);
+    Ok(())
 }
 
 fn accept_control(
@@ -101,7 +136,7 @@ async fn lost_control_is_retried(drop_ping: bool) -> R {
                 let FinalControl::Ping(nonce) = ping else {
                     return Err("Ping required".into());
                 };
-                let (metadata, packet, token) = stage_control(&mut a, lane, ping)?;
+                let (metadata, packet, token) = stage_control(&mut a, &af, lane, ping)?;
                 if attempt == 0 {
                     previous.push((ping, metadata, packet.clone()));
                 } else {
@@ -123,7 +158,7 @@ async fn lost_control_is_retried(drop_ping: bool) -> R {
                     assert_eq!(accept_control(&mut b, lane)?.0, ping);
                     let pong = b.poll_final_control(lane)?.ok_or("Pong obligation")?;
                     assert_eq!(pong, FinalControl::Pong(nonce));
-                    let (_, pong_packet, pong_token) = stage_control(&mut b, lane, pong)?;
+                    let (_, pong_packet, pong_token) = stage_control(&mut b, &bf, lane, pong)?;
                     flush(&mut a, &mut b).await?;
                     assert_eq!(
                         b.take_sent_record(lane)?.ok_or("accepted Pong")?.token,
@@ -197,7 +232,7 @@ async fn compact_final_raw_liveness_retry_cancellation_and_wouldblock_keep_custo
     tokio::time::advance(Duration::from_secs(5)).await;
     let ping = a.poll_final_control(lane)?.ok_or("Ping due")?;
     fault.drop_final_controls.store(true, Ordering::SeqCst);
-    stage_control(&mut a, lane, ping)?;
+    stage_control(&mut a, &fault, lane, ping)?;
     flush(&mut a, &mut b).await?;
     a.take_sent_record(lane)?.ok_or("original Ping receipt")?;
     let last_ping = a.lanes[0].as_ref().ok_or("lane")?.last_ping;
@@ -224,7 +259,7 @@ async fn compact_final_raw_liveness_retry_cancellation_and_wouldblock_keep_custo
     ));
     fault.drop_final_controls.store(false, Ordering::SeqCst);
     fault.block_all.store(true, Ordering::SeqCst);
-    let (retry_metadata, packet, token) = stage_control(&mut a, lane, ping)?;
+    let (retry_metadata, packet, token) = stage_control(&mut a, &fault, lane, ping)?;
     assert_eq!(retry_metadata, metadata);
     flush(&mut a, &mut b).await?;
     assert!(a.take_sent_record(lane)?.is_none());
@@ -288,7 +323,7 @@ async fn compact_final_raw_liveness_retry_dead_peer_expires_at_original_cap() ->
         } else {
             challenge = Some(ping);
         }
-        let (_, _, token) = stage_control(&mut a, lane, ping)?;
+        let (_, _, token) = stage_control(&mut a, &fault, lane, ping)?;
         flush(&mut a, &mut b).await?;
         let sent = a.lanes[0]
             .as_ref()

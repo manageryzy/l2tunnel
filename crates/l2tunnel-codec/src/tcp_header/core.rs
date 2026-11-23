@@ -22,6 +22,15 @@ pub(crate) struct Context {
     layout: Layout,
 }
 impl Context {
+    fn from_header(bytes: &[u8], layout: Layout) -> Self {
+        let mut header = Self {
+            bytes: [0; MAX_HEADER],
+            len: bytes.len(),
+            layout,
+        };
+        header.bytes[..bytes.len()].copy_from_slice(bytes);
+        header
+    }
     pub(crate) fn bytes(&self) -> &[u8] {
         &self.bytes[..self.len]
     }
@@ -191,17 +200,46 @@ pub(crate) fn view(bytes: &[u8], format: Format) -> Result<View<'_>, Error> {
     let layout = layout(bytes, format, false).ok_or(Error::InvalidRecord)?;
     Ok(View { bytes, layout })
 }
+
+/// Classify established DATA acknowledgements by their complete packet geometry.
+#[cfg(feature = "lz4")]
+pub(crate) fn pure_ipv4_ack(bytes: &[u8]) -> bool {
+    let Some(l) = layout(bytes, Format::Ip, true) else {
+        return false;
+    };
+    if !l.ipv4 || l.header != bytes.len() || bytes[6] & 0x80 != 0 {
+        return false;
+    }
+    let tcp = &bytes[l.tcp..];
+    // ACK, optionally accompanied by ECN indications. Preserve every option and checksum byte.
+    if tcp[12] & 0x0f != 0 || tcp[13] & 0x3f != 0x10 {
+        return false;
+    }
+    // Layout checked the extent of each option and timestamp length. SACK blocks
+    // need whole left/right pairs. SYN-only options cannot appear in this profile.
+    let mut pos = 20;
+    while pos < tcp.len() {
+        let kind = tcp[pos];
+        match kind {
+            0 => return tcp[pos + 1..].iter().all(|&b| b == 0),
+            1 => pos += 1,
+            2..=4 | 34 => return false,
+            _ => {
+                let n = usize::from(tcp[pos + 1]);
+                if kind == 5 && (n < 10 || (n - 2) % 8 != 0) {
+                    return false;
+                }
+                pos += n;
+            }
+        }
+    }
+    true
+}
 pub(crate) fn context(bytes: &[u8], format: Format) -> Result<Context, Error> {
     let l = layout(bytes, format, false)
         .filter(|l| l.header == bytes.len())
         .ok_or(Error::InvalidRecord)?;
-    let mut result = Context {
-        bytes: [0; MAX_HEADER],
-        len: bytes.len(),
-        layout: l,
-    };
-    result.bytes[..bytes.len()].copy_from_slice(bytes);
-    Ok(result)
+    Ok(Context::from_header(bytes, l))
 }
 fn field(l: Layout, bit: usize) -> Option<(usize, usize)> {
     match bit {
@@ -311,19 +349,21 @@ pub(super) fn encode(
             next: previous,
         });
     };
-    let header = context(&packet[..l.header], format)?;
+    let header = Context::from_header(&packet[..l.header], l);
     let values = fields(&header);
     let payload = &packet[l.header..];
-    if restore(&header, &values, payload)? != header {
+    let needs_context = match previous {
+        Some(old) if old.layout == l => restore(&old, &values, payload)? != header,
+        _ => true,
+    };
+    // Reconstructing the exact incoming header from the prior context already
+    // verified both checksums. Only a new context needs separate validation.
+    if needs_context && restore(&header, &values, payload)? != header {
         return Ok(Encoded {
             written: raw(packet, output)?,
             next: previous,
         });
     }
-    let needs_context = match previous {
-        None => true,
-        Some(old) => old.layout != l || restore(&old, &values, payload)? != header,
-    };
     let mut prefix = [0; MAX_HEADER + 47];
     let mut cursor = 0;
     if needs_context {

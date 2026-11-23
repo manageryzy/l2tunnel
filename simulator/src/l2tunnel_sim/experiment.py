@@ -34,12 +34,14 @@ def _percentiles(values, levels):
     return np.percentile(values, levels).tolist()
 
 
-def measure(sim):
+def measure(sim, *, segmented_payload=None):
     forward, reverse = sim.forward, sim.reverse
     sent = len(sim.sent_times)
     forward_wire = sum(sim.wire[False].values())
     reverse_wire = sum(sim.wire[True].values())
-    payload = sim.tcp_received * sim.traffic.payload_bytes
+    if getattr(sim, "segment_offsets", None) is not None:
+        segmented_payload = sim.byte_offset(sim.tcp_received)
+    payload = sim.tcp_received * sim.traffic.payload_bytes if segmented_payload is None else segmented_payload
     frame_p50, frame_p95, frame_p99 = _percentiles(forward.delays, [50, 95, 99])
     rtt_p50, rtt_p95 = _percentiles(sim.tcp_rtts, [50, 95])
     row = {
@@ -68,7 +70,7 @@ def measure(sim):
         "tcp_recovery": {"tcp": "newreno", "quic": "aioquic"}.get(sim.strategy.mode, "outer_arq"),
         "quic_retransmitted_stream_bytes": getattr(sim, "quic_retransmitted_stream_bytes", None),
         "quic_cwnd_bytes": getattr(sim, "quic_cwnd_bytes", None),
-        "payload_bytes_per_frame": sim.traffic.payload_bytes,
+        "payload_bytes_per_frame": sim.traffic.payload_bytes if segmented_payload is None else None,
         "offered_frames": sent,
         "released_frames": len(forward.delays),
         "tcp_delivered_frames": sim.tcp_received,
@@ -100,6 +102,9 @@ def run_experiment(experiment, out):
     rng = Random(experiment.seed)
     replications, summary, comparisons, cdf = [], [], [], []
     baseline = experiment.strategies[0].name
+    report_paws = any(strategy.tcp_data_paws for strategy in experiment.strategies)
+    report_undo = any(strategy.tcp_partial_timestamp_undo for strategy in experiment.strategies)
+    report_ack_heuristic = any(strategy.tcp_newreno_ack_heuristic for strategy in experiment.strategies)
     for scenario_id, scenario in enumerate(experiment.scenarios(), 1):
         keys = {"scenario_id": scenario_id, **asdict(scenario)}
         rows = defaultdict(list)
@@ -113,6 +118,18 @@ def run_experiment(experiment, out):
                     **keys, "strategy": strategy.name, "replication": replication,
                     "seed": seed, **measure(sim),
                 }
+                if report_paws:
+                    row["tcp_data_paws"] = strategy.tcp_data_paws
+                    row["tcp_data_paws_rejections"] = (
+                        sim.data_paws.rejections if strategy.tcp_data_paws else None)
+                if report_undo:
+                    row["tcp_partial_timestamp_undo"] = strategy.tcp_partial_timestamp_undo
+                    row["tcp_partial_timestamp_undos"] = (
+                        sim.tcp_partial_timestamp_undos if strategy.tcp_partial_timestamp_undo else None)
+                if report_ack_heuristic:
+                    row["tcp_newreno_ack_heuristic"] = strategy.tcp_newreno_ack_heuristic
+                    row["tcp_newreno_ack_heuristic_entries"] = (
+                        sim.tcp_newreno_ack_heuristic_entries if strategy.tcp_newreno_ack_heuristic else None)
                 replications.append(row)
                 rows[strategy.name].append(row)
                 delays[strategy.name].extend(sim.forward.delays)

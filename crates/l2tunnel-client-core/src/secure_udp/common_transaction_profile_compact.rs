@@ -148,6 +148,11 @@ fn rebase(descriptor: common::Descriptor, overhead: usize) -> io::Result<common:
     let mut profile = *descriptor.profile();
     match &mut profile {
         common::Profile::Swift { .. } => {}
+        common::Profile::Striped { forward, reverse } => {
+            for direction in [forward, reverse] {
+                direction.overhead_bytes = overhead;
+            }
+        }
         common::Profile::Aligned { forward, reverse } => {
             for config in [forward, reverse] {
                 config.recovery.outer_overhead_bytes = overhead;

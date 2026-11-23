@@ -75,6 +75,7 @@ impl Engine {
             Owner::Rolling(owner) => {
                 visit(CodecBufferSnapshot::Endpoint(owner.codec_buffer_snapshot()))
             }
+            Owner::Striped(_) => {}
             Owner::Research(owner) => {
                 visit(CodecBufferSnapshot::Endpoint(owner.codec_buffer_snapshot()))
             }
@@ -152,7 +153,7 @@ impl Engine {
                         })
                     })
             }
-            Owner::Swift(_) | Owner::Rolling(_) | Owner::Research(_) => {}
+            Owner::Swift(_) | Owner::Striped(_) | Owner::Rolling(_) | Owner::Research(_) => {}
         }
     }
 }
@@ -198,7 +199,7 @@ impl Engine {
                         })
                     })
             }
-            Owner::Swift(_) | Owner::Rolling(_) | Owner::Research(_) => {}
+            Owner::Swift(_) | Owner::Striped(_) | Owner::Rolling(_) | Owner::Research(_) => {}
         }
     }
 }

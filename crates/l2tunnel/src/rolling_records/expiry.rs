@@ -14,6 +14,8 @@ pub enum LocalOwner {
     Incoming,
     /// Authenticated deferred feedback awaiting causal output ordering.
     DeferredFeedback,
+    /// A reserved second physical handoff of an already emitted gap request.
+    GapRequestCopy,
 }
 /// A first actual failed local check, not an inference from a later sample.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

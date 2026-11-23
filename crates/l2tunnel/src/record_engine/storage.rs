@@ -71,6 +71,7 @@ impl std::error::Error for Error {}
 #[derive(Clone, Copy)]
 #[allow(clippy::large_enum_variant)] // Bounded pure plans require no allocating indirection.
 enum RecordPlan {
+    Striped(crate::striped_records::StoragePlan),
     Swift(swift::storage::Plan),
     Aligned(aligned::storage::Plan),
     Packed(aligned::storage::Plan),
@@ -80,6 +81,19 @@ enum RecordPlan {
     Research(crate::research_records::storage::Plan),
     Connections(crate::connection_records::storage::Plan),
 }
+// Keep each large intermediate Result in the selected family's own stack
+// frame while planning or constructing an inline record owner.
+fn selected<T, E, R>(
+    build: impl FnOnce() -> Result<T, E>,
+    variant: impl FnOnce(T) -> R,
+    error: impl FnOnce(E) -> Error,
+) -> Result<R, Error> {
+    match build() {
+        Ok(value) => Ok(variant(value)),
+        Err(cause) => Err(error(cause)),
+    }
+}
+
 impl RecordPlan {
     fn for_engine(
         config: &configuration::Configuration,
@@ -87,31 +101,47 @@ impl RecordPlan {
         ingress: Option<rolling_records::IngressLimits>,
         framing: Option<rolling_records::OutputFraming>,
     ) -> Result<Self, Error> {
+        if let configuration::Profile::Striped { forward, reverse } = config.descriptor().profile()
+        {
+            return selected(
+                || crate::striped_records::StoragePlan::new(*forward, *reverse, context.role),
+                Self::Striped,
+                Error::Engine,
+            );
+        }
         if let configuration::Profile::Research { config, stream } = config.descriptor().profile() {
-            return crate::research_records::storage::Plan::for_endpoint_with_output_framing(
-                *config,
-                context,
-                *stream,
-                Tick(0),
-                rolling_records::CopyPolicies::ONE,
-                ingress,
-                framing,
-            )
-            .map(Self::Research)
-            .map_err(Error::Rolling);
+            return selected(
+                || {
+                    crate::research_records::storage::Plan::for_endpoint_with_output_framing(
+                        *config,
+                        context,
+                        *stream,
+                        Tick(0),
+                        rolling_records::CopyPolicies::ONE,
+                        ingress,
+                        framing,
+                    )
+                },
+                Self::Research,
+                Error::Rolling,
+            );
         }
         if let configuration::Profile::Rolling { config, stream } = config.descriptor().profile() {
-            return rolling_records::storage::Plan::for_endpoint_with_output_framing(
-                *config,
-                context,
-                *stream,
-                Tick(0),
-                rolling_records::CopyPolicies::ONE,
-                ingress,
-                framing,
-            )
-            .map(Self::Rolling)
-            .map_err(Error::Rolling);
+            return selected(
+                || {
+                    rolling_records::storage::Plan::for_endpoint_with_output_framing(
+                        *config,
+                        context,
+                        *stream,
+                        Tick(0),
+                        rolling_records::CopyPolicies::ONE,
+                        ingress,
+                        framing,
+                    )
+                },
+                Self::Rolling,
+                Error::Rolling,
+            );
         }
         if let configuration::Profile::RollingCopies {
             config,
@@ -119,17 +149,21 @@ impl RecordPlan {
             copies,
         } = config.descriptor().profile()
         {
-            return rolling_records::storage::Plan::for_endpoint_with_output_framing(
-                *config,
-                context,
-                *stream,
-                Tick(0),
-                *copies,
-                ingress,
-                framing,
-            )
-            .map(Self::Rolling)
-            .map_err(Error::Rolling);
+            return selected(
+                || {
+                    rolling_records::storage::Plan::for_endpoint_with_output_framing(
+                        *config,
+                        context,
+                        *stream,
+                        Tick(0),
+                        *copies,
+                        ingress,
+                        framing,
+                    )
+                },
+                Self::Rolling,
+                Error::Rolling,
+            );
         }
         let local = config.descriptor().local(context.role);
         if let (
@@ -137,46 +171,59 @@ impl RecordPlan {
             configuration::DirectionProfile::PerConnectionCompact(receive),
         ) = (local.send().profile(), local.receive().profile())
         {
-            return connections::Connections::plan(*send, *receive)
-                .map(Self::Connections)
-                .map_err(Error::Engine);
+            return selected(
+                || connections::Connections::plan(*send, *receive),
+                Self::Connections,
+                Error::Engine,
+            );
         }
         match (local.send().profile(), local.receive().profile()) {
             (
                 configuration::DirectionProfile::Swift(send),
                 configuration::DirectionProfile::Swift(receive),
-            ) => swift::storage::Plan::for_engine(*send, *receive)
-                .map(Self::Swift)
-                .map_err(Error::Swift),
+            ) => selected(
+                || swift::storage::Plan::for_engine(*send, *receive),
+                Self::Swift,
+                Error::Swift,
+            ),
             (
                 configuration::DirectionProfile::Aligned(send),
                 configuration::DirectionProfile::Aligned(receive),
-            ) => aligned::storage::Plan::for_duplex(*send, *receive)
-                .map(Self::Aligned)
-                .map_err(Error::Aligned),
+            ) => selected(
+                || aligned::storage::Plan::for_duplex(*send, *receive),
+                Self::Aligned,
+                Error::Aligned,
+            ),
             (
                 configuration::DirectionProfile::Packed(send),
                 configuration::DirectionProfile::Packed(receive),
-            ) => aligned::storage::Plan::for_packed_duplex(*send, *receive)
-                .map(Self::Packed)
-                .map_err(Error::Aligned),
+            ) => selected(
+                || aligned::storage::Plan::for_packed_duplex(*send, *receive),
+                Self::Packed,
+                Error::Aligned,
+            ),
             (
                 configuration::DirectionProfile::AlignedCompact(send),
                 configuration::DirectionProfile::AlignedCompact(receive),
-            ) => aligned::compact_storage::Plan::for_duplex(*send, *receive)
-                .map(Self::AlignedCompact)
-                .map_err(Error::Aligned),
+            ) => selected(
+                || aligned::compact_storage::Plan::for_duplex(*send, *receive),
+                Self::AlignedCompact,
+                Error::Aligned,
+            ),
             (
                 configuration::DirectionProfile::PackedCompact(send),
                 configuration::DirectionProfile::PackedCompact(receive),
-            ) => aligned::compact_storage::Plan::for_packed_duplex(*send, *receive)
-                .map(Self::PackedCompact)
-                .map_err(Error::Aligned),
+            ) => selected(
+                || aligned::compact_storage::Plan::for_packed_duplex(*send, *receive),
+                Self::PackedCompact,
+                Error::Aligned,
+            ),
             _ => Err(Error::Engine(super::Error::Configuration)),
         }
     }
     fn heap_bytes(self) -> usize {
         match self {
+            Self::Striped(plan) => plan.heap_bytes(),
             Self::Swift(plan) => plan.capacity_bytes(),
             Self::Aligned(plan) | Self::Packed(plan) => plan.capacity_bytes(),
             Self::AlignedCompact(plan) | Self::PackedCompact(plan) => plan.capacity_bytes(),
@@ -188,69 +235,100 @@ impl RecordPlan {
     fn construct(self, context: Context) -> Result<Owner, Error> {
         let recovery = owner::recovery_context(context);
         match self {
-            Self::Connections(plan) => connections::Connections::new(plan, context)
-                .map(Owner::Connections)
-                .map_err(Error::Engine),
+            Self::Striped(plan) => {
+                selected(|| plan.construct(context), Owner::Striped, Error::Engine)
+            }
+            Self::Connections(plan) => selected(
+                || connections::Connections::new(plan, context),
+                Owner::Connections,
+                Error::Engine,
+            ),
             Self::Swift(plan) => {
                 let capacity_bytes = size_of::<swift::storage::Owned>()
                     .checked_add(plan.capacity_bytes())
                     .ok_or(Error::Layout)?;
-                swift::storage::Owned::new(plan, swift::storage::Limits { capacity_bytes })
-                    .map(Owner::Swift)
-                    .map_err(Error::Swift)
+                selected(
+                    || swift::storage::Owned::new(plan, swift::storage::Limits { capacity_bytes }),
+                    Owner::Swift,
+                    Error::Swift,
+                )
             }
-            Self::Aligned(plan) => aligned::Endpoint::new_reserved_with_plan(
-                plan,
-                recovery,
-                aligned::storage::Limits {
-                    capacity_bytes: plan.capacity_bytes(),
+            Self::Aligned(plan) => selected(
+                || {
+                    aligned::Endpoint::new_reserved_with_plan(
+                        plan,
+                        recovery,
+                        aligned::storage::Limits {
+                            capacity_bytes: plan.capacity_bytes(),
+                        },
+                    )
                 },
-            )
-            .map(Owner::Aligned)
-            .map_err(Error::Aligned),
-            Self::Packed(plan) => aligned::packed::Endpoint::new_reserved_with_plan(
-                plan,
-                recovery,
-                aligned::storage::Limits {
-                    capacity_bytes: plan.capacity_bytes(),
+                Owner::Aligned,
+                Error::Aligned,
+            ),
+            Self::Packed(plan) => selected(
+                || {
+                    aligned::packed::Endpoint::new_reserved_with_plan(
+                        plan,
+                        recovery,
+                        aligned::storage::Limits {
+                            capacity_bytes: plan.capacity_bytes(),
+                        },
+                    )
                 },
-            )
-            .map(Owner::Packed)
-            .map_err(Error::Aligned),
-            Self::AlignedCompact(plan) => aligned::Endpoint::new_compact_reserved_with_plan(
-                plan,
-                recovery,
-                aligned::storage::Limits {
-                    capacity_bytes: plan.capacity_bytes(),
+                Owner::Packed,
+                Error::Aligned,
+            ),
+            Self::AlignedCompact(plan) => selected(
+                || {
+                    aligned::Endpoint::new_compact_reserved_with_plan(
+                        plan,
+                        recovery,
+                        aligned::storage::Limits {
+                            capacity_bytes: plan.capacity_bytes(),
+                        },
+                    )
                 },
-            )
-            .map(Owner::Aligned)
-            .map_err(Error::Aligned),
-            Self::PackedCompact(plan) => aligned::packed::Endpoint::new_compact_reserved_with_plan(
-                plan,
-                recovery,
-                aligned::storage::Limits {
-                    capacity_bytes: plan.capacity_bytes(),
+                Owner::Aligned,
+                Error::Aligned,
+            ),
+            Self::PackedCompact(plan) => selected(
+                || {
+                    aligned::packed::Endpoint::new_compact_reserved_with_plan(
+                        plan,
+                        recovery,
+                        aligned::storage::Limits {
+                            capacity_bytes: plan.capacity_bytes(),
+                        },
+                    )
                 },
-            )
-            .map(Owner::Packed)
-            .map_err(Error::Aligned),
-            Self::Rolling(plan) => rolling_records::Endpoint::new_reserved_with_copies(
-                plan,
-                rolling_records::storage::Limits {
-                    capacity_bytes: plan.capacity_bytes(),
+                Owner::Packed,
+                Error::Aligned,
+            ),
+            Self::Rolling(plan) => selected(
+                || {
+                    rolling_records::Endpoint::new_reserved_with_copies(
+                        plan,
+                        rolling_records::storage::Limits {
+                            capacity_bytes: plan.capacity_bytes(),
+                        },
+                    )
                 },
-            )
-            .map(Owner::Rolling)
-            .map_err(Error::Rolling),
-            Self::Research(plan) => crate::research_records::Endpoint::new_reserved_with_copies(
-                plan,
-                rolling_records::storage::Limits {
-                    capacity_bytes: plan.capacity_bytes(),
+                Owner::Rolling,
+                Error::Rolling,
+            ),
+            Self::Research(plan) => selected(
+                || {
+                    crate::research_records::Endpoint::new_reserved_with_copies(
+                        plan,
+                        rolling_records::storage::Limits {
+                            capacity_bytes: plan.capacity_bytes(),
+                        },
+                    )
                 },
-            )
-            .map(Owner::Research)
-            .map_err(Error::Rolling),
+                Owner::Research,
+                Error::Rolling,
+            ),
         }
     }
 }

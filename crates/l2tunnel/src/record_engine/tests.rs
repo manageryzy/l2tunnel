@@ -229,6 +229,7 @@ pub(super) fn identity_channel(identity: ProfileIdentity) -> u16 {
         ProfileIdentity::Aligned(identity)
         | ProfileIdentity::Packed(identity)
         | ProfileIdentity::Research(identity)
+        | ProfileIdentity::Striped(identity)
         | ProfileIdentity::Rolling(identity) => u16::from(identity.channel.0),
     }
 }
@@ -308,6 +309,14 @@ impl Link {
             ),
             configuration::DirectionProfile::Rolling { config, .. } => (
                 configuration.descriptor().path_mtu(),
+                usize::from(config.packing.max_units),
+                false,
+            ),
+            configuration::DirectionProfile::Striped(config) => (
+                config
+                    .profile
+                    .max_wire_bytes
+                    .max(crate::fec::striped_group::feedback::MAX_WIRE_BYTES),
                 usize::from(config.packing.max_units),
                 false,
             ),
@@ -657,6 +666,7 @@ fn roundtrip(
             ProfileIdentity::Aligned(identity)
             | ProfileIdentity::Packed(identity)
             | ProfileIdentity::Research(identity)
+            | ProfileIdentity::Striped(identity)
             | ProfileIdentity::Rolling(identity) => {
                 assert!(data.units.contains(&identity))
             }
@@ -848,6 +858,7 @@ fn loose_recovery_ceiling_preserves_configuration_and_uses_actual_public_output_
             | configuration::Profile::Research { .. }
             | configuration::Profile::Rolling { .. }
             | configuration::Profile::RollingCopies { .. }
+            | configuration::Profile::Striped { .. }
             | configuration::Profile::PerConnectionCompact { .. } => {
                 return Err("aligned-family fixture".into());
             }
@@ -876,6 +887,7 @@ fn loose_recovery_ceiling_preserves_configuration_and_uses_actual_public_output_
                 | configuration::DirectionProfile::PackedCompact(_)
                 | configuration::DirectionProfile::Research { .. }
                 | configuration::DirectionProfile::Rolling { .. }
+                | configuration::DirectionProfile::Striped(_)
                 | configuration::DirectionProfile::PerConnectionCompact(_) => {
                     return Err("aligned-family direction".into());
                 }
@@ -1028,6 +1040,7 @@ fn prepared_aligned_native_cap_is_original_record_expiry_not_a_recovery_service_
             | configuration::DirectionProfile::PackedCompact(_)
             | configuration::DirectionProfile::Research { .. }
             | configuration::DirectionProfile::Rolling { .. }
+            | configuration::DirectionProfile::Striped(_)
             | configuration::DirectionProfile::PerConnectionCompact(_) => {
                 return Err("aligned-family lifetime".into());
             }

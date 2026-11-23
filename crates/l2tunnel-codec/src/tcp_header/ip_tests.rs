@@ -1,4 +1,6 @@
 //! Exact native bytes and real selected codec ownership; not runtime/native proof.
+#[path = "ip_fixed_anchor_sender_tests.rs"]
+mod fixed_anchor_sender;
 #[path = "ip_preview_tests.rs"]
 mod preview_gap;
 use super::*;

@@ -6,7 +6,7 @@ fn catalog_uses_near8(catalog: &common::Catalog) -> bool {
     catalog.descriptors().iter().any(|value| {
         matches!(value.direction(mg::Role::Client).profile(),
         common::DirectionProfile::Rolling { config, .. }
-        if config.scheduler.source_wire == l2tunnel_fec::rolling::wire::SourceWire::TargetedNear8)
+        if config.scheduler.source_wire.is_near8())
     })
 }
 
@@ -382,6 +382,16 @@ impl CommonTransactionContract {
             && compact_wire.protection == security::compact::Protection::ChaCha20Crc32c
         {
             return Err(invalid("near8 requires authenticated compact data"));
+        }
+        if compact_wire.protection == security::compact::Protection::ChaCha20Crc32c
+            && catalog
+                .descriptors()
+                .iter()
+                .any(|d| matches!(d.profile(), common::Profile::Striped { .. }))
+        {
+            return Err(invalid(
+                "mixed packet recovery requires authenticated data members",
+            ));
         }
         if extra_wire_bytes != 0 {
             return Err(invalid(
@@ -800,6 +810,10 @@ pub(super) fn maximum_body(
     opposite: common::DirectionView<'_>,
 ) -> io::Result<usize> {
     match view.profile() {
+        common::DirectionProfile::Striped(direction) => Ok(direction
+            .profile
+            .max_wire_bytes
+            .max(l2tunnel_fec::striped_group::feedback::MAX_WIRE_BYTES)),
         common::DirectionProfile::Research { config, .. } => Ok(config
             .maximum_packet_bytes()
             .map_err(invalid)?
@@ -849,6 +863,15 @@ fn maximum_compact_body(
     opposite: common::DirectionView<'_>,
 ) -> io::Result<(usize, usize)> {
     match view.profile() {
+        common::DirectionProfile::Striped(direction) => {
+            if !matches!(opposite.profile(), common::DirectionProfile::Striped(_)) {
+                return Err(invalid("mixed directional family mismatch"));
+            }
+            Ok((
+                direction.profile.max_wire_bytes,
+                l2tunnel_fec::striped_group::feedback::MAX_WIRE_BYTES,
+            ))
+        }
         common::DirectionProfile::Swift(config) => {
             Ok((config.codec.datagram_bytes, config.codec.datagram_bytes))
         }

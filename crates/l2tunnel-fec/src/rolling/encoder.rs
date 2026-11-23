@@ -205,7 +205,8 @@ impl Encoder {
                 && job.profile.is_none()
                 && self.explicit.is_none()
                 && self.config.local_window < self.config.window
-                && job.support.end - job.support.start == self.config.window as u32
+                && job.support.end >= self.config.window as u32
+                && ((job.id.0 & 0x7fff) as u16).is_multiple_of(self.config.global_every)
         })
     }
     // Queued originals move from separate custody into a ring vector. The
@@ -370,18 +371,23 @@ impl Encoder {
         }
         at
     }
-    pub(super) fn next_regular(&self) -> Result<(RepairId, Support), Error> {
+    pub(super) fn next_regular(&self, confirmed: u32) -> Result<(RepairId, Support), Error> {
         if self.next_repair == u64::MAX {
             return Err(Error::Exhausted);
         }
         let id = RepairId(self.next_repair);
-        Ok((id, self.config.support(self.next, id, false)?))
+        Ok((
+            id,
+            self.config
+                .confirmed_prefix_support(self.next, id, false, confirmed)?,
+        ))
     }
     // An already frozen equation keeps the current serial until its physical receipt.
     pub(super) fn following_regular(
         &self,
         queued: u32,
         end: u32,
+        confirmed: u32,
     ) -> Result<(RepairId, Support), Error> {
         let serial = self
             .next_repair
@@ -390,12 +396,17 @@ impl Encoder {
             .filter(|v| *v < u64::MAX)
             .ok_or(Error::Exhausted)?;
         let id = RepairId(serial);
-        Ok((id, self.config.support(end, id, false)?))
+        Ok((
+            id,
+            self.config
+                .confirmed_prefix_support(end, id, false, confirmed)?,
+        ))
     }
     pub(super) fn begin_earned_regular(
         &mut self,
         id: RepairId,
         support: Support,
+        confirmed: u32,
         cap: Tick,
         now: Tick,
     ) -> Result<RepairId, Error> {
@@ -408,7 +419,13 @@ impl Encoder {
             || self.confirmed == self.next
             || support.end > self.next
             || support.start < self.next.saturating_sub(self.config.window as u32)
-            || support != self.config.support(support.end, id, false)?
+            || support
+                != self.config.confirmed_prefix_support(
+                    support.end,
+                    id,
+                    false,
+                    confirmed.min(support.start),
+                )?
         {
             return Err(Error::Identity);
         }
@@ -419,6 +436,14 @@ impl Encoder {
     }
     /// Begin the next owned regular/tail equation. A failed call consumes no ID.
     pub fn begin_repair(&mut self, tail: bool, now: Tick) -> Result<RepairId, Error> {
+        self.begin_repair_with_prefix(tail, 0, now)
+    }
+    pub(super) fn begin_repair_with_prefix(
+        &mut self,
+        tail: bool,
+        confirmed: u32,
+        now: Tick,
+    ) -> Result<RepairId, Error> {
         if self.explicit.is_some() {
             return Err(Error::Configuration);
         }
@@ -434,7 +459,9 @@ impl Encoder {
             return Err(Error::Exhausted);
         }
         let id = RepairId(self.next_repair);
-        let support = self.config.support(self.next, id, tail)?;
+        let support = self
+            .config
+            .confirmed_prefix_support(self.next, id, tail, confirmed)?;
         self.start_repair(id, support, None, now)
     }
     // Only the research owner may admit a canonical alternative equation. Its

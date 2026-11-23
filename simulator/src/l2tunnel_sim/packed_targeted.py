@@ -13,7 +13,7 @@ from math import isfinite
 from struct import Struct
 from zlib import crc32
 
-from .compact_wire import CRC, GLOBAL_WINDOW, encode_source
+from .compact_wire import CRC, GLOBAL_WINDOW
 from .packed_wire import PackedWireTransport
 
 
@@ -84,12 +84,38 @@ class TargetedPackedWireTransport(PackedWireTransport):
         super().__init__(sim, reverse, config)
         self.policy = policy
         self.targeted_counts = Counter()
-        self._request_armed = False
+        self._request_due = None
         self._probe_armed = False
         self._fresh = OrderedDict()
         self._repeat = OrderedDict()
         self._repeat_turn = False
         self._observed_end = 0
+        self._fifo_sources = Counter()
+
+    def accept_fifo_source(self, wire):
+        """Observe a validated systematic identity after reserving a decoder FIFO slot."""
+        try:
+            packet = self.decode_data_packet(wire)
+        except ValueError:
+            return None
+        if packet.kind != "source" or packet.index < self.received_prefix:
+            return None
+        index = packet.index
+        self._fifo_sources[index] += 1
+        self._fresh.pop(index, None)
+        self._repeat.pop(index, None)
+        self.targeted_counts["fifo_accepted_source_copies"] += 1
+        if index + 1 > self._observed_end:
+            self.targeted_counts["fifo_horizon_advances"] += 1
+        self._observe_gap_horizon(index + 1)
+        return index
+
+    def release_fifo_source(self, index):
+        """Release this physical copy after the regular decoder committed the job."""
+        if index is not None:
+            self._fifo_sources[index] -= 1
+            if not self._fifo_sources[index]:
+                del self._fifo_sources[index]
 
     def _new_known(self, symbols):
         for index in symbols:
@@ -99,30 +125,32 @@ class TargetedPackedWireTransport(PackedWireTransport):
 
     def _advance(self):
         super()._advance()
-        end = self.highest_received + 1
+        self._observe_gap_horizon(self.highest_received + 1)
+
+    def _observe_gap_horizon(self, end):
         if end > self.received_prefix + GLOBAL_WINDOW:
             raise ValueError("observed evidence exceeds source custody")
-        # A received source or decoded repair header supplied this high water.
-        # Each source ID is checked at most once here, even across long holes.
+        # Each position is visited once, even if decoding trails the admitted
+        # systematic horizon. Only decoder completion advances received_prefix.
         start = max(self.received_prefix, self._observed_end)
         if start < end:
             due = self.sim.now + self.policy.gap_ms / 1000
             self.targeted_counts["window_positions_checked"] += end - start
             for index in range(start, end):
-                if index not in self.decoder.known:
+                if index not in self.decoder.known and index not in self._fifo_sources:
                     self._fresh[index] = due
             self._observed_end = end
             self.targeted_counts["peak_request_state"] = max(
                 self.targeted_counts["peak_request_state"], len(self._fresh) + len(self._repeat))
-        if (self._fresh or self._repeat) and not self._request_armed:
+        if (self._fresh or self._repeat) and self._request_due is None:
             self._arm_request()
 
     def _arm_request(self):
-        self._request_armed = True
-        self.sim.at(self.sim.now + self.policy.gap_ms / 1000, self._request_tick)
+        self._request_due = self.sim.now + self.policy.gap_ms / 1000
+        self.sim.at(self._request_due, self._request_tick)
 
     def _request_tick(self):
-        self._request_armed = False
+        self._request_due = None
         selected = []
         for _ in range(self.policy.max_ids):
             queues = (self._repeat, self._fresh) if self._repeat_turn else (self._fresh, self._repeat)
@@ -138,6 +166,36 @@ class TargetedPackedWireTransport(PackedWireTransport):
         # The bounded work budget covers all spans combined. Charge another
         # datagram when distant targets cannot fit the current byte offsets.
         selected.sort()
+        self._send_named(selected)
+        if self._fresh or self._repeat:
+            self._arm_request()
+
+    def request_fresh_frontier(self, first, end, missing_count):
+        """Advance one already observed, unpaid frontier mask into the current slot."""
+        if not first <= self.received_prefix < end or end > self._observed_end:
+            return False
+        if end-first > self.policy.window or not 1 <= missing_count <= self.policy.max_ids:
+            return False
+        if self._request_due is None or (self._repeat and next(iter(self._repeat.values())) <= self._request_due):
+            return False
+        missing = [i for i in range(self.received_prefix, end)
+                   if i not in self.decoder.known and i not in self._fifo_sources]
+        if (len(missing) != missing_count or missing[0] != self.received_prefix
+                or any(i not in self._fresh for i in missing)):
+            return False
+        # An ordinary tick already covers a simultaneous burst of missing
+        # ordinals. Advance only a mask that straddles two issue opportunities.
+        if not self._fresh[missing[0]] <= self._request_due < self._fresh[missing[-1]]:
+            return False
+        repeat = self.sim.now + self.policy.repeat_ms / 1000
+        for i in missing:
+            del self._fresh[i]
+            self._repeat[i] = repeat
+        self._repeat_turn = True
+        self._send_named(missing)
+        return True
+
+    def _send_named(self, selected):
         pos = 0
         while pos < len(selected):
             start = selected[pos]
@@ -151,8 +209,6 @@ class TargetedPackedWireTransport(PackedWireTransport):
             self.targeted_counts["requested_ids"] += len(offsets)
             self.sim.send(not self.reverse, self.ip_header_bytes + len(wire), "gap_request",
                           lambda wire=wire: self._receive_request(wire))
-        if self._fresh or self._repeat:
-            self._arm_request()
 
     def _receive_request(self, wire):
         try:
@@ -179,10 +235,11 @@ class TargetedPackedWireTransport(PackedWireTransport):
         retained = self.source_payloads[index]
         if retained is None or len(retained) < size:
             raise RuntimeError("unconfirmed source outside retained custody")
-        wire = encode_source(index, retained[:size], self.config.encapsulation)
+        wire = self.source_wire(index, retained[:size])
+        header = self.source_wire_header_bytes(wire, size)
         self.targeted_counts[reason] += 1
-        self.targeted_counts["retry_ip_bytes"] += self.ip_header_bytes + len(wire)
-        return self._send_wire(wire, "retry", 2)[0]
+        self.targeted_counts["retry_ip_bytes"] += self.source_ip_bytes(index, wire)
+        return self._send_wire(wire, "retry", header)[0]
 
     def _schedule_tail(self, after, generation):
         # A busy sender updates last_source_at on every admitted original. One

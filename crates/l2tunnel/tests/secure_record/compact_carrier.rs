@@ -3,6 +3,9 @@ use super::*;
 use l2tunnel::secure_record::compact::{Kind, Layout, Selection};
 use security::compact::Protection;
 
+#[path = "striped_udp.rs"]
+mod striped_udp;
+
 fn peers(protection: Protection) -> Result<[Records; 2]> {
     let (a, b) = covers(cover::Appearance::QuicLike)?;
     let make = |role, cover| -> Result<Records> {

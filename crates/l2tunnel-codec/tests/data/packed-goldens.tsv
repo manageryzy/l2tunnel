@@ -1,6 +1,6 @@
 # packed-goldens-v1; actual Python methods; times in integer microseconds
-# python_source=simulator/src/l2tunnel_sim/packed_wire.py; sha256=56784f4a0a0bec66fef80a1413bb610e0d24c9a82061de1f16a9096b8d5a9fec
-# python_source=simulator/src/l2tunnel_sim/compact_wire.py; sha256=88fb794dedc7c7bb501e7ddd636920751aeb54500019eba4ef48bb87fbfcfba4
+# python_source=simulator/src/l2tunnel_sim/packed_wire.py; sha256=707b65fa0db9ef686f3bf239c65270b987a157a576333d9e319759fd111ad081
+# python_source=simulator/src/l2tunnel_sim/compact_wire.py; sha256=d7467b3c8608a3baa77623012cb0d5183be2e2ca1d465731af9145a4c4bfc33c
 # python_source=simulator/src/l2tunnel_sim/aligned_records.py; sha256=f3a5eb8e0471e4f8b613aed7fbb9c361da8dab49eb2133d7febaebdd5424c43a
 # python_source=simulator/src/l2tunnel_sim/compact.py; sha256=0f3fae6419b22bffec2b63b75c7f8fb09bce86d23fb04a8aa0de4cfecf3b14fe
 S	deadline	0	0	3	000000020042616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161	-

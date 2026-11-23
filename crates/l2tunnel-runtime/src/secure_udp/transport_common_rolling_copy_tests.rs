@@ -175,6 +175,28 @@ fn actual_udp_rolling_three_copies_survive_first_loss_early_feedback_and_mode_sw
                 assert_eq!(&lost[..bytes], first_wire);
                 assert_eq!(fixture.endpoints[1].driver.counters.native_written, 0);
 
+                // The next already-prepared copy becomes sendable as soon as
+                // its own wire cost and the management reserve are available.
+                let driver = &mut fixture.endpoints[0].driver;
+                let required = cost + driver.reserve;
+                assert!(driver.bucket.allowance() >= required);
+                let next = driver.wake_common_with_custody(first_at, false, false)?;
+                assert!(next.work_ready && next.at <= driver.origin + duration(first_at));
+                // Leave the test bucket one byte short of the required credit.
+                // The selector must arm the precise refill instant and
+                // keep the original copy pending without scheduling busy work.
+                driver.bucket.refill(first_at)?;
+                let tokens = driver.bucket.tokens;
+                driver
+                    .bucket
+                    .charge(driver.bucket.allowance() - (required - 1))?;
+                let ready = driver.bucket.ready_at(required)?;
+                assert!(ready > first_at);
+                let next = driver.wake_common_with_custody(first_at, false, false)?;
+                assert!(!next.work_ready);
+                assert_eq!(next.at, driver.origin + duration(ready));
+                driver.bucket.tokens = tokens;
+
                 let mut numbers = vec![first_sealed.number];
                 let mut wires = vec![first_wire];
                 for ordinal in 2..=3 {

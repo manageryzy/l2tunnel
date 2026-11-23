@@ -97,6 +97,15 @@ pub(super) fn write(
         v.next_head, v.refusals, v.omitted_refusals, v.blocker_unavailable, v.terminal_unavailable
     )?;
     optional(out, v.terminal_at.map(|t| t.0))?;
+    let independent = v.independent_population;
+    write!(
+        out,
+        ",\"independent_commits\":{},\"independent_head_wait\":{{\"episodes\":{},\"sum_us\":{},\"maximum_us\":{}}}",
+        v.residence.independent_commits,
+        independent.episodes,
+        independent.elapsed_us,
+        independent.maximum_us
+    )?;
     write!(out, ",\"populations\":[")?;
     for (i, name) in ["staged", "duplicate", "stale", "censored"]
         .into_iter()
@@ -140,6 +149,7 @@ pub(super) fn write(
             Some(Outcome::Staged) => write!(out, "\"staged\"")?,
             Some(Outcome::Duplicate) => write!(out, "\"duplicate\"")?,
             Some(Outcome::Stale) => write!(out, "\"stale\"")?,
+            Some(Outcome::Independent) => write!(out, "\"independent\"")?,
             None => write!(out, "\"censored\"")?,
         }
         write!(out, ",\"admitted_job\":")?;

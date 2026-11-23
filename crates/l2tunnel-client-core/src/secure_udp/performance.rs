@@ -20,6 +20,8 @@ pub struct Driver {
     pub udp_batch_packets: u64,
     /// Same named observation and units as transport::Performance.
     pub udp_batch_limit_hits: u64,
+    /// Original UDP batches returned early for runnable targeted receive work.
+    pub udp_rolling_pressure_yields: u64,
     /// Same named observation and units as transport::Performance.
     pub native_read_batch_packets: u64,
     /// Same named observation and units as transport::Performance.
@@ -91,6 +93,7 @@ impl From<transport::Performance> for Driver {
             request_events: value.request_events,
             udp_batch_packets: value.udp_batch_packets,
             udp_batch_limit_hits: value.udp_batch_limit_hits,
+            udp_rolling_pressure_yields: value.udp_rolling_pressure_yields,
             native_read_batch_packets: value.native_read_batch_packets,
             native_read_batch_limit_hits: value.native_read_batch_limit_hits,
             native_write_batch_packets: value.native_write_batch_packets,

@@ -4,6 +4,7 @@ use crate::field;
 
 #[cfg(test)]
 mod expiry_detail_tests;
+mod independent;
 mod lifetimes;
 mod transaction;
 use transaction::{Cell, Pool, Ticket};
@@ -74,6 +75,10 @@ impl Input {
 #[derive(Clone, Copy)]
 #[cfg_attr(test, derive(Debug, Eq, PartialEq))]
 enum Phase {
+    SourceColumn {
+        id: u32,
+        row: usize,
+    },
     CopyRow {
         row: usize,
         from: usize,
@@ -162,6 +167,7 @@ impl Phase {
     fn expiry_cursor(self) -> expiry::DecoderPhase {
         use expiry::DecoderPhase as Cursor;
         match self {
+            Self::SourceColumn { id, row } => Cursor::Others { pivot: id, row },
             Self::CopyRow {
                 row,
                 from,
@@ -219,8 +225,8 @@ impl Phase {
 struct Job {
     ticket: Ticket,
     resume: Option<Phase>,
-    // Only authenticated originals with no unresolved equation may bypass
-    // candidate algebra. The existing input vector retains exact length/padding.
+    // Only originals absent from every unresolved equation bypass candidate
+    // algebra. The input vector retains their exact length and padding.
     systematic: bool,
     // Exact coefficient count from CandidateCount, retained until row insertion.
     candidate_nonzero: usize,
@@ -681,26 +687,27 @@ impl Decoder {
         received: Tick,
         admitted: Tick,
     ) -> Result<Begin, Error> {
-        let ticket = self.decisions.begin()?;
-        self.active = Some(ticket);
-        self.shadow = self.live;
-        self.shadow.observed = self.shadow.observed.max(input.end());
         // Every committed equation ends at or before the exclusive observed end.
         // A newer original cannot eliminate a coefficient in any retained row.
         let systematic =
             matches!(input, Input::Source(id) if self.live.rank == 0 || id >= self.live.observed);
-        let phase = if let Input::Source(id) = input
-            && systematic
-        {
-            Phase::Validate {
+        let phase = match input {
+            Input::Source(id) if systematic => Phase::Validate {
                 row: None,
                 id,
                 index: 0,
                 length: 0,
+            },
+            // A mapped pivot already proves that the original needs elimination.
+            Input::Source(id) if self.map_at(id as usize % self.config.window)?.is_none() => {
+                Phase::SourceColumn { id, row: 0 }
             }
-        } else {
-            Phase::Clear(0)
+            _ => Phase::Clear(0),
         };
+        let ticket = self.decisions.begin()?;
+        self.active = Some(ticket);
+        self.shadow = self.live;
+        self.shadow.observed = self.shadow.observed.max(input.end());
         self.job = Some(Job {
             ticket,
             resume: None,
@@ -852,6 +859,16 @@ impl Decoder {
         now: Tick,
         original_deadline: Tick,
     ) -> Result<Begin, Error> {
+        self.begin_regular_repair_until(repair, received, now, original_deadline, false)
+    }
+    pub(super) fn begin_regular_repair_until(
+        &mut self,
+        repair: Repair<'_>,
+        received: Tick,
+        now: Tick,
+        original_deadline: Tick,
+        trimmed: bool,
+    ) -> Result<Begin, Error> {
         if self.explicit.is_some() {
             return Err(Error::Configuration);
         }
@@ -859,13 +876,27 @@ impl Decoder {
             return Err(Error::Scope);
         }
         repair.validate_extent(self.width)?;
-        if repair.id.0 == u64::MAX
-            || self
-                .config
-                .support(repair.support.end, repair.id, repair.support.tail)?
-                != repair.support
-        {
+        let nominal = self
+            .config
+            .support(repair.support.end, repair.id, repair.support.tail)?;
+        if repair.id.0 == u64::MAX {
             return Err(Error::Identity);
+        }
+        if repair.support != nominal {
+            // The authenticated sender can report only a prefix this decoder
+            // already proved and committed in the same scope. A shadow prefix,
+            // later observed source or a peer's declaration supplies no proof.
+            if !trimmed
+                || repair.support.start > self.live.prefix
+                || self.config.confirmed_prefix_support(
+                    nominal.end,
+                    repair.id,
+                    nominal.tail,
+                    repair.support.start,
+                )? != repair.support
+            {
+                return Err(Error::Identity);
+            }
         }
         self.stage_repair(repair, None, (0, false), received, now, original_deadline)
     }
@@ -1219,6 +1250,25 @@ impl Decoder {
         let w = self.config.window;
         let width = self.width;
         match job.phase {
+            Phase::SourceColumn { id, row } => {
+                // Inspect one occupied or vacant slot per budgeted metadata visit.
+                let column = id as usize % w;
+                if row == self.live.row_end {
+                    job.systematic = true;
+                    job.phase = Phase::Validate {
+                        row: None,
+                        id,
+                        index: 0,
+                        length: 0,
+                    };
+                } else if self.pivot_at(row)?.is_some_and(|pivot| pivot <= id)
+                    && self.row_byte(row, column)? != 0
+                {
+                    job.phase = Phase::Clear(0);
+                } else {
+                    job.phase = Phase::SourceColumn { id, row: row + 1 };
+                }
+            }
             Phase::CopyRow {
                 row,
                 from,
@@ -1883,7 +1933,8 @@ impl Decoder {
             }
             Phase::Advance => {
                 let id = self.shadow.prefix;
-                if ((id - self.handoff) as usize) < self.config.handoff_sources
+                if id < self.shadow.observed
+                    && ((id - self.handoff) as usize) < self.config.handoff_sources
                     && self.known_at(id as usize % (2 * w))? == Some(id)
                 {
                     self.shadow.prefix = id.checked_add(1).ok_or(Error::Exhausted)?;
@@ -1933,6 +1984,9 @@ impl Decoder {
                 }
             }
             Phase::Commit => {
+                // Disjoint originals can extend the committed horizon while this
+                // job runs. Its GF scans retain the original observation bound.
+                self.shadow.observed = self.shadow.observed.max(self.live.observed);
                 let observed_at = (self.shadow.observed > self.live.observed)
                     .then_some(job.debt)
                     .flatten();
@@ -2068,6 +2122,11 @@ impl Decoder {
         let vector = &self.known_data[slot * self.width..(slot + 1) * self.width];
         let length = usize::from(u16::from_be_bytes([vector[0], vector[1]]));
         Some((SourceId(self.handoff), &vector[2..2 + length]))
+    }
+    pub(super) fn repair_in_progress(&self) -> bool {
+        self.job
+            .as_ref()
+            .is_some_and(|job| matches!(job.input, Input::Repair(_)))
     }
     /// Borrow an exact committed original at or beyond the upper handoff prefix.
     /// Candidate/shadow writes are never exposed, and this does not acknowledge

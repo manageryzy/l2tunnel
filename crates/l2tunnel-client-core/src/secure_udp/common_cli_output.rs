@@ -62,6 +62,18 @@ pub(super) fn inspection(profile: &Profile, role: Role) -> io::Result<Vec<Value>
         profile.runtime_contract(role)?.resources()
     };
     let parameters = profile.parameters();
+    let mut descriptor_bytes = [0; l2tunnel::record_configuration::DESCRIPTOR_BYTES];
+    profile
+        .initial()
+        .descriptor()
+        .encode_into(&mut descriptor_bytes)
+        .map_err(io::Error::other)?;
+    let mut descriptor_hex = String::with_capacity(descriptor_bytes.len() * 2);
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    for byte in descriptor_bytes {
+        descriptor_hex.push(char::from(HEX[usize::from(byte >> 4)]));
+        descriptor_hex.push(char::from(HEX[usize::from(byte & 15)]));
+    }
     let mut output = Vec::new();
     output.try_reserve_exact(17).map_err(io::Error::other)?;
     let work = resources
@@ -74,6 +86,10 @@ pub(super) fn inspection(profile: &Profile, role: Role) -> io::Result<Vec<Value>
         "configuration":profile.configuration()?.0,"envelope":profile.envelope().as_bytes(),
         "catalog":profile.catalog().root().as_bytes(),"catalog_members":profile.catalog().descriptors().len(),
         "initial":CanonicalConfiguration::from_configuration(profile.initial())?,
+        "python_reference_actual":crate::python_reference::actual(profile.initial().descriptor()),
+        "kcp_like_requested":crate::kcp_like_l2::selected(&profile.requested_catalog().initial()),
+        "kcp_like_effective":crate::kcp_like_l2::selected(profile.initial().descriptor()),
+        "python_reference_descriptor_hex":descriptor_hex,
         "rolling_work":work,"rolling_work_semantics":"independent send/receive caps per live epoch per Driver turn; at most four directional caps",
         "resource_preallocation_complete":false,"retained_state_recovery":false,"fresh_rekey":false,
         "parameters":{"retry_ms":parameters.protocol.retry_ms,"phase_timeout_ms":parameters.protocol.phase_timeout_ms,

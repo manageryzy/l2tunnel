@@ -41,9 +41,13 @@ class LatencyPackedWireTransport(TargetedPackedWireTransport):
         super()._aligned_source(payload)
 
     def _resend(self, index, reason):
+        before = self.targeted_counts["retry_ip_bytes"]
         finish = super()._resend(index, reason)
         if reason == "requested_retries":
-            amount = self._weight * (self.source_header + self.sources[index].size)
+            charged = (self.targeted_counts["retry_ip_bytes"] - before
+                       if self.c48_union or self.source_wire_codec is not None
+                       else self.source_header + self.sources[index].size)
+            amount = self._weight * charged
             balance = min(self._cap, self._balance + amount)
             self.latency_counts["retry_credit_bytes"] += amount / 2
             self.latency_counts["cap_discarded_bytes"] += (self._balance + amount - balance) / 2
@@ -56,8 +60,12 @@ class LatencyPackedWireTransport(TargetedPackedWireTransport):
         if tail or self.base >= len(self.sources):
             return super()._repair(tail)
         width = LOCAL_WINDOW if (self.repair_serial + 1) % GLOBAL_EVERY else GLOBAL_WINDOW
+        if self.confirmed_support and width == GLOBAL_WINDOW and self.config.trim_repair_padding:
+            maxima = self._extents[width]
+            while maxima and maxima[0][0] < self.base:
+                maxima.popleft()
         extent = self._extents[width][0][1] if self.config.trim_repair_padding else SYMBOL_BYTES
-        size = self.repair_header + extent
+        size = self.c48_regular_charge(extent) if self.c48_union else self.repair_header + extent
         self.latency_counts["regular_opportunities"] += 1
         self.latency_counts["regular_opportunity_ip_bytes"] += size
         if self._balance >= 2 * size:

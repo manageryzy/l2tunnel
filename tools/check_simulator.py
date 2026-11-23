@@ -15,11 +15,12 @@ import subprocess
 import sys
 
 ROOT = Path(__file__).resolve().parents[1]
-DEPENDENCIES = ('numpy', 'scipy', 'plotly', 'pytest', 'aioquic', 'matplotlib')
+DEPENDENCIES = ('numpy', 'scipy', 'plotly', 'pytest', 'aioquic', 'matplotlib', 'lz4')
 # aioquic's package root does not load its native crypto or connection adapters.
 # Import the actual modules used by the simulator before starting the full gate.
 DEPENDENCY_IMPORTS = {
     'aioquic': ('aioquic', 'aioquic.quic.configuration', 'aioquic.quic.connection'),
+    'lz4': ('lz4.block',),
 }
 _SKIP_COUNT = 0
 _SKIP_EXAMPLES: list[str] = []

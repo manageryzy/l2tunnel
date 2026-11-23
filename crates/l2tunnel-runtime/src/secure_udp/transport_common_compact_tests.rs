@@ -17,6 +17,7 @@ pub(super) fn direction(
 ) -> Result<aligned::CompactConfig> {
     let bounds = old.recovery.arq;
     Ok(aligned::CompactConfig {
+        native_delivery: aligned::NativeDelivery::ProfileDefault,
         native_policy: old.native_policy,
         receiver: old.receiver,
         recovery: CompactReliableConfig::new(

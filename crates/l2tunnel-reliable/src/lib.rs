@@ -481,7 +481,17 @@ impl Reliable {
         } else {
             Some(fec::Decoder::new(receive_fec, receive_config.fec)?)
         };
-        let scratch = vec![0; arq.send_max_packet_bytes()];
+        let scratch_bytes = arq.send_max_packet_bytes().max(if decoder.is_some() {
+            receive_config
+                .fec
+                .block
+                .max_source_bytes
+                .checked_add(2)
+                .ok_or(Error::Exhausted)?
+        } else {
+            0
+        });
+        let scratch = vec![0; scratch_bytes];
         Ok(Self {
             policies: compact::Policies::Legacy {
                 send: config,
@@ -637,8 +647,13 @@ impl Reliable {
         )?;
         let fec_deadlines = backing::Deadlines::reserved(generations, a)?;
         let expired = backing::expired(generations, a)?;
-        let mut scratch = a.vec(arq.send_max_packet_bytes())?;
-        scratch.resize(arq.send_max_packet_bytes(), 0);
+        let scratch_bytes = arq.send_max_packet_bytes().max(if decoder.is_some() {
+            storage::add(receive_config.fec.block.max_source_bytes, 2)?
+        } else {
+            0
+        });
+        let mut scratch = a.vec(scratch_bytes)?;
+        scratch.resize(scratch_bytes, 0);
         let mut diagnostics = a.vec::<diagnostics::Snapshot>(usize::from(plan.diagnostics))?;
         if plan.diagnostics {
             diagnostics.push(diagnostics::Snapshot::new(context, encoder.is_some()));
@@ -881,6 +896,7 @@ impl Reliable {
                 self.advance(now)?;
                 self.enqueue(inner, false)?;
                 self.pump()?;
+                self.enrich_retry(inner, now)?;
             }
             2 => {
                 match inspect_packet(
@@ -1566,6 +1582,15 @@ impl Reliable {
     }
 
     fn receive_fec_view(&mut self, view: fec::SymbolView<'_>, now: Duration) -> Result<(), Error> {
+        self.receive_fec_view_inner(view, now, false)
+    }
+
+    fn receive_fec_view_inner(
+        &mut self,
+        view: fec::SymbolView<'_>,
+        now: Duration,
+        direct_already_retained: bool,
+    ) -> Result<(), Error> {
         let maximum_source_bytes = self.legacy_receive()?.arq.max_source_bytes;
         let compact = self.compact_wire.is_some();
         let systematic = if view.kind == fec::SymbolKind::Systematic {
@@ -1606,6 +1631,30 @@ impl Reliable {
         } else {
             decoder.accept_view_observed(view, ticks, refused)
         };
+        let inferred_sources = if accepted.is_ok() {
+            systematic
+                .map(|source| {
+                    backing::GenerationSources::from_systematic(
+                        self.source_id(source)?,
+                        view.symbol.0,
+                        view.source_count,
+                        view.coded_bytes,
+                    )
+                })
+                .transpose()
+                .or_else(|error| self.fail(error))?
+        } else {
+            None
+        };
+        let retained_sources = self.fec_deadlines.sources(view.generation);
+        if accepted.is_ok()
+            && inferred_sources
+                .zip(retained_sources)
+                .is_some_and(|(new, old)| new != old)
+        {
+            return self.fail(Error::SourceConflict);
+        }
+        let mut reconstructed = false;
         match accepted {
             Ok(fec::AcceptStatus::Complete(_)) => {
                 let checked = (|| -> Result<(), Error> {
@@ -1615,6 +1664,12 @@ impl Reliable {
                         .ok_or(Error::Malformed)?
                         .decoded_sources(view.generation)?;
                     let first = self.source_id(sources.next().ok_or(Error::Malformed)?)?;
+                    if retained_sources
+                        .or(inferred_sources)
+                        .is_some_and(|expected| expected.base != first)
+                    {
+                        return Err(Error::SourceConflict);
+                    }
                     for (index, source) in self
                         .decoder
                         .as_ref()
@@ -1651,6 +1706,9 @@ impl Reliable {
                 for source in sources {
                     let identity =
                         source_id_selected(self.context, maximum_source_bytes, source, compact)?;
+                    if direct_already_retained && Some(identity) == direct_identity {
+                        continue;
+                    }
                     if !self.restored.contains_key(&identity) {
                         let total = self
                             .restored_bytes
@@ -1673,15 +1731,19 @@ impl Reliable {
                     .statistics
                     .decoded_source_vectors
                     .saturating_add(count as u64);
+                reconstructed = true;
             }
             Ok(_) => {
-                self.fec_deadlines.insert(
-                    view.generation,
-                    ticks
-                        .checked_add(self.legacy_receive()?.fec.max_lifetime_ticks)
-                        .ok_or(Error::TimeOverflow)?,
-                )?;
-                if let Some(source) = systematic {
+                self.fec_deadlines
+                    .insert(
+                        view.generation,
+                        ticks
+                            .checked_add(self.legacy_receive()?.fec.max_lifetime_ticks)
+                            .ok_or(Error::TimeOverflow)?,
+                        inferred_sources,
+                    )
+                    .or_else(|error| self.fail(error))?;
+                if !direct_already_retained && let Some(source) = systematic {
                     self.enqueue(source, false)?;
                 }
             }
@@ -1693,15 +1755,82 @@ impl Reliable {
                 | fec::Error::AlreadyCompleted
                 | fec::Error::CompletePending,
             ) => {
-                self.statistics.skipped_fec_packets =
-                    self.statistics.skipped_fec_packets.saturating_add(1);
-                if let Some(source) = systematic {
+                if !direct_already_retained {
+                    self.statistics.skipped_fec_packets =
+                        self.statistics.skipped_fec_packets.saturating_add(1);
+                }
+                if !direct_already_retained && let Some(source) = systematic {
                     self.enqueue(source, false)?;
                 }
             }
             Err(error) => return self.fail(error.into()),
         }
-        self.pump()
+        if !direct_already_retained || reconstructed {
+            self.pump()
+        } else {
+            Ok(())
+        }
+    }
+
+    /// A direct source is already retained in ARQ or the original restored queue.
+    /// Enrichment is optional under staging pressure and never creates a generation.
+    fn enrich_retry(&mut self, source: &[u8], now: Duration) -> Result<(), Error> {
+        if self.decoder.is_none() {
+            return Ok(());
+        }
+        let identity = self.source_id(source)?;
+        let Some((generation, range)) = self.fec_deadlines.retry_generation(identity) else {
+            return Ok(());
+        };
+        let maximum = range
+            .count
+            .checked_mul(range.width - 2)
+            .ok_or(Error::Exhausted)?;
+        match self.ensure_restored(range.count, maximum, now) {
+            Ok(()) => {}
+            Err(Error::RestoredCapacity) => return Ok(()),
+            Err(error) => return Err(error),
+        }
+        let length = source.len().checked_add(2).ok_or(Error::Exhausted)?;
+        if length > range.width {
+            return self.fail(Error::SourceConflict);
+        }
+        let index = usize::try_from(identity - range.base).map_err(|_| Error::Exhausted)?;
+        let mut coefficients = [0; fec::MAX_SOURCES];
+        *coefficients.get_mut(index).ok_or(Error::Exhausted)? = 1;
+        // No allocation: restore the one existing scratch owner on every result.
+        // receive_fec_view and its pump do not use sending scratch.
+        let mut scratch = std::mem::take(&mut self.scratch);
+        let result = (|| {
+            let payload = scratch.get_mut(..range.width).ok_or(Error::Exhausted)?;
+            payload.fill(0);
+            payload[..2].copy_from_slice(
+                &u16::try_from(source.len())
+                    .map_err(|_| Error::Exhausted)?
+                    .to_be_bytes(),
+            );
+            payload[2..length].copy_from_slice(source);
+            let extent = if self.compact_wire.is_some() {
+                length
+            } else {
+                range.width
+            };
+            self.receive_fec_view_inner(
+                fec::SymbolView {
+                    generation,
+                    symbol: fec::SymbolId(u32::try_from(index).map_err(|_| Error::Exhausted)?),
+                    kind: fec::SymbolKind::Systematic,
+                    source_count: range.count,
+                    coded_bytes: range.width,
+                    coefficients: coefficients.get(..range.count).ok_or(Error::Exhausted)?,
+                    payload: &payload[..extent],
+                },
+                now,
+                true,
+            )
+        })();
+        self.scratch = scratch;
+        result
     }
 
     fn seal(&mut self) -> Result<(), Error> {

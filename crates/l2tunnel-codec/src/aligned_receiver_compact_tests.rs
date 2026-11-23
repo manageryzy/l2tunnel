@@ -1,6 +1,9 @@
 use super::*;
 use crate::{aligned_envelope as envelope, aligned_sender as sender, aligned_storage as heap};
 
+#[path = "aligned_receiver/fixed_anchor_tests.rs"]
+mod fixed_anchor;
+
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 fn scope() -> Scope {
     Scope {

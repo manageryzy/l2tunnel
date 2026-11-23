@@ -78,7 +78,10 @@ def make_simulation(task):
         Scenario(task["rtt_ms"], task["loss_rate"], task["loss_model"], mtu=task["mtu"]),
         traffic, (PathConfig(task["forward_mbps"], task["reverse_mbps"]),),
         Strategy(profile["name"], mode="tcp", tcp_rto_min_ms=profile["rto_min_ms"],
-                 tcp_cc=profile.get("controller", "cubic")),
+                 tcp_cc=profile.get("controller", "cubic"),
+                 tcp_data_paws=profile.get("tcp_data_paws", False),
+                 tcp_partial_timestamp_undo=profile.get("tcp_partial_timestamp_undo", False),
+                 tcp_newreno_ack_heuristic=profile.get("tcp_newreno_ack_heuristic", False)),
         task["seed"], profile["flow_count"], simulation_factory=factory, **simulation_options)
     if targeted:
         # Install before producers, probes or receiver service attach. The named
@@ -137,7 +140,8 @@ def execute(task, *, observe_packed=None):
 
     def snapshot(when):
         snapshots[when] = (sum(flow.tcp_received for flow in sim.flows),
-                           sum(sum(flow.datagrams[False].values()) for flow in sim.flows))
+                           sum(sum(flow.datagrams[False].values()) for flow in sim.flows),
+                           sum(flow.byte_offset(flow.tcp_received) for flow in sim.flows))
 
     for when in (task["warmup_s"], task["duration_s"]):
         sim.flows[0].at(when, snapshot, when)
@@ -152,7 +156,7 @@ def execute(task, *, observe_packed=None):
     delivered = end[0] - begin[0]
     row.update(application_goodput_mbps=row["tcp_goodput_mbps"],
                application_capacity_pct=100 * row["tcp_goodput_mbps"] / task["forward_mbps"],
-               steady_application_goodput_mbps=delivered * task["payload_bytes"] * 8 / (
+               steady_application_goodput_mbps=(end[2] - begin[2]) * 8 / (
                    (task["duration_s"] - task["warmup_s"]) * 1e6),
                steady_forward_datagrams=end[1] - begin[1], steady_delivered_frames=delivered,
                ack_delay_ms=sim.traffic.ack_delay_ms, ack_every=sim.traffic.ack_every,
@@ -165,6 +169,14 @@ def execute(task, *, observe_packed=None):
     for key in ("tcp_timeouts", "tcp_retransmissions", "tcp_fast_retransmits", "ack_generated",
                 "ack_superseded", "ack_transmitted", "ack_duplicates_transmitted", "ack_copy_duplicates"):
         row[key] = sum(getattr(flow, key) for flow in sim.flows)
+    if sim.flows[0].data_paws is not None:
+        row["tcp_data_paws"] = "linux_6_8_established_data"
+        row["tcp_data_paws_rejections"] = sum(flow.data_paws.rejections for flow in sim.flows)
+    if sim.flows[0].strategy.tcp_partial_timestamp_undo:
+        row["tcp_partial_timestamp_undos"] = sum(flow.tcp_partial_timestamp_undos for flow in sim.flows)
+    if sim.flows[0].strategy.tcp_newreno_ack_heuristic:
+        row["tcp_newreno_ack_heuristic"] = True
+        row["tcp_newreno_ack_heuristic_entries"] = sum(flow.tcp_newreno_ack_heuristic_entries for flow in sim.flows)
     shared = sim.shared_forward
     if task.get("packed_targeted_recovery"):
         row["targeted_policy"] = asdict(shared.policy)
@@ -256,7 +268,8 @@ def execute(task, *, observe_packed=None):
             and row["tcp_syn_ping_p99_ms"] <= row["tcp_syn_ping_budget_ms"]
             and row["tcp_syn_ping_deadline_miss_upper_pct"] <= 1)
     assert row["tcp_acked_frames"] <= row["tcp_delivered_frames"] <= row["offered_frames"]
-    assert row["forward_l2_bytes"] == row["released_frames"] * (task["payload_bytes"] + 66)
+    assert row["forward_l2_bytes"] == (sum(flow.byte_offset(flow.tcp_received) for flow in sim.flows)
+                                       + row["released_frames"] * 66)
     if row["compact_wire_invalid_packets"] is not None:
         assert row["compact_wire_invalid_packets"] == 0
     for direction in ("forward", "reverse"):

@@ -13,6 +13,7 @@ pub struct Plan {
     pub(super) sender: usize,
     pub(super) receiver: codec::ReceiverPlan,
     pub(super) reliable: l2tunnel_reliable::storage::CompactPlan,
+    packed_workspace_bytes: usize,
     pub(super) wrapper: usize,
     bytes: usize,
     pub(super) receiver_handoff_diagnostics: bool,
@@ -46,7 +47,7 @@ impl Plan {
         receive_packed: Option<packed::CompactConfig>,
     ) -> Result<Self, storage::Error> {
         let (sender, cell) = if let Some(p) = send_packed {
-            let plan = if send.native_policy == NativePolicy::IpHeaders {
+            let plan = if send.native_policy.uses_ip_headers() {
                 codec::PackedSenderPlan::for_ip_config(p.sender())
             } else {
                 codec::PackedSenderPlan::for_config(p.sender())
@@ -57,7 +58,7 @@ impl Plan {
                 size_of::<l2tunnel_codec::packed_sender::Sender>(),
             )
         } else {
-            let plan = if send.native_policy == NativePolicy::IpHeaders {
+            let plan = if send.native_policy.uses_ip_headers() {
                 codec::SenderPlan::for_ip_config(sender_config(send.body()))
             } else {
                 codec::SenderPlan::for_config(sender_config(send.body()))
@@ -65,12 +66,10 @@ impl Plan {
             .map_err(storage::Error::Codec)?;
             (plan.capacity_bytes(), size_of::<sender::Sender>())
         };
-        let receiver = if receive.native_policy == NativePolicy::IpHeaders {
-            codec::ReceiverPlan::for_ip_limits(receive.receiver)
-        } else {
-            codec::ReceiverPlan::for_limits(receive.receiver)
-        }
-        .map_err(storage::Error::Codec)?;
+        let receiver = receive
+            .native_policy
+            .receiver_plan(receive.receiver)
+            .map_err(storage::Error::Codec)?;
         let reliable =
             l2tunnel_reliable::storage::CompactPlan::for_duplex(send.recovery, receive.recovery)
                 .map_err(storage::Error::Reliable)?;
@@ -79,16 +78,17 @@ impl Plan {
         {
             return Err(storage::Error::Endpoint(Error::Configuration));
         }
-        let symbols = receive_packed.map_or(Ok(0), |p| {
+        let packed_workspace_bytes = receive_packed.map_or(Ok(0), |p| {
             usize::from(p.max_units)
                 .checked_mul(receive.receiver.body.symbol_bytes)
+                .and_then(|symbols| symbols.checked_add(receive.body().packed_preview_bytes()))
                 .ok_or(storage::Error::Layout)
         })?;
         let wrapper = storage::sum(&[
             cell,
             send.recovery.arq().bounds().max_source_bytes,
             receive.recovery.arq().bounds().max_source_bytes,
-            symbols,
+            packed_workspace_bytes,
         ])?;
         Layout::array::<u8>(wrapper).map_err(|_| storage::Error::Layout)?;
         let bytes = storage::sum(&[
@@ -105,6 +105,7 @@ impl Plan {
             sender,
             receiver,
             reliable,
+            packed_workspace_bytes,
             wrapper,
             bytes,
             receiver_handoff_diagnostics: false,
@@ -217,7 +218,7 @@ impl Endpoint {
         let mut guard = storage::Construction::default();
         let (sender, sender_usage) = if let Some(p) = plan.send_packed {
             let mut cell = allocation.vec(1)?;
-            let instance = if send.native_policy == NativePolicy::IpHeaders {
+            let instance = if send.native_policy.uses_ip_headers() {
                 l2tunnel_codec::packed_sender::Sender::new_reserved_ip_with_copies(
                     send_scope,
                     p.sender(),
@@ -242,7 +243,7 @@ impl Endpoint {
             (packed::SenderOwner::Packed(cell), usage)
         } else {
             let mut cell = allocation.vec(1)?;
-            let instance = if send.native_policy == NativePolicy::IpHeaders {
+            let instance = if send.native_policy.uses_ip_headers() {
                 sender::Sender::new_reserved_ip(
                     send_scope,
                     sender_config(send.body()),
@@ -267,10 +268,7 @@ impl Endpoint {
         guard.sender = Some(sender);
         let packing = plan.send_packed.map(|p| p.options());
         let receive_packing = plan.receive_packed.map(|p| p.options());
-        let symbols = receive_packing.map_or(0, |p| {
-            usize::from(p.max_units) * receive.receiver.body.symbol_bytes
-        });
-        guard.packed_symbols = allocation.bytes(symbols)?;
+        guard.packed_symbols = allocation.bytes(plan.packed_workspace_bytes)?;
         guard.recovery = Some(
             Reliable::new_compact_duplex_reserved(
                 send.recovery,
@@ -283,24 +281,16 @@ impl Endpoint {
             .map_err(storage::Error::Reliable)?,
         );
         guard.receiver = Some(
-            if receive.native_policy == NativePolicy::IpHeaders {
-                receiver::Receiver::new_reserved_ip(
+            receive
+                .native_policy
+                .reserved_receiver(
                     receive_scope,
                     receive.receiver,
                     codec::Limits {
                         capacity_bytes: plan.receiver.capacity_bytes(),
                     },
                 )
-            } else {
-                receiver::Receiver::new_reserved(
-                    receive_scope,
-                    receive.receiver,
-                    codec::Limits {
-                        capacity_bytes: plan.receiver.capacity_bytes(),
-                    },
-                )
-            }
-            .map_err(storage::Error::Codec)?,
+                .map_err(storage::Error::Codec)?,
         );
         guard.send_buffer = allocation.bytes(send.recovery.arq().bounds().max_source_bytes)?;
         guard.receive_buffer =

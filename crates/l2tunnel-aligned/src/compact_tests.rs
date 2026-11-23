@@ -52,6 +52,7 @@ fn policy(reverse: bool, packed: bool) -> TestResult<packed::CompactConfig> {
     )?;
     Ok(packed::CompactConfig {
         base: CompactConfig {
+            native_delivery: NativeDelivery::ProfileDefault,
             native_policy: NativePolicy::EthernetHeaders,
             receiver,
             recovery,
@@ -348,6 +349,9 @@ fn packed_requested_copies_remain_canonical_but_refuse_before_storage_admission(
 
 #[path = "native_compression_tests.rs"]
 mod native_compression;
+
+#[path = "kcp_like_tests.rs"]
+mod kcp_like;
 
 #[test]
 fn selected_compact_arq_short_aligned_unit_charges_actual_bytes_and_preserves_witness() -> TestResult

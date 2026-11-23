@@ -7,6 +7,8 @@
 
 use std::fmt;
 mod core;
+#[cfg(feature = "lz4")]
+pub(crate) use core::pure_ipv4_ack;
 pub(crate) use core::{Context as IpContext, View as ContextView};
 
 /// Complete Ethernet/IPv4/TCP timestamp context size.
@@ -349,19 +351,25 @@ fn restore_header(
         .try_into()
         .map_err(|_| Error::InvalidRecord)
 }
-// Internet checksum, not a cryptographic authenticator. Fold each word so no
-// unchecked accumulator growth depends on caller packet length.
+// Each block adds at most 32,768 16-bit words to the folded partial sum.
 fn checksum(parts: &[&[u8]]) -> u16 {
     let mut sum = 0u32;
     let mut high = None;
-    for part in parts {
-        for byte in *part {
-            if let Some(previous) = high.take() {
-                sum += u32::from(u16::from_be_bytes([previous, *byte]));
-                sum = (sum & 65535) + (sum >> 16);
-            } else {
-                high = Some(*byte);
-            }
+    for mut part in parts.iter().copied() {
+        if let Some((&first, rest)) = part.split_first()
+            && let Some(previous) = high.take()
+        {
+            sum += u32::from(u16::from_be_bytes([previous, first]));
+            part = rest;
+        }
+        for block in part.chunks(65_536) {
+            let (words, tail) = block.as_chunks::<2>();
+            sum += words
+                .iter()
+                .map(|word| u32::from(u16::from_be_bytes(*word)))
+                .sum::<u32>();
+            sum = (sum & 65535) + (sum >> 16);
+            high = tail.first().copied();
         }
     }
     if let Some(previous) = high {

@@ -27,6 +27,8 @@ pub struct Performance {
     pub udp_batch_packets: u64,
     /// UDP batches that consumed their complete configured/current quota.
     pub udp_batch_limit_hits: u64,
+    /// Original UDP batches returned early while targeted receive work was runnable.
+    pub udp_rolling_pressure_yields: u64,
     /// Physical native packets read, including size rejection or post-I/O expiry.
     pub native_read_batch_packets: u64,
     /// Native read batches that consumed their complete configured quota.
@@ -67,6 +69,18 @@ pub struct Performance {
     pub credit_ready_late_max_micros: u64,
     /// Native receive steps that actually returned WouldBlock/no packet.
     pub native_read_would_block: u64,
+    /// Native admission attempts refused. The ACK coalescer could not retain another flow history.
+    pub native_ingress_ack_history_refusals: u64,
+    /// Native admission attempts refused. The packet flow assignment table was full.
+    pub native_ingress_flow_table_refusals: u64,
+    /// Native admission attempts refused. The pipeline shared byte allowance was full.
+    pub native_ingress_shared_byte_refusals: u64,
+    /// Native admission attempts refused. The pipeline shared packet allowance was full.
+    pub native_ingress_shared_packet_refusals: u64,
+    /// Native admission attempts refused. The selected TUN flow exhausted its byte allowance.
+    pub native_ingress_flow_byte_refusals: u64,
+    /// Native admission attempts refused. The selected TUN flow exhausted its packet allowance.
+    pub native_ingress_flow_packet_refusals: u64,
     /// Native transmit steps that actually returned WouldBlock.
     pub native_write_would_block: u64,
     /// Native collection polls blocked by the bounded output queue.

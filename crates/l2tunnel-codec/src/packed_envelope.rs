@@ -13,6 +13,8 @@ use std::fmt;
 
 mod compact;
 pub use compact::{decode_compact, encode_compact};
+mod ack_lz4;
+pub use ack_lz4::{AckLz4Config, AckLz4Table};
 
 /// Fixed source identity header, before per-unit u64 record IDs and inner bytes.
 pub const HEADER_BYTES: usize = Layout::Packed.header_bytes();
@@ -55,6 +57,8 @@ pub struct Identity {
 /// Explicit framing failure; rejected encoding never changes caller output.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {
+    /// This build does not include the negotiated LZ4 provider.
+    CompressionUnavailable,
     /// Invalid negotiated geometry or nonzero-session requirement.
     Configuration,
     /// Unknown version, flags, geometry, length, padding or inner container.

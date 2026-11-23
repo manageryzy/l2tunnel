@@ -58,6 +58,13 @@ pub(crate) fn validate_aligned_unit(unit: &[u8], symbol_bytes: usize) -> Result<
         return Err(Error::Malformed);
     }
     let body = &unit[3..];
+    let body = if body[0] == crate::aligned_body::FIXED_ANCHOR_TAG {
+        crate::aligned_body::fixed_anchor_parts(body)
+            .map_err(|_| Error::Malformed)?
+            .1
+    } else {
+        body
+    };
     match body[0] {
         4 => {
             if body.len() <= 5 {

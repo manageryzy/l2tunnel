@@ -48,7 +48,10 @@ def make_simulation(task):
     return SharedRecordMultiFlow(
         Scenario(task["rtt_ms"], task["loss_rate"], task["loss_model"], mtu=task["mtu"]),
         traffic, (PathConfig(task["forward_mbps"], task["reverse_mbps"]),),
-        Strategy(profile["name"], mode="tcp", tcp_rto_min_ms=profile["rto_min_ms"]),
+        Strategy(profile["name"], mode="tcp", tcp_rto_min_ms=profile["rto_min_ms"],
+                 tcp_data_paws=profile.get("tcp_data_paws", False),
+                 tcp_partial_timestamp_undo=profile.get("tcp_partial_timestamp_undo", False),
+                 tcp_newreno_ack_heuristic=profile.get("tcp_newreno_ack_heuristic", False)),
         task["seed"], profile["flow_count"], compact_config=config, simulation_factory=factory, **transport)
 
 
@@ -84,6 +87,14 @@ def execute(task):
         row["steady_forward_datagrams"] / delivered - 1) if delivered else None
     for key in ("tcp_timeouts", "tcp_retransmissions", "tcp_fast_retransmits"):
         row[key] = sum(getattr(flow, key) for flow in sim.flows)
+    if sim.flows[0].data_paws is not None:
+        row["tcp_data_paws"] = "linux_6_8_established_data"
+        row["tcp_data_paws_rejections"] = sum(flow.data_paws.rejections for flow in sim.flows)
+    if sim.flows[0].strategy.tcp_partial_timestamp_undo:
+        row["tcp_partial_timestamp_undos"] = sum(flow.tcp_partial_timestamp_undos for flow in sim.flows)
+    if sim.flows[0].strategy.tcp_newreno_ack_heuristic:
+        row["tcp_newreno_ack_heuristic"] = True
+        row["tcp_newreno_ack_heuristic_entries"] = sum(flow.tcp_newreno_ack_heuristic_entries for flow in sim.flows)
     shared = sim.shared_forward
     row["tcp_all_acknowledged"] = all(flow.tcp_acked == len(flow.sent_times) for flow in sim.flows)
     row["outer_all_confirmed"] = shared.base == len(shared.sources) and not shared.buffer_bytes and not shared.callbacks

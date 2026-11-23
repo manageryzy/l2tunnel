@@ -1,6 +1,8 @@
 //! Real charged wire handoffs under selective loss, with an old missing source.
 use super::*;
 
+mod confirmed_prefix;
+
 fn setup() -> (Policy, Scope, WorkBudget) {
     (
         Policy {
@@ -431,6 +433,96 @@ fn a_queued_original_withdraws_only_the_unsealed_distant_span() -> Result<(), Er
     r.step(Tick(4_000), work)?;
     let next = r.pending_request().ok_or(Error::Busy)?;
     assert_eq!((next.start, next.mask), (35, 1));
+    Ok(())
+}
+
+#[test]
+fn a_repair_retires_only_solved_names_from_an_unpublished_distant_span() -> Result<(), Error> {
+    let (mut policy, scope, work) = setup();
+    policy.recovery.local_window = 2;
+    let mut receiver = Receiver::new(policy, scope, Tick(0))?;
+    let mut encoder = Encoder::new(policy.recovery, scope, Tick(0))?;
+    for id in 0_u32..=38 {
+        if id <= 35 {
+            encoder.admit_source(&id.to_be_bytes(), Tick(0))?;
+        }
+        if ![0, 35, 37].contains(&id) {
+            inject(&mut receiver, id, Tick(0), work)?;
+        }
+    }
+    receiver.step(Tick(2_000), work)?;
+    let frozen = receiver.pending_request().ok_or(Error::Busy)?;
+    assert_eq!((frozen.start, frozen.mask), (0, 1));
+    encoder.begin_repair(false, Tick(2_001))?;
+    encoder.step(Tick(2_001), work)?;
+    let row = encoder.pending_repair().ok_or(Error::WorkLimit)?;
+    assert_eq!((row.support.start, row.support.end), (34, 36));
+    receiver.receive_view_until(
+        wire::View::Repair(row),
+        Tick(2_001),
+        Tick(2_001),
+        Tick(u64::MAX),
+    )?;
+    receiver.step(Tick(2_001), work)?;
+    assert_eq!(
+        receiver.decoded_source(SourceId(35))?,
+        Some(35_u32.to_be_bytes().as_slice())
+    );
+    assert_eq!(receiver.pending_request(), Some(frozen));
+    receiver.confirm_feedback(frozen.id, Tick(2_001))?;
+    let one_lookup = WorkBudget {
+        field: 0,
+        copies: 0,
+        metadata: 1,
+    };
+    let partial = receiver.step(Tick(2_002), one_lookup)?;
+    assert!(partial.work.metadata <= 1);
+    assert!(receiver.pending_request().is_none());
+    receiver.step(Tick(2_002), work)?;
+    let next = receiver.pending_request().ok_or(Error::Busy)?;
+    assert_eq!((next.prefix, next.start, next.mask), (0, 37, 1));
+    Ok(())
+}
+
+#[test]
+fn a_queued_higher_source_can_name_a_hole_while_a_repair_is_running() -> Result<(), Error> {
+    let (policy, scope, work) = setup();
+    let mut receiver = Receiver::new(policy, scope, Tick(0))?;
+    let mut encoder = Encoder::new(policy.recovery, scope, Tick(0))?;
+    for id in 0_u32..3 {
+        encoder.admit_source(&id.to_be_bytes(), Tick(0))?;
+        if id != 1 {
+            inject(&mut receiver, id, Tick(0), work)?;
+        }
+    }
+    encoder.begin_repair(false, Tick(0))?;
+    encoder.step(Tick(0), work)?;
+    let row = encoder.pending_repair().ok_or(Error::WorkLimit)?;
+    receiver.receive_view_until(wire::View::Repair(row), Tick(0), Tick(0), Tick(u64::MAX))?;
+    receiver.hold_queued_source(SourceId(3))?;
+    receiver.hold_queued_source(SourceId(5))?;
+    let no_field = WorkBudget { field: 0, ..work };
+    receiver.step(Tick(0), no_field)?;
+    receiver.step(Tick(1_999), no_field)?;
+    assert!(receiver.pending_request().is_none());
+    let step = receiver.step(Tick(2_000), no_field)?;
+    assert_eq!(step.work.field, 0);
+    assert!(receiver.status().decoder.pending_job);
+    let request = receiver.pending_request().ok_or(Error::Busy)?;
+    assert_eq!(
+        (request.prefix, request.start, request.mask),
+        (1, 1, 0b1001)
+    );
+    // The higher authenticated FIFO inputs changed only the named request.
+    // Source 4 is absent; the current equation stops before that source.
+    assert_eq!(receiver.status().decoder.observed_end, 3);
+    assert_eq!(receiver.status().decoder.decoded_prefix, 1);
+    receiver.confirm_feedback(request.id, Tick(2_000))?;
+    receiver.step(Tick(2_001), work)?;
+    assert_eq!(
+        receiver.decoded_source(SourceId(1))?,
+        Some(1_u32.to_be_bytes().as_slice())
+    );
     Ok(())
 }
 

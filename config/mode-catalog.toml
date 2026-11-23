@@ -21,6 +21,14 @@ python_reference = "model.py:Tunnel.add_to_code/flush_code; coding.py:block_coef
 parity_contract = "Systematic GF(256) Cauchy blocks; block_size, block_repairs, partial-block proportional rounding, fec_wait_ms, repair_spacing_ms; residual ARQ. Total Cauchy symbols at most 256."
 
 [[mode]]
+id = "striped-cauchy"
+status = "planned"
+category = "protocol-model-or-byte-codec"
+milestone = "M3"
+python_reference = "src/l2tunnel_sim/striped_cauchy.py; studies/packed_striped_path.py"
+parity_contract = "Every physical member carries its own systematic data and cross-packet parity. Any k of n distinct authenticated packets recover the group. Preserve immediate delivery, deadline-shortened groups, split singletons, MTU, charged old-hole retries, bounded state and single-flow TCP qualification."
+
+[[mode]]
 id = "legacy-sliding-fec"
 status = "planned"
 category = "protocol-model-or-byte-codec"
@@ -259,6 +267,14 @@ category = "comparison-baseline"
 milestone = "M5"
 python_reference = "kcp.py:KCPContext; reliable_tunnel.py:RecordKCP/ReliableTunnelMultiFlow"
 parity_contract = "Actual pinned upstream C KCP; ordered messages, window, nodelay, interval, resend, nocwnd, MTU. Current inner-TCP reference shares a queue with probes."
+
+[[mode]]
+id = "kcp-like-l2"
+status = "implemented"
+category = "protocol-model-or-byte-codec"
+milestone = "M3"
+python_reference = "kcp.py:KCPContext (comparison only); studies/kcp_like_l2_baseline.py"
+parity_contract = "Explicit KCP-inspired selective repeat over Common Compact records: conservative fast ACK, paid-attempt RTT/RTO, bounded timeout backoff, raw Ethernet, Ethernet header compression or stateless LZ4. Complete stateless records may deliver out of order with old-hole custody. Not upstream KCP wire or behavioral equivalence; retain the separate pinned C baseline."
 
 [[mode]]
 id = "research-age-support"

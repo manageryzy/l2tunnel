@@ -282,3 +282,53 @@ fn one_copy_earning_source_publishes_its_own_larger_extent_before_pricing() -> T
     owner.confirm_output(Tick(2), ready)?;
     Ok(())
 }
+
+#[test]
+fn confirmed_prefix_compact_charge_matches_physical_shortened_global() -> TestResult {
+    let format = rolling::wire::SourceWire::TargetedNear8ConfirmedPrefix;
+    let mut cfg = config(true, format);
+    cfg.reverse.scheduler.source_wire = rolling::wire::SourceWire::TargetedExact;
+    cfg.forward.scheduler.recovery.global_every = 1;
+    let mut owner = endpoint(cfg, Role::Client)?;
+    owner.enable_compact_wire(41)?;
+    owner.configure_near8(1500, 12_500_000)?;
+    owner.enable_queue_aware_repair_budget(1500)?;
+    let (_, big) = emit_source(&mut owner, 0, 119)?;
+    let feedback = scheduler::Feedback {
+        scope: owner.send_rolling_scope,
+        id: scheduler::FeedbackId(1),
+        prefix: 1,
+        observed_end: 1,
+        deficit: 0,
+    };
+    let mut ack = [0; 64];
+    let n = compact::encode_feedback(feedback, &mut ack)?;
+    owner.accept_authenticated(Tick(1), record_engine::EmissionKind::Feedback, &ack[..n])?;
+    let (_, small) = emit_source(&mut owner, 2, 75)?;
+    assert!(big > small);
+    owner.step(Tick(3), work())?;
+    let (ready, bytes) = prepare(&mut owner, Tick(3))?;
+    assert_eq!(bytes[0], 7);
+    let compact::View::Data(rolling::wire::View::Repair(row)) = compact::inspect_with(
+        cfg.forward.scheduler.recovery,
+        format,
+        owner.send_rolling_scope,
+        &bytes,
+    )?
+    else {
+        return Err("expected shortened global".into());
+    };
+    assert_eq!(
+        (row.support.start, row.support.end, row.bytes.len()),
+        (1, 2, small + 2)
+    );
+    let status = owner.repair_budget_status().ok_or("repair budget")?;
+    assert_eq!(status.opportunity_wire_bytes, (bytes.len() + 41) as u64);
+    assert_eq!(ready.wire_bytes, bytes.len() + 41);
+    owner.confirm_output(Tick(3), ready)?;
+    let confirmed = owner
+        .repair_budget_status()
+        .ok_or("confirmed repair budget")?;
+    assert_eq!(confirmed.regular_wire_bytes, status.opportunity_wire_bytes);
+    Ok(())
+}

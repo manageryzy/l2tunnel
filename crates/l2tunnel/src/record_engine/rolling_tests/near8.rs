@@ -50,6 +50,25 @@ fn selected(wire: SourceWire, role: Role) -> TestResult<Engine> {
 }
 
 #[test]
+fn named_gap_diagnostics_follow_the_coding_direction_at_both_endpoints() -> TestResult {
+    let client = selected(SourceWire::TargetedNear8, Role::Client)?;
+    let server = selected(SourceWire::TargetedNear8, Role::Server)?;
+    let wire = [5, 9, 1, 2, 0, 0, 0, 5];
+    let forward = server.inspect_rolling_gap(true, &wire)?.ok_or("gap")?;
+    assert_eq!(client.inspect_rolling_gap(false, &wire)?, Some(forward));
+    assert_eq!(
+        (forward.id.0, forward.prefix, forward.start, forward.mask),
+        (9, 1, 2, 5)
+    );
+    let reverse = client.inspect_rolling_gap(true, &wire)?.ok_or("gap")?;
+    assert_eq!(server.inspect_rolling_gap(false, &wire)?, Some(reverse));
+    assert_eq!(forward.scope.direction ^ 1, reverse.scope.direction);
+    assert!(client.inspect_rolling_gap(false, &wire[..7]).is_err());
+    assert_eq!(server.inspect_rolling_gap(true, &[3])?, None);
+    Ok(())
+}
+
+#[test]
 fn negotiated_forward_near8_delivers_a_lost_source_before_feedback() -> TestResult {
     let mut sender = selected(SourceWire::TargetedNear8, Role::Client)?;
     let mut receiver = selected(SourceWire::TargetedNear8, Role::Server)?;

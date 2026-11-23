@@ -29,22 +29,23 @@ class CompactTCP(PlainTCP):
 
     def transmit_segment(self, index):
         segment = self.forward.pending[index]
+        payload = self.segment_bytes(index)
         if segment.attempts:
             self.inner_retransmissions += 1
-            self.inner_retransmitted_payload_bytes += self.traffic.payload_bytes
+            self.inner_retransmitted_payload_bytes += payload
         sent_at = self.now
-        frame_bytes = self.traffic.payload_bytes + IP_TCP_BYTES + ETHERNET_BYTES
+        frame_bytes = payload + IP_TCP_BYTES + ETHERNET_BYTES
         frame = None
         if self.compact_config.header_profile == 'tcp_delta':
             frame = tcp_profile_frame(
-                sequence=index * self.traffic.payload_bytes,
+                sequence=self.byte_offset(index),
                 identification=self.data_packet_id, timestamp=int(sent_at * 1000),
                 echoed_timestamp=int(self.peer_timestamp * 1000),
-                payload_bytes=self.traffic.payload_bytes,
+                payload_bytes=payload,
             )
         self.data_packet_id += 1
         self.compact_forward.submit(
-            frame_bytes, self.traffic.payload_bytes,
+            frame_bytes, payload,
             lambda: self.on_data(index, sent_at), frame=frame,
         )
         segment.last_sent_at = sent_at
@@ -70,7 +71,7 @@ class CompactTCP(PlainTCP):
             frame = None
             if self.compact_config.header_profile == 'tcp_delta':
                 frame = tcp_profile_frame(
-                    acknowledged=acknowledged * self.traffic.payload_bytes,
+                    acknowledged=self.byte_offset(acknowledged),
                     identification=self.ack_packet_id, timestamp=int(created_at * 1000),
                     echoed_timestamp=int((echoed_timestamp or 0) * 1000),
                     payload_bytes=0, flags=0x10,

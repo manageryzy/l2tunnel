@@ -4,6 +4,24 @@ use pipeline::ack_coalescing as ack;
 
 pub use ack::Admission as IngressAdmission;
 
+/// Per-flow queue threshold for one retained TCP data packet after a byte refusal.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FlowByteWait {
+    key: pipeline::FlowKey,
+    maximum_queued: usize,
+}
+
+impl FlowByteWait {
+    /// The actual queued bytes alone still prevent this packet from fitting.
+    pub fn still_blocked(self, engine: &Engine) -> bool {
+        engine.ingress_empty()
+            && engine
+                .pipeline
+                .flow(&self.key)
+                .is_some_and(|flow| flow.queued.bytes > self.maximum_queued)
+    }
+}
+
 /// Local real owner observations; not endpoint ACK generation or remote authority.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct IngressSnapshot {
@@ -17,6 +35,27 @@ pub struct IngressSnapshot {
     pub expiry: Option<Tick>,
 }
 impl Engine {
+    /// Observe a real FlowBytes refusal on the current held packet. ACK handling
+    /// must run normally whenever the coalescer has an original in custody.
+    pub fn flow_byte_wait(&self, bytes: &[u8]) -> Option<FlowByteWait> {
+        if !self.ingress_empty() {
+            return None;
+        }
+        let local = self.configuration.descriptor().local(self.context.role);
+        let pipeline::Profile::TunDrr(qos) = local.send().common().pipeline().profile else {
+            return None;
+        };
+        let class = self.pipeline.classify(bytes).ok()?;
+        if class.kind != l2tunnel_packet::PacketKind::Tcp || class.transport?.payload_bytes == 0 {
+            return None;
+        }
+        let wait = FlowByteWait {
+            key: class.key,
+            maximum_queued: qos.per_flow.bytes.checked_sub(bytes.len())?,
+        };
+        wait.still_blocked(self).then_some(wait)
+    }
+
     /// Consume only on an explicit typed success. A held ACK has no Pipeline ID.
     /// Errors retain the new input; an older held original may already have moved.
     pub fn ingest_borrowed(
@@ -72,7 +111,14 @@ impl Engine {
         draining: bool,
         work: usize,
     ) -> Result<ack::Progress, Error> {
-        self.advance(now)?;
+        if let Err(error) = self.advance(now) {
+            if error == Error::Ingress(ack::Error::Expired)
+                && let Some(ingress) = &mut self.ingress
+            {
+                ingress.observe_service_time(duration(now));
+            }
+            return Err(error);
+        }
         let Some(ingress) = &mut self.ingress else {
             return Ok(ack::Progress::default());
         };
@@ -84,6 +130,12 @@ impl Engine {
     /// True only when this generation retains no unsent coalescing candidate.
     pub fn ingress_empty(&self) -> bool {
         self.ingress.as_ref().is_none_or(ack::Ingress::is_empty)
+    }
+    /// Earliest original still held and the service attempts observed for it.
+    pub fn earliest_held_ack_service(
+        &self,
+    ) -> Option<(ack::Pending, ack::HeldService, Option<Duration>)> {
+        self.ingress.as_ref()?.earliest_held_service()
     }
     /// Retire matching history only after actual common/profile custody is drained.
     /// This conservative shared-owner proof is stronger than per-flow queue emptiness.

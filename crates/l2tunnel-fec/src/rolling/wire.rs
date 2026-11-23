@@ -20,12 +20,22 @@ pub const EXACT_SOURCE_VERSION: u8 = 4;
 pub const TARGETED_VERSION: u8 = 5;
 /// Exact targeted records with a separately negotiated eight-source repair arm.
 pub const TARGETED_NEAR8_VERSION: u8 = 6;
+/// Authenticated policy selector for near8 with bounded native TCP reordering.
+/// Source and repair packets still use the version-six grammar.
+pub const TARGETED_NEAR8_HOLD35_POLICY: u8 = 7;
+/// Authenticated selection allowing global equations over the unconfirmed suffix.
+pub const TARGETED_NEAR8_CONFIRMED_POLICY: u8 = 8;
+/// Authenticated selection for reversible compression of complete packed ACK sources.
+pub const TARGETED_EXACT_ACK_LZ4_POLICY: u8 = 9;
+/// Independent forward selection for near8 rows funded by otherwise expired credit.
+pub const TARGETED_NEAR8_HEADROOM_POLICY: u8 = 10;
 
 /// Explicitly selected systematic-source encoding, bound by the authenticated policy.
 ///
 /// All formats share the header, identities and effective repair extents and
-/// present the identical original bytes to the decoder. Each accepts only its
-/// own version byte, so records of different formats cannot be mixed.
+/// present the identical original bytes to the decoder. Parsing requires the
+/// selected grammar's version byte. Native delivery policies can share a
+/// grammar while retaining distinct authenticated policy selectors.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum SourceWire {
     /// Version 3: every source record carries its complete zero-padded vector.
@@ -38,23 +48,58 @@ pub enum SourceWire {
     TargetedExact,
     /// Version 6 additionally selects eight-source repairs for the marked direction.
     TargetedNear8,
+    /// Near8 with a bounded 35 ms reordering interval at the native TUN receiver.
+    TargetedNear8Hold35,
+    /// Negotiate a compact global repair carrying its frozen confirmed-prefix bound.
+    TargetedNear8ConfirmedPrefix,
+    /// Targeted exact recovery with a separately negotiated packed ACK block codec.
+    TargetedExactAckLz4,
+    /// Near8 with optional use of overflow credit on an underused physical carrier.
+    TargetedNear8Headroom,
 }
 impl SourceWire {
     /// Whether the authenticated selection permits named source requests and retries.
     pub const fn is_targeted(self) -> bool {
-        matches!(self, Self::TargetedExact | Self::TargetedNear8)
+        matches!(self, Self::TargetedExact | Self::TargetedExactAckLz4) || self.is_near8()
+    }
+    /// Whether this direction may compress an eligible packed ACK source.
+    pub const fn compresses_packed_acks(self) -> bool {
+        matches!(self, Self::TargetedExactAckLz4)
     }
     /// Whether this direction negotiated the separate eight-source repair arm.
     pub const fn is_near8(self) -> bool {
-        matches!(self, Self::TargetedNear8)
+        matches!(
+            self,
+            Self::TargetedNear8
+                | Self::TargetedNear8Hold35
+                | Self::TargetedNear8ConfirmedPrefix
+                | Self::TargetedNear8Headroom
+        )
+    }
+    /// Whether this direction can encode the confirmed-prefix global repair grammar.
+    pub const fn trims_confirmed_prefix(self) -> bool {
+        matches!(self, Self::TargetedNear8ConfirmedPrefix)
+    }
+    /// Directional selector covered by the session configuration digest.
+    pub const fn policy_id(self) -> u8 {
+        match self {
+            Self::TargetedNear8Hold35 => TARGETED_NEAR8_HOLD35_POLICY,
+            Self::TargetedNear8ConfirmedPrefix => TARGETED_NEAR8_CONFIRMED_POLICY,
+            Self::TargetedExactAckLz4 => TARGETED_EXACT_ACK_LZ4_POLICY,
+            Self::TargetedNear8Headroom => TARGETED_NEAR8_HEADROOM_POLICY,
+            _ => self.version(),
+        }
     }
     /// Wire version byte required in every record of this format.
     pub const fn version(self) -> u8 {
         match self {
             Self::Padded => VERSION,
             Self::Exact => EXACT_SOURCE_VERSION,
-            Self::TargetedExact => TARGETED_VERSION,
-            Self::TargetedNear8 => TARGETED_NEAR8_VERSION,
+            Self::TargetedExact | Self::TargetedExactAckLz4 => TARGETED_VERSION,
+            Self::TargetedNear8 | Self::TargetedNear8Hold35 | Self::TargetedNear8Headroom => {
+                TARGETED_NEAR8_VERSION
+            }
+            Self::TargetedNear8ConfirmedPrefix => TARGETED_NEAR8_CONFIRMED_POLICY,
         }
     }
 }
@@ -69,9 +114,13 @@ pub fn source_len(config: Config, format: SourceWire, original: usize) -> Result
     }
     match format {
         SourceWire::Padded => add(HEADER_BYTES, width),
-        SourceWire::Exact | SourceWire::TargetedExact | SourceWire::TargetedNear8 => {
-            add(add(HEADER_BYTES, 2)?, original)
-        }
+        SourceWire::Exact
+        | SourceWire::TargetedExact
+        | SourceWire::TargetedExactAckLz4
+        | SourceWire::TargetedNear8
+        | SourceWire::TargetedNear8Hold35
+        | SourceWire::TargetedNear8Headroom
+        | SourceWire::TargetedNear8ConfirmedPrefix => add(add(HEADER_BYTES, 2)?, original),
     }
 }
 const MAGIC: &[u8; 4] = b"L2RW";
@@ -107,14 +156,36 @@ fn source_support(id: SourceId) -> Result<Support, Error> {
         tail: false,
     })
 }
-fn repair_shape(config: Config, repair: Repair<'_>, width: usize) -> Result<(), Error> {
-    repair.validate_extent(width)?;
-    if repair.id.0 == u64::MAX
-        || config.support(repair.support.end, repair.id, repair.support.tail)? != repair.support
+fn support_trim(
+    config: Config,
+    format: SourceWire,
+    id: RepairId,
+    support: Support,
+) -> Result<u32, Error> {
+    let nominal = config.support(support.end, id, support.tail)?;
+    if nominal == support && id.0 != u64::MAX {
+        return Ok(0);
+    }
+    if !format.trims_confirmed_prefix()
+        || id.0 == u64::MAX
+        || support.start >= support.end
+        || config.confirmed_prefix_support(support.end, id, support.tail, support.start)? != support
     {
         return Err(Error::Identity);
     }
-    Ok(())
+    support
+        .start
+        .checked_sub(nominal.start)
+        .ok_or(Error::Identity)
+}
+fn repair_shape(
+    config: Config,
+    format: SourceWire,
+    repair: Repair<'_>,
+    width: usize,
+) -> Result<(), Error> {
+    repair.validate_extent(width)?;
+    support_trim(config, format, repair.id, repair.support).map(|_| ())
 }
 
 /// Inspect exactly one complete version-one record without allocation.
@@ -183,9 +254,13 @@ pub fn inspect_with(config: Config, format: SourceWire, bytes: &[u8]) -> Result<
         let tail = vector.get(2 + length..).ok_or(Error::Length)?;
         let canonical = match format {
             SourceWire::Padded => tail.iter().all(|b| *b == 0),
-            SourceWire::Exact | SourceWire::TargetedExact | SourceWire::TargetedNear8 => {
-                tail.is_empty()
-            }
+            SourceWire::Exact
+            | SourceWire::TargetedExact
+            | SourceWire::TargetedExactAckLz4
+            | SourceWire::TargetedNear8
+            | SourceWire::TargetedNear8Hold35
+            | SourceWire::TargetedNear8Headroom
+            | SourceWire::TargetedNear8ConfirmedPrefix => tail.is_empty(),
         };
         if !canonical {
             return Err(Error::Length);
@@ -202,7 +277,7 @@ pub fn inspect_with(config: Config, format: SourceWire, bytes: &[u8]) -> Result<
             support,
             bytes: vector,
         };
-        repair_shape(config, repair, width)?;
+        repair_shape(config, format, repair, width)?;
         Ok(View::Repair(repair))
     }
 }
@@ -302,7 +377,7 @@ pub fn encode_repair_with(
     output: &mut [u8],
 ) -> Result<usize, Error> {
     let width = config.width()?;
-    repair_shape(config, repair, width)?;
+    repair_shape(config, format, repair, width)?;
     let length = add(HEADER_BYTES, repair.bytes.len())?;
     if output.len() < length {
         return Err(Error::OutputTooSmall);

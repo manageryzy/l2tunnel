@@ -152,6 +152,25 @@ input is serviced independently of restored-data pressure. The configured stagin
 headroom covers one sender window plus one complete block; peer window negotiation
 and matching configuration remain integration requirements.
 
+The isolated retry-enrichment correction keeps one optional source range in each
+existing generation/deadline cell. An accepted systematic fixes the range under
+the existing contiguous decoded-ID constraint; every later accepted systematic
+and full decode must agree. After original direct ARQ admission succeeds, an
+exact retry can enter one unambiguous retained generation as its original
+systematic equation. No range, repair-only state, ambiguous overlap or optional
+staging/symbol pressure leaves the direct source path unchanged. The original
+generation deadline, work cap and full-rank commit remain authoritative; no
+incomplete generation is evicted. Inconsistent authenticated equations or source
+ranges can fail earlier than before. Completion still installs the existing
+terminal tombstone, so the existing terminal ignore boundary can begin earlier
+when newly available direct source bytes complete the generation. Future unseen
+conflicting repairs are then ignored exactly as after any ordinary completion;
+retained conflicting equations are checked before that commit.
+The existing scratch reservation includes the largest receive coded extent, and
+expanded deadline-cell metadata is included in the complete reserved plan. The
+outer runtime retained-byte allowance remains unchanged and authoritative.
+Five retry-enrichment regressions passed. A native Cauchy UDP forward run completed at 0.9869568 Mbit/s. The result does not quantify how many generations the enrichment released.
+
 FEC capacity/window/expiry loss is observable and falls back to ARQ. A systematic
 packet can still supply its ARQ source when optional FEC state cannot be retained;
 a skipped repair never causes a source ACK. Structural conflicts, invalid decoded

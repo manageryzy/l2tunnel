@@ -394,6 +394,26 @@ impl Sender {
             crate::aligned_body::Encoding::RefreshedHeaders,
         )
     }
+    /// Stage native-IP deltas that reference a full header context by serial.
+    pub fn stage_fixed_anchor_headers_observed(
+        &mut self,
+        channel: ChannelId,
+        frame: &[u8],
+        now: u64,
+    ) -> Result<
+        (
+            RecordIdentity,
+            crate::aligned_body::NativeEncodingObservation,
+        ),
+        Error,
+    > {
+        self.stage_selected(
+            channel,
+            frame,
+            now,
+            crate::aligned_body::Encoding::FixedAnchorHeaders,
+        )
+    }
     /// Observe successful raw native staging without attributing packing containers.
     pub fn stage_raw_observed(
         &mut self,

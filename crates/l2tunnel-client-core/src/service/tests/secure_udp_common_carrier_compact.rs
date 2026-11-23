@@ -4,11 +4,23 @@ use super::*;
 use l2tunnel_recovery::{CompactArqConfig, CompactBounds, CompactRecovery, CompactTiming};
 use l2tunnel_reliable::CompactReliableConfig;
 
-fn compact_direction(old: aligned::Config, reverse: bool) -> Result<aligned::CompactConfig> {
+fn compact_direction(
+    old: aligned::Config,
+    reverse: bool,
+    kcp: Option<aligned::NativePolicy>,
+) -> Result<aligned::CompactConfig> {
     let arq = old.recovery.arq;
+    let mut receiver = old.receiver;
+    if kcp.is_some_and(aligned::NativePolicy::is_stateless) {
+        receiver.body.elide_payload_length = false;
+        receiver.body.predictive = false;
+        receiver.body.timestamp_pair_dictionary = false;
+        receiver.body.independent_short_frame_bytes = 0;
+    }
     Ok(aligned::CompactConfig {
-        native_policy: old.native_policy,
-        receiver: old.receiver,
+        native_delivery: aligned::NativeDelivery::ProfileDefault,
+        native_policy: kcp.unwrap_or(old.native_policy),
+        receiver,
         recovery: CompactReliableConfig::new(
             CompactArqConfig::new(
                 CompactBounds {
@@ -26,7 +38,14 @@ fn compact_direction(old: aligned::Config, reverse: bool) -> Result<aligned::Com
                 if reverse { 400 } else { 200 },
                 32,
                 8,
-                if reverse {
+                if kcp.is_some() {
+                    CompactRecovery::KcpLike(l2tunnel_recovery::KcpLikeConfig {
+                        fast_resend: 2,
+                        interval_ms: 10,
+                        minimum_rto_ms: 30,
+                        maximum_rto_ms: 1000,
+                    })
+                } else if reverse {
                     CompactRecovery::FirstFlight
                 } else {
                     CompactRecovery::Guarded
@@ -39,7 +58,10 @@ fn compact_direction(old: aligned::Config, reverse: bool) -> Result<aligned::Com
     })
 }
 
-fn compact_carrier_plans(hosts: &[Arc<Host>; 2]) -> Result<CarrierPlans> {
+fn compact_carrier_plans(
+    hosts: &[Arc<Host>; 2],
+    kcp: Option<aligned::NativePolicy>,
+) -> Result<CarrierPlans> {
     let CarrierPlans {
         plans: [left, right],
         addresses,
@@ -49,18 +71,18 @@ fn compact_carrier_plans(hosts: &[Arc<Host>; 2]) -> Result<CarrierPlans> {
     for value in original.catalog().descriptors() {
         let profile = match *value.profile() {
             common::Profile::Aligned { forward, reverse } => common::Profile::AlignedCompact {
-                forward: compact_direction(forward, false)?,
-                reverse: compact_direction(reverse, true)?,
+                forward: compact_direction(forward, false, kcp)?,
+                reverse: compact_direction(reverse, true, kcp)?,
             },
             common::Profile::Packed { forward, reverse } => common::Profile::PackedCompact {
                 forward: aligned::packed::CompactConfig {
-                    base: compact_direction(forward.base, false)?,
+                    base: compact_direction(forward.base, false, kcp)?,
                     hold_micros: forward.hold_micros,
                     max_units: forward.max_units,
                     work_limit: forward.work_limit,
                 },
                 reverse: aligned::packed::CompactConfig {
-                    base: compact_direction(reverse.base, true)?,
+                    base: compact_direction(reverse.base, true, kcp)?,
                     hold_micros: reverse.hold_micros,
                     max_units: reverse.max_units,
                     work_limit: reverse.work_limit,
@@ -68,11 +90,26 @@ fn compact_carrier_plans(hosts: &[Arc<Host>; 2]) -> Result<CarrierPlans> {
             },
             _ => continue,
         };
+        let common_direction =
+            |value: &common::CommonDirection| -> Result<common::CommonDirection> {
+                if kcp.is_none() {
+                    return Ok(*value);
+                }
+                let mut pipeline = value.pipeline();
+                pipeline.profile = l2tunnel::pipeline::Profile::TapSystem;
+                Ok(common::CommonDirection::new(
+                    traffic::TrafficPolicy::tap(),
+                    pipeline,
+                    value.bytes_per_second(),
+                    value.burst_bytes(),
+                    common::NativeWindow::Disabled,
+                )?)
+            };
         selected.push(common::Descriptor::new(
             value.path_mtu(),
             value.duplex(),
-            *value.direction(DataRole::Client).common(),
-            *value.direction(DataRole::Server).common(),
+            common_direction(value.direction(DataRole::Client).common())?,
+            common_direction(value.direction(DataRole::Server).common())?,
             profile,
         )?);
     }
@@ -81,8 +118,17 @@ fn compact_carrier_plans(hosts: &[Arc<Host>; 2]) -> Result<CarrierPlans> {
         .iter()
         .find(|value| matches!(value.profile(), common::Profile::AlignedCompact { .. }))
         .ok_or("explicit initial Compact policy absent")?;
+    let mut connection = original.connection();
+    if let Some(native) = kcp {
+        connection.layer = l2tunnel_device::PacketLayer::Ethernet;
+        connection.compression = if native.uses_lz4() {
+            l2tunnel::codec::Compression::Lz4IfSmaller
+        } else {
+            l2tunnel::codec::Compression::None
+        };
+    }
     let requested = common_transaction_profile::Profile::new(
-        original.connection(),
+        connection,
         original.settings(),
         original.peers(),
         original.runtime_contract(Role::Initiator)?.resources(),
@@ -90,7 +136,7 @@ fn compact_carrier_plans(hosts: &[Arc<Host>; 2]) -> Result<CarrierPlans> {
         common::Catalog::new(initial, &selected)?,
         original.parameters(),
     )?;
-    let reprepare = |plan: Prepared| -> Result<Prepared> {
+    let reprepare = |plan: Prepared, side: usize| -> Result<Prepared> {
         let data = Arc::try_unwrap(plan.data)
             .map_err(|_| "unstarted actual credentials unexpectedly shared")?;
         let prepared::Data {
@@ -99,12 +145,18 @@ fn compact_carrier_plans(hosts: &[Arc<Host>; 2]) -> Result<CarrierPlans> {
             transport,
             ..
         } = data;
+        let attachment = if kcp.is_some() {
+            hosts[side].attachment_for(l2tunnel_device::PacketLayer::Ethernet)
+        } else {
+            attachment
+        };
         let prepared::Transport::SecureUdpCommonCarrier { outer, .. } = transport else {
             return Err("actual original-carrier transport absent".into());
         };
         let mut outer = *outer;
         // Transfer genuine unstarted credentials; only the explicit catalog and
         // its requested setup digest change before the actual factory executes.
+        outer.base = requested.connection().session()?;
         outer.base.digest = l2tunnel_core::ConfigDigest(requested.requested_configuration()?.0);
         match endpoint {
             prepared::Endpoint::CommonCarrierClient { outer: tls, inner } => {
@@ -134,7 +186,7 @@ fn compact_carrier_plans(hosts: &[Arc<Host>; 2]) -> Result<CarrierPlans> {
             _ => Err("actual carrier credential owner absent".into()),
         }
     };
-    let plans = [reprepare(left)?, reprepare(right)?];
+    let plans = [reprepare(left, 0)?, reprepare(right, 1)?];
     assert!(
         hosts
             .iter()
@@ -150,6 +202,23 @@ fn compact_carrier_plans(hosts: &[Arc<Host>; 2]) -> Result<CarrierPlans> {
 #[tokio::test]
 async fn actual_carrier_v4_service_binds_compact_catalog_and_switches_exact_native_bytes() -> Result
 {
+    exercise(None).await
+}
+
+#[tokio::test]
+async fn kcp_like_actual_carrier_service_preserves_l2_encodings_management_and_epoch_switch()
+-> Result {
+    for native in [
+        aligned::NativePolicy::RawEthernet,
+        aligned::NativePolicy::EthernetHeaders,
+        aligned::NativePolicy::Lz4Ethernet,
+    ] {
+        exercise(Some(native)).await?;
+    }
+    Ok(())
+}
+
+async fn exercise(kcp: Option<aligned::NativePolicy>) -> Result {
     // Keep this same real lifecycle future out of the harness/timeout value.
     // Its typed response locals otherwise remain inline across API awaits.
     timeout(
@@ -160,7 +229,7 @@ async fn actual_carrier_v4_service_binds_compact_catalog_and_switches_exact_nati
                 plans: [left, right],
                 addresses,
                 requested,
-            } = compact_carrier_plans(&hosts)?;
+            } = compact_carrier_plans(&hosts, kcp)?;
             let (client, run) = channel();
             let (server, peer) = channel();
             let client_task = tokio::spawn(run);
@@ -277,6 +346,16 @@ async fn actual_carrier_v4_service_binds_compact_catalog_and_switches_exact_nati
                 assert!(response.ok);
                 let status = observed(&response)?;
                 assert_current(status, target, epoch + 1)?;
+                if kcp.is_some() {
+                    let selected = status
+                        .kcp_like_current
+                        .as_ref()
+                        .ok_or("effective KCP-like status absent")?;
+                    assert_eq!(selected["recovery"], "kcp_like");
+                    assert_eq!(selected["forward"]["fast_resend"], 2);
+                    assert!(status.kcp_like_initial.is_some());
+                    assert!(status.kcp_like_requested.is_none());
+                }
                 let carrier = status
                     .original_carrier
                     .as_ref()

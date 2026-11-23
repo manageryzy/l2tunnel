@@ -2,6 +2,79 @@
 use super::*;
 
 #[test]
+fn a_lone_ack_is_serviced_at_its_deadline_with_one_slot_of_work() -> TestResult {
+    let (mut pipeline, mut ingress) = pair(false, 16)?;
+    let first = ack(false, false, 100, 1, 4096, false);
+    ingress.ingest(&mut pipeline, &first, ms(0), ms(50))?;
+    assert_eq!(take(&mut pipeline)?, first);
+    let second = ack(false, false, 101, 2, 4096, false);
+    assert_eq!(
+        ingress.ingest(&mut pipeline, &second, ms(1), ms(50))?,
+        Admission::Held
+    );
+    assert_eq!(
+        ingress.advance(&mut pipeline, ms(3), false, 1)?.forwarded,
+        0
+    );
+    let due = ingress.advance(&mut pipeline, ms(6), false, 1)?;
+    assert_eq!(due.forwarded, 1);
+    assert_eq!(due.visited, 1);
+    assert_eq!(take(&mut pipeline)?, second);
+    assert_eq!(ingress.advance(&mut pipeline, ms(7), false, 4)?.visited, 0);
+    Ok(())
+}
+
+#[test]
+fn due_flush_evidence_distinguishes_capacity_from_missing_service() -> TestResult {
+    for backpressured in [false, true] {
+        let (mut pipeline, mut ingress) = pair(false, 1)?;
+        let baseline = ack(false, false, 100, 1, 4096, false);
+        ingress.ingest(&mut pipeline, &baseline, ms(0), ms(99))?;
+        assert_eq!(take(&mut pipeline)?, baseline);
+        for n in 1..=2 {
+            ingress.ingest(
+                &mut pipeline,
+                &ack(false, false, 100 + n, n + 1, 4096, false),
+                ms(u64::from(n)),
+                ms(99),
+            )?;
+        }
+        ingress.advance(&mut pipeline, ms(5), false, 1)?;
+        if backpressured {
+            pipeline.enqueue_borrowed(&baseline, ms(5))?;
+            for t in [8, 12] {
+                assert_eq!(ingress.advance(&mut pipeline, ms(t), false, 1)?.blocked, 1);
+            }
+        }
+        assert_eq!(
+            ingress.advance(&mut pipeline, ms(21), false, 1),
+            Err(Error::Expired)
+        );
+        let (pending, observed, last_completed) =
+            ingress.earliest_held_service().ok_or("expired candidate")?;
+        assert_eq!(
+            (
+                pending.first_created,
+                pending.latest_created,
+                pending.deadline,
+                pending.expires
+            ),
+            (ms(1), ms(2), ms(6), ms(21))
+        );
+        assert_eq!(
+            observed.first_due_service,
+            Some(ms(if backpressured { 8 } else { 21 }))
+        );
+        assert_eq!(observed.blocked, if backpressured { 2 } else { 0 });
+        assert_eq!(observed.first_blocked, backpressured.then(|| ms(8)));
+        assert_eq!(observed.last_blocked, backpressured.then(|| ms(12)));
+        assert_eq!(last_completed, Some(ms(if backpressured { 12 } else { 5 })));
+        assert_eq!(ingress.statistics().refusals, 0);
+    }
+    Ok(())
+}
+
+#[test]
 fn superseded_ack_flush_keeps_original_time_and_cap_in_the_same_pipeline_metadata() -> TestResult {
     for l2 in [false, true] {
         let (mut pipeline, mut ingress) = pair(l2, 16)?;

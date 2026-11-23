@@ -82,6 +82,24 @@ def test_repeated_timeouts_exponentially_back_off():
     assert sim.cwnd == 1
 
 
+def test_fast_recovery_requires_progress_beyond_the_previous_exclusive_end():
+    sim = connection(packets=40)
+    sim.produce()
+    for _ in range(3):
+        sim.on_ack(0)
+    assert sim.tcp_fast_retransmits == 1
+    previous_end = sim.recover
+    sim.on_ack(previous_end)
+    assert sim.forward.pending and not sim.in_recovery
+    for _ in range(3):
+        sim.on_ack(previous_end)
+    assert sim.tcp_fast_retransmits == 1
+    sim.on_ack(previous_end + 1)
+    for _ in range(3):
+        sim.on_ack(previous_end + 1)
+    assert sim.tcp_fast_retransmits == 2
+
+
 def test_rtt_estimator_matches_rfc6298_updates():
     sim = connection()
     sim.update_rtt(0.1)

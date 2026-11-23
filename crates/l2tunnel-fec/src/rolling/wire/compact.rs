@@ -2,6 +2,9 @@
 use super::*;
 use crate::rolling::scheduler::{Feedback, FeedbackId, GapRequest, Output};
 
+const TRIMMED_GLOBAL: u8 = 7;
+const TRIMMED_TAIL: u8 = 8;
+
 /// Selected source/repair/strong-feedback body under an established context.
 #[derive(Clone, Copy, Debug)]
 pub enum View<'a> {
@@ -15,6 +18,15 @@ pub enum View<'a> {
 /// Worst-case complete selected data union, before enclosing protection.
 pub fn maximum_data_bytes(config: Config) -> Result<usize, Error> {
     Ok(16 + config.width()?)
+}
+/// Maximum selected union including the optional varint skipped-source count.
+pub fn maximum_data_bytes_with(config: Config, format: SourceWire) -> Result<usize, Error> {
+    let base = maximum_data_bytes(config)?;
+    if format.trims_confirmed_prefix() {
+        Ok(base + len((config.window - 1) as u64))
+    } else {
+        Ok(base)
+    }
 }
 /// Worst-case complete selected feedback union, preserving all identities.
 pub const MAXIMUM_FEEDBACK_BYTES: usize = 26;
@@ -46,9 +58,56 @@ pub fn repair_len(id: RepairId, end: u32, extent: usize) -> Result<usize, Error>
     }
     Ok(1 + len(id.0) + len(u64::from(end)) + extent)
 }
+/// Price the exact frozen support before spending whole-packet repair credit.
+pub fn repair_len_with(
+    config: Config,
+    format: SourceWire,
+    id: RepairId,
+    support: Support,
+    extent: usize,
+) -> Result<usize, Error> {
+    let trim = support_trim(config, format, id, support)?;
+    if extent > config.width()? {
+        return Err(Error::Length);
+    }
+    Ok(repair_len(id, support.end, extent)? + trim_len(trim))
+}
+fn trim_len(trim: u32) -> usize {
+    if trim == 0 { 0 } else { len(u64::from(trim)) }
+}
+/// Exact unprotected selected output under the authenticated recovery policy.
+pub fn data_len_with(
+    config: Config,
+    format: SourceWire,
+    value: Output<'_>,
+) -> Result<usize, Error> {
+    if let Output::Repair(row) = value {
+        repair_len_with(config, format, row.id, row.support, row.bytes.len())
+    } else {
+        data_len(value)
+    }
+}
 /// Serialize actual fields once; exact source bytes have no zero tail or duplicate length.
 pub fn encode_data(value: Output<'_>, output: &mut [u8]) -> Result<usize, Error> {
-    let required = data_len(value)?;
+    encode_with_trim(value, 0, output)
+}
+/// Serialize the actual support once. Untrimmed equations retain their original layout.
+pub fn encode_data_with(
+    config: Config,
+    format: SourceWire,
+    value: Output<'_>,
+    output: &mut [u8],
+) -> Result<usize, Error> {
+    let trim = if let Output::Repair(row) = value {
+        row.validate_extent(config.width()?)?;
+        support_trim(config, format, row.id, row.support)?
+    } else {
+        0
+    };
+    encode_with_trim(value, trim, output)
+}
+fn encode_with_trim(value: Output<'_>, trim: u32, output: &mut [u8]) -> Result<usize, Error> {
+    let required = data_len(value)? + trim_len(trim);
     if output.len() < required {
         return Err(Error::OutputTooSmall);
     }
@@ -61,9 +120,17 @@ pub fn encode_data(value: Output<'_>, output: &mut [u8]) -> Result<usize, Error>
         }
         Output::Near8(row) => return crate::rolling::near8::encode(row, output),
         Output::Repair(repair) => {
-            output[0] = if repair.support.tail { 4 } else { 2 };
+            output[0] = match (repair.support.tail, trim) {
+                (false, 0) => 2,
+                (true, 0) => 4,
+                (false, _) => TRIMMED_GLOBAL,
+                (true, _) => TRIMMED_TAIL,
+            };
             write(repair.id.0, output, &mut position);
             write(u64::from(repair.support.end), output, &mut position);
+            if trim != 0 {
+                write(u64::from(trim), output, &mut position);
+            }
             repair.bytes
         }
     };
@@ -125,6 +192,15 @@ pub fn encode_gap(config: Config, request: GapRequest, output: &mut [u8]) -> Res
 }
 /// Canonical bounded union parsing with complete externally established scope.
 pub fn inspect(config: Config, scope: Scope, bytes: &[u8]) -> Result<View<'_>, Error> {
+    inspect_with(config, SourceWire::Exact, scope, bytes)
+}
+/// Inspect the union grammar selected by the authenticated configuration.
+pub fn inspect_with(
+    config: Config,
+    format: SourceWire,
+    scope: Scope,
+    bytes: &[u8],
+) -> Result<View<'_>, Error> {
     config.validate()?;
     let kind = *bytes.first().ok_or(Error::Length)?;
     let mut position = 1;
@@ -143,18 +219,30 @@ pub fn inspect(config: Config, scope: Scope, bytes: &[u8]) -> Result<View<'_>, E
                 original,
             }))
         }
-        2 | 4 => {
+        2 | 4 | TRIMMED_GLOBAL | TRIMMED_TAIL => {
             if id == u64::MAX {
                 return Err(Error::Identity);
             }
             let end = u32::try_from(read(bytes, &mut position)?).map_err(|_| Error::Identity)?;
+            let mut support =
+                config.support(end, RepairId(id), matches!(kind, 4 | TRIMMED_TAIL))?;
+            if matches!(kind, TRIMMED_GLOBAL | TRIMMED_TAIL) {
+                if !format.trims_confirmed_prefix() {
+                    return Err(Error::Format);
+                }
+                let trim = word(bytes, &mut position)?;
+                if trim == 0 {
+                    return Err(Error::Format);
+                }
+                support.start = support.start.checked_add(trim).ok_or(Error::Identity)?;
+            }
             let repair = Repair {
                 scope,
                 id: RepairId(id),
-                support: config.support(end, RepairId(id), kind == 4)?,
+                support,
                 bytes: &bytes[position..],
             };
-            repair_shape(config, repair, config.width()?)?;
+            repair_shape(config, format, repair, config.width()?)?;
             Ok(View::Data(super::View::Repair(repair)))
         }
         3 => {

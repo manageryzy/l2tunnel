@@ -53,6 +53,7 @@ fn limits(profile: configuration::DirectionProfile<'_>) -> Result<receiver::Limi
         P::PackedCompact(c) => Ok(c.base.receiver),
         P::Rolling { config, .. } => Ok(config.receiver),
         P::Research { config, .. } => Ok(config.receiver),
+        P::Striped(config) => Ok(config.receiver),
         // These owners require their own native-to-source witness composition.
         P::Swift(_) | P::PerConnectionCompact(_) => {
             Err(Error::Unsupported(Capability::NativeWindow))
@@ -162,6 +163,7 @@ fn identity(value: ProfileIdentity) -> Result<receiver::RecordIdentity, Error> {
         ProfileIdentity::Aligned(id)
         | ProfileIdentity::Packed(id)
         | ProfileIdentity::Rolling(id)
+        | ProfileIdentity::Striped(id)
         | ProfileIdentity::Research(id) => Ok(id),
         _ => Err(Error::Unsupported(Capability::NativeWindow)),
     }

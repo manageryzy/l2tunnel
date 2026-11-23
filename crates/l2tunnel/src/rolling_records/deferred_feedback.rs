@@ -107,7 +107,7 @@ impl Endpoint<crate::fec::research::Config> {
                 _ => input.received <= accepted,
             };
             if input.kind != record_engine::EmissionKind::Feedback || earlier != before {
-                owner.queue.rotate_front().map_err(Error::Ingress)?;
+                owner.rotate_front()?;
                 continue;
             }
             if now >= input.deadline {

@@ -884,11 +884,12 @@ async fn observed_actual_selection_preserves_shutdown_request_and_alternating_io
                 &mut requests,
                 Interest::READABLE,
                 true,
-                true,
+                ReceiveInterest::Poll,
                 SelectedWake {
                     at: origin,
                     work_ready: true,
-                },
+                }
+                .wait(None),
                 true,
             ),
             Selected::winner,
@@ -908,11 +909,12 @@ async fn observed_actual_selection_preserves_shutdown_request_and_alternating_io
                 &mut requests,
                 Interest::READABLE,
                 true,
-                true,
+                ReceiveInterest::Poll,
                 SelectedWake {
                     at: origin,
                     work_ready: true,
-                },
+                }
+                .wait(None),
                 true,
             ),
             Selected::winner,
@@ -934,11 +936,12 @@ async fn observed_actual_selection_preserves_shutdown_request_and_alternating_io
                     &mut requests,
                     Interest::READABLE,
                     true,
-                    true,
+                    ReceiveInterest::Poll,
                     SelectedWake {
                         at: origin,
                         work_ready: true,
-                    },
+                    }
+                    .wait(None),
                     native_first,
                 ),
                 Selected::winner,
@@ -961,8 +964,8 @@ async fn observed_actual_selection_preserves_shutdown_request_and_alternating_io
                 &mut requests,
                 Interest::READABLE,
                 false,
-                false,
-                SelectedWake::timer(origin),
+                ReceiveInterest::Disabled,
+                SelectedWake::timer(origin).wait(None),
                 false,
             ),
             Selected::winner,
@@ -982,11 +985,12 @@ async fn observed_actual_selection_preserves_shutdown_request_and_alternating_io
                 &mut requests,
                 Interest::READABLE,
                 false,
-                false,
+                ReceiveInterest::Disabled,
                 SelectedWake {
                     at: origin,
                     work_ready: true,
-                },
+                }
+                .wait(None),
                 false,
             ),
             Selected::winner,
@@ -1018,12 +1022,12 @@ async fn work_wake_yields_without_timer_advance_and_idle_wake_stays_pending() ->
         work_ready: true,
     };
     let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
-    let mut work_wait = std::pin::pin!(work.wait());
+    let mut work_wait = std::pin::pin!(work.wait(None));
     assert!(std::future::Future::poll(work_wait.as_mut(), &mut cx).is_pending());
     assert!(std::future::Future::poll(work_wait.as_mut(), &mut cx).is_ready());
     assert_eq!(Instant::now(), now);
     let idle = SelectedWake::timer(now + duration(100));
-    let mut idle_wait = std::pin::pin!(idle.wait());
+    let mut idle_wait = std::pin::pin!(idle.wait(None));
     assert!(std::future::Future::poll(idle_wait.as_mut(), &mut cx).is_pending());
     assert!(std::future::Future::poll(idle_wait.as_mut(), &mut cx).is_pending());
     assert_eq!(Instant::now(), now);

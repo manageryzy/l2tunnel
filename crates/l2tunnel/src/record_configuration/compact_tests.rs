@@ -40,6 +40,7 @@ fn policy(reverse: bool, packed: bool) -> Result<aligned::packed::CompactConfig>
     )?;
     Ok(aligned::packed::CompactConfig {
         base: aligned::CompactConfig {
+            native_delivery: aligned::NativeDelivery::ProfileDefault,
             native_policy: old.native_policy,
             receiver: old.receiver,
             recovery,

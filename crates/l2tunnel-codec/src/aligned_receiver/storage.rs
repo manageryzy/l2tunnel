@@ -159,6 +159,17 @@ impl Receiver {
     ) -> Result<Self, heap::Error> {
         Self::new_reserved_mode(scope, limits, budget, ReceiverMode::IpEarlyReplay)
     }
+    /// Prepay all live fixed-anchor history and both channel rollback versions.
+    pub fn new_reserved_ip_with_fixed_anchors(
+        scope: Scope,
+        limits: Limits,
+        budget: heap::Limits,
+    ) -> Result<Self, heap::Error> {
+        Self::new_reserved_mode(scope, limits, budget, ReceiverMode::FixedIpAnchors)
+    }
+    pub(crate) fn fixed_anchor_history_bytes(limits: Limits) -> Result<usize, heap::Error> {
+        heap::array_bytes::<AnchorHistory>(3 * usize::from(limits.channels))
+    }
     fn new_reserved_mode(
         scope: Scope,
         limits: Limits,
@@ -168,6 +179,7 @@ impl Receiver {
         let plan = match mode {
             ReceiverMode::Ethernet => heap::ReceiverPlan::for_limits(limits)?,
             ReceiverMode::Ip => heap::ReceiverPlan::for_ip_limits(limits)?,
+            ReceiverMode::FixedIpAnchors => heap::ReceiverPlan::for_fixed_anchor_ip_limits(limits)?,
             ReceiverMode::IpEarlyReplay => {
                 heap::ReceiverPlan::for_ip_limits_with_early_replay(limits)?
             }
@@ -205,9 +217,14 @@ impl Receiver {
         let ip = mode != ReceiverMode::Ethernet;
         let c = usize::from(l.channels);
         let r = c + l.lookahead_records;
-        let compacted_slots = Self::compacted_capacity(l, mode == ReceiverMode::IpEarlyReplay);
+        let compacted_slots = Self::compacted_capacity(l, mode.compact_replay());
         let indexed = r + compacted_slots;
         let s = l.source_window;
+        let mut anchors = Vec::new();
+        if mode == ReceiverMode::FixedIpAnchors {
+            anchors = a.vec(3 * c)?;
+            anchors.resize_with(3 * c, AnchorHistory::default);
+        }
         let mut channels = a.vec(c)?;
         for _ in 0..c {
             channels.push(Channel {
@@ -255,6 +272,7 @@ impl Receiver {
             compacted_slots,
             mode,
             channels,
+            anchors,
             records,
             ordered_slots: a.vec(indexed)?,
             proofs,
@@ -373,6 +391,22 @@ impl Receiver {
         body: &[u8],
     ) -> Result<(), Error> {
         let record = self.records[slot].as_ref().ok_or(Error::Malformed)?;
+        let validate = |bytes: &[u8]| {
+            fixed_anchor::validate_tag(self.mode, record.id, bytes, true)?;
+            if bytes.first() == Some(&aligned_body::FIXED_ANCHOR_TAG) {
+                let (_, inner) =
+                    aligned_body::fixed_anchor_parts(bytes).map_err(|_| Error::Malformed)?;
+                if implicit_body(inner[0]) {
+                    // The exact reconstructed fragment length is outer-authenticated.
+                    // Its context-dependent payload extent is checked at decode.
+                    return Ok(());
+                }
+            }
+            if explicit_length(bytes)? != bytes.len() {
+                return Err(Error::Malformed);
+            }
+            Ok(())
+        };
         if let Some(r) = &mut self.reserved {
             let n = record.bytes.len();
             if n > r.complete.len() {
@@ -380,15 +414,11 @@ impl Receiver {
             }
             r.complete[..n].copy_from_slice(&record.bytes);
             r.complete[offset..offset + body.len()].copy_from_slice(body);
-            if explicit_length(&r.complete[..n])? != n {
-                return Err(Error::Malformed);
-            }
+            validate(&r.complete[..n])?;
         } else {
             let mut complete = record.bytes.clone();
             complete[offset..offset + body.len()].copy_from_slice(body);
-            if explicit_length(&complete)? != complete.len() {
-                return Err(Error::Malformed);
-            }
+            validate(&complete)?;
         }
         Ok(())
     }
@@ -431,6 +461,7 @@ impl Receiver {
                 compacted: old.compacted,
                 independent_short: old.independent_short,
                 defer_early: old.defer_early,
+                defer_head: old.defer_head,
             })
         } else {
             None
@@ -485,6 +516,10 @@ impl Receiver {
         }
         if j.channel_order.len() == j.channel_order.capacity() {
             return Err(Error::Storage);
+        }
+        if self.mode == ReceiverMode::FixedIpAnchors {
+            let backup = (active + 1) * self.channels.len() + channel;
+            self.anchors[backup] = self.anchors[channel].clone();
         }
         j.channels[channel] = Some(ChannelCheckpoint {
             expected: self.channels[channel].expected,
@@ -614,6 +649,10 @@ impl Receiver {
                 self.channels[channel].expected = old.expected;
                 self.channels[channel].decoder.restore(old.header);
                 self.channels[channel].preview = old.preview;
+                if self.mode == ReceiverMode::FixedIpAnchors {
+                    let backup = (index + 1) * self.channels.len() + channel;
+                    self.anchors[channel] = self.anchors[backup].clone();
+                }
             }
         }
         let r = self.reserved.as_mut().ok_or(Error::Storage)?;
@@ -637,7 +676,7 @@ impl Receiver {
         &mut self,
         symbols: &[AuthenticatedSymbol<'_>],
         now: Tick,
-        validated: bool,
+        policy: Option<BatchValidation>,
     ) -> Result<Vec<Admission>, Error> {
         if !(1..=255).contains(&symbols.len()) {
             return Err(Error::Configuration);
@@ -649,7 +688,7 @@ impl Receiver {
             .try_reserve_exact(symbols.len())
             .map_err(|_| Error::Allocation)?;
         result.resize(symbols.len(), Admission::Accepted);
-        self.reserved_batch_into(symbols, now, &mut result, validated)?;
+        self.reserved_batch_into(symbols, now, &mut result, policy)?;
         Ok(result)
     }
     /// Atomic batch admission with caller-owned outcomes; selected endpoint uses
@@ -661,7 +700,7 @@ impl Receiver {
         output: &mut [Admission],
     ) -> Result<usize, Error> {
         if self.reserved.is_some() {
-            return self.reserved_batch_into(symbols, now, output, false);
+            return self.reserved_batch_into(symbols, now, output, None);
         }
         if output.len() < symbols.len() {
             return Err(Error::OutputTooSmall);
@@ -677,13 +716,35 @@ impl Receiver {
         now: Tick,
         output: &mut [Admission],
     ) -> Result<usize, Error> {
+        self.validated_batch_into(symbols, now, output, BatchValidation::Ordered)
+    }
+
+    /// Validate every complete retained body using the independent-packet delivery policy.
+    /// The enclosing owner must enforce its negotiated native encoding on all incoming units.
+    /// The validation journal rehearses real decoding and leaves live native custody intact.
+    pub fn admit_independent_validated_batch_authenticated_into(
+        &mut self,
+        symbols: &[AuthenticatedSymbol<'_>],
+        now: Tick,
+        output: &mut [Admission],
+    ) -> Result<usize, Error> {
+        self.validated_batch_into(symbols, now, output, BatchValidation::IndependentPackets)
+    }
+
+    fn validated_batch_into(
+        &mut self,
+        symbols: &[AuthenticatedSymbol<'_>],
+        now: Tick,
+        output: &mut [Admission],
+        policy: BatchValidation,
+    ) -> Result<usize, Error> {
         if self.reserved.is_some() {
-            return self.reserved_batch_into(symbols, now, output, true);
+            return self.reserved_batch_into(symbols, now, output, Some(policy));
         }
         if output.len() < symbols.len() {
             return Err(Error::OutputTooSmall);
         }
-        let results = self.admit_validated_batch_authenticated(symbols, now)?;
+        let results = self.validated_batch(symbols, now, policy)?;
         output[..results.len()].copy_from_slice(&results);
         Ok(results.len())
     }
@@ -692,7 +753,7 @@ impl Receiver {
         symbols: &[AuthenticatedSymbol<'_>],
         now: Tick,
         output: &mut [Admission],
-        validated: bool,
+        policy: Option<BatchValidation>,
     ) -> Result<usize, Error> {
         if !(1..=255).contains(&symbols.len()) {
             return Err(Error::Configuration);
@@ -714,9 +775,9 @@ impl Receiver {
             self.end_journal(0, false)?;
             return Err(error);
         }
-        if validated {
+        if let Some(policy) = policy {
             self.begin_journal(1)?;
-            let validation = self.validate_pending_batch(now);
+            let validation = self.validate_pending_batch(now, policy);
             self.end_journal(1, false)?;
             if let Err(error) = validation {
                 self.end_journal(0, false)?;
@@ -727,7 +788,11 @@ impl Receiver {
         output[..symbols.len()].copy_from_slice(&outcomes[..symbols.len()]);
         Ok(symbols.len())
     }
-    fn validate_pending_batch(&mut self, now: Tick) -> Result<(), Error> {
+    pub(super) fn validate_pending_batch(
+        &mut self,
+        now: Tick,
+        policy: BatchValidation,
+    ) -> Result<(), Error> {
         if self.pending.is_some() {
             self.commit_delivery(now)?;
         }
@@ -738,7 +803,18 @@ impl Receiver {
                     return Err(Error::UnresolvedContext);
                 }
                 work -= 1;
-                match self.prepare(ChannelId(channel as u8), now, 1)? {
+                let channel = ChannelId(channel as u8);
+                let prepared = match policy {
+                    BatchValidation::Ordered => self.prepare(channel, now, 1)?,
+                    BatchValidation::IndependentPackets => self.prepare_with_independent_packets(
+                        channel,
+                        now,
+                        1,
+                        |_| true,
+                        |_, _| EarlyDecision::Allow,
+                    )?,
+                };
+                match prepared {
                     Prepared::Idle => break,
                     Prepared::Progress => {}
                     Prepared::Ready => self.commit_delivery(now)?,

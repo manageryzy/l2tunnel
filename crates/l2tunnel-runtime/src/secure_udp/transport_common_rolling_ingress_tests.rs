@@ -2,6 +2,90 @@
 //! This finite fixture does not qualify full8192 or run a fresh handshake.
 use super::*;
 
+#[tokio::test]
+async fn trace_marks_exact_rolling_record_number_accepted_or_fifo_full() -> Result {
+    let kind = cover::Appearance::QuicLike;
+    let old = short_contracts(kind)?;
+    let limits = rolling_records::IngressLimits {
+        slots: 1,
+        capacity_bytes: 100_000,
+    };
+    let contracts = contracts_with_catalog_and_options(
+        kind,
+        old[0].catalog().clone(),
+        1,
+        Some(work()),
+        Some(limits),
+    )?;
+    let mut fixture = Fixture::from_contracts(kind, contracts).await?;
+    let directory =
+        std::env::temp_dir().join(format!("l2t-rolling-admission-{}", std::process::id()));
+    std::fs::create_dir(&directory)?;
+    let receiver = &mut fixture.endpoints[1].driver;
+    receiver
+        .common
+        .as_deref_mut()
+        .ok_or("common peer")?
+        .reverse_trace = Some(reverse_trace::Trace::in_directory(
+        &directory,
+        true,
+        reverse_trace::Direction::Forward,
+        receiver.origin,
+    )?);
+    let mut pns = Vec::new();
+    for id in 0..3 {
+        fixture.admit(0, &frame(40_000 + id as u16, 82)).await?;
+        let wire = transmit_source(&mut fixture, rolling::SourceId(id))?;
+        let endpoint = &mut fixture.endpoints[1];
+        let mut buf = [0; 1501];
+        let n =
+            tokio::time::timeout(Duration::from_secs(1), endpoint.socket.recv(&mut buf)).await??;
+        assert_eq!(&buf[..n], wire);
+        endpoint.driver.receive_selected(
+            &buf[..n],
+            fixture.now,
+            endpoint.driver.origin + duration(fixture.now),
+        )?;
+        pns.push(
+            fixture.endpoints[0]
+                .driver
+                .records
+                .next_number(Class::User)
+                .0
+                - 1,
+        );
+    }
+    let endpoint = &mut fixture.endpoints[1].driver;
+    assert_eq!(endpoint.counters.native_backpressure_drops, 1);
+    drop(
+        endpoint
+            .common
+            .as_deref_mut()
+            .ok_or("common peer")?
+            .reverse_trace
+            .take(),
+    );
+    let saved = std::fs::read_to_string(
+        directory.join(format!("forward-records-b-{}.tsv", std::process::id())),
+    )?;
+    let rows: Vec<_> = saved
+        .lines()
+        .skip(2)
+        .map(|line| line.split('\t').collect::<Vec<_>>())
+        .collect();
+    for (pn, result) in pns.iter().zip(["accepted", "accepted", "fifo_full"]) {
+        let same: Vec<_> = rows
+            .iter()
+            .filter(|row| row[2].parse::<u64>() == Ok(*pn))
+            .collect();
+        assert_eq!(same.len(), 2);
+        assert_eq!(same[0][3], "opened");
+        assert_eq!(&same[1][3..], ["admission", result]);
+    }
+    std::fs::remove_dir_all(directory)?;
+    Ok(())
+}
+
 #[test]
 fn actual_common_wire_ingress_retains_burst_replay_and_drains_before_switch() -> Result {
     tokio::runtime::Builder::new_current_thread()
@@ -115,7 +199,7 @@ fn actual_common_wire_ingress_retains_burst_replay_and_drains_before_switch() ->
                 .driver
                 .snapshot_common(now, true)?
                 .rolling_work_used;
-            let mut wait = std::pin::pin!(wake.wait());
+            let mut wait = std::pin::pin!(wake.wait(None));
             let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
             // Runnable work is cooperative, not a Ready spin or a future timer.
             assert!(std::future::Future::poll(wait.as_mut(), &mut cx).is_pending());

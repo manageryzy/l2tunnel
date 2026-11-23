@@ -31,6 +31,26 @@ def make_transport(reverse=False, **options):
     return simulation, transport
 
 
+def test_native_udp_packing_caps_sources_and_keeps_coding_width():
+    sim, transport = make_transport()
+    transport.select_packing_geometry(1251, 8)
+    frames = [tcp_profile_frame(payload_bytes=0, identification=i) for i in range(8)]
+    received = []
+    for frame in frames:
+        submit(transport, frame, received)
+    assert len(transport.sources) == 1 and transport.packed_flush_reasons["unit_limit"] == 1
+    with pytest.raises(ValueError, match="active"):
+        transport.select_packing_geometry(1251, 8)
+    frames.append(tcp_profile_frame(payload_bytes=1448))
+    submit(transport, frames[-1], received)
+    run_until(sim, .25)
+    assert received == frames and transport.fragmented_records >= 1
+    assert max(item.size for item in transport.sources) <= 1251
+    receiver = PackedAlignedReceiver(1251, 128, coding_bytes=1460, max_units=8)
+    with pytest.raises(ValueError, match="length"):
+        receiver.receive(0, bytes(1459) + b"X")
+
+
 def run_until(simulation, until):
     while simulation.events and simulation.events[0][0] <= until:
         simulation.now, _, callback, arguments = heappop(simulation.events)

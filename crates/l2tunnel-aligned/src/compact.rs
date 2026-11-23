@@ -6,11 +6,45 @@ use l2tunnel_reliable::CompactReliableConfig;
 
 /// Active canonical directional bytes, including explicit copy policy.
 pub const CONFIG_BYTES: usize = 249;
+/// Native device ordering, authenticated separately for each Compact direction.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum NativeDelivery {
+    /// Use the original native and recovery profile's delivery behavior.
+    #[default]
+    ProfileDefault,
+    /// Write complete frames in record order on each MUX channel.
+    ChannelOrdered,
+}
+
+impl NativeDelivery {
+    fn wire(self, native: NativePolicy) -> Result<u8, Error> {
+        match (self, native) {
+            (Self::ProfileDefault, native) => Ok(native.wire()),
+            (Self::ChannelOrdered, NativePolicy::RawEthernet) => Ok(0x84),
+            (Self::ChannelOrdered, NativePolicy::Lz4Ethernet) => Ok(0x85),
+            _ => Err(Error::Configuration),
+        }
+    }
+
+    fn from_wire(byte: u8) -> Result<(NativePolicy, Self), Error> {
+        match byte {
+            0x84 => Ok((NativePolicy::RawEthernet, Self::ChannelOrdered)),
+            0x85 => Ok((NativePolicy::Lz4Ethernet, Self::ChannelOrdered)),
+            byte => Ok((
+                NativePolicy::from_wire(byte).ok_or(Error::Configuration)?,
+                Self::ProfileDefault,
+            )),
+        }
+    }
+}
+
 /// Complete Compact R0 policy with no unused legacy/FEC parameters.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Config {
     /// Exact authenticated native interpretation.
     pub native_policy: NativePolicy,
+    /// Delivery order on the native device, independent of outer ARQ feedback.
+    pub native_delivery: NativeDelivery,
     /// Actual ordering, body, bounded lookahead and original native lifetime.
     pub receiver: receiver::Limits,
     /// Complete actual adaptive Compact recovery direction and wire overhead.
@@ -36,7 +70,11 @@ impl Config {
         original: usize,
         minimum_sources: usize,
     ) -> Result<(), Error> {
-        if !self.native_policy.available() {
+        self.native_delivery.wire(self.native_policy)?;
+        if !self.native_policy.available()
+            || self.native_delivery == NativeDelivery::ChannelOrdered
+                && !matches!(self.recovery.arq().recovery(), CompactRecovery::KcpLike(_))
+        {
             return Err(Error::Configuration);
         }
         self.receiver
@@ -77,11 +115,14 @@ impl Config {
         let bounds = self.recovery.arq().bounds();
         BodyConfig {
             native_policy: self.native_policy,
+            native_delivery: self.native_delivery,
             receiver: self.receiver,
             send_records: bounds.send_records,
             receive_records: bounds.receive_records,
             outer_overhead_bytes: self.recovery.outer_overhead_bytes(),
             compact: true,
+            independent_packets: self.native_policy.is_stateless()
+                && matches!(self.recovery.arq().recovery(), CompactRecovery::KcpLike(_)),
         }
     }
     /// Canonical complete requested policy, without selecting runtime capability.
@@ -94,7 +135,7 @@ impl Config {
             return Err(Error::Configuration);
         }
         let mut w = Writer::new(output);
-        w.byte(self.native_policy.wire())?;
+        w.byte(self.native_delivery.wire(self.native_policy)?)?;
         let r = self.receiver;
         let b = r.body;
         for n in [
@@ -187,7 +228,7 @@ impl Config {
             return Err(Error::Configuration);
         }
         let mut r = Reader::new(input);
-        let native_policy = NativePolicy::from_wire(r.byte()?).ok_or(Error::Configuration)?;
+        let (native_policy, native_delivery) = NativeDelivery::from_wire(r.byte()?)?;
         let body = l2tunnel_codec::aligned_body::Config {
             max_frame_bytes: r.size()?,
             symbol_bytes: r.size()?,
@@ -268,6 +309,7 @@ impl Config {
         r.finish()?;
         Ok(Self {
             native_policy,
+            native_delivery,
             receiver,
             recovery,
             max_recovery_packet_bytes,
@@ -289,21 +331,36 @@ impl Config {
 #[derive(Clone, Copy)]
 pub(super) struct BodyConfig {
     pub native_policy: NativePolicy,
+    pub native_delivery: NativeDelivery,
     pub receiver: receiver::Limits,
     pub send_records: usize,
     pub receive_records: usize,
     pub outer_overhead_bytes: usize,
     pub compact: bool,
+    // Derived only from the authenticated recovery and native policies.
+    pub independent_packets: bool,
+}
+impl BodyConfig {
+    /// Bytes preceding the symbol scratch in a Packed receiver's workspace.
+    pub(super) fn packed_preview_bytes(self) -> usize {
+        if self.independent_packets {
+            self.receive_records.div_ceil(8)
+        } else {
+            0
+        }
+    }
 }
 impl From<super::Config> for BodyConfig {
     fn from(c: super::Config) -> Self {
         Self {
             native_policy: c.native_policy,
+            native_delivery: NativeDelivery::ProfileDefault,
             receiver: c.receiver,
             send_records: c.recovery.arq.send_records,
             receive_records: c.recovery.arq.receive_records,
             outer_overhead_bytes: c.recovery.outer_overhead_bytes,
             compact: false,
+            independent_packets: false,
         }
     }
 }

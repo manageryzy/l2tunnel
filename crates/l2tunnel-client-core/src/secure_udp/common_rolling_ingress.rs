@@ -95,6 +95,9 @@ pub struct RollingIngressObservation {
     /// Full queue refusals by source, repair and deferred feedback since this generation started.
     #[serde(default)]
     pub full_refusals: [u64; 3],
+    /// Authenticated systematic copies absorbed by an identical retained source.
+    #[serde(default)]
+    pub coalesced_sources: u64,
     /// Earliest original queued job/operation/session cap.
     pub deadline_micros: Option<u64>,
 }
@@ -131,6 +134,7 @@ impl RollingIngressStatus {
                     oldest_received_micros: value.oldest_received.map(|tick| tick.0),
                     oldest_records_number: value.oldest_records_number,
                     full_refusals: value.full_refusals,
+                    coalesced_sources: value.coalesced_sources,
                     deadline_micros: value.deadline.map(|tick| tick.0),
                 })
             })

@@ -15,6 +15,7 @@ pub(super) fn config(owners: u16) -> TestResult<Config> {
     let symbol = 128;
     let source = aligned_envelope::HEADER_BYTES + symbol;
     let policy = aligned::CompactConfig {
+        native_delivery: aligned::NativeDelivery::ProfileDefault,
         native_policy: aligned::NativePolicy::RawIp,
         receiver: aligned_receiver::Limits {
             body: aligned_body::Config {

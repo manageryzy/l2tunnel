@@ -1085,6 +1085,7 @@ impl Bounds {
             }
             DirectionProfile::Swift(_)
             | DirectionProfile::Rolling { .. }
+            | DirectionProfile::Striped(_)
             | DirectionProfile::Research { .. } => return None,
         })
     }

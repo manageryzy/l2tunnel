@@ -37,6 +37,275 @@ fn container(units: &[Vec<u8>]) -> Vec<u8> {
     }
     bytes
 }
+
+fn ack_config() -> AckLz4Config {
+    AckLz4Config {
+        packed: config(),
+        max_source_bytes: 1460,
+        max_ack_bytes: 128,
+    }
+}
+
+#[cfg(feature = "lz4")]
+fn ack_source(packets: &[Vec<u8>]) -> Vec<u8> {
+    let ident = identity();
+    let records: Vec<_> = (0..packets.len())
+        .map(|i| RecordId(3463 + i as u64))
+        .collect();
+    let units: Vec<_> = packets
+        .iter()
+        .zip(&records)
+        .map(|(p, r)| unit(0, r.0 as u16, p))
+        .collect();
+    let payload = if units.len() == 1 {
+        units[0].clone()
+    } else {
+        container(&units)
+    };
+    let mut plain = vec![0; 1460];
+    let n = encode_compact(config(), ident, &records, &payload, &mut plain).unwrap();
+    plain.truncate(n);
+    plain
+}
+
+#[cfg(feature = "lz4")]
+fn test_ack() -> Vec<u8> {
+    let mut b = vec![0; 64];
+    b[0] = 0x45;
+    b[2..4].copy_from_slice(&64u16.to_be_bytes());
+    b[6] = 0x40;
+    b[8] = 64;
+    b[9] = 6;
+    b[12..20].copy_from_slice(&[10, 0, 0, 2, 10, 0, 0, 1]);
+    b[20..24].copy_from_slice(&[0, 80, 1, 2]);
+    b[32] = 0xb0;
+    b[33] = 0x10;
+    b[40..52].copy_from_slice(&[1, 1, 8, 10, 0, 0, 0, 12, 0, 0, 0, 9]);
+    b[52..64].copy_from_slice(&[1, 1, 5, 10, 0, 0, 1, 0, 0, 1, 0, 0]);
+    b
+}
+
+#[cfg(feature = "lz4")]
+#[test]
+fn ack_lz4_exact_packed_bytes_and_independent_sources() {
+    let cfg = ack_config();
+    let id = identity();
+    let mut table = AckLz4Table::new().unwrap();
+    assert_eq!((table.allocations(), table.capacity_bytes()), (1, 8192));
+    let mut work = vec![0x55; cfg.encode_scratch_len().unwrap()];
+    let mut packets = vec![test_ack(); 8];
+    packets[1][33] |= 0xc0;
+    let a = ack_source(&packets);
+    packets[3][26] = 123;
+    let b = ack_source(&packets);
+    let mut frames = Vec::new();
+    for plain in [&a, &b] {
+        let n = cfg
+            .try_encode(id.scope, id.source, plain, &mut work, &mut table)
+            .unwrap()
+            .unwrap();
+        assert!(n < plain.len());
+        assert_eq!(
+            &work[..3],
+            &[0, (plain.len() >> 8) as u8, plain.len() as u8]
+        );
+        frames.push(work[..n].to_vec());
+        assert!(decode_compact(config(), id.scope, id.source, &work[..n]).is_err());
+    }
+    // Restore B before A and with no other source available. The final zero bytes matter.
+    for (wire, plain) in frames.iter().zip([&a, &b]).rev() {
+        let mut result = vec![0xa5; 1460];
+        assert_eq!(
+            cfg.decode(id.scope, id.source, wire, &mut result).unwrap(),
+            Some(plain.len())
+        );
+        assert_eq!(&result[..plain.len()], &plain[..]);
+        assert!(result[plain.len()..].iter().all(|&b| b == 0xa5));
+        assert_eq!(&plain[plain.len() - 2..], &[0, 0]);
+        assert_eq!(
+            cfg.decode(id.scope, id.source, plain, &mut []).unwrap(),
+            None
+        );
+    }
+}
+
+#[cfg(feature = "lz4")]
+#[test]
+fn ack_lz4_rejects_non_ack_units_and_malformed_or_oversized_blocks() {
+    let cfg = ack_config();
+    let id = identity();
+    let mut table = AckLz4Table::new().unwrap();
+    let mut work = vec![0; cfg.encode_scratch_len().unwrap()];
+    for (off, value) in [
+        (0, 0x65),
+        (6, 0x60),
+        (7, 1),
+        (9, 17),
+        (3, 65),
+        (32, 0x90),
+        (33, 0x12),
+        (33, 0x14),
+        (33, 0x11),
+        (33, 0x18),
+        (55, 9),
+    ] {
+        let mut bad = test_ack();
+        bad[off] = value;
+        let plain = ack_source(&[test_ack(), bad]);
+        assert_eq!(
+            cfg.try_encode(id.scope, id.source, &plain, &mut work, &mut table)
+                .unwrap(),
+            None
+        );
+        // An authenticated peer cannot relabel this mixed source as a compressed ACK block.
+        let mut forged = vec![0, (plain.len() >> 8) as u8, plain.len() as u8];
+        forged.extend(lz4_flex::block::compress(&plain));
+        assert!(forged.len() < plain.len());
+        assert!(cfg.decode(id.scope, id.source, &forged, &mut work).is_err());
+    }
+    let raw = ack_source(&[test_ack(), test_ack()]);
+    let n = cfg
+        .try_encode(id.scope, id.source, &raw, &mut work, &mut table)
+        .unwrap()
+        .unwrap();
+    let valid = work[..n].to_vec();
+    assert!(matches!(
+        cfg.try_encode(id.scope, id.source, &raw, &mut [0; 8], &mut table),
+        Err(Error::OutputTooSmall { .. })
+    ));
+    assert_eq!(
+        cfg.decode(id.scope, id.source, &valid, &mut [0; 8]),
+        Err(Error::OutputTooSmall { needed: raw.len() })
+    );
+    let mut undersized = valid.clone();
+    undersized[1..3].copy_from_slice(&((raw.len() - 1) as u16).to_be_bytes());
+    let mut longer = valid.clone();
+    longer[1..3].copy_from_slice(&((raw.len() + 1) as u16).to_be_bytes());
+    let mut padded = valid.clone();
+    padded.push(0);
+    for bytes in [
+        &[][..],
+        &[0],
+        &[0, 0, 99],
+        &[0, 0, 4, 0],
+        &[0, 0xff, 0xff, 0],
+        &valid[..n - 1],
+        &undersized,
+        &longer,
+        &padded,
+    ] {
+        assert!(cfg.decode(id.scope, id.source, bytes, &mut work).is_err());
+    }
+    let small = AckLz4Config {
+        max_source_bytes: raw.len() - 1,
+        ..cfg
+    };
+    assert!(
+        small
+            .decode(id.scope, id.source, &valid, &mut work)
+            .is_err()
+    );
+    assert!(
+        small
+            .try_encode(id.scope, id.source, &raw, &mut work, &mut table)
+            .is_err()
+    );
+    let mut invalid = raw.clone();
+    invalid[1] = 9;
+    assert!(
+        cfg.try_encode(id.scope, id.source, &invalid, &mut work, &mut table)
+            .is_err()
+    );
+    let mut fragment = vec![0, 0, 1, 4, 0, 8, 0, 0];
+    fragment.extend([0; 8]);
+    let mut envelope = [0; 64];
+    let n = encode_compact(config(), id, &[RecordId(1)], &fragment, &mut envelope).unwrap();
+    assert_eq!(
+        cfg.try_encode(id.scope, id.source, &envelope[..n], &mut work, &mut table)
+            .unwrap(),
+        None
+    );
+}
+
+#[cfg(feature = "lz4")]
+#[test]
+fn ack_lz4_incompressible_plain_and_all_nonzero_unit_counts_are_unambiguous() {
+    let cfg = ack_config();
+    let id = identity();
+    let mut table = AckLz4Table::new().unwrap();
+    let mut work = vec![0; cfg.encode_scratch_len().unwrap()];
+    let mut ip: Vec<_> = (0u8..40)
+        .map(|i| i.wrapping_mul(71).wrapping_add(57))
+        .collect();
+    ip[0] = 0x45;
+    ip[2..4].copy_from_slice(&40u16.to_be_bytes());
+    ip[6..8].copy_from_slice(&[0x40, 0]);
+    ip[9] = 6;
+    ip[32] = 0x50;
+    ip[33] = 0x10;
+    assert!(crate::tcp_header::pure_ipv4_ack(&ip));
+    let plain = ack_source(&[ip]);
+    assert_eq!(
+        cfg.try_encode(id.scope, id.source, &plain, &mut work, &mut table)
+            .unwrap(),
+        None
+    );
+    let wide = Config {
+        symbol_bytes: 8192,
+        channels: 4,
+        max_units: 255,
+    };
+    let records: Vec<_> = (0..255).map(RecordId).collect();
+    let raw: Vec<_> = records.iter().map(|r| unit(1, r.0 as u16, &[42])).collect();
+    let mut source = vec![0; wide.max_source_bytes().unwrap()];
+    let n = encode_compact(wide, id, &records, &container(&raw), &mut source).unwrap();
+    assert_eq!(source[0], 255);
+    assert_eq!(
+        decode_compact(wide, id.scope, id.source, &source[..n])
+            .unwrap()
+            .units()
+            .unwrap()
+            .len(),
+        255
+    );
+    assert_eq!(
+        AckLz4Config {
+            packed: wide,
+            max_source_bytes: n,
+            ..cfg
+        }
+        .decode(id.scope, id.source, &source[..n], &mut [])
+        .unwrap(),
+        None
+    );
+    source[0] = 0;
+    assert!(decode_compact(wide, id.scope, id.source, &source[..n]).is_err());
+}
+
+#[cfg(not(feature = "lz4"))]
+#[test]
+fn ack_lz4_provider_absent_is_explicit_and_preserves_plain_source() {
+    let cfg = ack_config();
+    let id = identity();
+    assert!(matches!(
+        AckLz4Table::new(),
+        Err(Error::CompressionUnavailable)
+    ));
+    assert_eq!(cfg.encode_scratch_len(), Err(Error::CompressionUnavailable));
+    assert_eq!(
+        cfg.decode(id.scope, id.source, &[0, 0, 20, 0], &mut []),
+        Err(Error::CompressionUnavailable)
+    );
+    assert_eq!(
+        cfg.decode(
+            id.scope,
+            id.source,
+            &[1, 1, 0, 0, 0, 0, 0, 2, 0, 1, 42],
+            &mut []
+        ),
+        Ok(None)
+    );
+}
 fn source(identity: Identity, records: &[RecordId], payload: &[u8]) -> Vec<u8> {
     let mut output = vec![0xaa; config().max_source_bytes().unwrap()];
     let length = encode(config(), identity, records, payload, &mut output).unwrap();

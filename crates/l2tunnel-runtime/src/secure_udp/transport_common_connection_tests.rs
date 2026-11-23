@@ -391,6 +391,17 @@ fn original_udp_sixteen_compact_owners_lossy_raw_ack_and_native_pressure_keep_cu
                 .ok_or("actual deferred queue status")?;
             assert_eq!((input.packets, input.retained, input.admitted), (2, 2, 0));
             assert_eq!(input.deadline_micros, Some(older_received + 100_000));
+            // A raw carrier can hold the outgoing body across a receive turn.
+            // A retry of the queued incoming ACK must leave that buffer intact.
+            let driver = &mut fixture.endpoints[0].driver;
+            let transmit = driver.buffers.frame.clone();
+            driver.retry_common_connection_input(fixture.now)?;
+            assert_eq!(driver.buffers.frame, transmit);
+            let retried = driver
+                .snapshot_common(fixture.now, true)?
+                .connection_input
+                .ok_or("retried queue status")?;
+            assert!(retried.retried > input.retried);
             let cap = fixture.now + 100_000;
             fixture.now = older_received
                 .checked_add(101_000)

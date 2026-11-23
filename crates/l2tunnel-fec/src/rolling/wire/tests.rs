@@ -1,6 +1,8 @@
 use super::*;
 use crate::rolling::{Begin, DecodeStep, Decoder, Tick, WorkBudget};
 
+#[path = "confirmed_prefix_tests.rs"]
+mod confirmed_prefix;
 #[path = "extent_tests.rs"]
 mod extent;
 
@@ -35,6 +37,44 @@ fn hex(value: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
         .chunks(2)
         .map(|chunk| Ok(u8::from_str_radix(std::str::from_utf8(chunk)?, 16)?))
         .collect()
+}
+
+#[test]
+fn ack_lz4_selector_keeps_the_expanded_exact_source_grammar() -> TestResult {
+    let original = b"ack";
+    let old = SourceWire::TargetedExact;
+    let new = SourceWire::TargetedExactAckLz4;
+    assert_eq!((old.policy_id(), new.policy_id()), (5, 9));
+    assert!(!old.compresses_packed_acks());
+    assert!(new.compresses_packed_acks() && new.is_targeted() && !new.is_near8());
+    let mut old_bytes = [0; 80];
+    let mut new_bytes = [0; 80];
+    let old_len = encode_source_with(
+        config(),
+        old,
+        scope(),
+        SourceId(3),
+        original,
+        &mut old_bytes,
+    )?;
+    let new_len = encode_source_with(
+        config(),
+        new,
+        scope(),
+        SourceId(3),
+        original,
+        &mut new_bytes,
+    )?;
+    assert_eq!(old_len, new_len);
+    assert_eq!(old_bytes[..old_len], new_bytes[..new_len]);
+    assert!(matches!(
+        inspect_with(config(), old, &new_bytes[..new_len])?,
+        View::Source {
+            id: SourceId(3),
+            ..
+        }
+    ));
+    Ok(())
 }
 
 // Header literals derive from independent Python struct.pack, with the version

@@ -909,16 +909,25 @@ impl Engine {
         ))
     }
 
+    // All unacknowledged sources are in [base, next_source). Indexed lookup
+    // visits the active sequence span instead of every prepaid source slot.
+    // Physically held acknowledged attempts below base need no send opportunity.
+    fn compact_candidates(&self, base: u64) -> impl Iterator<Item = (SourceId, &Flight)> {
+        (base..self.next_source).filter_map(|number| {
+            let source = SourceId(number);
+            self.sent.get(&source).map(|flight| (source, flight))
+        })
+    }
+
     pub(super) fn compact_source_deadline(&self) -> Option<Duration> {
         let state = self.compact.as_ref()?;
-        self.sent
-            .iter()
+        self.compact_candidates(state.base)
             .filter(|(_, flight)| !flight.acknowledged && flight.transmission == 0)
             // No local timer frees a history slot: real peer feedback does.
             // Errors remain actionable so normal polling exposes fatal limits.
-            .filter(|(source, _)| !self.compact_source_blocked(**source).unwrap_or(false))
+            .filter(|(source, _)| !self.compact_source_blocked(*source).unwrap_or(false))
             .filter_map(|(source, flight)| {
-                if state.meta(*source).fast {
+                if state.meta(source).fast {
                     Some(self.last_now)
                 } else {
                     flight
@@ -1242,26 +1251,25 @@ impl Engine {
         let state = self.compact.as_ref().ok_or(RecoveryError::InvalidConfig)?;
         let source = allow_sources
             .then(|| {
-                self.sent
-                    .iter()
+                self.compact_candidates(state.base)
                     .filter(|(source, flight)| {
                         !flight.acknowledged
                             && flight.transmission == 0
                             && (flight.attempts == 0
                                 || flight.retry_at.is_some_and(|at| at <= now)
-                                || state.meta(**source).fast)
+                                || state.meta(*source).fast)
                     })
                     .map(|(source, flight)| {
                         (
                             if flight.attempts == 0 {
                                 2
-                            } else if state.meta(*source).fast {
+                            } else if state.meta(source).fast {
                                 0
                             } else {
                                 1
                             },
                             flight.retry_at.unwrap_or(now),
-                            *source,
+                            source,
                         )
                     })
                     .min()

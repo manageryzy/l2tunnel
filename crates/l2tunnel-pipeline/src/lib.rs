@@ -35,6 +35,11 @@ use l2tunnel_qos::{ClassConfig, ClassId, FlowConfig, Scheduler, SchedulerConfig}
 /// Explicit owned/benchmark ACK custody before ordinary Pipeline admission.
 pub mod ack_coalescing;
 mod backing;
+pub mod path_ack;
+/// Independent physical-path DATA packing and carrier handoff.
+pub mod path_batch;
+pub mod path_request;
+pub mod path_retransmit;
 /// Complete checked fallible Pipeline backing and actual retained capacity.
 pub mod storage;
 
@@ -571,11 +576,25 @@ impl Pipeline {
         if timing.received > now || timing.original_deadline.is_some_and(|cap| now >= cap) {
             return Err((PipelineError::Timing, input));
         }
-        let key = classification.key;
-        let (total, per_flow) = match self.preflight(key, input.bytes().len(), weight) {
+        let usage = match self.preflight(classification.key, input.bytes().len(), weight) {
             Ok(value) => value,
             Err(kind) => return Err((kind, input)),
         };
+        self.enqueue_preflighted(input, weight, timing, classification, usage)
+    }
+
+    // The caller has checked timing and the real queue budgets in the same
+    // exclusive admission, with no intervening Pipeline mutation.
+    fn enqueue_preflighted<'a>(
+        &mut self,
+        input: Input<'a>,
+        weight: u32,
+        timing: PacketTiming,
+        classification: Classification,
+        (total, per_flow): (QueueUsage, QueueUsage),
+    ) -> Result<PacketMetadata, (PipelineError, Input<'a>)> {
+        let now = timing.admitted;
+        let key = classification.key;
         let transaction = match self.flows.prepare_assign(key, now) {
             Ok(value) => value,
             Err(error) => return Err((PipelineError::Flow(error), input)),

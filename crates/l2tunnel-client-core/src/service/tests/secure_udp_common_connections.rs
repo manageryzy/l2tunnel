@@ -72,6 +72,7 @@ fn selected_wire(
             owners: 16,
             incarnation: 29,
             compact: aligned::CompactConfig {
+                native_delivery: aligned::NativeDelivery::ProfileDefault,
                 native_policy: aligned::NativePolicy::IpHeaders,
                 receiver,
                 recovery,

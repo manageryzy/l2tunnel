@@ -41,6 +41,7 @@ fn udp_values(kind: cover::Appearance) -> Result<[C; 3]> {
             | c::Profile::AlignedCompact { .. }
             | c::Profile::PackedCompact { .. }
             | c::Profile::PerConnectionCompact { .. }
+            | c::Profile::Striped { .. }
             | c::Profile::Research { .. } => {
                 return Err(io::Error::new(
                     io::ErrorKind::Unsupported,

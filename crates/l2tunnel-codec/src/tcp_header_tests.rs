@@ -1,6 +1,32 @@
 use super::*;
 type TestError = Box<dyn std::error::Error + Send + Sync>;
 type TestResult = Result<(), TestError>;
+
+#[test]
+fn checksum_preserves_words_across_empty_parts_odd_splits_and_block_boundaries() {
+    let bytes: Vec<u8> = (0..196_619u32).map(|i| 255 - (i % 19) as u8).collect();
+    for len in [0, 1, 20, 51, 1448, 65_535, 65_536, 65_537, bytes.len()] {
+        let packet = &bytes[..len];
+        let sum = packet
+            .iter()
+            .enumerate()
+            .map(|(i, byte)| u64::from(*byte) << if i % 2 == 0 { 8 } else { 0 })
+            .sum::<u64>();
+        let expected = if sum == 0 {
+            0xffff
+        } else {
+            0xfffe - ((sum - 1) % 65_535) as u16
+        };
+        for stride in [1, 7, 1448, 65_535, 65_536, 65_537] {
+            let parts: Vec<_> = packet
+                .chunks(stride)
+                .flat_map(|part| [part, &[][..]])
+                .collect();
+            assert_eq!(checksum(&parts), expected, "length {len}, stride {stride}");
+        }
+    }
+}
+
 struct Vector {
     profile: HeaderProfile,
     name: &'static str,

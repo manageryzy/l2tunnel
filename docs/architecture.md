@@ -1,5 +1,10 @@
 # Protocol architecture
 
+The explicitly selected [KCP-like L2 profile](modules/kcp-like-l2.md) adds a
+recovery policy inside Common. It reuses native framing, packing, authentication,
+carrier ownership and management; it is not another carrier or a new default.
+Its upstream KCP comparison and native performance qualification remain separate.
+
 Status: current-format cutover and verification in progress. Public Rust
 protocol libraries remain independent of OS handles, clocks and async runtimes.
 Swift and other record algorithms operate inside the selected same-owner carrier;
@@ -310,7 +315,156 @@ Its current runtime uses the original UDP socket's all-traffic accepted IP byte
 counter. The gate estimates local serialization from that counter and the
 configured pacer. See [wire costs and measured scope](modules/frame-channel-experiment.md#negotiated-eight-source-forward-repair).
 
+Forward selector 10 enables a second, one-MTU near8 account for first-copy
+credit that the ordinary account would discard at its cap. A group with more
+than eight MTUs queued in the fresh MUX can use that account if recent physical
+IP submissions leave capacity. The sender rechecks capacity while computing
+the equation and charges the complete IP cost on physical acceptance. The
+row uses the same authenticated near8 representation as selector 6. The two
+profiles have distinct negotiated configuration digests.
+
+The experimental reverse selector `TargetedExactAckLz4` (9) compresses one
+complete compact Packed source when all contained native records are short
+IPv4 TCP ACKs. A compressed source starts with a reserved zero record count,
+a two-byte original length and a bounded LZ4 block. An ordinary nonzero
+record count retains its original representation. The receiver authenticates
+and replay-checks the carrier record, restores the exact Packed source, then
+admits that source to recovery. Regular FEC equations use the original
+bytes. Each systematic copy and named retransmission pays its actual
+physical length. The descriptor binds the reverse format independently of
+the forward near8 and fixed-anchor selections.
+
+Two forward policies can be evaluated separately. A bounded native reordering
+interval acts after complete packet reconstruction at the TUN receiver. A
+confirmed-prefix global equation omits only columns below a cumulative source
+receipt that the sender has already verified from its peer. Its actual support is
+carried in a separately negotiated grammar and stays fixed through retries.
+Neither mechanism changes inner TCP's ownership of its congestion window.
+The [single-flow evidence](modules/frame-channel-experiment.md#inner-tcp-retransmissions-in-the-single-flow-near8-run)
+distinguishes capture replay, endpoint behavior and native workload results.
+
+An optional native-IP body policy assigns each TCP header delta to one full
+context on its own channel. The authenticated directional descriptor selects
+policy 7. A data body carries tag 11 and a one-byte backward record distance
+in the range 1 through 8 before the encoded delta. The receiver can deliver
+the IP packet when its own fragments and that exact context are available.
+A lost context still needs recovery. The receive epoch owns the history and
+the sender retains the existing old-source recovery policy.
+[Wire format and single-flow evidence](modules/frame-channel-experiment.md#fixed-anchor-ip-header-compression).
+
+### Mixed data and parity in each packet
+
+The additional point-to-point recovery profile puts an immediately usable
+systematic part and parity protecting other positions in every physical
+packet. For a group of `n` packets with `m` allowed erasures, `k = n - m`
+distinct authenticated packets must suffice to recover all originals.
+Existing C48 rolling and Packed block Cauchy remain separate profiles.
+Their historical Linux measurements apply to their own formats.
+
+The experimental codec rotates the positions of `k` systematic cells and
+`m` Cauchy parity cells in each of `n` stripes. Every physical packet
+carries one cell from each stripe and all the direct data for one original.
+Thus any `k` packets supply an invertible set of columns for every stripe.
+The original length participates in coding. On wire, zero extension after
+an original is implicit. The complete parity suffix travels in the same
+authenticated packet. An intact source can be handed to the native record
+decoder immediately. A fragmented TCP segment still needs its own fragments
+and any required header context. The receiver spends reconstruction work
+when an earlier source is needed and enough packets have arrived.
+
+The owner selected bounded-time shortening, including splitting a lone
+record into two mixed packets. The first source starts the clock. Filling
+the group makes it sendable immediately. The experimental shape policy uses
+`min(q - 1, ceil(q * m / n))` parity cells for `q >= 2` actual members.
+A split group uses two members and reconstructs one logical source. If an
+ordinary short group would exceed the path MTU, the sender emits a fitting
+contiguous prefix or splits the first source, then rechecks the remaining
+sources at the original expiry. The nominal geometry, hold
+time and ratio for a short group are engineering parameters under study.
+An implementation must charge every physical packet, including splits,
+preserve old-gap custody and keep the authenticated management path available.
+
+The current producer exposes first-seal timing, group formation and the
+physical charge for fresh members, named retries, quiet retries and outgoing
+feedback through the shared service status. The previously selected 500 µs
+forward hold and the 1,500 µs experiment are separate authenticated
+descriptors. Both use a 500 µs Packed hold and a 500 µs reverse group hold.
+
+The Rust group windows distinguish an admitted logical source, an accepted
+physical transmission, a mathematically recoverable group and a committed
+original. Only contiguous commits advance the cumulative receipt. A fully
+committed later group releases its expanded bytes while retaining its range.
+The receiver reserves enough space for a maximum-size frontier group even
+when unrelated later groups arrive first.
+
+CompleteV2 tag 10 binds the two directional mixed-packet policies,
+including their coding stream, native and packed record limits, source
+aperture, MTU and timers. Its functional Common Engine passes actual
+Packed sources to a single recovery owner. A source remains outstanding
+until every native record depending on it has completed. The authenticated
+outer data/feedback class selects the parser, since some legal group
+shapes share the first byte of a feedback message. The normal service prices
+the physical windows, native codec, dependency and deadline indexes, and
+shared small-group decode workspace for each concurrent epoch. Both roles
+use the same reserved Engine when the Bank installs a negotiated descriptor.
+
+The group must have its input before parity depending on that input can be
+sent. When sufficient packets arrive, prompt recovery saves the loss-feedback
+round trip. The send hold, serialization, reordering and local computation
+still contribute to latency. See the [packet contract and measurement
+limits](modules/frame-channel-experiment.md#mixed-packets-and-local-erasure-recovery).
+
 ## Reviewed target and implementation boundary
+
+The physical-path bundle under study divides each native packet across a
+configurable number of established carrier paths. Its recovery threshold
+is configurable separately. A path can combine its shares from several
+native packets in one authenticated datagram. Each path flushes on its own
+size limit or the oldest share's deadline. A late path leaves the others
+eligible to send. The receiver can deliver any complete native IP packet
+to TUN as soon as it has enough distinct coding ordinals for that record.
+
+Feedback batches per-path packet observations and native delivery receipts.
+Either direction may carry these receipts in ordinary DATA. A count limit
+or deadline triggers standalone feedback when needed. Native source custody
+ends on confirmation of delivery to the peer's native interface. Lost
+members can be requested by logical record and ordinal and sent on another
+authenticated path. Whole-record erasure at the end of a quiet stream
+also needs a sender retry. [Implementation and measured scope](modules/frame-channel-experiment.md#independent-physical-paths-for-one-inner-flow).
+
+The sender must also use the selected path's physical ACKs to repair lost
+DATA on that path. Positive receipts above a hole provide evidence before
+the timer expires. Missing feedback at the paid-send deadline also triggers
+repair, including at the end of an idle stream. A receiver forgetting an old
+packet number does not acknowledge it. A confirmed native delivery can
+cancel the remaining coding work. The experimental reorder threshold,
+timer, N/K and target retransmission fraction require measurement.
+
+The experimental sender can share pending member custody across first flights,
+named requests and physical retries. Only complete carrier acceptance counts
+as payment. A request may take over an unstaged first flight while preserving
+its admission deadline; the original lane then skips that same first flight.
+Explicit replicas remain separate payments. A bounded scheduler rotates new
+members, physical repairs and named/quiet repairs. This optional policy is under
+measurement and does not change the normal service's carrier selection.
+
+The subsequent paced-recovery experiment gives all physical paths in one
+direction a single byte budget. DATA, native TCP ACK records, authenticated
+ACKs and named requests consume the same aggregate capacity; control service
+rotates within that budget. Successful socket handoff charges actual IP bytes
+plus the modeled Ethernet header. Blocked writes retain their frozen bytes
+and cannot consume payment credit. Physical RTT measurements retain a bounded
+history of actual packet payments independently of native delivery credit.
+These laboratory policies remain explicit selections, with effective rates
+and timeout limits observable in the receipt.
+
+The Linux bundle lab offers independent TUN writes, strict group order and
+ordered TCP data with a validated pure TCP ACK allowed across a gap. All
+three use the same physical data admission and require successful native
+handoff for logical confirmation. The shared sender can retain a configured
+amount of earned byte credit. Production Common path authentication and
+joining remain a separate integration requirement.
+[Measured qualifications and open policies](modules/frame-channel-experiment.md#native-delivery-order-and-sender-pacing-in-the-linux-path-bundle).
 
 The 2026-11-13 owner discussion confirmed a fixed point-to-point deployment for
 studying tunnel transport and QoS between controlled endpoints. The target uses

@@ -17,6 +17,7 @@ class PendingACK:
     acknowledged: int
     created_at: float
     echoed_timestamp: float | None
+    sack_blocks: tuple = ()
 
 
 class CoalescedACKTCP(CompactTCP):
@@ -70,9 +71,10 @@ class CoalescedACKTCP(CompactTCP):
         duplicate = self.tcp_received == self.last_ack
         self.ack_timer = None
         self.last_ack = self.tcp_received
-        packet = PendingACK(self.tcp_received, self.now, self.timestamp_recent)
+        blocks = self.sack_receiver.take_blocks(self.byte_offset) if self.sack_receiver is not None else ()
+        packet = PendingACK(self.tcp_received, self.now, self.timestamp_recent, blocks)
         self.ack_generated += 1
-        if duplicate or self.ack_coalesce_ms == 0:
+        if duplicate or blocks or self.ack_coalesce_ms == 0:
             # Preserve duplicate-ACK cardinality and send the preceding advancing
             # ACK first, so a fast-retransmit sequence cannot lose its first ACK.
             self.flush_pending_ack(self.pending_ack_generation)

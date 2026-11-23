@@ -84,7 +84,13 @@ impl Plan {
             l2tunnel_recovery::DATA_HEADER_BYTES,
             receive.arq.max_source_bytes,
         )?;
-        let scratch = bs.max(l2tunnel_recovery::ACK_PACKET_BYTES);
+        let scratch = bs
+            .max(l2tunnel_recovery::ACK_PACKET_BYTES)
+            .max(if decoder.is_some() {
+                add(receive.fec.block.max_source_bytes, 2)?
+            } else {
+                0
+            });
         let mut bytes = add(
             arq.capacity_bytes(),
             add(

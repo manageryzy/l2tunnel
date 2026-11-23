@@ -10,7 +10,7 @@ class SelectedBody(bytes):
 
 
 class NearStudy:
-    def __init__(self, sim, services, sender_ip_bytes_per_second):
+    def __init__(self, sim, services, sender_ip_bytes_per_second, prefix_selection=None):
         self.mux = sim.mux
         self.service = services["forward"]
         self.t = self.service.transport
@@ -21,6 +21,10 @@ class NearStudy:
         self.pending = deque()
         self.pending_bytes = 0
         self.restore = []
+        self.prefix = None
+        if prefix_selection is not None:
+            from packed_idle_prefix import IdlePrefix
+            self.prefix = IdlePrefix(self, prefix_selection)
         # Wrap before the caller installs physical UDP pricing, to see actual IP bytes.
         for net in {id(s.transport.sim): s.transport.sim for s in services.values()}.values():
             self.observe_network(net)
@@ -32,6 +36,8 @@ class NearStudy:
             finish, rtt = original(reverse, size, kind, receive)
             if not reverse:
                 self.gate.accept(size)
+                if self.prefix is not None and kind == "source":
+                    self.prefix.first_source(size, finish)
                 if kind != "near_repair":
                     self.pending.append((finish, size))
                     self.pending_bytes += size
@@ -85,27 +91,42 @@ class NearStudy:
             original_source(payload)
             end = len(t.sources)
             source_id_bytes = max(1, ((end - 1).bit_length() + 6) // 7)
-            self.gate.earn_first(OUTER + 1 + source_id_bytes + t.sources[-1].size)
+            if self.prefix is None:
+                self.gate.earn_first(OUTER + 1 + source_id_bytes + t.sources[-1].size)
             if end % GROUP:
                 return
             self.counts["opportunities"] += 1
-            if not self.gate.enabled:
+            early = self.prefix is not None and self.prefix.early_allowed(end)
+            if self.prefix is not None and self.prefix.group_used(end - GROUP):
+                self.counts["near8_already_covered_by_prefix"] += 1
+                return
+            if not self.gate.enabled and not early:
                 self.counts["closed"] += 1
                 return
             extent = max(s.size for s in t.sources[-GROUP:])
             ip_size = OUTER + 1 + len(end_bytes(end)) + 2 + extent
             queued = self.backlog()
-            if t.base >= end or not self.gate.reserve_row(ip_size, queued):
+            available = self.gate.enabled
+            try:
+                self.gate.enabled = available or early
+                funded = t.base < end and self.gate.reserve_row(ip_size, queued)
+            finally:
+                self.gate.enabled = available
+            if not funded:
                 self.counts["refused_backlog" if queued > 12000 else "refused_credit_or_scope"] += 1
                 return
             bodies = [p[:s.size] for p,s in zip(t.source_payloads[-GROUP:], t.sources[-GROUP:])]
             body = SelectedBody(row_bytes(end, bodies))
             assert ip_size == OUTER + len(body)
+            if self.prefix is not None:
+                self.prefix.full_row(end, ip_size, early and not available)
             t.sim.send(False, ip_size, "near_repair", lambda: t._receive_wire(body))
             self.counts["sent"] += 1
             self.counts["sent_ip_bytes"] += ip_size
 
         t._aligned_source = seal
+        if self.prefix is not None:
+            self.prefix.install_receiver()
 
         def bucket(index):
             backlog = self.backlog()
@@ -124,6 +145,9 @@ class NearStudy:
     def finish(self):
         for module, original in self.restore:
             module.decode_packet = original
-        return dict(counts=dict(self.counts), snapshots=self.snapshots,
-                    buckets=self.buckets, bucket_fields=["index", "accepted_ip_bytes",
-                    "ordinary_backlog", "enabled_after_bucket", "near_emitted_total"])
+        report = dict(counts=dict(self.counts), snapshots=self.snapshots,
+                      buckets=self.buckets, bucket_fields=["index", "accepted_ip_bytes",
+                      "ordinary_backlog", "enabled_after_bucket", "near_emitted_total"])
+        if self.prefix is not None:
+            report["idle_prefix"] = self.prefix.report()
+        return report

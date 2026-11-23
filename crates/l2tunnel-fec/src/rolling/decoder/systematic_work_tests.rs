@@ -98,6 +98,53 @@ fn systematic_original_work_is_independent_of_window_and_row_capacity() -> Resul
 }
 
 #[test]
+fn late_original_only_reduces_equations_that_use_its_column() -> Result<(), Error> {
+    let c = config(8192, 8);
+    let mut e = Encoder::new(c, scope(), Tick(0))?;
+    e.admit_source(&[11], Tick(0))?;
+    e.admit_source(&[22], Tick(0))?;
+    e.begin_repair(false, Tick(0))?;
+    while e.pending_repair().is_none() {
+        e.step(Tick(0), budget(MAX_STEP_WORK))?;
+    }
+    let equation = e.pending_repair().ok_or(Error::Identity)?;
+    let mut costs = Vec::new();
+    for use_full_algebra in [false, true] {
+        let mut d = Decoder::new(c, scope(), Tick(0))?;
+        d.begin_repair(equation, Tick(0))?;
+        finish(&mut d, Tick(0), MAX_STEP_WORK)?;
+        assert_eq!(d.status().rank, 1);
+        d.begin_source(scope(), SourceId(8191), &[8], Tick(0))?;
+        finish(&mut d, Tick(0), MAX_STEP_WORK)?;
+        // The unresolved row uses 0 and 1. Original 2 now arrives far behind
+        // observed_end. Its coefficient shares a block with the two nonzeros.
+        d.begin_source(scope(), SourceId(2), &[33; 64], Tick(0))?;
+        if use_full_algebra {
+            d.job.as_mut().ok_or(Error::Identity)?.phase = Phase::Clear(0);
+        }
+        costs.push(finish(&mut d, Tick(0), 1)?);
+        assert_eq!(d.decoded_source(SourceId(2))?, Some([33; 64].as_slice()));
+        assert_eq!(d.status().rank, 1);
+        assert!(d.pending_source().is_none());
+        // Original 1 is a nonpivot term of the same row. Eliminating it
+        // recovers the withheld original 0 and permits ordinary handoff.
+        d.begin_source(scope(), SourceId(1), &[22], Tick(0))?;
+        finish(&mut d, Tick(0), 1)?;
+        assert_eq!(d.pending_source(), Some((SourceId(0), [11].as_slice())));
+        d.confirm_handoff(SourceId(0), Tick(0))?;
+        assert_eq!(d.pending_source(), Some((SourceId(1), [22].as_slice())));
+        assert_eq!(d.status().rank, 0);
+    }
+    let (fast, full) = (&costs[0], &costs[1]);
+    eprintln!("late original with an absent coefficient: fast={fast:?}, full={full:?}");
+    assert_eq!(fast.field, 0);
+    assert_eq!(fast.copies, c.width()?);
+    assert!(fast.metadata < c.width()? + 32);
+    assert!(full.metadata > c.window && full.copies > fast.copies);
+    Ok(())
+}
+
+#[test]
 fn systematic_tiny_budget_preserves_exact_lengths_zero_tails_and_ring_history() -> Result<(), Error>
 {
     let mut d = Decoder::new(config(8, 8), scope(), Tick(0))?;

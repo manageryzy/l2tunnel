@@ -1,0 +1,607 @@
+{
+  "definition": "Full named requested simulator configurations and source bindings. A supported core algorithm projection never implies native workload, kernel TCP, byte or clock equivalence.",
+  "source_review": {
+    "id": "compact-arq-quic-overhead",
+    "reference_sha256": "9e98202e40cff58c7506e1eedbbf31079e520019f97ebef786b717e6ed983df8",
+    "historical_source_revision": "502314fb86ec21b075e705492b7280ee19551791",
+    "reviewed_projection_sha256": {
+      "simulator/src/l2tunnel_sim/compact_ack.py": "f61b4b3d38f4d1ea65334359c80f31563801c72a7412171723ea8bd627b18f10",
+      "simulator/src/l2tunnel_sim/compact_tcp.py": "431493d6028c459f4faf7f4f9197f51ae1f1d9923b5bceaa7d3153666fdf5de5",
+      "simulator/src/l2tunnel_sim/compact_wire.py": "d7467b3c8608a3baa77623012cb0d5183be2e2ca1d465731af9145a4c4bfc33c",
+      "simulator/src/l2tunnel_sim/config.py": "956f59d42d1bd5e1a4d0aff4df09f9d6a0fb13d408188edb3086f2202430eb15",
+      "simulator/src/l2tunnel_sim/multiflow.py": "98af06bbd4eb83ebcca2d26d194801a54c81ba45ff15c4b3d69629a018ccb88e",
+      "simulator/src/l2tunnel_sim/mux_tcp.py": "744d981f1d7b4080af78c9db3e91c18d113c460f7126e8d01447cec4a9315e3a",
+      "simulator/src/l2tunnel_sim/packed_wire.py": "707b65fa0db9ef686f3bf239c65270b987a157a576333d9e319759fd111ad081",
+      "simulator/src/l2tunnel_sim/tcp.py": "38cb6dd8360517628cfcf4d2ef94f782b16332c559e077ac82a5a580c7d1883e"
+    }
+  },
+  "references": {
+    "compact-arq-quic-overhead": {
+      "behavior": {
+        "ack_coalesce_micros": 0,
+        "adaptive_srtt_rttvar": true,
+        "algorithm": "CompactARQTransport",
+        "fast_retry_guard": "max(nominal_rtt,srtt)+2*feedback_interval",
+        "fast_retry_later_receipts": 3,
+        "fast_retry_requires_new_feedback_serial": true,
+        "fast_retry_requires_newer_echo": true,
+        "feedback_ack_delay_micros": true,
+        "feedback_echoes_transmission": true,
+        "feedback_extra_copies_after_source_receipt": 2,
+        "feedback_serial_on_wire": true,
+        "source_copies": 1,
+        "timeout_origin": "actual_source_serialization_finish",
+        "transmission_serial_on_wire": true
+      },
+      "configuration": {
+        "compact": {
+          "authentication_bytes": 45,
+          "block_sources": 8192,
+          "coding": "gf256",
+          "feedback_ms": 5.0,
+          "feedback_packets": 64,
+          "flush_ms": 1.0,
+          "header_profile": "tcp_delta",
+          "outer_header_bytes": 36,
+          "repair_ratio": 0,
+          "tail_repair_delay_ms": null
+        },
+        "drain_s": 20.0,
+        "duration_s": 25.0,
+        "flow_count": 16,
+        "payload_rate_mbps": null,
+        "replication": 1,
+        "rto_min_ms": 1000,
+        "run_id": 4,
+        "seed": 11891353551447149637,
+        "variant": "quic-overhead",
+        "warmup_s": 5.0
+      },
+      "configuration_name": "quic-overhead",
+      "configuration_source": {
+        "path": "work/secure-udp-simulator-sensitivity-20261113/attempt-1/tasks.json",
+        "sha256": "e19e4ec9381355d51816b20708a4decc0f722a51b2e38ef4c357c9e0fa29e9ac"
+      },
+      "id": "compact-arq-quic-overhead",
+      "layout": {
+        "mux_channels": null,
+        "native_tcp_flows": 16,
+        "native_window_bytes": 4194304,
+        "native_window_policy": "fixed_total",
+        "physical_paths_per_direction": 1,
+        "recovery_owner_layout": "per_connection",
+        "recovery_owners_per_direction": 16,
+        "reverse_inner_ack_path": "charged_lossy_native_bypassing_record_recovery"
+      },
+      "native_binding": "algorithm_configuration_only",
+      "observations": [
+        {
+          "historical_id": "quic-overhead-1",
+          "path": "work/secure-udp-simulator-sensitivity-20261113/attempt-1/quic-overhead-1.json",
+          "replication": 1,
+          "seed": 11891353551447149637,
+          "sha256": "2ee92997413dbb574ac3cc67e2e0562fb87ed486315f9ce31ab42881f37c244c"
+        },
+        {
+          "historical_id": "quic-overhead-2",
+          "path": "work/secure-udp-simulator-sensitivity-20261113/attempt-1/quic-overhead-2.json",
+          "replication": 2,
+          "seed": 10446470503212366402,
+          "sha256": "c3bb34b634fc6bc1ac9e98d1ae04cf43be843aae76f1b8c941e59ce2707cdbc9"
+        },
+        {
+          "historical_id": "quic-overhead-3",
+          "path": "work/secure-udp-simulator-sensitivity-20261113/attempt-1/quic-overhead-3.json",
+          "replication": 3,
+          "seed": 13241087429290935744,
+          "sha256": "2c32461e0441761ae22f63ceb8e5853ed4ebef42bbbce3b24c7a3c5317a740f7"
+        }
+      ],
+      "provenance": {
+        "artifact": "work/parallel-features-20261115/python-parity-staging/flow-layout/comparison-manifest-v1.json",
+        "kind": "saved_named_configuration_and_source_audit_not_new_measurement",
+        "sha256": "5cf9130a3547318fb25b15f5f24488cd10fab4e10b41d1673c85c076c838991a"
+      },
+      "remaining_differences": {
+        "acceptance_clock": "Python anchors link serialization completion; native anchors accepted carrier records and retains separate observation timestamps.",
+        "codec_geometry": "Python compact stream/header codec and fixed modeled symbol geometry differ from selected native IP codec, authentication fields and carrier-sized records.",
+        "finite_retry_history": "Python has no finite nine-attempt retry ceiling or matching native bounded transmission-history resource failure; native retains explicit finite limits.",
+        "kernel_tcp": "Python models CUBIC, fixed aggregate4MiB inner window, minimum RTO1000ms and explicit ACK policy; native transparent TUN leaves the real kernel controller/window/ACK policy authoritative.",
+        "measurement_window": "Named reference traffic/warmup/drain differs from the diagnostic native2s warmup plus10s sample and finite EOF/drain phase cap.",
+        "real_crypto_wire": "Python charges modeled authentication/outer bytes; native executes real integrity/confidentiality and selected UDP/raw/TLS/QUIC framing."
+      },
+      "required_actual": {
+        "feedback_interval_us": 5000,
+        "feedback_packets": 64,
+        "nominal_rtt_us": 70000,
+        "owners_per_direction": 16,
+        "recovery": "compact_arq_guarded",
+        "reverse_ack_path": "lossy_unrecovered",
+        "source_window_per_owner": 8192,
+        "topology": "per_connection"
+      },
+      "scenario": {
+        "forward_mbit_s": 100,
+        "loss_probability_each_direction": 0.15,
+        "path_mtu": 1500,
+        "reverse_mbit_s": 10,
+        "rtt_ms": 70
+      },
+      "sha256": "9e98202e40cff58c7506e1eedbbf31079e520019f97ebef786b717e6ed983df8",
+      "source_sha256": {
+        "simulator/src/l2tunnel_sim/aligned_records.py": "f3a5eb8e0471e4f8b613aed7fbb9c361da8dab49eb2133d7febaebdd5424c43a",
+        "simulator/src/l2tunnel_sim/compact.py": "0f3fae6419b22bffec2b63b75c7f8fb09bce86d23fb04a8aa0de4cfecf3b14fe",
+        "simulator/src/l2tunnel_sim/compact_ack.py": "2f0caebd2e86f29ee1d329a85a00fad53faaaea1a01b2f9ed2bd27adf2e8129d",
+        "simulator/src/l2tunnel_sim/compact_arq.py": "582b3c4020805c7cf3192e225a941154a0501dc7b0580c79c8c6134246e103d4",
+        "simulator/src/l2tunnel_sim/compact_tcp.py": "7c98e1724f5bd1b53da5138df4678b3035870336c6446019c3c2a9e25ba5b759",
+        "simulator/src/l2tunnel_sim/compact_wire.py": "88fb794dedc7c7bb501e7ddd636920751aeb54500019eba4ef48bb87fbfcfba4",
+        "simulator/src/l2tunnel_sim/config.py": "c76efdc1b30539e7ff5eb0d6976c22e8074131dccc4b59d549948d909377d33a",
+        "simulator/src/l2tunnel_sim/model.py": "5694670e336cc71d04c47d6b25b8b3b7c8cc6dce0a1adbe0cd823ce89053b73f",
+        "simulator/src/l2tunnel_sim/multiflow.py": "e140f18a2d9d7b87a939baa63fb90dc4949842a55b7e019d6e2dfbe76840354f",
+        "simulator/src/l2tunnel_sim/mux.py": "584e162d1b8c8a2ba7875202ff8f6ef14086ded25b90e65d905e56e1d0c9bcec",
+        "simulator/src/l2tunnel_sim/mux_tcp.py": "2038aca3b5c4ab4492dcbcfc4fa36865545bc1d40f0838e69bdf6568dc7ee2b8",
+        "simulator/src/l2tunnel_sim/packed_wire.py": "56784f4a0a0bec66fef80a1413bb610e0d24c9a82061de1f16a9096b8d5a9fec",
+        "simulator/src/l2tunnel_sim/shared_records.py": "2a5cce4a1e2757e62ea21be810f5d0057c7f32c2299a7d8a17e416ed5ea6d64b",
+        "simulator/src/l2tunnel_sim/tcp.py": "f0f3f13a007b239dcb35060c11622b257ee5fcab5ce868e7e2cde3938759dce0",
+        "simulator/studies/compact_multiflow.py": "0952a1837f98f06432eeb95dc6971b74bd2b48ec41feed9a9c7c8939a758bcb8"
+      }
+    },
+    "packed-c46": {
+      "behavior": {
+        "ack_aggregation": false,
+        "ack_coalesce_micros": 5000,
+        "ack_copies": 1,
+        "ack_delay_micros": 10000,
+        "ack_every_segments": 2,
+        "actual_crypto_work_modeled": false,
+        "algorithm": "PackedWireTransport with CompactWireConfig",
+        "authentication_bytes": 0,
+        "encapsulation": "raw_ipv4_crc32",
+        "feedback_event_threshold": 64,
+        "feedback_interval_micros": 1000,
+        "global_support_sources": 8192,
+        "header_profile": "tcp_delta",
+        "independent_short_frame_bytes": 128,
+        "local_support_sources": 128,
+        "pack_max_delay_micros": 500,
+        "regular_global_every": 16,
+        "repair_ratio": 0.205,
+        "source_copies": 3,
+        "source_copy_max_unit_bytes": 128,
+        "source_copy_scope": "context_and_independent"
+      },
+      "configuration": {
+        "ack_aggregation": false,
+        "ack_coalesce_ms": 5,
+        "ack_copies": 1,
+        "ack_delay_ms": 10,
+        "ack_every": 2,
+        "acknowledged_segment_slow_start": true,
+        "compact": {
+          "block_sources": 8192,
+          "elide_payload_length": true,
+          "encapsulation": "raw_ipv4_crc32",
+          "feedback_ms": 1,
+          "feedback_packets": 64,
+          "flush_ms": 2,
+          "global_repair_every": 16,
+          "header_profile": "tcp_delta",
+          "independent_delivery": true,
+          "independent_short_frame_bytes": 128,
+          "pack_sources_max_delay_ms": 0.5,
+          "packed_predictive_records": true,
+          "repair_ratio": 0.205,
+          "repair_window_sources": 128,
+          "short_source_copies": 3,
+          "short_source_copy_scope": "context_and_independent",
+          "short_source_max_bytes": 128,
+          "tail_repair_delay_ms": null,
+          "trim_repair_padding": true
+        },
+        "controller": "cubic",
+        "flow_count": 16,
+        "mux": {
+          "channels": 16,
+          "mapping": "connection_round_robin"
+        },
+        "name": "Mux16 Select3 Pack0.5 ACK2 C5 Load64",
+        "payload_rate_mbps": 64,
+        "recovery": "unified_mux_rlnc",
+        "reliable_acks": false,
+        "rto_min_ms": 1000,
+        "tcp_syn_probe": {
+          "copy_spacing_ms": 0.1,
+          "initial_rto_ms": 1000,
+          "interval_ms": 200,
+          "queue_tolerance_ms": 1,
+          "reverse_copies": 1,
+          "stability_window_s": 1,
+          "stability_windows": 3,
+          "throughput_tolerance_pct": 3,
+          "timeout_ms": 5000
+        },
+        "window_bytes": 4194304,
+        "wire_format": "compact_wire"
+      },
+      "configuration_name": "Mux16 Select3 Pack0.5 ACK2 C5 Load64",
+      "configuration_source": {
+        "path": "work/results-20261110/tcp-latency/tcp-syn-small-packet-analysis/current-series-means.csv",
+        "sha256": "10c6c168997b08d15b6dea061b576673e7db99b391aeff28f3feec7f192ceb70"
+      },
+      "id": "packed-c46",
+      "layout": {
+        "mux_channels": 16,
+        "native_tcp_flows": 16,
+        "native_window_bytes": 4194304,
+        "native_window_policy": "fixed_total",
+        "physical_paths_per_direction": 1,
+        "recovery_owner_layout": "shared_directional",
+        "recovery_owners_per_direction": 1,
+        "reverse_inner_ack_path": "shared_mux_and_record_recovery"
+      },
+      "native_binding": "unsupported_named_composition",
+      "observations": [
+        {
+          "historical_id": "tcp-latency/tcp-syn-small-packet-64-qualified/runs/00002.json#1",
+          "path": "tcp-latency/tcp-syn-small-packet-64-qualified/runs/00002.json",
+          "replication": 1,
+          "seed": 11891353551447149637,
+          "sha256": "ad55c8ff3e3823abc67e6f2fa34507a81ece62c28fd66fb90f8cbac032f17af8"
+        },
+        {
+          "historical_id": "tcp-latency/tcp-syn-small-packet-64-qualified/runs/00004.json#1",
+          "path": "tcp-latency/tcp-syn-small-packet-64-qualified/runs/00004.json",
+          "replication": 2,
+          "seed": 10446470503212366402,
+          "sha256": "46cd450ff815930272d75b645820502e68ed0159e4a7578768a759d3eb0ddda5"
+        },
+        {
+          "historical_id": "tcp-latency/tcp-syn-small-packet-64-qualified/runs/00006.json#1",
+          "path": "tcp-latency/tcp-syn-small-packet-64-qualified/runs/00006.json",
+          "replication": 3,
+          "seed": 13241087429290935744,
+          "sha256": "378f02e442e1d1409ec3e2d2a19da4d5c2eae06a10733a531dd0ed69a10f31c0"
+        }
+      ],
+      "provenance": {
+        "artifact": "work/parallel-features-20261115/python-parity-staging/flow-layout/comparison-manifest-v1.json",
+        "kind": "saved_named_configuration_and_source_audit_not_new_measurement",
+        "sha256": "5cf9130a3547318fb25b15f5f24488cd10fab4e10b41d1673c85c076c838991a"
+      },
+      "remaining_differences": {
+        "named_composition": "No complete native C46/C47/C48 binding is declared; shared ownership, copies, ACK coalescing, symbol geometry and offered-load cases must be bound separately."
+      },
+      "required_actual": null,
+      "scenario": {
+        "forward_mbit_s": 100,
+        "loss_probability_each_direction": 0.15,
+        "path_mtu": 1500,
+        "reverse_mbit_s": 10,
+        "rtt_ms": 70
+      },
+      "sha256": "ac3bc7c697c4d447b5b1831b724d188bdf301802c468df89cb5eace31bf3c9db",
+      "source_sha256": {
+        "simulator/src/l2tunnel_sim/aligned_records.py": "f3a5eb8e0471e4f8b613aed7fbb9c361da8dab49eb2133d7febaebdd5424c43a",
+        "simulator/src/l2tunnel_sim/compact.py": "0f3fae6419b22bffec2b63b75c7f8fb09bce86d23fb04a8aa0de4cfecf3b14fe",
+        "simulator/src/l2tunnel_sim/compact_ack.py": "2f0caebd2e86f29ee1d329a85a00fad53faaaea1a01b2f9ed2bd27adf2e8129d",
+        "simulator/src/l2tunnel_sim/compact_arq.py": "582b3c4020805c7cf3192e225a941154a0501dc7b0580c79c8c6134246e103d4",
+        "simulator/src/l2tunnel_sim/compact_tcp.py": "7c98e1724f5bd1b53da5138df4678b3035870336c6446019c3c2a9e25ba5b759",
+        "simulator/src/l2tunnel_sim/compact_wire.py": "88fb794dedc7c7bb501e7ddd636920751aeb54500019eba4ef48bb87fbfcfba4",
+        "simulator/src/l2tunnel_sim/config.py": "c76efdc1b30539e7ff5eb0d6976c22e8074131dccc4b59d549948d909377d33a",
+        "simulator/src/l2tunnel_sim/model.py": "5694670e336cc71d04c47d6b25b8b3b7c8cc6dce0a1adbe0cd823ce89053b73f",
+        "simulator/src/l2tunnel_sim/multiflow.py": "e140f18a2d9d7b87a939baa63fb90dc4949842a55b7e019d6e2dfbe76840354f",
+        "simulator/src/l2tunnel_sim/mux.py": "584e162d1b8c8a2ba7875202ff8f6ef14086ded25b90e65d905e56e1d0c9bcec",
+        "simulator/src/l2tunnel_sim/mux_tcp.py": "2038aca3b5c4ab4492dcbcfc4fa36865545bc1d40f0838e69bdf6568dc7ee2b8",
+        "simulator/src/l2tunnel_sim/packed_wire.py": "56784f4a0a0bec66fef80a1413bb610e0d24c9a82061de1f16a9096b8d5a9fec",
+        "simulator/src/l2tunnel_sim/shared_records.py": "2a5cce4a1e2757e62ea21be810f5d0057c7f32c2299a7d8a17e416ed5ea6d64b",
+        "simulator/src/l2tunnel_sim/tcp.py": "f0f3f13a007b239dcb35060c11622b257ee5fcab5ce868e7e2cde3938759dce0",
+        "simulator/studies/compact_multiflow.py": "0952a1837f98f06432eeb95dc6971b74bd2b48ec41feed9a9c7c8939a758bcb8"
+      }
+    },
+    "packed-c47": {
+      "behavior": {
+        "ack_aggregation": false,
+        "ack_coalesce_micros": 5000,
+        "ack_copies": 1,
+        "ack_delay_micros": 10000,
+        "ack_every_segments": 2,
+        "actual_crypto_work_modeled": false,
+        "algorithm": "PackedWireTransport with CompactWireConfig",
+        "authentication_bytes": 0,
+        "encapsulation": "raw_ipv4_crc32",
+        "feedback_event_threshold": 64,
+        "feedback_interval_micros": 1000,
+        "global_support_sources": 8192,
+        "header_profile": "tcp_delta",
+        "independent_short_frame_bytes": 128,
+        "local_support_sources": 128,
+        "pack_max_delay_micros": 500,
+        "regular_global_every": 16,
+        "repair_ratio": 0.205,
+        "source_copies": 3,
+        "source_copy_max_unit_bytes": 128,
+        "source_copy_scope": "context_and_independent"
+      },
+      "configuration": {
+        "ack_aggregation": false,
+        "ack_coalesce_ms": 5,
+        "ack_copies": 1,
+        "ack_delay_ms": 10,
+        "ack_every": 2,
+        "acknowledged_segment_slow_start": true,
+        "compact": {
+          "block_sources": 8192,
+          "elide_payload_length": true,
+          "encapsulation": "raw_ipv4_crc32",
+          "feedback_ms": 1,
+          "feedback_packets": 64,
+          "flush_ms": 2,
+          "global_repair_every": 16,
+          "header_profile": "tcp_delta",
+          "independent_delivery": true,
+          "independent_short_frame_bytes": 128,
+          "pack_sources_max_delay_ms": 0.5,
+          "packed_predictive_records": true,
+          "repair_ratio": 0.205,
+          "repair_window_sources": 128,
+          "short_source_copies": 3,
+          "short_source_copy_scope": "context_and_independent",
+          "short_source_max_bytes": 128,
+          "tail_repair_delay_ms": null,
+          "trim_repair_padding": true
+        },
+        "controller": "cubic",
+        "flow_count": 16,
+        "mux": {
+          "channels": 16,
+          "mapping": "connection_round_robin"
+        },
+        "name": "Mux16 Select3 Pack0.5 ACK2 C5 Load72",
+        "payload_rate_mbps": 72,
+        "recovery": "unified_mux_rlnc",
+        "reliable_acks": false,
+        "rto_min_ms": 1000,
+        "tcp_syn_probe": {
+          "copy_spacing_ms": 0.1,
+          "initial_rto_ms": 1000,
+          "interval_ms": 200,
+          "queue_tolerance_ms": 1,
+          "reverse_copies": 1,
+          "stability_window_s": 1,
+          "stability_windows": 3,
+          "throughput_tolerance_pct": 3,
+          "timeout_ms": 5000
+        },
+        "window_bytes": 4194304,
+        "wire_format": "compact_wire"
+      },
+      "configuration_name": "Mux16 Select3 Pack0.5 ACK2 C5 Load72",
+      "configuration_source": {
+        "path": "work/results-20261110/tcp-latency/tcp-syn-small-packet-analysis/current-series-means.csv",
+        "sha256": "10c6c168997b08d15b6dea061b576673e7db99b391aeff28f3feec7f192ceb70"
+      },
+      "id": "packed-c47",
+      "layout": {
+        "mux_channels": 16,
+        "native_tcp_flows": 16,
+        "native_window_bytes": 4194304,
+        "native_window_policy": "fixed_total",
+        "physical_paths_per_direction": 1,
+        "recovery_owner_layout": "shared_directional",
+        "recovery_owners_per_direction": 1,
+        "reverse_inner_ack_path": "shared_mux_and_record_recovery"
+      },
+      "native_binding": "unsupported_named_composition",
+      "observations": [
+        {
+          "historical_id": "tcp-latency/tcp-syn-small-packet-qualified/runs/00003.json#1",
+          "path": "tcp-latency/tcp-syn-small-packet-qualified/runs/00003.json",
+          "replication": 1,
+          "seed": 11891353551447149637,
+          "sha256": "dceba87d192cc1e2b5182becb2e69b813dec501169977c55807833a8b49ff523"
+        },
+        {
+          "historical_id": "tcp-latency/tcp-syn-small-packet-qualified/runs/00007.json#1",
+          "path": "tcp-latency/tcp-syn-small-packet-qualified/runs/00007.json",
+          "replication": 2,
+          "seed": 10446470503212366402,
+          "sha256": "a5d027199611c409a796c38f4237a0f716909b53cf00545b00ffbccc650691b8"
+        },
+        {
+          "historical_id": "tcp-latency/tcp-syn-small-packet-qualified/runs/00011.json#1",
+          "path": "tcp-latency/tcp-syn-small-packet-qualified/runs/00011.json",
+          "replication": 3,
+          "seed": 13241087429290935744,
+          "sha256": "cedb46be8e7f62c03c95411b5cc05b4d2444f9400d395723389c5f17a8713b4f"
+        }
+      ],
+      "provenance": {
+        "artifact": "work/parallel-features-20261115/python-parity-staging/flow-layout/comparison-manifest-v1.json",
+        "kind": "saved_named_configuration_and_source_audit_not_new_measurement",
+        "sha256": "5cf9130a3547318fb25b15f5f24488cd10fab4e10b41d1673c85c076c838991a"
+      },
+      "remaining_differences": {
+        "named_composition": "No complete native C46/C47/C48 binding is declared; shared ownership, copies, ACK coalescing, symbol geometry and offered-load cases must be bound separately."
+      },
+      "required_actual": null,
+      "scenario": {
+        "forward_mbit_s": 100,
+        "loss_probability_each_direction": 0.15,
+        "path_mtu": 1500,
+        "reverse_mbit_s": 10,
+        "rtt_ms": 70
+      },
+      "sha256": "a97f9a92a31c590627d9c1040339b98bccf09207273473d215089cfe1e974bd9",
+      "source_sha256": {
+        "simulator/src/l2tunnel_sim/aligned_records.py": "f3a5eb8e0471e4f8b613aed7fbb9c361da8dab49eb2133d7febaebdd5424c43a",
+        "simulator/src/l2tunnel_sim/compact.py": "0f3fae6419b22bffec2b63b75c7f8fb09bce86d23fb04a8aa0de4cfecf3b14fe",
+        "simulator/src/l2tunnel_sim/compact_ack.py": "2f0caebd2e86f29ee1d329a85a00fad53faaaea1a01b2f9ed2bd27adf2e8129d",
+        "simulator/src/l2tunnel_sim/compact_arq.py": "582b3c4020805c7cf3192e225a941154a0501dc7b0580c79c8c6134246e103d4",
+        "simulator/src/l2tunnel_sim/compact_tcp.py": "7c98e1724f5bd1b53da5138df4678b3035870336c6446019c3c2a9e25ba5b759",
+        "simulator/src/l2tunnel_sim/compact_wire.py": "88fb794dedc7c7bb501e7ddd636920751aeb54500019eba4ef48bb87fbfcfba4",
+        "simulator/src/l2tunnel_sim/config.py": "c76efdc1b30539e7ff5eb0d6976c22e8074131dccc4b59d549948d909377d33a",
+        "simulator/src/l2tunnel_sim/model.py": "5694670e336cc71d04c47d6b25b8b3b7c8cc6dce0a1adbe0cd823ce89053b73f",
+        "simulator/src/l2tunnel_sim/multiflow.py": "e140f18a2d9d7b87a939baa63fb90dc4949842a55b7e019d6e2dfbe76840354f",
+        "simulator/src/l2tunnel_sim/mux.py": "584e162d1b8c8a2ba7875202ff8f6ef14086ded25b90e65d905e56e1d0c9bcec",
+        "simulator/src/l2tunnel_sim/mux_tcp.py": "2038aca3b5c4ab4492dcbcfc4fa36865545bc1d40f0838e69bdf6568dc7ee2b8",
+        "simulator/src/l2tunnel_sim/packed_wire.py": "56784f4a0a0bec66fef80a1413bb610e0d24c9a82061de1f16a9096b8d5a9fec",
+        "simulator/src/l2tunnel_sim/shared_records.py": "2a5cce4a1e2757e62ea21be810f5d0057c7f32c2299a7d8a17e416ed5ea6d64b",
+        "simulator/src/l2tunnel_sim/tcp.py": "f0f3f13a007b239dcb35060c11622b257ee5fcab5ce868e7e2cde3938759dce0",
+        "simulator/studies/compact_multiflow.py": "0952a1837f98f06432eeb95dc6971b74bd2b48ec41feed9a9c7c8939a758bcb8"
+      }
+    },
+    "packed-c48": {
+      "behavior": {
+        "ack_aggregation": false,
+        "ack_coalesce_micros": 5000,
+        "ack_copies": 1,
+        "ack_delay_micros": 10000,
+        "ack_every_segments": 2,
+        "actual_crypto_work_modeled": false,
+        "algorithm": "PackedWireTransport with CompactWireConfig",
+        "authentication_bytes": 0,
+        "encapsulation": "raw_ipv4_crc32",
+        "feedback_event_threshold": 64,
+        "feedback_interval_micros": 1000,
+        "global_support_sources": 8192,
+        "header_profile": "tcp_delta",
+        "independent_short_frame_bytes": 128,
+        "local_support_sources": 128,
+        "pack_max_delay_micros": 500,
+        "regular_global_every": 16,
+        "repair_ratio": 0.205,
+        "source_copies": 3,
+        "source_copy_max_unit_bytes": 128,
+        "source_copy_scope": "context_and_independent"
+      },
+      "configuration": {
+        "ack_aggregation": false,
+        "ack_coalesce_ms": 5,
+        "ack_copies": 1,
+        "ack_delay_ms": 10,
+        "ack_every": 2,
+        "acknowledged_segment_slow_start": true,
+        "compact": {
+          "block_sources": 8192,
+          "elide_payload_length": true,
+          "encapsulation": "raw_ipv4_crc32",
+          "feedback_ms": 1,
+          "feedback_packets": 64,
+          "flush_ms": 2,
+          "global_repair_every": 16,
+          "header_profile": "tcp_delta",
+          "independent_delivery": true,
+          "independent_short_frame_bytes": 128,
+          "pack_sources_max_delay_ms": 0.5,
+          "packed_predictive_records": true,
+          "repair_ratio": 0.205,
+          "repair_window_sources": 128,
+          "short_source_copies": 3,
+          "short_source_copy_scope": "context_and_independent",
+          "short_source_max_bytes": 128,
+          "tail_repair_delay_ms": null,
+          "trim_repair_padding": true
+        },
+        "controller": "cubic",
+        "flow_count": 16,
+        "mux": {
+          "channels": 16,
+          "mapping": "connection_round_robin"
+        },
+        "name": "Mux16 Select3 Pack0.5 ACK2 C5 Load76",
+        "payload_rate_mbps": 76,
+        "recovery": "unified_mux_rlnc",
+        "reliable_acks": false,
+        "rto_min_ms": 1000,
+        "tcp_syn_probe": {
+          "copy_spacing_ms": 0.1,
+          "initial_rto_ms": 1000,
+          "interval_ms": 200,
+          "queue_tolerance_ms": 1,
+          "reverse_copies": 1,
+          "stability_window_s": 1,
+          "stability_windows": 3,
+          "throughput_tolerance_pct": 3,
+          "timeout_ms": 5000
+        },
+        "window_bytes": 4194304,
+        "wire_format": "compact_wire"
+      },
+      "configuration_name": "Mux16 Select3 Pack0.5 ACK2 C5 Load76",
+      "configuration_source": {
+        "path": "work/results-20261110/tcp-latency/tcp-syn-small-packet-analysis/current-series-means.csv",
+        "sha256": "10c6c168997b08d15b6dea061b576673e7db99b391aeff28f3feec7f192ceb70"
+      },
+      "id": "packed-c48",
+      "layout": {
+        "mux_channels": 16,
+        "native_tcp_flows": 16,
+        "native_window_bytes": 4194304,
+        "native_window_policy": "fixed_total",
+        "physical_paths_per_direction": 1,
+        "recovery_owner_layout": "shared_directional",
+        "recovery_owners_per_direction": 1,
+        "reverse_inner_ack_path": "shared_mux_and_record_recovery"
+      },
+      "native_binding": "unsupported_named_composition",
+      "observations": [
+        {
+          "historical_id": "tcp-latency/tcp-syn-small-packet-qualified/runs/00004.json#1",
+          "path": "tcp-latency/tcp-syn-small-packet-qualified/runs/00004.json",
+          "replication": 1,
+          "seed": 11891353551447149637,
+          "sha256": "e841941899e7f599f54511cbf7f19877498b87a1ae1f3026958068525c4e3b34"
+        },
+        {
+          "historical_id": "tcp-latency/tcp-syn-small-packet-qualified/runs/00008.json#1",
+          "path": "tcp-latency/tcp-syn-small-packet-qualified/runs/00008.json",
+          "replication": 2,
+          "seed": 10446470503212366402,
+          "sha256": "abac0282e08b94fde378f348eaa84cde93fa21f33c1979a8e2a90d6cf19373ab"
+        },
+        {
+          "historical_id": "tcp-latency/tcp-syn-small-packet-qualified/runs/00012.json#1",
+          "path": "tcp-latency/tcp-syn-small-packet-qualified/runs/00012.json",
+          "replication": 3,
+          "seed": 13241087429290935744,
+          "sha256": "42d7b34b2d826743e77447434ff544c9cd9dc433e2a86790b81b2c22c113b8a5"
+        }
+      ],
+      "provenance": {
+        "artifact": "work/parallel-features-20261115/python-parity-staging/flow-layout/comparison-manifest-v1.json",
+        "kind": "saved_named_configuration_and_source_audit_not_new_measurement",
+        "sha256": "5cf9130a3547318fb25b15f5f24488cd10fab4e10b41d1673c85c076c838991a"
+      },
+      "remaining_differences": {
+        "named_composition": "No complete native C46/C47/C48 binding is declared; shared ownership, copies, ACK coalescing, symbol geometry and offered-load cases must be bound separately."
+      },
+      "required_actual": null,
+      "scenario": {
+        "forward_mbit_s": 100,
+        "loss_probability_each_direction": 0.15,
+        "path_mtu": 1500,
+        "reverse_mbit_s": 10,
+        "rtt_ms": 70
+      },
+      "sha256": "56c7bc9d2177e12f9f859fb9f39b0eb75f46bb9906b13b2c6ec6eb8525c63c4a",
+      "source_sha256": {
+        "simulator/src/l2tunnel_sim/aligned_records.py": "f3a5eb8e0471e4f8b613aed7fbb9c361da8dab49eb2133d7febaebdd5424c43a",
+        "simulator/src/l2tunnel_sim/compact.py": "0f3fae6419b22bffec2b63b75c7f8fb09bce86d23fb04a8aa0de4cfecf3b14fe",
+        "simulator/src/l2tunnel_sim/compact_ack.py": "2f0caebd2e86f29ee1d329a85a00fad53faaaea1a01b2f9ed2bd27adf2e8129d",
+        "simulator/src/l2tunnel_sim/compact_arq.py": "582b3c4020805c7cf3192e225a941154a0501dc7b0580c79c8c6134246e103d4",
+        "simulator/src/l2tunnel_sim/compact_tcp.py": "7c98e1724f5bd1b53da5138df4678b3035870336c6446019c3c2a9e25ba5b759",
+        "simulator/src/l2tunnel_sim/compact_wire.py": "88fb794dedc7c7bb501e7ddd636920751aeb54500019eba4ef48bb87fbfcfba4",
+        "simulator/src/l2tunnel_sim/config.py": "c76efdc1b30539e7ff5eb0d6976c22e8074131dccc4b59d549948d909377d33a",
+        "simulator/src/l2tunnel_sim/model.py": "5694670e336cc71d04c47d6b25b8b3b7c8cc6dce0a1adbe0cd823ce89053b73f",
+        "simulator/src/l2tunnel_sim/multiflow.py": "e140f18a2d9d7b87a939baa63fb90dc4949842a55b7e019d6e2dfbe76840354f",
+        "simulator/src/l2tunnel_sim/mux.py": "584e162d1b8c8a2ba7875202ff8f6ef14086ded25b90e65d905e56e1d0c9bcec",
+        "simulator/src/l2tunnel_sim/mux_tcp.py": "2038aca3b5c4ab4492dcbcfc4fa36865545bc1d40f0838e69bdf6568dc7ee2b8",
+        "simulator/src/l2tunnel_sim/packed_wire.py": "56784f4a0a0bec66fef80a1413bb610e0d24c9a82061de1f16a9096b8d5a9fec",
+        "simulator/src/l2tunnel_sim/shared_records.py": "2a5cce4a1e2757e62ea21be810f5d0057c7f32c2299a7d8a17e416ed5ea6d64b",
+        "simulator/src/l2tunnel_sim/tcp.py": "f0f3f13a007b239dcb35060c11622b257ee5fcab5ce868e7e2cde3938759dce0",
+        "simulator/studies/compact_multiflow.py": "0952a1837f98f06432eeb95dc6971b74bd2b48ec41feed9a9c7c8939a758bcb8"
+      }
+    }
+  },
+  "schema": 1
+}
