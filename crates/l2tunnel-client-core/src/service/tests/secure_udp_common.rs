@@ -284,6 +284,48 @@ fn common_plans(
         outside,
     })
 }
+
+#[tokio::test]
+async fn rejected_socket_protection_precedes_connect_authentication_and_native_open() -> Result {
+    let hosts = support::hosts();
+    let CommonPlans {
+        plans: [take, _],
+        addresses,
+        ..
+    } = common_plans(support::appearances()[0], &hosts)?;
+    let peer = std::net::UdpSocket::bind(addresses[1])?;
+    peer.set_nonblocking(true)?;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let observed = Arc::clone(&calls);
+    let plan = take.with_udp_socket_protector(move |socket| {
+        assert_eq!(socket.local_addr().ok(), Some(addresses[0]));
+        assert!(socket.peer_addr().is_err());
+        observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        std::future::ready(Err(io::ErrorKind::PermissionDenied.into()))
+    })?;
+    let (handle, owner) = channel();
+    let task = tokio::spawn(owner);
+    let accepted = handle
+        .connect(plan, handle.next_key().map_err(submit)?)
+        .map_err(submit)?;
+    let completed = timeout(Duration::from_secs(3), handle.wait(accepted.operation))
+        .await?
+        .map_err(submit)?;
+    assert_eq!(
+        completed,
+        Completed::Failed(Failure {
+            kind: io::ErrorKind::PermissionDenied
+        })
+    );
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(
+        peer.recv_from(&mut [0]).err().map(|err| err.kind()),
+        Some(io::ErrorKind::WouldBlock)
+    );
+    support::assert_unopened(&hosts);
+    task.abort();
+    Ok(())
+}
 fn common_frame(handle: &Handle) -> Result<SecureUdpCommonFrame> {
     handle
         .snapshot()
@@ -403,6 +445,22 @@ async fn exchange_stage(
     let reverse_udp = u16::try_from(reverse.len() - 20)?;
     forward[24..26].copy_from_slice(&forward_udp.to_be_bytes());
     reverse[24..26].copy_from_slice(&reverse_udp.to_be_bytes());
+    if expected
+        .descriptor()
+        .direction(DataRole::Client)
+        .common()
+        .traffic()
+        .layer
+        == traffic::NetworkLayer::Tap
+    {
+        let wrap = |packet: Vec<u8>| {
+            let mut frame = vec![2, 0, 0, 0, 0, 2, 2, 0, 0, 0, 0, 1, 8, 0];
+            frame.extend_from_slice(&packet);
+            frame
+        };
+        forward = wrap(forward);
+        reverse = wrap(reverse);
+    }
     assert!(forward.iter().any(|byte| *byte != 0) && reverse.iter().any(|byte| *byte != 0));
     hosts[0].send(&forward)?;
     hosts[1].send(&reverse)?;

@@ -43,6 +43,8 @@ fn selected(hosts: &[Arc<Host>; 2]) -> Result<Selected> {
         let mut receiver = original.receiver;
         receiver.lifetime_ticks = 5_000_000;
         research_records::DirectionConfig {
+            native_release: Default::default(),
+            return_guard: Default::default(),
             native_policy: original.native_policy,
             receiver,
             packing: codec::packed_sender::Config {

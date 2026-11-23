@@ -1,7 +1,6 @@
 use super::*;
 use prepared::{Endpoint, Transport};
 use std::task::Poll;
-#[cfg(unix)]
 mod common;
 mod proxy;
 pub(super) struct Active {
@@ -40,7 +39,6 @@ fn finish(shared: &Shared, id: OperationId, result: Completed) {
         .iter_mut()
         .find(|e| e.accepted.operation == id)
     {
-        #[cfg(unix)]
         if let Some(record) = &mut entry.setup {
             record.complete(&result, entry.accepted, Instant::now());
         }
@@ -82,6 +80,12 @@ fn stopped(shared: &Shared, active: &mut Option<Active>, terminal: Terminal) {
             proxy_close_report,
         });
         state.snapshot.terminal = Some(terminal);
+    }
+    if state.snapshot.operation.is_none() {
+        state.snapshot.phase = match terminal {
+            Terminal::Failed(_) => Phase::Failed,
+            _ => Phase::Disconnected,
+        };
     }
     drop(state);
     shared.changed();
@@ -152,7 +156,6 @@ pub(super) fn establish(shared: Arc<Shared>, plan: Prepared, accepted: Accepted)
             deadline,
             proxy::raw::common(&shared, &plan, accepted, deadline, profile, raw, opener)
         ),
-        #[cfg(unix)]
         Transport::SecureUdpCommon(profile) => selected!(
             deadline,
             common::establish(&shared, &plan, accepted, deadline, profile)
@@ -179,7 +182,6 @@ pub(super) fn establish(shared: Arc<Shared>, plan: Prepared, accepted: Accepted)
     }
 }
 
-#[cfg(unix)]
 async fn authenticate_selected_secure_udp(
     shared: &Arc<Shared>,
     plan: &Prepared,
@@ -193,6 +195,7 @@ async fn authenticate_selected_secure_udp(
     let role = match &plan.data.endpoint {
         Endpoint::SecureClient(_) => Role::Initiator,
         Endpoint::SecureServer(_) => Role::Responder,
+        #[cfg(unix)]
         _ => {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -209,6 +212,12 @@ async fn authenticate_selected_secure_udp(
     let socket = tokio::net::UdpSocket::bind(local).await.inspect_err(|_| {
         setup::reason(shared, accepted.operation, SetupFailureReason::LocalIo);
     })?;
+    if let Some(protect) = &plan.udp_socket_protector {
+        protect(&socket).await.inspect_err(|_| {
+            setup::reason(shared, accepted.operation, SetupFailureReason::LocalIo);
+        })?;
+        check(deadline)?;
+    }
     setup::stage(shared, accepted.operation, SetupStage::SocketConnect);
     socket.connect(peer).await.inspect_err(|_| {
         setup::reason(shared, accepted.operation, SetupFailureReason::LocalIo);
@@ -288,6 +297,7 @@ async fn authenticate_selected_secure_udp(
                 )
                 .await?
         }
+        #[cfg(unix)]
         _ => {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -298,7 +308,6 @@ async fn authenticate_selected_secure_udp(
     check(deadline)?;
     Ok(session)
 }
-#[cfg(unix)]
 fn secure_udp_termination(
     reason: l2tunnel_runtime::secure_udp::transport::StopReason,
 ) -> io::Error {
@@ -365,7 +374,6 @@ fn commit_ready(
         let result = Completed::Connected {
             generation: accepted.operation,
         };
-        #[cfg(unix)]
         if let Some(record) = &mut entry.setup {
             record.complete(&result, entry.accepted, Instant::now());
         }
@@ -398,7 +406,6 @@ pub(super) async fn run(shared: Arc<Shared>) -> io::Result<()> {
                     stopped(&shared, &mut active, Terminal::Aborted);
                     finish(&shared, accepted.operation, Completed::Aborted);
                 }
-                #[cfg(unix)]
                 Command::Common(configuration) => {
                     let Some(session) = active.as_mut() else {
                         finish(&shared, accepted.operation, Completed::OutcomeUnknown);
@@ -423,7 +430,6 @@ pub(super) async fn run(shared: Arc<Shared>) -> io::Result<()> {
                     };
                     finish(&shared, accepted.operation, result);
                 }
-                #[cfg(unix)]
                 Command::ConnectionReuse(request) => {
                     let Some(session) = active.as_mut() else {
                         finish(&shared, accepted.operation, Completed::OutcomeUnknown);
@@ -585,14 +591,18 @@ pub(super) async fn run(shared: Arc<Shared>) -> io::Result<()> {
             tokio::select! {
                 ()=shared.wake.notified()=>{},
                 result=&mut session.runtime=>{
+                    if !shared.lock().claim_runtime_exit() {
+                        // The accepted disconnect owns release. If its proxy path needs
+                        // the driver's result, reuse this result without polling twice.
+                        session.runtime = Box::pin(std::future::ready(result));
+                        continue;
+                    }
                     let clean = result.is_ok() && matches!(&session.backend,
                         ObservedBackend::Proxy(backend) if backend.clean_closed());
                     let terminal = if clean { Terminal::Closed } else {
                         Terminal::Failed(Failure { kind: result.err().map_or(io::ErrorKind::UnexpectedEof, |error| error.kind()) })
                     };
                     stopped(&shared, &mut active, terminal);
-                    shared.lock().snapshot.phase = if clean { Phase::Disconnected } else { Phase::Failed };
-                    shared.changed();
                 },
             }
         } else {

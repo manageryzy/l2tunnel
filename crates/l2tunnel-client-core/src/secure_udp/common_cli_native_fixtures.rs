@@ -128,6 +128,8 @@ fn rolling(packed: aligned::packed::Config) -> rolling_records::DirectionConfig 
     let mut receiver = packed.base.receiver;
     receiver.lifetime_ticks = 5_000_000;
     rolling_records::DirectionConfig {
+        native_release: Default::default(),
+        return_guard: Default::default(),
         native_policy: packed.base.native_policy,
         receiver,
         packing: codec::packed_sender::Config {
@@ -333,6 +335,7 @@ fn all_native_carrier_plans_validate_four_full_families_and_both_roles_before_ex
                         common::Profile::AlignedCompact { .. }
                         | common::Profile::PackedCompact { .. }
                         | common::Profile::PerConnectionCompact { .. }
+                        | common::Profile::Striped { .. }
                         | common::Profile::Research { .. } => {
                             return Err(io::Error::new(
                                 io::ErrorKind::Unsupported,

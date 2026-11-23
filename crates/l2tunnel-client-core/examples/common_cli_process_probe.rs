@@ -958,6 +958,8 @@ mod probe {
             let packed = packed(channels);
             let receiver = packed.base.receiver;
             rolling_records::DirectionConfig {
+                native_release: Default::default(),
+                return_guard: Default::default(),
                 native_policy: packed.base.native_policy,
                 receiver,
                 packing: codec::packed_sender::Config {

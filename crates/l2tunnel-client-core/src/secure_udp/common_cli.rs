@@ -7,7 +7,7 @@ use serde::{Deserialize, Deserializer, de};
 use std::{fmt, io, path::Path, time::Duration};
 
 #[derive(Clone, Debug)]
-pub(super) struct Plan {
+pub(crate) struct Plan {
     catalog: Catalog,
     parameters: transport::TransactionSettings,
     runtime: RuntimeDto,
@@ -20,7 +20,7 @@ pub(super) struct Plan {
     compact_wire: Option<crate::secure_udp::common_status::CompactWireSelection>,
 }
 impl Plan {
-    pub(super) fn read(path: &Path) -> io::Result<Self> {
+    pub(crate) fn read(path: &Path) -> io::Result<Self> {
         Self::decode(&read_document(path)?)
     }
     fn decode(bytes: &[u8]) -> io::Result<Self> {
@@ -54,13 +54,13 @@ impl Plan {
             compact_wire: dto.compact_wire,
         })
     }
-    pub(super) fn initial(&self) -> Descriptor {
+    pub(crate) fn initial(&self) -> Descriptor {
         self.catalog.initial()
     }
-    pub(super) fn report_interval(&self) -> Option<Duration> {
+    pub(crate) fn report_interval(&self) -> Option<Duration> {
         self.runtime.report_interval()
     }
-    pub(super) fn protected_body_capacity(&self, packet_bytes: usize) -> io::Result<usize> {
+    pub(crate) fn protected_body_capacity(&self, packet_bytes: usize) -> io::Result<usize> {
         let overhead = self
             .compact_wire
             .map(|value| value.build().map(|selection| selection.maximum_overhead()))
@@ -71,7 +71,7 @@ impl Plan {
             .filter(|value| *value > 0)
             .ok_or_else(|| invalid("carrier capacity below selected final protection"))
     }
-    pub(super) fn validate_carrier(&self, selected: bool) -> io::Result<()> {
+    pub(crate) fn validate_carrier(&self, selected: bool) -> io::Result<()> {
         match (selected, &self.outer_carrier) {
             (false, None) => Ok(()),
             (true, Some(value)) if value.version == 1 && value.backend == "openvpn_wire_common" => {
@@ -82,7 +82,7 @@ impl Plan {
             )),
         }
     }
-    pub(super) fn outer_capacity(&self) -> io::Result<usize> {
+    pub(crate) fn outer_capacity(&self) -> io::Result<usize> {
         self.validate_carrier(true)?;
         usize::try_from(
             self.outer_carrier
@@ -92,7 +92,7 @@ impl Plan {
         )
         .map_err(|_| invalid("outer record capacity exceeds platform width"))
     }
-    pub(super) fn outer_config(
+    pub(crate) fn outer_config(
         &self,
         profile: &secure_udp::common_transaction_profile::Profile,
     ) -> io::Result<l2tunnel_openvpn::wire_carrier::common::Config> {
@@ -139,7 +139,7 @@ impl Plan {
         }
         Ok(config)
     }
-    pub(super) fn build(
+    pub(crate) fn build(
         &self,
         connection: ConnectionConfig,
         settings: secure_udp::Settings,
@@ -159,7 +159,7 @@ impl Plan {
         )
     }
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn build_raw(
+    pub(crate) fn build_raw(
         &self,
         connection: ConnectionConfig,
         settings: secure_udp::Settings,
@@ -181,7 +181,7 @@ impl Plan {
     }
     #[allow(clippy::too_many_arguments)]
     #[cfg(test)]
-    pub(super) fn build_proxy(
+    pub(crate) fn build_proxy(
         &self,
         connection: ConnectionConfig,
         settings: secure_udp::Settings,
@@ -228,7 +228,7 @@ impl Plan {
         )
     }
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn build_maintained(
+    pub(crate) fn build_maintained(
         &self,
         connection: ConnectionConfig,
         settings: secure_udp::Settings,
@@ -250,7 +250,7 @@ impl Plan {
         )
     }
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn build_selected_on(
+    pub(crate) fn build_selected_on(
         &self,
         connection: ConnectionConfig,
         settings: secure_udp::Settings,
@@ -621,6 +621,6 @@ fn invalid(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message)
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 #[path = "common_cli_tests.rs"]
 mod tests;

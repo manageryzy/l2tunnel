@@ -4,8 +4,11 @@ use super::*;
 use l2tunnel::record_configuration::Configuration;
 use l2tunnel_runtime::secure_udp::transport;
 
+#[cfg(unix)]
 pub(super) mod carrier;
+#[cfg(unix)]
 pub(super) mod maintained;
+#[cfg(unix)]
 pub(super) mod raw;
 
 pub(super) async fn establish(
@@ -37,7 +40,7 @@ pub(super) async fn establish(
     }
     let parts = session.into_parts();
     setup::stage(shared, accepted.operation, SetupStage::Attachment);
-    let device = plan.open_native().inspect_err(|_| {
+    let device = plan.open_common_native().await.inspect_err(|_| {
         setup::reason(shared, accepted.operation, SetupFailureReason::LocalIo);
     })?;
     check(deadline)?;

@@ -39,6 +39,8 @@ fn research_plans(hosts: &[Arc<Host>; 2]) -> Result<(CarrierPlans, Vec<Arc<Probe
         let mut receiver = original.receiver;
         receiver.lifetime_ticks = 5_000_000;
         research_records::DirectionConfig {
+            native_release: Default::default(),
+            return_guard: Default::default(),
             native_policy: original.native_policy,
             receiver,
             packing: codec::packed_sender::Config {

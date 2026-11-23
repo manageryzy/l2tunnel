@@ -9,7 +9,7 @@ use std::{fmt, io, io::Read, path::Path, time::Duration};
 const MAX_PLAN_BYTES: usize = 256 * 1024;
 
 /// Read the same finite regular-file plan input without following symlinks.
-pub(super) fn read_document(path: &Path) -> io::Result<Vec<u8>> {
+pub(crate) fn read_document(path: &Path) -> io::Result<Vec<u8>> {
     let mut options = std::fs::OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
@@ -68,7 +68,7 @@ impl<'de> Deserialize<'de> for Size {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(super) struct TransactionDto {
+pub(crate) struct TransactionDto {
     retry_ms: u64,
     phase_timeout_ms: u64,
     reconcile_timeout_ms: u64,
@@ -76,7 +76,7 @@ pub(super) struct TransactionDto {
     retained_bytes: Size,
 }
 impl TransactionDto {
-    pub(super) fn build(self) -> Parameters {
+    pub(crate) fn build(self) -> Parameters {
         Parameters {
             protocol: transaction::Settings {
                 retry_ms: self.retry_ms,
@@ -91,7 +91,7 @@ impl TransactionDto {
 
 #[derive(Clone, Copy, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(super) struct RuntimeDto {
+pub(crate) struct RuntimeDto {
     control_epoch: u64,
     data_epoch: u64,
     legacy_policy: LegacyPolicyDto,
@@ -105,10 +105,10 @@ pub(super) struct RuntimeDto {
     report_interval_micros: RequiredReport,
 }
 impl RuntimeDto {
-    pub(super) fn report_interval(self) -> Option<Duration> {
+    pub(crate) fn report_interval(self) -> Option<Duration> {
         self.report_interval_micros.0.map(Duration::from_micros)
     }
-    pub(super) fn templates_for(
+    pub(crate) fn templates_for(
         self,
         path_mtu: usize,
         send: policy::Direction,
@@ -245,7 +245,7 @@ impl DeliveryDto {
 }
 #[derive(Clone, Copy, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(super) struct RecoveryDto {
+pub(crate) struct RecoveryDto {
     max_source_bytes: Size,
     send_bytes: Size,
     receive_bytes: Size,
@@ -257,7 +257,7 @@ pub(super) struct RecoveryDto {
     max_retries: u16,
 }
 impl RecoveryDto {
-    pub(super) fn build(self) -> l2tunnel_recovery::ArqConfig {
+    pub(crate) fn build(self) -> l2tunnel_recovery::ArqConfig {
         l2tunnel_recovery::ArqConfig {
             max_source_bytes: self.max_source_bytes.0,
             send_bytes: self.send_bytes.0,

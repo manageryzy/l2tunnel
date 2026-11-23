@@ -7,6 +7,9 @@ use std::{
 
 fn execute() -> io::Result<()> {
     let arguments: Vec<String> = std::env::args().skip(1).collect();
+    if arguments.first().is_some_and(|arg| arg == "common-worker") {
+        return l2tunnel_windows::worker::execute(&arguments[1..]);
+    }
     match cli::parse(&arguments)? {
         Command::Help => writeln!(io::stdout().lock(), "{}", cli::HELP),
         Command::Version => writeln!(
@@ -16,7 +19,7 @@ fn execute() -> io::Result<()> {
         ),
         Command::Plan => writeln!(
             io::stdout().lock(),
-            "Windows Common client/service binding: unsupported and pending. The obsolete managed TCP/TLS foreground path has been removed. Wintun device/configuration and bounded helper components remain available; they do not establish a tunnel. Windows service/named pipes, TAP L2, credential vault, sleep/recovery, and native carrier/mode qualification remain open.\n{}",
+            "Windows original UDP Common worker supports provisioned API4 lifecycle and a pinned Wintun L3 device. Start the packaged local host to use the GUI. Windows TAP, alternate carriers, credential vault, sleep/recovery and native hardware qualification remain open.\n{}",
             l2tunnel::IMPLEMENTATION_STATUS
         ),
         Command::Connect(plan) => {

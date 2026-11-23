@@ -269,7 +269,6 @@ fn explicit_transaction_plans_preserve_complete_contract_before_any_io() -> Resu
                     attachment(&opened, PacketLayer::Ip, true),
                 )?,
             };
-            assert!(prepared.secure_udp());
             assert!(prepared.secure_udp_common());
             assert_eq!(
                 prepared.setup_timeout(),
@@ -301,6 +300,30 @@ fn explicit_transaction_plans_preserve_complete_contract_before_any_io() -> Resu
             assert_eq!(opened.fetch_sub(1, Ordering::SeqCst), 1);
         }
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn native_provisioning_preserves_disconnected_api4_without_device_io() -> Result {
+    let plans = plans(Appearance::QuicLike)?;
+    let opens = Arc::new(AtomicUsize::new(0));
+    let plan = Prepared::secure_udp_common_client(
+        plans.generic,
+        client(false, 11, 22, hs::Profile::Ik)?,
+        attachment(&opens, PacketLayer::Ip, true),
+    )?;
+    let (handle, _owner) = crate::service::channel_with_plan(plan);
+    let state = handle
+        .lifecycle_request(crate::local::Request {
+            version: crate::local::COMMON_VERSION,
+            action: crate::local::Action::Status {},
+        })
+        .await;
+    assert!(state.ok);
+    let observed = state.state.ok_or("missing idle state")?;
+    assert_eq!(observed.phase, "disconnected");
+    assert!(observed.common.is_none());
+    assert_eq!(opens.load(Ordering::SeqCst), 0);
     Ok(())
 }
 

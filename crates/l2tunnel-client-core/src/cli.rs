@@ -2,7 +2,7 @@
 use super::*;
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 use std::io::Read;
 use std::io::Write;
 use std::path::Path;
@@ -50,7 +50,7 @@ fn required<'a>(options: &'a BTreeMap<String, String>, key: &str) -> io::Result<
         .map(String::as_str)
         .ok_or_else(|| input(format!("missing {key}")))
 }
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn bounded_file(path: &str, maximum: usize) -> io::Result<Vec<u8>> {
     let file = File::open(path)?;
     let mut contents = Vec::new();

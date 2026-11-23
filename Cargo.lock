@@ -795,6 +795,10 @@ name = "l2tunnel-android"
 version = "0.1.0"
 dependencies = [
  "l2tunnel",
+ "l2tunnel-client-core",
+ "l2tunnel-device",
+ "rustix",
+ "tokio",
 ]
 
 [[package]]
@@ -890,6 +894,7 @@ dependencies = [
 name = "l2tunnel-fec"
 version = "0.1.0"
 dependencies = [
+ "l2tunnel-core",
  "sha2",
  "tape-reed-solomon",
 ]
@@ -1116,6 +1121,7 @@ dependencies = [
  "l2tunnel-openvpn",
  "l2tunnel-packet",
  "l2tunnel-pipeline",
+ "l2tunnel-platform-linux",
  "l2tunnel-qos",
  "l2tunnel-quic",
  "l2tunnel-raw-io",
@@ -1128,8 +1134,11 @@ dependencies = [
  "l2tunnel-udp",
  "l2tunnel-udp-control",
  "l2tunnel-wire",
+ "nix",
  "rcgen",
  "ring",
+ "rustix",
+ "serde",
  "serde_json",
  "socket2",
  "tokio",

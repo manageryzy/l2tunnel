@@ -13,3 +13,13 @@ l2tunnel = { path = "../../crates/l2tunnel" }
 
 [lib]
 crate-type = ["rlib", "cdylib"]
+
+[[bin]]
+name = "l2tunnel-android-service"
+path = "src/main.rs"
+
+[target.'cfg(any(target_os = "android", target_os = "linux"))'.dependencies]
+l2tunnel-client-core = { path = "../../crates/l2tunnel-client-core" }
+l2tunnel-device = { path = "../../crates/l2tunnel-device" }
+rustix = { version = "=1.1.4", features = ["fs", "net", "process"] }
+tokio = { version = "=1.53.1", features = ["rt-multi-thread", "net", "io-util", "time", "macros"] }

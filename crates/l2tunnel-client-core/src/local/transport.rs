@@ -1,56 +1,18 @@
 //! Private, bounded Unix API transport; wire types live in the portable schema.
+use super::framing::*;
 use super::*;
 use l2tunnel_runtime::initialization_timing::{
     Outcome as TimingOutcome, Owner as TimingOwner, Stage as TimingStage, Timing,
 };
-use serde::{Deserialize, Serialize};
 use std::future::Future;
 use std::io;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+#[cfg(test)]
+use tokio::io::AsyncWriteExt;
 use tokio::net::{UnixListener, UnixStream};
 use tokio::time::Instant;
-
-const REQUEST_LIMIT: usize = 4096;
-const RESPONSE_LIMIT: usize = 8192;
-const COMMON_RESPONSE_LIMIT: usize = 32768;
-fn response_limit(version: u16) -> usize {
-    if version == COMMON_VERSION {
-        COMMON_RESPONSE_LIMIT
-    } else {
-        RESPONSE_LIMIT
-    }
-}
-fn invalid(message: &'static str) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidData, message)
-}
-async fn read_json<R: AsyncRead + Unpin, T: for<'a> Deserialize<'a>>(
-    stream: &mut R,
-    maximum: usize,
-) -> io::Result<T> {
-    let count = stream.read_u32().await? as usize;
-    if count == 0 || count > maximum {
-        return Err(invalid("local API message exceeds bound"));
-    }
-    let mut bytes = vec![0; count];
-    stream.read_exact(&mut bytes).await?;
-    serde_json::from_slice(&bytes).map_err(|_| invalid("invalid local API JSON"))
-}
-async fn write_json<W: AsyncWrite + Unpin, T: Serialize>(
-    stream: &mut W,
-    value: &T,
-    maximum: usize,
-) -> io::Result<()> {
-    let bytes = serde_json::to_vec(value).map_err(io::Error::other)?;
-    if bytes.is_empty() || bytes.len() > maximum {
-        return Err(invalid("local API reply exceeds bound"));
-    }
-    stream.write_u32(bytes.len() as u32).await?;
-    stream.write_all(&bytes).await?;
-    stream.flush().await
-}
 
 /// Listener owning exactly one private Unix socket path.
 pub struct Server {

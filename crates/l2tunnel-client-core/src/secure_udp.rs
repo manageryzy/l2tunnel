@@ -5,14 +5,23 @@
 
 #[cfg(all(test, unix))]
 pub(crate) mod common_fixture;
+#[cfg(unix)]
+pub(crate) use crate::cli::secure_udp_frontend::{common_cli, common_runtime_cli};
+#[cfg(not(unix))]
+pub(crate) mod common_cli;
+#[cfg(not(unix))]
+pub(crate) mod common_runtime_cli;
 /// Portable complete Common configuration values and explicit APIv4 observations.
 pub mod common_status;
 /// Explicit complete common record catalog and actual authentication handoff.
 pub mod common_transaction_profile;
 /// Explicit runtime credential owners and bounded manual key-file readers.
 pub mod credentials;
+pub(crate) mod datagram_profile;
 /// Explicit maintained TCP/TLS and genuine QUIC Common transport policies.
 pub mod maintained;
+/// Load a provisioned native Common UDP client.
+pub mod native_client;
 /// Bounded performance telemetry shared by CLI and embedding frontends.
 pub mod performance;
 

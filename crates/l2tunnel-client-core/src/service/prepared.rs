@@ -12,8 +12,13 @@ pub struct Attachment {
     layer: PacketLayer,
     open: Open,
 }
+#[cfg(windows)]
+type Opening = Pin<Box<dyn Future<Output = io::Result<crate::native::Native>> + Send>>;
+
 #[derive(Clone)]
 enum Open {
+    #[cfg(windows)]
+    Deferred(Arc<dyn Fn() -> Opening + Send + Sync>),
     Packet(Arc<dyn Fn() -> io::Result<Device> + Send + Sync>),
     #[cfg(unix)]
     Readable(Arc<dyn Fn() -> io::Result<crate::native::Native> + Send + Sync>),
@@ -22,6 +27,11 @@ impl Attachment {
     pub(super) fn open(&self) -> io::Result<Device> {
         match &self.open {
             Open::Packet(open) => open(),
+            #[cfg(windows)]
+            Open::Deferred(_) => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "asynchronous attachment requires a Common owner",
+            )),
             #[cfg(unix)]
             Open::Readable(open) => Ok(Box::new(open()?)),
         }
@@ -70,6 +80,22 @@ impl Attachment {
             open: Open::Readable(Arc::new(open)),
         }
     }
+    /// Bind a cancellable Windows native setup future. Its owner must join
+    /// outstanding OS work and release an unclaimed device when dropped.
+    #[cfg(windows)]
+    pub fn deferred_native<F>(
+        layer: PacketLayer,
+        open: impl Fn() -> F + Send + Sync + 'static,
+    ) -> Self
+    where
+        F: Future<Output = io::Result<crate::native::Native>> + Send + 'static,
+    {
+        Self {
+            layer,
+            open: Open::Deferred(Arc::new(move || Box::pin(open()))),
+        }
+    }
+
     /// Bind an advertised layer and a fresh-owner factory; does not invoke it.
     pub fn new(
         layer: PacketLayer,
@@ -102,9 +128,7 @@ pub struct Server {
     pub members: MemberAllowlist,
 }
 pub(super) enum Endpoint {
-    #[cfg(unix)]
     SecureClient(crate::secure_udp::credentials::Client),
-    #[cfg(unix)]
     SecureServer(Box<SecureServer>),
     #[cfg(unix)]
     CommonCarrierClient {
@@ -128,7 +152,6 @@ pub(super) enum Endpoint {
     #[cfg(unix)]
     CommonMaintainedServer(Box<CommonMaintainedServer>),
 }
-#[cfg(unix)]
 pub(super) struct SecureServer {
     pub credentials: crate::secure_udp::credentials::Server,
     pub admission: tokio::sync::Mutex<Option<crate::secure_udp::Server>>,
@@ -173,7 +196,6 @@ pub(super) enum Transport {
         raw: Arc<crate::raw_packet::common::Settings>,
         opener: crate::raw_packet::common::PacketOpener,
     },
-    #[cfg(unix)]
     SecureUdpCommon(Arc<crate::secure_udp::common_transaction_profile::Profile>),
     #[cfg(unix)]
     SecureUdpCommonMaintained(Arc<crate::secure_udp::common_transaction_profile::Profile>),
@@ -201,8 +223,30 @@ pub(super) struct Data {
 pub struct Prepared {
     pub(super) identity: Arc<()>,
     pub(super) data: Arc<Data>,
+    pub(super) udp_socket_protector: Option<UdpSocketProtector>,
 }
+type Protection = std::pin::Pin<Box<dyn std::future::Future<Output = io::Result<()>> + Send>>;
+type UdpSocketProtector = Arc<dyn Fn(&tokio::net::UdpSocket) -> Protection + Send + Sync>;
 impl Prepared {
+    /// Require platform protection of each freshly bound client UDP socket before
+    /// connecting it or starting authentication. A failed protection stops setup.
+    pub fn with_udp_socket_protector<F, Fut>(mut self, protect: F) -> io::Result<Self>
+    where
+        F: Fn(&tokio::net::UdpSocket) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = io::Result<()>> + Send + 'static,
+    {
+        if !matches!(self.data.transport, Transport::SecureUdpCommon(_))
+            || !matches!(self.data.endpoint, Endpoint::SecureClient(_))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "UDP client protection requires a Common UDP client",
+            ));
+        }
+        self.identity = Arc::new(());
+        self.udp_socket_protector = Some(Arc::new(move |socket| Box::pin(protect(socket))));
+        Ok(self)
+    }
     /// Explicit fixed proxy over the original Common authenticated UDP owner.
     #[cfg(unix)]
     pub fn proxy_common_client(
@@ -283,7 +327,6 @@ impl Prepared {
         )
     }
     /// Explicit mixed-profile client using the existing authenticated UDP factory.
-    #[cfg(unix)]
     pub fn secure_udp_common_client(
         profile: crate::secure_udp::common_transaction_profile::Profile,
         credentials: crate::secure_udp::credentials::Client,
@@ -297,7 +340,6 @@ impl Prepared {
         )
     }
     /// Explicit mixed-profile acceptor retaining the same admission quarantine.
-    #[cfg(unix)]
     pub fn secure_udp_common_server(
         profile: crate::secure_udp::common_transaction_profile::Profile,
         credentials: crate::secure_udp::credentials::Server,
@@ -472,28 +514,14 @@ impl Prepared {
             },
         )
     }
-    #[cfg(unix)]
-    pub(super) fn secure_udp(&self) -> bool {
-        matches!(
-            &self.data.transport,
-            Transport::ProxyCommon(_)
-                | Transport::ProxyCommonMaintained(_)
-                | Transport::ProxyCommonRaw { .. }
-                | Transport::SecureUdpCommon(_)
-                | Transport::SecureUdpCommonMaintained(_)
-                | Transport::SecureUdpCommonCarrier { .. }
-                | Transport::SecureUdpCommonRaw { .. }
-        )
-    }
-    #[cfg(unix)]
     pub(super) fn secure_udp_common(&self) -> bool {
-        matches!(
-            &self.data.transport,
-            Transport::SecureUdpCommon(_)
-                | Transport::SecureUdpCommonMaintained(_)
-                | Transport::SecureUdpCommonCarrier { .. }
-                | Transport::SecureUdpCommonRaw { .. }
-        )
+        match &self.data.transport {
+            #[cfg(unix)]
+            Transport::ProxyCommon(_)
+            | Transport::ProxyCommonMaintained(_)
+            | Transport::ProxyCommonRaw { .. } => false,
+            _ => true,
+        }
     }
     /// Bound of one accepted setup operation, started at acceptance.
     pub(super) fn setup_timeout(&self) -> Duration {
@@ -513,6 +541,58 @@ impl Prepared {
         }
         Ok(())
     }
+    fn validate_datagram(
+        profile: &crate::secure_udp::common_transaction_profile::Profile,
+        endpoint: &Endpoint,
+        attachment: &Attachment,
+        proxy: bool,
+    ) -> io::Result<()> {
+        if profile.proxy_config().is_some() != proxy {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "Common proxy requires explicit proxy service selection",
+            ));
+        }
+        let session = profile.settings();
+        let (noise, role) = match endpoint {
+            Endpoint::SecureClient(credentials) => {
+                if credentials.member_key() != session.member {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "configured member differs from actual credential",
+                    ));
+                }
+                (credentials.noise(), l2tunnel_security::Role::Initiator)
+            }
+            Endpoint::SecureServer(server) => (
+                server.credentials.noise(),
+                l2tunnel_security::Role::Responder,
+            ),
+            #[cfg(unix)]
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "common UDP requires distinct Noise credentials",
+                ));
+            }
+        };
+        if noise.profile() != session.profile
+            || (profile.proxy_config().is_none() && !attachment.readable_kind())
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "common UDP profile/credentials or readable attachment differ",
+            ));
+        }
+        if noise.peers(role) != profile.peers() {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "actual Noise credentials differ from Common plan pins",
+            ));
+        }
+        profile.runtime_contract(role)?;
+        Ok(())
+    }
     fn new(
         connection: ConnectionConfig,
         endpoint: Endpoint,
@@ -520,53 +600,12 @@ impl Prepared {
         transport: Transport,
     ) -> io::Result<Self> {
         match &transport {
+            Transport::SecureUdpCommon(profile) => {
+                Self::validate_datagram(profile, &endpoint, &attachment, false)?;
+            }
             #[cfg(unix)]
-            Transport::SecureUdpCommon(profile) | Transport::ProxyCommon(profile) => {
-                if profile.proxy_config().is_some()
-                    != matches!(&transport, Transport::ProxyCommon(_))
-                {
-                    return Err(io::Error::new(
-                        io::ErrorKind::Unsupported,
-                        "Common proxy requires explicit proxy service selection",
-                    ));
-                }
-                let session = profile.settings();
-                let (noise, role) = match &endpoint {
-                    Endpoint::SecureClient(credentials) => {
-                        if credentials.member_key() != session.member {
-                            return Err(io::Error::new(
-                                io::ErrorKind::PermissionDenied,
-                                "configured member differs from actual credential",
-                            ));
-                        }
-                        (credentials.noise(), l2tunnel_security::Role::Initiator)
-                    }
-                    Endpoint::SecureServer(server) => (
-                        server.credentials.noise(),
-                        l2tunnel_security::Role::Responder,
-                    ),
-                    _ => {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidInput,
-                            "common UDP requires distinct Noise credentials",
-                        ));
-                    }
-                };
-                if noise.profile() != session.profile
-                    || (profile.proxy_config().is_none() && !attachment.readable_kind())
-                {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "common UDP profile/credentials or readable attachment differ",
-                    ));
-                }
-                if noise.peers(role) != profile.peers() {
-                    return Err(io::Error::new(
-                        io::ErrorKind::PermissionDenied,
-                        "actual Noise credentials differ from Common plan pins",
-                    ));
-                }
-                profile.runtime_contract(role)?;
+            Transport::ProxyCommon(profile) => {
+                Self::validate_datagram(profile, &endpoint, &attachment, true)?;
             }
             #[cfg(unix)]
             Transport::SecureUdpCommonRaw { profile, raw, .. }
@@ -860,6 +899,7 @@ impl Prepared {
         }
         Ok(Self {
             identity: Arc::new(()),
+            udp_socket_protector: None,
             data: Arc::new(Data {
                 connection,
                 endpoint,
@@ -868,8 +908,20 @@ impl Prepared {
             }),
         })
     }
+    pub(super) async fn open_common_native(&self) -> io::Result<crate::native::Native> {
+        #[cfg(windows)]
+        if let Open::Deferred(open) = &self.data.attachment.open {
+            return self.check_native_layer(open().await?);
+        }
+        self.open_native()
+    }
     pub(super) fn open_native(&self) -> io::Result<crate::native::Native> {
-        let device = self.data.attachment.open_native()?;
+        self.check_native_layer(self.data.attachment.open_native()?)
+    }
+    fn check_native_layer(
+        &self,
+        device: crate::native::Native,
+    ) -> io::Result<crate::native::Native> {
         if PacketDevice::layer(&device) != self.data.connection.layer {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,

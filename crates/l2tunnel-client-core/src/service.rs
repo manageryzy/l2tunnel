@@ -17,22 +17,17 @@ use tokio::{
     sync::{Notify, watch},
     time::Instant,
 };
-#[cfg(unix)]
 mod connection_reuse;
 mod prepared;
 pub use prepared::{Attachment, Client, Prepared, Server};
-#[cfg(unix)]
 mod common_local;
-#[cfg(unix)]
 mod common_reuse_local;
 mod owner;
 mod proxy_backend;
 #[cfg(unix)]
 pub use proxy_backend::ProxyCommonFrame;
 pub use proxy_backend::{ProxyFrame, ProxyProfile};
-#[cfg(unix)]
 mod setup;
-#[cfg(unix)]
 pub use setup::{SetupFailure, SetupFailureReason, SetupObservation, SetupOutcome, SetupStage};
 #[cfg(all(test, unix))]
 #[path = "service/tests/atomic_local.rs"]
@@ -84,7 +79,7 @@ pub enum Phase {
     Connected,
     /// Existing runtime peer transaction is awaiting its own actual result.
     Applying,
-    /// Explicit local abort is releasing original owners.
+    /// The original owners are being released before terminal publication or reconnect.
     Stopping,
     /// Setup/runtime failed; no clean close claim.
     Failed,
@@ -114,7 +109,6 @@ pub enum Completed {
     Rejected(local::Response),
     /// Actual complete Common-profile result, without a Swift-only DTO conversion.
     /// Closed or uncertain peer outcomes use OutcomeUnknown instead.
-    #[cfg(unix)]
     Common {
         /// Exact originally submitted complete configuration.
         configuration: l2tunnel::record_configuration::Configuration,
@@ -122,7 +116,6 @@ pub enum Completed {
         outcome: Result<l2tunnel_core::Epoch, l2tunnel_runtime::secure_udp::transport::SwitchError>,
     },
     /// Exact result of the selected reuse protocol on this same runtime owner.
-    #[cfg(unix)]
     ConnectionReuse {
         /// Original bounded owner/flow request retained for exact replay.
         request: local::ConnectionReuseRequest,
@@ -162,7 +155,6 @@ pub struct Listening {
 }
 /// Actual selected mixed-profile runtime observation for shared embedding clients.
 /// Local APIv4 and shared frontends project this same retained view.
-#[cfg(unix)]
 #[derive(Clone, Debug)]
 pub struct SecureUdpCommonFrame {
     /// Complete effective startup plan and authenticated finite catalog. A carrier
@@ -177,7 +169,6 @@ pub struct SecureUdpCommonFrame {
     /// Actual service release, separate from the last runtime observation.
     pub service_terminal: Option<Terminal>,
 }
-#[cfg(unix)]
 impl SecureUdpCommonFrame {
     /// Bounded complete-configuration observation without credentials or payloads.
     pub fn status(&self) -> io::Result<crate::secure_udp::common_status::Status> {
@@ -200,14 +191,12 @@ pub enum Observation {
     /// Exact fixed/measured TCP proxy owner, separate from Common profiles.
     Proxy(Box<ProxyFrame>),
     /// Explicit mixed-profile Common owner; no Swift status projection.
-    #[cfg(unix)]
     SecureUdpCommon(Box<SecureUdpCommonFrame>),
 }
 impl Observation {
     fn record_service_terminal(&mut self, terminal: Terminal) {
         match self {
             Self::Proxy(frame) => frame.service_terminal = Some(terminal),
-            #[cfg(unix)]
             Self::SecureUdpCommon(frame) => frame.service_terminal = Some(terminal),
         }
     }
@@ -219,7 +208,6 @@ impl Observation {
         }
     }
     /// Actual complete Common observation, absent for other backend selections.
-    #[cfg(unix)]
     pub fn secure_udp_common(&self) -> Option<&SecureUdpCommonFrame> {
         match self {
             Self::SecureUdpCommon(frame) => Some(frame),
@@ -232,10 +220,8 @@ impl Observation {
 #[derive(Clone)]
 enum ObservedBackend {
     Proxy(Arc<proxy_backend::Backend>),
-    #[cfg(unix)]
     SecureUdpCommon(Arc<SecureUdpCommonBackend>),
 }
-#[cfg(unix)]
 struct SecureUdpCommonBackend {
     requested: Arc<crate::secure_udp::common_transaction_profile::Profile>,
     info: l2tunnel_runtime::secure_udp::member::Info,
@@ -247,7 +233,6 @@ impl ObservedBackend {
     fn observe(&self) -> Option<Observation> {
         match self {
             Self::Proxy(proxy) => Some(Observation::Proxy(Box::new(proxy.observe()))),
-            #[cfg(unix)]
             Self::SecureUdpCommon(secure) => Some(Observation::SecureUdpCommon(Box::new(
                 SecureUdpCommonFrame {
                     requested: secure.requested.clone(),
@@ -309,21 +294,15 @@ enum Fingerprint {
     Reconnect(Arc<()>),
     Disconnect,
     Apply(local::Request),
-    #[cfg(unix)]
     Common(l2tunnel::record_configuration::Configuration),
-    #[cfg(unix)]
     ConnectionReuse(local::ConnectionReuseRequest),
 }
 impl Fingerprint {
     fn is_apply(&self) -> bool {
-        match self {
-            Self::Apply(_) => true,
-            #[cfg(unix)]
-            Self::Common(_) => true,
-            #[cfg(unix)]
-            Self::ConnectionReuse(_) => true,
-            _ => false,
-        }
+        matches!(
+            self,
+            Self::Apply(_) | Self::Common(_) | Self::ConnectionReuse(_)
+        )
     }
     fn same(&self, other: &Self) -> bool {
         match (self, other) {
@@ -332,9 +311,7 @@ impl Fingerprint {
             }
             (Self::Disconnect, Self::Disconnect) => true,
             (Self::Apply(a), Self::Apply(b)) => a == b,
-            #[cfg(unix)]
             (Self::Common(a), Self::Common(b)) => a == b,
-            #[cfg(unix)]
             (Self::ConnectionReuse(a), Self::ConnectionReuse(b)) => a == b,
             _ => false,
         }
@@ -345,7 +322,6 @@ struct Entry {
     fingerprint: Fingerprint,
     result: Option<Completed>,
     cancel: bool,
-    #[cfg(unix)]
     setup: Option<setup::Record>,
 }
 // The sole queued command retains its complete value without another allocation.
@@ -355,9 +331,7 @@ enum Command {
     Reconnect(Prepared),
     Disconnect,
     Apply(local::Request),
-    #[cfg(unix)]
     Common(l2tunnel::record_configuration::Configuration),
-    #[cfg(unix)]
     ConnectionReuse(local::ConnectionReuseRequest),
 }
 struct Job {
@@ -381,6 +355,21 @@ struct State {
     terminals: VecDeque<TerminalRecord>,
     last_key: u64,
     retired_through: u64,
+}
+impl State {
+    /// Arbitrate an idle runtime exit against disconnect admission under the same lock.
+    fn claim_runtime_exit(&mut self) -> bool {
+        if matches!(
+            self.queued.as_ref().map(|job| &job.command),
+            Some(Command::Disconnect)
+        ) {
+            return false;
+        }
+        if self.snapshot.operation.is_none() {
+            self.snapshot.phase = Phase::Stopping;
+        }
+        true
+    }
 }
 struct LocalView {
     version: u16,
@@ -445,7 +434,6 @@ impl Handle {
     }
     /// Latest fixed-size evidence for exactly one retained accepted setup.
     /// Reading never refreshes time, performs I/O or adopts another generation.
-    #[cfg(unix)]
     pub fn setup_observation(
         &self,
         id: OperationId,
@@ -509,7 +497,6 @@ impl Handle {
     }
     /// Submit a complete supported Common value through the same retained actor.
     /// Retained keys replay their exact acceptance before fresh validation.
-    #[cfg(unix)]
     pub fn apply_common(
         &self,
         configuration: l2tunnel::record_configuration::Configuration,
@@ -557,7 +544,7 @@ impl Handle {
         if state.last_key.checked_add(1) != Some(key.0) {
             return Err(SubmitError::FutureKey);
         }
-        if state.snapshot.operation.is_some() {
+        if state.snapshot.operation.is_some() || state.snapshot.phase == Phase::Stopping {
             return Err(SubmitError::Busy);
         }
         if matches!(&state.backend, Some(ObservedBackend::Proxy(backend)) if backend.awaiting_release())
@@ -567,7 +554,6 @@ impl Handle {
             return Err(SubmitError::Busy);
         }
         let connected = state.backend.is_some();
-        #[cfg(unix)]
         if let Command::Common(configuration) = &command {
             let Some(ObservedBackend::SecureUdpCommon(backend)) = &state.backend else {
                 return Err(if connected {
@@ -582,7 +568,6 @@ impl Handle {
                 .and_then(|contract| contract.resolve(*configuration))
                 .map_err(|_| SubmitError::InvalidConfiguration)?;
         }
-        #[cfg(unix)]
         let reuse_timeout = if let Command::ConnectionReuse(request) = &command {
             Some(connection_reuse::validate(&state, *request)?)
         } else {
@@ -623,7 +608,6 @@ impl Handle {
                     .checked_add(p.setup_timeout())
                     .ok_or(SubmitError::Closed)?,
             ),
-            #[cfg(unix)]
             Command::ConnectionReuse(_) => Some(
                 accepted_at
                     .checked_add(reuse_timeout.ok_or(SubmitError::State)?)
@@ -651,11 +635,12 @@ impl Handle {
             state.retired_through = retired.accepted.operation.0;
         }
         state.last_key = key.0;
-        #[cfg(unix)]
         let setup = match &command {
-            Command::Connect(plan) | Command::Reconnect(plan) if plan.secure_udp() => Some(
-                setup::Record::new(accepted.operation, accepted_at, plan.setup_timeout()),
-            ),
+            Command::Connect(plan) | Command::Reconnect(plan) => Some(setup::Record::new(
+                accepted.operation,
+                accepted_at,
+                plan.setup_timeout(),
+            )),
             _ => None,
         };
         state.entries.push_back(Entry {
@@ -663,16 +648,13 @@ impl Handle {
             fingerprint,
             result: None,
             cancel: false,
-            #[cfg(unix)]
             setup,
         });
         state.snapshot.operation = Some(accepted.operation);
         state.snapshot.phase = match command {
             Command::Connect(_) => Phase::Preparing,
             Command::Apply(_) => Phase::Applying,
-            #[cfg(unix)]
             Command::Common(_) => Phase::Applying,
-            #[cfg(unix)]
             Command::ConnectionReuse(_) => Phase::Applying,
             _ => Phase::Stopping,
         };
@@ -816,7 +798,6 @@ impl Handle {
         if let Some(response) = self.api_version(&request) {
             return response;
         }
-        #[cfg(unix)]
         if matches!(
             &request.action,
             local::Action::SwitchCommonConfiguration { .. }
@@ -854,31 +835,15 @@ impl Handle {
         Self::selected_version_locked(&self.0.lock())
     }
     fn selected_version_locked(state: &State) -> u16 {
-        #[cfg(unix)]
         {
             match &state.backend {
                 Some(ObservedBackend::SecureUdpCommon(_)) => local::COMMON_VERSION,
                 Some(_) => local::VERSION,
                 None => match &state.plan {
-                    Some(plan)
-                        if matches!(
-                            &plan.data.transport,
-                            prepared::Transport::ProxyCommon(_)
-                                | prepared::Transport::ProxyCommonRaw { .. }
-                                | prepared::Transport::ProxyCommonMaintained(_)
-                        ) =>
-                    {
-                        local::VERSION
-                    }
                     Some(plan) if plan.secure_udp_common() => local::COMMON_VERSION,
                     _ => local::VERSION,
                 },
             }
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = state;
-            local::VERSION
         }
     }
     fn api_version(&self, request: &local::Request) -> Option<local::Response> {
@@ -920,13 +885,8 @@ impl Handle {
             Ok(view) => view,
             Err(response) => return *response,
         };
-        let response = Self::status_from_view(view, request, idle_ok).await;
-        #[cfg(unix)]
-        let response = {
-            let mut response = response;
-            self.common_reply_key(&mut response);
-            response
-        };
+        let mut response = Self::status_from_view(view, request, idle_ok).await;
+        self.common_reply_key(&mut response);
         response
     }
     async fn status_from_view(
@@ -936,7 +896,6 @@ impl Handle {
     ) -> local::Response {
         match view.backend {
             Some(ObservedBackend::Proxy(_)) => Self::proxy_status_from(view.snapshot, true, "ok"),
-            #[cfg(unix)]
             Some(ObservedBackend::SecureUdpCommon(_)) => {
                 Self::common_status_from(view.snapshot, true, "ok")
             }
@@ -956,7 +915,6 @@ impl Handle {
             None if idle_ok => {
                 Self::lifecycle_reply_from(view.version, view.snapshot, false, true, "ok")
             }
-            #[cfg(unix)]
             None if view.version == local::COMMON_VERSION => {
                 Self::common_status_from(view.snapshot, false, "closed")
             }
@@ -1056,19 +1014,14 @@ impl Handle {
                 refusal
             };
         }
-        let response = Self::lifecycle_reply_from(
+        let mut response = Self::lifecycle_reply_from(
             view.version,
             view.snapshot,
             view.backend.is_some(),
             ok,
             code,
         );
-        #[cfg(unix)]
-        let response = {
-            let mut response = response;
-            self.common_reply_key(&mut response);
-            response
-        };
+        self.common_reply_key(&mut response);
         response
     }
     fn lifecycle_reply_from(
@@ -1078,7 +1031,6 @@ impl Handle {
         ok: bool,
         code: &str,
     ) -> local::Response {
-        #[cfg(unix)]
         if version == local::COMMON_VERSION {
             return Self::common_status_from(snapshot, ok, code);
         }
@@ -1157,7 +1109,6 @@ impl Drop for Completion {
         }
         for entry in &mut state.entries {
             if entry.result.is_none() {
-                #[cfg(unix)]
                 if let Some(record) = &mut entry.setup {
                     record.owner_closed(Instant::now());
                 }
@@ -1193,6 +1144,16 @@ impl Drop for Completion {
 /// Allocate a fixed-size service with one operation/session slot and 32 retained
 /// operation results/identities plus 32 terminal generation outcomes.
 pub fn channel() -> (Handle, Run) {
+    create_channel(None)
+}
+
+/// Create an idle service with an explicitly provisioned reconnect plan.
+/// No socket or device is opened until the first successful submission.
+pub fn channel_with_plan(plan: Prepared) -> (Handle, Run) {
+    create_channel(Some(plan))
+}
+
+fn create_channel(plan: Option<Prepared>) -> (Handle, Run) {
     let (changed, _) = watch::channel(());
     let shared = Arc::new(Shared {
         state: Mutex::new(State {
@@ -1207,7 +1168,7 @@ pub fn channel() -> (Handle, Run) {
             backend: None,
             queued: None,
             entries: VecDeque::with_capacity(RETAINED),
-            plan: None,
+            plan,
             terminals: VecDeque::with_capacity(RETAINED),
             last_key: 0,
             retired_through: 0,

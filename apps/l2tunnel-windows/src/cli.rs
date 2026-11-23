@@ -1,4 +1,4 @@
-//! Side-effect-free Windows configuration validation; Common service binding is pending.
+//! Side-effect-free Windows configuration and Wintun validation.
 use l2tunnel_auth::ClientSni;
 use l2tunnel_client_core::{Compression, ConnectionConfig};
 use l2tunnel_core::Duplex;
@@ -7,7 +7,7 @@ use l2tunnel_platform_windows::Config;
 use std::{collections::BTreeMap, io, net::SocketAddr, path::PathBuf, time::Duration};
 
 /// Accepted configuration syntax and explicit execution capability limits.
-pub const HELP: &str = "l2tunnel-windows connect --carrier tcp-tls --layer tun --remote IP:PORT --ca DER --server-name DNS --identity PKCS8 --wintun-dll ABSOLUTE_DLL --wintun-sha256 HEX64 --address IPV4/PREFIX [--mtu 1280..65519] [--duplex half|full] [--compression off|lz4] [--sni DNS] [--handshake-seconds 1..120] [--control stdin]\nConfiguration validation only: connect returns Unsupported before opening credentials, sockets or Wintun. The obsolete managed TCP/TLS foreground path has been removed; binding the Windows application to the current Common client/service API remains pending. Wintun device/configuration components and bounded input/diagnostic helpers are retained separately. No effective carrier or native tunnel execution is claimed. Other commands: plan, --help, --version.";
+pub const HELP: &str = "l2tunnel-windows common-worker --profile DIR --wintun-dll ABSOLUTE_DLL --wintun-sha256 HEX64 --address IPV4/PREFIX\nThe Windows GUI host runs this child using private framed API4 requests. Original UDP Common uses an authenticated peer and an explicitly pinned Wintun L3 adapter. The legacy tcp-tls connect command only validates its configuration. Other commands: plan, --help, --version.";
 
 /// One parsed command; parsing opens no sockets, credentials or devices.
 pub enum Command {
@@ -155,26 +155,13 @@ pub fn parse(args: &[String]) -> io::Result<Command> {
         .unwrap_or("30")
         .parse()
         .map_err(|_| invalid("invalid handshake limit"))?;
-    let (address, prefix) = get("--address")?
-        .split_once('/')
-        .ok_or_else(|| invalid("address requires IPV4/PREFIX"))?;
-    let device = Config::new(
-        PathBuf::from(get("--wintun-dll")?),
-        sha256(get("--wintun-sha256")?)?,
-        address
-            .parse()
-            .map_err(|_| invalid("invalid interface IPv4 address"))?,
-        prefix.parse().map_err(|_| invalid("invalid IPv4 prefix"))?,
+    let device = device_config(
+        get("--wintun-dll")?,
+        get("--wintun-sha256")?,
+        get("--address")?,
         mtu,
+        remote,
     )?;
-    if let std::net::IpAddr::V4(remote_ip) = remote.ip() {
-        let mask = u32::MAX << (32 - device.prefix());
-        if u32::from(remote_ip) & mask == u32::from(device.address()) & mask {
-            return Err(invalid(
-                "outer peer must not lie in the new Wintun on-link subnet",
-            ));
-        }
-    }
     let connection = ConnectionConfig {
         layer: PacketLayer::Ip,
         duplex,
@@ -193,6 +180,36 @@ pub fn parse(args: &[String]) -> io::Result<Command> {
         server_name: server_name.to_owned(),
         sni,
     })))
+}
+
+pub(crate) fn device_config(
+    dll: &str,
+    pin: &str,
+    address: &str,
+    mtu: u16,
+    remote: SocketAddr,
+) -> io::Result<Config> {
+    let (address, prefix) = address
+        .split_once('/')
+        .ok_or_else(|| invalid("address requires IPV4/PREFIX"))?;
+    let device = Config::new(
+        PathBuf::from(dll),
+        sha256(pin)?,
+        address
+            .parse()
+            .map_err(|_| invalid("invalid interface IPv4 address"))?,
+        prefix.parse().map_err(|_| invalid("invalid IPv4 prefix"))?,
+        mtu,
+    )?;
+    if let std::net::IpAddr::V4(remote_ip) = remote.ip() {
+        let mask = u32::MAX << (32 - device.prefix());
+        if u32::from(remote_ip) & mask == u32::from(device.address()) & mask {
+            return Err(invalid(
+                "outer peer must not lie in the new Wintun on-link subnet",
+            ));
+        }
+    }
+    Ok(device)
 }
 
 fn sha256(value: &str) -> io::Result<[u8; 32]> {

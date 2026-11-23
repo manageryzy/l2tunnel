@@ -16,6 +16,8 @@ fn rolling_direction(packed: aligned::packed::Config) -> rolling_records::Direct
     let mut receiver = packed.base.receiver;
     receiver.lifetime_ticks = 5_000_000;
     rolling_records::DirectionConfig {
+        native_release: Default::default(),
+        return_guard: Default::default(),
         native_policy: packed.base.native_policy,
         receiver,
         packing: codec::packed_sender::Config {
