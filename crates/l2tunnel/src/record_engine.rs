@@ -32,7 +32,7 @@ pub use buffer_diagnostics::{
 };
 pub use connection_ingress::ConnectionSnapshot;
 mod ingress;
-pub use ingress::{IngressAdmission, IngressSnapshot};
+pub use ingress::{FlowByteWait, IngressAdmission, IngressSnapshot};
 mod carrier;
 mod fragment;
 pub use fragment::{
@@ -41,7 +41,7 @@ pub use fragment::{
     ReassemblyPolicies,
 };
 mod native;
-pub use carrier::CarrierOutputToken;
+pub use carrier::{CarrierOutputToken, RollingDataLabel, StripedDataLabel};
 mod native_counts;
 mod native_encoding;
 pub use native_encoding::{NativeEncodingKind, NativeEncodingObservation, ObservedProfileIdentity};
@@ -50,13 +50,15 @@ pub use native_counts::NativeCounts;
 pub use native_window::NativeDelivery;
 mod compact_wire;
 mod wire_extent;
-pub use wire_extent::{CodecCoverage, OutputExtent};
+pub use wire_extent::{CodecCoverage, OutputExtent, StripedOutputExtent};
 mod owner;
 mod proxy_records;
 #[cfg(test)]
 pub(crate) mod rolling_tests;
 #[cfg(test)]
 mod storage_tests;
+#[cfg(test)]
+mod striped_tests;
 #[cfg(test)]
 mod tests;
 use owner::Owner;
@@ -103,6 +105,8 @@ pub enum ProfileIdentity {
     Packed(receiver::RecordIdentity),
     /// Compact rolling body identity, separate from recovery source/repair IDs.
     Rolling(receiver::RecordIdentity),
+    /// A native Packed record on a mixed physical striped group.
+    Striped(receiver::RecordIdentity),
     /// Actual packed-record identity from the selected research recovery owner.
     Research(receiver::RecordIdentity),
     /// Actual independently recovered connection body, retaining owner/incarnation.
@@ -166,6 +170,10 @@ pub enum Capability {
 /// Configuration, caller-contract or authoritative owner failure.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {
+    /// Mixed physical data group or scoped recovery feedback failed.
+    Striped(crate::fec::Error),
+    /// Packed native staging or delivery in the mixed striped owner failed.
+    StripedNative(crate::striped_records::native::NativeError),
     /// Independent native-byte delivery owner rejected a limit, clock or receipt.
     NativeWindow(crate::flow_control::delivery_window::Error),
     /// Invalid complete configuration or local binding.
@@ -328,7 +336,7 @@ pub enum NativePreparation {
     AlreadyPending(PreparedNative),
 }
 
-enum NativeStep {
+pub(crate) enum NativeStep {
     Idle,
     Progress,
     Ready {
@@ -853,6 +861,14 @@ impl Engine {
             Ok(()) => Ok(()),
             Err(Error::Aligned(error)) if error.is_backpressure() => Err(Error::Aligned(error)),
             Err(Error::Rolling(error)) if error.is_backpressure() => Err(Error::Rolling(error)),
+            Err(
+                error @ Error::Striped(
+                    crate::fec::Error::Capacity | crate::fec::Error::WindowBlocked,
+                ),
+            ) => Err(error),
+            Err(Error::StripedNative(error)) if error.is_backpressure() => {
+                Err(Error::StripedNative(error))
+            }
             Err(Error::Connections(error)) if error.is_backpressure() => {
                 Err(Error::Connections(error))
             }
@@ -933,6 +949,30 @@ impl Engine {
                 .map_err(Error::Rolling)?;
         }
         Ok(())
+    }
+
+    /// Current generation's requested/effective release order and return guard.
+    pub fn rolling_delivery(&self) -> Option<rolling_records::DeliveryStatus> {
+        match &self.owner {
+            Owner::Rolling(endpoint) => Some(endpoint.delivery_status()),
+            _ => None,
+        }
+    }
+
+    /// Current active receive generation's opt-in TCP byte-order observations.
+    pub fn rolling_native_reorder(&self) -> Option<rolling_records::NativeReorderStatus> {
+        match &self.owner {
+            Owner::Rolling(endpoint) => endpoint.native_reorder_status(),
+            _ => None,
+        }
+    }
+
+    /// Current sending and receiving source debt in the mixed packet owner.
+    pub fn striped_sources(&self) -> Option<crate::striped_records::SourceStatus> {
+        match &self.owner {
+            Owner::Striped(endpoint) => Some(endpoint.source_status()),
+            _ => None,
+        }
     }
 
     /// Counters of the local sending direction's selected repair budget.
@@ -1057,6 +1097,17 @@ impl Engine {
         match endpoint.continue_targeted_send(now, work) {
             Ok(used) => Ok(used),
             Err(error) => self.fail(Error::Rolling(error)),
+        }
+    }
+
+    /// Exact complete wire cost for an immutable, unreserved rolling or striped output.
+    pub fn ready_rolling_data_wire_bytes(&self) -> Result<Option<usize>, Error> {
+        self.healthy()?;
+        match &self.owner {
+            Owner::Striped(endpoint) => endpoint.ready_data_wire_bytes(),
+            Owner::Rolling(endpoint) => endpoint.ready_data_wire_bytes().map_err(Error::Rolling),
+            Owner::Research(endpoint) => endpoint.ready_data_wire_bytes().map_err(Error::Rolling),
+            _ => Ok(None),
         }
     }
 
@@ -1320,6 +1371,12 @@ fn parameters_selected(
         return Err(Error::Configuration);
     }
     let descriptor = configuration.descriptor();
+    if let configuration::Profile::Striped { forward, reverse } = descriptor.profile()
+        && (forward.native_stall_micros != native_limits.stall_micros
+            || reverse.native_stall_micros != native_limits.stall_micros)
+    {
+        return Err(Error::Geometry);
+    }
     if let configuration::Profile::Rolling { config, .. }
     | configuration::Profile::RollingCopies { config, .. } = descriptor.profile()
         && (config.geometry != geometry || config.native_stall_micros != native_limits.stall_micros)
@@ -1439,6 +1496,14 @@ fn dimensions(
     opposite: configuration::DirectionProfile<'_>,
 ) -> Result<(usize, usize, Option<usize>), Error> {
     Ok(match profile {
+        configuration::DirectionProfile::Striped(config) => (
+            config
+                .profile
+                .max_wire_bytes
+                .max(crate::fec::striped_group::feedback::MAX_WIRE_BYTES),
+            usize::from(config.packing.max_units),
+            Some(config.overhead_bytes),
+        ),
         configuration::DirectionProfile::Swift(config) => (config.codec.datagram_bytes, 0, None),
         configuration::DirectionProfile::Aligned(config) => (
             config

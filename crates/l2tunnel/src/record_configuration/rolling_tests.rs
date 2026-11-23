@@ -19,13 +19,21 @@ fn current_repair_grammar_roundtrips_selected_formats_and_rejects_unknown_versio
         ] {
             assert_eq!(
                 &bytes[offset..offset + 8],
-                &u64::from(format.version()).to_be_bytes()
+                &u64::from(format.policy_id()).to_be_bytes()
             );
-            for old in [1u64, 2, 7] {
+            for old in [1u64, 2, 255, u64::MAX] {
                 let mut stale = bytes;
                 stale[offset..offset + 8].copy_from_slice(&old.to_be_bytes());
                 assert_eq!(Configuration::decode(&stale), Err(Error::Prefix));
             }
+            let mut ethernet_ack_compression = bytes;
+            let selector = fec::rolling::wire::SourceWire::TargetedExactAckLz4.policy_id();
+            ethernet_ack_compression[offset..offset + 8]
+                .copy_from_slice(&u64::from(selector).to_be_bytes());
+            assert_eq!(
+                Configuration::decode(&ethernet_ack_compression),
+                Err(Error::Profile)
+            );
         }
     }
     Ok(())
@@ -307,5 +315,185 @@ fn near8_is_one_authenticated_forward_word_and_needs_its_own_catalog_entry() -> 
     reverse_only[offset + DIRECTION_BYTES..offset + DIRECTION_BYTES + 8]
         .copy_from_slice(&6u64.to_be_bytes());
     assert!(Descriptor::decode(&reverse_only).is_err());
+    Ok(())
+}
+
+#[test]
+fn near8_variants_negotiate_distinct_directional_configuration_digests() -> TestResult {
+    use fec::rolling::wire::SourceWire::{
+        TargetedExact, TargetedNear8, TargetedNear8ConfirmedPrefix, TargetedNear8Hold35,
+    };
+    let old = crate::record_engine::rolling_tests::fixture(true, TargetedExact)?;
+    let d = old.descriptor();
+    let Profile::Rolling { mut config, stream } = *d.profile() else {
+        return Err("missing rolling fixture".into());
+    };
+    let select = |config| {
+        Descriptor::new(
+            d.path_mtu(),
+            d.duplex(),
+            *d.direction(Role::Client).common(),
+            *d.direction(Role::Server).common(),
+            Profile::RollingCopies {
+                config,
+                stream,
+                copies: rolling_records::CopyPolicies::ONE,
+            },
+        )
+    };
+    config.forward.scheduler.source_wire = TargetedNear8;
+    let immediate = select(config)?;
+    config.forward.scheduler.source_wire = TargetedNear8Hold35;
+    let held = select(config)?;
+    let mut bytes = [0; DESCRIPTOR_BYTES];
+    held.encode_into(&mut bytes)?;
+    assert_eq!(Descriptor::decode(&bytes)?, held);
+    assert_eq!(TargetedNear8Hold35.version(), TargetedNear8.version());
+    assert_ne!(
+        Configuration::new(old.envelope(), immediate)?.digest()?,
+        Configuration::new(old.envelope(), held)?.digest()?
+    );
+    assert!(matches!(
+        Catalog::new(held, &[immediate]),
+        Err(Error::Unlisted)
+    ));
+    config.forward.scheduler.source_wire = TargetedNear8ConfirmedPrefix;
+    let prefix = select(config)?;
+    prefix.encode_into(&mut bytes)?;
+    assert_eq!(Descriptor::decode(&bytes)?, prefix);
+    assert_ne!(
+        Configuration::new(old.envelope(), immediate)?.digest()?,
+        Configuration::new(old.envelope(), prefix)?.digest()?
+    );
+    assert!(matches!(
+        Catalog::new(prefix, &[held, immediate]),
+        Err(Error::Unlisted)
+    ));
+    for reverse in [TargetedNear8Hold35, TargetedNear8ConfirmedPrefix] {
+        config.reverse.scheduler.source_wire = reverse;
+        assert!(select(config).is_err());
+    }
+    Ok(())
+}
+
+#[test]
+fn delivery_policy_selects_tags_11_and_12_and_round_trips_canonically() -> TestResult {
+    use fec::rolling::wire::SourceWire::{Exact, TargetedExact, TargetedNear8Hold35};
+    use rolling_records::{EffectiveRelease, GuardMode, NativeRelease, ReturnGuard};
+    let old = crate::record_engine::rolling_tests::fixture(true, TargetedExact)?;
+    let d = old.descriptor();
+    let Profile::Rolling { config, stream } = *d.profile() else {
+        return Err("missing rolling fixture".into());
+    };
+    assert!(config.forward.delivery_default() && config.reverse.delivery_default());
+    assert_eq!(
+        config.forward.effective_release(),
+        EffectiveRelease::FlowOrdered
+    );
+    assert_eq!(config.forward.effective_guard_per_mille(), Some(100));
+    let build = |config, copies: Option<rolling_records::CopyPolicies>| {
+        Descriptor::new(
+            d.path_mtu(),
+            d.duplex(),
+            *d.direction(Role::Client).common(),
+            *d.direction(Role::Server).common(),
+            match copies {
+                None => Profile::Rolling { config, stream },
+                Some(copies) => Profile::RollingCopies {
+                    config,
+                    stream,
+                    copies,
+                },
+            },
+        )
+    };
+    let word = |direction: usize| {
+        HEADER_BYTES + direction * DIRECTION_BYTES + COMMON_DIRECTION_BYTES + 43 * 8
+    };
+    // All-default values keep tag 4 and a zero upper stream half.
+    let mut default_bytes = [0; DESCRIPTOR_BYTES];
+    build(config, None)?.encode_into(&mut default_bytes)?;
+    assert_eq!(default_bytes[5], 4);
+    for direction in [0, 1] {
+        assert_eq!(default_bytes[word(direction)..word(direction) + 4], [0; 4]);
+    }
+    let mut mislabeled = default_bytes;
+    mislabeled[5] = 11;
+    assert_eq!(Descriptor::decode(&mislabeled), Err(Error::Prefix));
+
+    let mut explicit = config;
+    explicit.forward.native_release = NativeRelease::Independent;
+    explicit.reverse.return_guard = ReturnGuard::on(250);
+    let one = build(explicit, None)?;
+    let mut bytes = [0; DESCRIPTOR_BYTES];
+    one.encode_into(&mut bytes)?;
+    assert_eq!(bytes[5], 11);
+    assert_eq!(bytes[word(0)..word(0) + 4], [1, 0, 0, 0]);
+    assert_eq!(bytes[word(1)..word(1) + 4], [0, 2, 0, 250]);
+    assert_eq!(Descriptor::decode(&bytes)?, one);
+    let mut as_tag4 = bytes;
+    as_tag4[5] = 4;
+    assert_eq!(Descriptor::decode(&as_tag4), Err(Error::Prefix));
+    for (offset, value, error) in [
+        (word(0), 3, Error::Prefix),      // unknown release
+        (word(1) + 1, 3, Error::Prefix),  // unknown guard mode
+        (word(1) + 1, 1, Error::Profile), // Off with a nonzero ratio
+    ] {
+        let mut changed = bytes;
+        changed[offset] = value;
+        assert_eq!(Descriptor::decode(&changed), Err(error));
+    }
+    let two = build(explicit, Some(rolling_records::CopyPolicies::ONE))?;
+    two.encode_into(&mut bytes)?;
+    assert_eq!(bytes[5], 12);
+    assert_eq!(Descriptor::decode(&bytes)?, two);
+
+    // An explicit value that resolves like the default is still bound separately.
+    let mut same = config;
+    same.forward.native_release = NativeRelease::FlowOrdered;
+    assert_eq!(
+        same.forward.effective_release(),
+        config.forward.effective_release()
+    );
+    assert_ne!(same.digest()?, config.digest()?);
+    assert_ne!(explicit.digest()?, config.digest()?);
+    assert_ne!(
+        Configuration::new(old.envelope(), one)?.digest()?,
+        Configuration::new(old.envelope(), build(config, None)?)?.digest()?
+    );
+
+    for guard in [
+        ReturnGuard::on(0),
+        ReturnGuard::on(1001),
+        ReturnGuard {
+            mode: GuardMode::Off,
+            per_mille: 5,
+        },
+    ] {
+        let mut invalid = config;
+        invalid.forward.return_guard = guard;
+        assert!(build(invalid, None).is_err());
+    }
+    // Explicit values need a targeted IP direction without the bounded hold.
+    let plain = crate::record_engine::rolling_tests::fixture(true, Exact)?;
+    let Profile::Rolling { config: plain, .. } = *plain.descriptor().profile() else {
+        return Err("missing rolling fixture".into());
+    };
+    assert_eq!(plain.forward.effective_release(), EffectiveRelease::Channel);
+    assert_eq!(plain.forward.effective_guard_per_mille(), None);
+    let mut untargeted = plain;
+    untargeted.forward.native_release = NativeRelease::FlowOrdered;
+    assert!(untargeted.validate().is_err());
+    let mut unguarded = plain;
+    unguarded.forward.return_guard = ReturnGuard::OFF;
+    assert!(unguarded.validate().is_err());
+    let mut held = config;
+    held.forward.scheduler.source_wire = TargetedNear8Hold35;
+    assert_eq!(
+        held.forward.effective_release(),
+        EffectiveRelease::BoundedHold
+    );
+    held.forward.native_release = NativeRelease::FlowOrdered;
+    assert!(build(held, Some(rolling_records::CopyPolicies::ONE)).is_err());
     Ok(())
 }

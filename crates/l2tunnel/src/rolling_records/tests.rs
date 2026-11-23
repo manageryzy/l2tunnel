@@ -1,4 +1,6 @@
 //! Actual independent owners exchange wire bytes; no sender source ledger is read.
+#[path = "ack_lz4_tests.rs"]
+mod ack_lz4_tests;
 #[path = "early_tests.rs"]
 mod early;
 #[path = "repair_budget_tests.rs"]
@@ -25,6 +27,8 @@ fn direction(reverse: bool, raw: bool, wire: rolling::wire::SourceWire) -> Direc
     let first_record = receiver::RecordId(if reverse { 19 } else { 7 });
     let first_source = receiver::SourceId(if reverse { 91 } else { 13 });
     DirectionConfig {
+        native_release: Default::default(),
+        return_guard: Default::default(),
         native_policy: if raw {
             NativePolicy::RawIp
         } else {
@@ -739,6 +743,8 @@ fn selected_compact_wire_research_packed_source_feedback_and_exact_native_identi
     ] {
         let minimum_window = profile.minimum_window()?.max(256);
         let convert = |direction: DirectionConfig| DirectionConfig {
+            native_release: direction.native_release,
+            return_guard: direction.return_guard,
             native_policy: direction.native_policy,
             receiver: direction.receiver,
             packing: direction.packing,

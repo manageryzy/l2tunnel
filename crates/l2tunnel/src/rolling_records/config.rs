@@ -14,32 +14,201 @@ pub struct DirectionConfig<P: RecoveryPolicy = scheduler::Policy> {
     pub codec_stage_micros: u64,
     /// Actual fixed-window local/global scheduling and bounded work ownership.
     pub scheduler: P,
+    /// Requested native release order at this direction's receiver.
+    pub native_release: NativeRelease,
+    /// Requested return-traffic guard at this direction's sender.
+    pub return_guard: ReturnGuard,
 }
+
+/// Requested release order of complete native IP packets on a targeted direction.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum NativeRelease {
+    /// `FlowOrdered` on a targeted IP direction without the bounded-hold selector;
+    /// every other direction keeps its existing release behaviour.
+    #[default]
+    Default,
+    /// Release complete TCP data across sequence gaps.
+    Independent,
+    /// Release TCP data only when it is contiguous with its own flow's edge.
+    FlowOrdered,
+}
+impl NativeRelease {
+    /// Canonical configuration value; zero is the legacy all-default encoding.
+    pub const fn wire(self) -> u8 {
+        match self {
+            Self::Default => 0,
+            Self::Independent => 1,
+            Self::FlowOrdered => 2,
+        }
+    }
+    /// Strict inverse of [`Self::wire`].
+    pub const fn from_wire(value: u8) -> Option<Self> {
+        match value {
+            0 => Some(Self::Default),
+            1 => Some(Self::Independent),
+            2 => Some(Self::FlowOrdered),
+            _ => None,
+        }
+    }
+}
+
+/// Effective native release after default resolution, for status and dispatch.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EffectiveRelease {
+    /// Channel record order; no per-flow tracking is configured.
+    Channel,
+    /// Ethernet TCP data in flow order with the existing TAP decision.
+    EthernetFlowOrdered,
+    /// The authenticated bounded native reordering hold.
+    BoundedHold,
+    /// Complete IP TCP data released across sequence gaps.
+    Independent,
+    /// IP TCP data released only when contiguous with its flow.
+    FlowOrdered,
+}
+
+/// Requested return-traffic guard mode.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum GuardMode {
+    /// On at [`ReturnGuard::DEFAULT_PER_MILLE`] for a targeted IP direction; otherwise off.
+    #[default]
+    Default,
+    /// Measure only; never shed.
+    Off,
+    /// Shed sheddable extras above the configured ratio.
+    On,
+}
+
+/// Local sender limit on sheddable bytes relative to delivered peer traffic.
+///
+/// First copies of local sources, feedback, requested retries and control are
+/// never shed. This changes no packet format.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ReturnGuard {
+    /// Requested mode.
+    pub mode: GuardMode,
+    /// Sent wire bytes per thousand delivered peer bytes; nonzero only for `On`.
+    pub per_mille: u16,
+}
+impl ReturnGuard {
+    /// Default ratio when the default mode resolves to on.
+    pub const DEFAULT_PER_MILLE: u16 = 100;
+    /// Default mode, resolved per direction.
+    pub const DEFAULT: Self = Self {
+        mode: GuardMode::Default,
+        per_mille: 0,
+    };
+    /// Explicitly measure only.
+    pub const OFF: Self = Self {
+        mode: GuardMode::Off,
+        per_mille: 0,
+    };
+    /// Explicitly shed above `per_mille`, which must be within 1..=1000.
+    pub const fn on(per_mille: u16) -> Self {
+        Self {
+            mode: GuardMode::On,
+            per_mille,
+        }
+    }
+    /// Canonical configuration mode value; zero is the legacy all-default encoding.
+    pub const fn mode_wire(self) -> u8 {
+        match self.mode {
+            GuardMode::Default => 0,
+            GuardMode::Off => 1,
+            GuardMode::On => 2,
+        }
+    }
+    /// Strict inverse of [`Self::mode_wire`] with its ratio.
+    pub const fn from_wire(mode: u8, per_mille: u16) -> Option<Self> {
+        let mode = match mode {
+            0 => GuardMode::Default,
+            1 => GuardMode::Off,
+            2 => GuardMode::On,
+            _ => return None,
+        };
+        Some(Self { mode, per_mille })
+    }
+    fn valid(self) -> bool {
+        match self.mode {
+            GuardMode::On => (1..=1000).contains(&self.per_mille),
+            GuardMode::Default | GuardMode::Off => self.per_mille == 0,
+        }
+    }
+}
+
 impl<P: RecoveryPolicy> DirectionConfig<P> {
+    /// Whether this direction has the per-flow release choice.
+    fn release_selectable(self) -> bool {
+        self.scheduler.targeted()
+            && self.native_policy.is_ip()
+            && !self.scheduler.hold_native_reordering()
+    }
+    /// Whether both delivery fields are at their default values.
+    pub fn delivery_default(self) -> bool {
+        self.native_release == NativeRelease::Default && self.return_guard == ReturnGuard::DEFAULT
+    }
+    /// Effective native release after default resolution.
+    pub fn effective_release(self) -> EffectiveRelease {
+        let tracked = self.scheduler.targeted()
+            && (self.native_policy.is_ip() || self.receiver.body.independent_short_frame_bytes > 0);
+        if !tracked {
+            EffectiveRelease::Channel
+        } else if self.scheduler.hold_native_reordering() {
+            EffectiveRelease::BoundedHold
+        } else if !self.native_policy.is_ip() {
+            EffectiveRelease::EthernetFlowOrdered
+        } else if self.native_release == NativeRelease::Independent {
+            EffectiveRelease::Independent
+        } else {
+            EffectiveRelease::FlowOrdered
+        }
+    }
+    /// Effective guard ratio after default resolution; `None` means measure only.
+    pub fn effective_guard_per_mille(self) -> Option<u16> {
+        match self.return_guard.mode {
+            GuardMode::On => Some(self.return_guard.per_mille),
+            GuardMode::Off => None,
+            GuardMode::Default => (self.scheduler.targeted() && self.native_policy.is_ip())
+                .then_some(ReturnGuard::DEFAULT_PER_MILLE),
+        }
+    }
     pub(super) fn packing_plan(self) -> Result<codec::aligned_storage::PackedSenderPlan, Error> {
-        (if self.native_policy == NativePolicy::IpHeaders {
+        (if self.native_policy.uses_ip_headers() {
             codec::aligned_storage::PackedSenderPlan::for_ip_config
         } else {
             codec::aligned_storage::PackedSenderPlan::for_config
         })(self.packing)
         .map_err(Error::Storage)
     }
-    pub(super) fn uses_ip_early_replay(self) -> bool {
-        self.scheduler.targeted() && self.native_policy.is_ip()
+    pub(super) fn uses_standard_ip_replay_plan(self) -> bool {
+        // Fixed-anchor receivers provision early replay together with their anchor history.
+        self.scheduler.targeted()
+            && self.native_policy.is_ip()
+            && self.native_policy != NativePolicy::FixedAnchorIpHeaders
     }
     pub(super) fn receiver_plan(self) -> Result<codec::aligned_storage::ReceiverPlan, Error> {
-        (if self.uses_ip_early_replay() {
-            codec::aligned_storage::ReceiverPlan::for_ip_limits_with_early_replay
-        } else if self.native_policy == NativePolicy::IpHeaders {
-            codec::aligned_storage::ReceiverPlan::for_ip_limits
+        if self.uses_standard_ip_replay_plan() {
+            codec::aligned_storage::ReceiverPlan::for_ip_limits_with_early_replay(self.receiver)
         } else {
-            codec::aligned_storage::ReceiverPlan::for_limits
-        })(self.receiver)
+            self.native_policy.receiver_plan(self.receiver)
+        }
         .map_err(Error::Storage)
     }
     /// Validate actual owners and every cross-owner source/record geometry.
     pub fn validate(self) -> Result<(), Error> {
-        if !self.native_policy.available() {
+        if !self.native_policy.available()
+            || !self.return_guard.valid()
+            || (self.native_release != NativeRelease::Default && !self.release_selectable())
+            || (self.return_guard.mode != GuardMode::Default
+                && !(self.scheduler.targeted() && self.native_policy.is_ip()))
+        {
+            return Err(Error::Configuration);
+        }
+        if self.scheduler.compresses_packed_acks()
+            && (self.native_policy != NativePolicy::IpHeaders
+                || !codec::aligned_body::lz4_available()
+                || self.receiver.body.independent_short_frame_bytes == 0)
+        {
             return Err(Error::Configuration);
         }
         self.packing_plan()?;
@@ -100,7 +269,7 @@ impl<P: RecoveryPolicy> Config<P> {
     pub fn validate(self) -> Result<(), Error> {
         self.forward.validate()?;
         self.reverse.validate()?;
-        if self.native_stall_micros == 0 {
+        if self.native_stall_micros == 0 || self.forward.scheduler.compresses_packed_acks() {
             return Err(Error::Configuration);
         }
         for (direction, overhead) in [
@@ -200,6 +369,19 @@ impl<P: RecoveryPolicy> Config<P> {
             self.native_stall_micros,
         ] {
             hash.update(&value.to_be_bytes());
+        }
+        // All-default delivery keeps the exact legacy digest.
+        if !(self.forward.delivery_default() && self.reverse.delivery_default()) {
+            hash.update(b"l2tunnel/rolling-records/delivery-policy/v1\0");
+            for c in [self.forward, self.reverse] {
+                for value in [
+                    u64::from(c.native_release.wire()),
+                    u64::from(c.return_guard.mode_wire()),
+                    u64::from(c.return_guard.per_mille),
+                ] {
+                    hash.update(&value.to_be_bytes());
+                }
+            }
         }
         let digest = hash.finish();
         Ok(ConfigDigest(

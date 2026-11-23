@@ -152,7 +152,7 @@ fn actual_shared_pipeline_keeps_independent_loss_and_raw_ack_physical_custody_di
     assert_eq!(canonical[5], 8);
     assert_eq!(c::Configuration::decode(&canonical)?, value);
     let mut unsupported = canonical;
-    unsupported[5] = 10;
+    unsupported[5] = 13;
     assert_eq!(
         c::Configuration::decode(&unsupported),
         Err(c::Error::Prefix)

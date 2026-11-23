@@ -14,6 +14,150 @@ pub use compact_wire::{
 mod ack;
 pub use ack::{AckObservation, AckPolicies, AckPolicy, AckRead, AckSelection, AckStatus};
 
+/// Global source direction of a mixed-packet producer or consumer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StripedDirection {
+    /// Traffic from the session initiator to the responder.
+    InitiatorToResponder,
+    /// Traffic from the session responder to the initiator.
+    ResponderToInitiator,
+}
+
+/// Mixed group formation in one producer epoch, independent of datagram retries.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct StripedFormation {
+    /// Ordinary groups at the negotiated size.
+    pub full_groups: u64,
+    /// Shorter ordinary groups.
+    pub short_groups: u64,
+    /// Splits made with only one input at the original batch deadline.
+    pub lone_splits: u64,
+    /// Splits made with multiple inputs and no ordinary prefix fitting the MTU.
+    pub mtu_splits: u64,
+    /// Splits of a single input left after sealing part of a frozen batch.
+    pub trailing_splits: u64,
+    /// Number of first seals, counted once per input batch.
+    pub batches: u64,
+    /// Total time from oldest input to first seal across those batches.
+    pub hold_micros: u64,
+    /// Total time beyond the first input's deadline at first seal.
+    pub late_micros: u64,
+    /// Largest first-seal delay beyond that deadline.
+    pub max_late_micros: u64,
+}
+
+/// IP charges supplied on complete carrier acceptance in the current mixed epoch.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct StripedPayments {
+    /// First transmissions, including both members of every split.
+    pub fresh: StripedCharge,
+    /// Retries of explicitly named originals.
+    pub named: StripedCharge,
+    /// Quiet-tail retries.
+    pub quiet: StripedCharge,
+    /// Feedback for the opposite producer sent on this endpoint's carrier.
+    pub feedback: StripedCharge,
+}
+
+/// Complete physical datagrams and the corresponding charged IP bytes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct StripedCharge {
+    /// Completed datagrams.
+    pub packets: u64,
+    /// IP bytes supplied at physical payment.
+    pub ip_bytes: u64,
+}
+
+impl From<l2tunnel::fec::striped_group::schedule::Paid> for StripedCharge {
+    fn from(paid: l2tunnel::fec::striped_group::schedule::Paid) -> Self {
+        Self {
+            packets: paid.packets,
+            ip_bytes: paid.ip_bytes,
+        }
+    }
+}
+
+/// Exact source debt in the current mixed epoch, in logical source units.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct StripedSources {
+    /// Local producer's data direction.
+    pub send_direction: StripedDirection,
+    /// Authenticated stream of the producer.
+    pub send_stream: u32,
+    /// Assigned sources still awaiting peer confirmation.
+    pub send_outstanding: u64,
+    /// Source slots retained for physical recovery, including partial group custody.
+    pub send_retained: u64,
+    /// Absent in status captured before group formation accounting.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub send_formation: Option<StripedFormation>,
+    /// Absent in historical status captures without the per-class charges.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub send_paid: Option<StripedPayments>,
+    /// Last inclusive applied peer receipt.
+    pub send_confirmed: Option<u64>,
+    /// Local consumer's data direction.
+    pub receive_direction: StripedDirection,
+    /// Authenticated stream of the consumer.
+    pub receive_stream: u32,
+    /// Last contiguous native commit.
+    pub receive_confirmed: Option<u64>,
+    /// First source outside the confirmed prefix.
+    pub receive_frontier: Option<u64>,
+    /// Last ID known to have been sealed by the peer.
+    pub receive_sealed: Option<u64>,
+    /// Pending native commits in admitted groups.
+    pub receive_uncommitted_in_groups: u64,
+    /// Pending native commits including unseen gaps through the sealed horizon.
+    pub receive_uncommitted_through_sealed: u64,
+}
+
+impl From<l2tunnel::striped_records::SourceStatus> for StripedSources {
+    fn from(v: l2tunnel::striped_records::SourceStatus) -> Self {
+        use StripedDirection::{InitiatorToResponder, ResponderToInitiator};
+        let (send_direction, receive_direction) = match v.send_direction {
+            l2tunnel::fec::Direction::ClientToServer => {
+                (InitiatorToResponder, ResponderToInitiator)
+            }
+            l2tunnel::fec::Direction::ServerToClient => {
+                (ResponderToInitiator, InitiatorToResponder)
+            }
+        };
+        Self {
+            send_direction,
+            send_stream: v.send_stream,
+            send_outstanding: v.send_outstanding as u64,
+            send_retained: v.send_retained as u64,
+            send_formation: Some(StripedFormation {
+                full_groups: v.send_formation.full_groups,
+                short_groups: v.send_formation.short_groups,
+                lone_splits: v.send_formation.lone_splits,
+                mtu_splits: v.send_formation.mtu_splits,
+                trailing_splits: v.send_formation.trailing_splits,
+                batches: v.send_formation.batches,
+                hold_micros: v.send_formation.hold_ticks,
+                late_micros: v.send_formation.late_ticks,
+                max_late_micros: v.send_formation.max_late_ticks,
+            }),
+            send_paid: Some(StripedPayments {
+                fresh: v.send_paid.fresh.into(),
+                named: v.send_paid.named.into(),
+                quiet: v.send_paid.quiet.into(),
+                feedback: v.feedback_paid.into(),
+            }),
+            send_confirmed: v.send_confirmed.map(|id| id.0),
+            receive_direction,
+            receive_stream: v.receive_stream,
+            receive_confirmed: v.receive_confirmed.map(|id| id.0),
+            receive_frontier: v.receive_frontier.map(|id| id.0),
+            receive_sealed: v.receive_sealed.map(|id| id.0),
+            receive_uncommitted_in_groups: v.receive_uncommitted_in_groups as u64,
+            receive_uncommitted_through_sealed: v.receive_uncommitted_through_sealed as u64,
+        }
+    }
+}
+
 #[path = "common_rolling_ingress.rs"]
 mod rolling_ingress;
 pub use rolling_ingress::{
@@ -32,6 +176,14 @@ pub enum RollingWireProfile {
     TargetedExact,
     /// Targeted C48 recovery with forward eight-source equations.
     TargetedNear8,
+    /// Forward near8 with bounded native TCP reordering at the receiver.
+    TargetedNear8Hold35,
+    /// Forward near8 with confirmed-prefix global repair.
+    TargetedNear8ConfirmedPrefix,
+    /// Forward near8 with an additional repair paid from unused source credit.
+    TargetedNear8Headroom,
+    /// Targeted exact recovery with optional compression of packed ACK sources.
+    TargetedExactAckLz4,
 }
 
 impl From<l2tunnel::fec::rolling::wire::SourceWire> for RollingWireProfile {
@@ -42,6 +194,10 @@ impl From<l2tunnel::fec::rolling::wire::SourceWire> for RollingWireProfile {
             SourceWire::Exact => Self::Exact,
             SourceWire::TargetedExact => Self::TargetedExact,
             SourceWire::TargetedNear8 => Self::TargetedNear8,
+            SourceWire::TargetedNear8Hold35 => Self::TargetedNear8Hold35,
+            SourceWire::TargetedNear8ConfirmedPrefix => Self::TargetedNear8ConfirmedPrefix,
+            SourceWire::TargetedNear8Headroom => Self::TargetedNear8Headroom,
+            SourceWire::TargetedExactAckLz4 => Self::TargetedExactAckLz4,
         }
     }
 }
@@ -105,9 +261,31 @@ pub struct Near8GateCounts {
     pub backlogged_groups: u64,
 }
 
+/// Additional near8 repair funded by original credit above the ordinary cap.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct Near8HeadroomBudget {
+    /// Available extra credit in eighths of one IP byte.
+    pub credit_eighths: u64,
+    /// Groups considered for an additional row.
+    pub qualifying_groups: u64,
+    /// Groups withheld for insufficient credit.
+    pub unfunded: u64,
+    /// Groups withheld by physical link load.
+    pub wire_busy: u64,
+    /// Additional rows abandoned before submission.
+    pub abandoned: u64,
+    /// Additional rows accepted by the carrier.
+    pub sent_rows: u64,
+    /// Complete physical IP bytes charged for these rows.
+    pub sent_ip_bytes: u64,
+}
+
 /// Independent eight-source repair budget observed at local physical handoff.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Near8Budget {
+    /// Present when the authenticated profile selects overflow-funded repair.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub headroom: Option<Near8HeadroomBudget>,
     /// Sustained spare-capacity gate.
     pub spare: bool,
     /// Independent counters for the observed reasons at each decision.
@@ -127,9 +305,162 @@ pub struct Near8Budget {
     pub sent_rows: u64,
     /// Actual accepted complete-IP cost.
     pub sent_ip_bytes: u64,
+    /// Global or tail rows confirmed at physical handoff.
+    #[serde(default)]
+    pub global_sent_rows: u64,
+    /// Confirmed global rows with a shorter than nominal support.
+    #[serde(default)]
+    pub global_trimmed_rows: u64,
+    /// Nominal source columns across confirmed global rows, including startup ramps.
+    #[serde(default)]
+    pub global_nominal_columns: u64,
+    /// Actual covered source columns in those rows.
+    #[serde(default)]
+    pub global_sent_columns: u64,
     /// Remaining physical-byte credit in eighths of one byte.
     pub credit_eighths: u64,
 }
+/// Receiver-side authenticated TCP native hold counters in the active generation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RollingNativeReorder {
+    /// First ahead-of-prefix segment starting a new hold.
+    pub starts: u64,
+    /// Episodes released at the original soft deadline.
+    pub deadline_releases: u64,
+    /// Episodes released upon exceeding the permitted byte span.
+    pub span_releases: u64,
+    /// Ahead-of-prefix data packets physically accepted during bypass.
+    pub bypass_writes: u64,
+    /// Waiting episodes closed by physical writes before bypass.
+    pub prefix_closes: u64,
+    /// Released episodes whose contiguous edge reached the original barrier.
+    pub bypass_prefix_closes: u64,
+    /// Flows failing open when the bounded exact range ledger fills.
+    pub range_overflows: u64,
+}
+impl From<l2tunnel::rolling_records::NativeReorderStatus> for RollingNativeReorder {
+    fn from(value: l2tunnel::rolling_records::NativeReorderStatus) -> Self {
+        Self {
+            starts: value.starts,
+            deadline_releases: value.deadline_releases,
+            span_releases: value.span_releases,
+            bypass_writes: value.bypass_writes,
+            prefix_closes: value.prefix_closes,
+            bypass_prefix_closes: value.bypass_prefix_closes,
+            range_overflows: value.range_overflows,
+        }
+    }
+}
+
+/// Requested or effective native release order at the local receiver.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RollingRelease {
+    /// Resolved per direction; see the effective value.
+    Default,
+    /// Channel record order without per-flow tracking.
+    Channel,
+    /// Ethernet TCP data in flow order.
+    EthernetFlowOrdered,
+    /// Authenticated bounded native hold.
+    BoundedHold,
+    /// IP TCP data released across sequence gaps.
+    Independent,
+    /// IP TCP data released only in its flow's order.
+    FlowOrdered,
+}
+impl From<l2tunnel::rolling_records::NativeRelease> for RollingRelease {
+    fn from(value: l2tunnel::rolling_records::NativeRelease) -> Self {
+        use l2tunnel::rolling_records::NativeRelease;
+        match value {
+            NativeRelease::Default => Self::Default,
+            NativeRelease::Independent => Self::Independent,
+            NativeRelease::FlowOrdered => Self::FlowOrdered,
+        }
+    }
+}
+impl From<l2tunnel::rolling_records::EffectiveRelease> for RollingRelease {
+    fn from(value: l2tunnel::rolling_records::EffectiveRelease) -> Self {
+        use l2tunnel::rolling_records::EffectiveRelease;
+        match value {
+            EffectiveRelease::Channel => Self::Channel,
+            EffectiveRelease::EthernetFlowOrdered => Self::EthernetFlowOrdered,
+            EffectiveRelease::BoundedHold => Self::BoundedHold,
+            EffectiveRelease::Independent => Self::Independent,
+            EffectiveRelease::FlowOrdered => Self::FlowOrdered,
+        }
+    }
+}
+/// Requested return-guard mode of the local sender.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RollingGuardMode {
+    /// Resolved per direction; see the effective ratio.
+    Default,
+    /// Measure only.
+    Off,
+    /// Shed above the requested ratio.
+    On,
+}
+/// Requested/effective release order and local return guard in the active generation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RollingDelivery {
+    /// Requested receive-direction release.
+    pub requested_release: RollingRelease,
+    /// Effective receive-direction release.
+    pub effective_release: RollingRelease,
+    /// Requested send-direction guard mode.
+    pub requested_guard: RollingGuardMode,
+    /// Requested ratio per thousand; zero unless the mode is on.
+    pub requested_guard_per_mille: u16,
+    /// Effective ratio per thousand; absent when the guard only measures.
+    pub effective_guard_per_mille: Option<u16>,
+    /// Whether the guard is currently engaged as a return path.
+    pub guard_engaged: bool,
+    /// One-second window: native bytes delivered from the peer.
+    pub window_delivered_bytes: u64,
+    /// One-second window: first-copy wire bytes sent.
+    pub window_first_bytes: u64,
+    /// One-second window: never-shed wire bytes sent.
+    pub window_required_bytes: u64,
+    /// One-second window: sheddable extra wire bytes sent.
+    pub window_extra_bytes: u64,
+    /// Sources admitted with their extra copies removed.
+    pub shed_copy_sources: u64,
+    /// Estimated wire bytes of removed copies.
+    pub shed_copy_bytes: u64,
+    /// Regular repairs displaced by the guard.
+    pub shed_repairs: u64,
+    /// Estimated wire bytes of displaced repairs.
+    pub shed_repair_bytes: u64,
+}
+impl From<l2tunnel::rolling_records::DeliveryStatus> for RollingDelivery {
+    fn from(value: l2tunnel::rolling_records::DeliveryStatus) -> Self {
+        use l2tunnel::rolling_records::GuardMode;
+        let g = value.guard;
+        Self {
+            requested_release: value.requested_release.into(),
+            effective_release: value.effective_release.into(),
+            requested_guard: match g.requested.mode {
+                GuardMode::Default => RollingGuardMode::Default,
+                GuardMode::Off => RollingGuardMode::Off,
+                GuardMode::On => RollingGuardMode::On,
+            },
+            requested_guard_per_mille: g.requested.per_mille,
+            effective_guard_per_mille: g.effective_per_mille,
+            guard_engaged: g.engaged,
+            window_delivered_bytes: g.window_delivered_bytes,
+            window_first_bytes: g.window_first_bytes,
+            window_required_bytes: g.window_required_bytes,
+            window_extra_bytes: g.window_extra_bytes,
+            shed_copy_sources: g.shed_copy_sources,
+            shed_copy_bytes: g.shed_copy_bytes,
+            shed_repairs: g.shed_repairs,
+            shed_repair_bytes: g.shed_repair_bytes,
+        }
+    }
+}
+
 /// Physical retransmission credits and regular FEC spending in the active local sender.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct RollingRepairBudget {
@@ -205,6 +536,15 @@ impl From<l2tunnel::rolling_records::RepairBudgetStatus> for RollingRepairBudget
     fn from(s: l2tunnel::rolling_records::RepairBudgetStatus) -> Self {
         Self {
             near8: s.near8.map(|v| Near8Budget {
+                headroom: v.headroom.map(|h| Near8HeadroomBudget {
+                    credit_eighths: h.credit_eighths,
+                    qualifying_groups: h.qualifying_groups,
+                    unfunded: h.unfunded,
+                    wire_busy: h.wire_busy,
+                    abandoned: h.abandoned,
+                    sent_rows: h.sent_rows,
+                    sent_ip_bytes: h.sent_ip_bytes,
+                }),
                 spare: v.spare,
                 gate: Near8GateCounts {
                     partial_buckets: v.gate.partial_buckets,
@@ -225,6 +565,10 @@ impl From<l2tunnel::rolling_records::RepairBudgetStatus> for RollingRepairBudget
                 abandoned: v.abandoned,
                 sent_rows: v.sent_rows,
                 sent_ip_bytes: v.sent_ip_bytes,
+                global_sent_rows: v.global_sent_rows,
+                global_trimmed_rows: v.global_trimmed_rows,
+                global_nominal_columns: v.global_nominal_columns,
+                global_sent_columns: v.global_sent_columns,
                 credit_eighths: v.credit_eighths,
             }),
             named_requests: Some(RollingNamedRequests {
@@ -383,7 +727,8 @@ impl<'de> Deserialize<'de> for CanonicalConfiguration {
 #[path = "common_observations.rs"]
 mod observations;
 pub use observations::{
-    Control, Liveness, Native, Operation, Phase, Scope, Security, Storage, Wire,
+    Control, Liveness, Native, NativeIngressRefusals, Operation, Phase, Scope, Security, Storage,
+    Wire,
 };
 /// Maximum full configurations returned by one generation-bound catalog request.
 pub const CATALOG_PAGE_LIMIT: u16 = 4;
@@ -550,6 +895,15 @@ pub struct Status {
     pub catalog_members: u16,
     /// Exact requested startup complete configuration.
     pub initial: CanonicalConfiguration,
+    /// Exact requested startup KCP-like policy, absent for other algorithms.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kcp_like_initial: Option<serde_json::Value>,
+    /// Actual current KCP-like policy, absent before installation or for other algorithms.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kcp_like_current: Option<serde_json::Value>,
+    /// Retained switch request, never substituted for the effective policy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kcp_like_requested: Option<serde_json::Value>,
     /// Actual Bank complete configuration; absent before a runtime report.
     pub current: Option<CanonicalConfiguration>,
     /// Actual retained local complete request, never substituted for current.
@@ -617,6 +971,15 @@ pub struct Status {
     /// Observed only when the active descriptor selects targeted recovery locally.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rolling_repair_budget: Option<RollingRepairBudget>,
+    /// Observed only from an active mixed-packet owner in this epoch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub striped_sources: Option<StripedSources>,
+    /// Effective bounded native TCP hold observations, absent on the ordinary receiver.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rolling_native_reorder: Option<RollingNativeReorder>,
+    /// Requested/effective release order and return guard of the active rolling generation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rolling_delivery: Option<RollingDelivery>,
     /// Explicit immutable Benchmark policy and actual Engine ingress observations.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ack_coalescing: Option<AckStatus>,
@@ -642,6 +1005,9 @@ pub struct Status {
     pub rolling_scheduler_steps: Option<u64>,
     /// Actual cumulative GF/copy/metadata work consumed.
     pub rolling_work_used: Option<[u64; 3]>,
+    /// Original UDP read batches yielded for an active decoder at queue pressure.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub udp_rolling_pressure_yields: Option<u64>,
     /// Complete catalog page only on an explicit bounded catalog request.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub catalog_page: Option<CatalogPage>,
@@ -877,6 +1243,14 @@ mod observe {
                 catalog_members: u16::try_from(profile.catalog().descriptors().len())
                     .map_err(invalid)?,
                 initial: CanonicalConfiguration::from_configuration(profile.initial())?,
+                kcp_like_initial: crate::kcp_like_l2::selected(
+                    &profile.requested_catalog().initial(),
+                ),
+                kcp_like_current: snapshot
+                    .and_then(|value| crate::kcp_like_l2::selected(value.current.descriptor())),
+                kcp_like_requested: snapshot
+                    .and_then(|value| value.requested)
+                    .and_then(|value| crate::kcp_like_l2::selected(value.descriptor())),
                 current: snapshot
                     .map(|value| CanonicalConfiguration::from_configuration(value.current))
                     .transpose()?,
@@ -936,6 +1310,14 @@ mod observe {
                             written: value.native_written,
                             oversize: value.native_oversize,
                             backpressure_drops: value.native_backpressure_drops,
+                            ingress_refusals: snapshot.map(|s| NativeIngressRefusals {
+                                ack_history: s.performance.native_ingress_ack_history_refusals,
+                                flow_table: s.performance.native_ingress_flow_table_refusals,
+                                shared_byte: s.performance.native_ingress_shared_byte_refusals,
+                                shared_packet: s.performance.native_ingress_shared_packet_refusals,
+                                flow_byte: s.performance.native_ingress_flow_byte_refusals,
+                                flow_packet: s.performance.native_ingress_flow_packet_refusals,
+                            }),
                             pending_packets: number(value.native_pending_packets)?,
                             pending_bytes: number(value.native_pending_bytes)?,
                         })
@@ -1008,9 +1390,14 @@ mod observe {
                 ack_coalescing: requested_ack
                     .map(|requested| AckStatus::observe(requested, snapshot))
                     .transpose()?,
+                rolling_native_reorder: snapshot
+                    .and_then(|s| s.rolling_native_reorder)
+                    .map(Into::into),
+                rolling_delivery: snapshot.and_then(|s| s.rolling_delivery).map(Into::into),
                 rolling_repair_budget: snapshot
                     .and_then(|s| s.rolling_repair_budget)
                     .map(Into::into),
+                striped_sources: snapshot.and_then(|s| s.striped_sources).map(Into::into),
                 rolling_ingress: requested_rolling
                     .map(|requested| RollingIngressStatus::observe(requested, snapshot))
                     .transpose()?,
@@ -1034,6 +1421,8 @@ mod observe {
                     .transpose()?,
                 rolling_scheduler_steps: snapshot.map(|value| value.rolling_scheduler_steps),
                 rolling_work_used: snapshot.map(|value| value.rolling_work_used),
+                udp_rolling_pressure_yields: snapshot
+                    .map(|value| value.performance.udp_rolling_pressure_yields),
                 catalog_page: None,
                 result: None,
             })

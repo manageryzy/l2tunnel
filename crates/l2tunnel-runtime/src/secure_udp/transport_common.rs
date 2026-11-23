@@ -110,6 +110,12 @@ pub struct CommonSnapshot {
     pub rolling_input: Option<l2tunnel::rolling_records::IngressStatus>,
     /// Effective local queue-aware budget in the active record generation.
     pub rolling_repair_budget: Option<l2tunnel::rolling_records::RepairBudgetStatus>,
+    /// Local producer and consumer custody in the current mixed packet epoch.
+    pub striped_sources: Option<l2tunnel::striped_records::SourceStatus>,
+    /// Actual current receiver generation's optional bounded TCP native hold.
+    pub rolling_native_reorder: Option<l2tunnel::rolling_records::NativeReorderStatus>,
+    /// Actual current generation's release order and return guard.
+    pub rolling_delivery: Option<l2tunnel::rolling_records::DeliveryStatus>,
     /// Actual current Engine fragment selection; absent for other record families.
     pub rolling_fragments: Option<engine::FragmentPolicy>,
     /// Actual independently retained reassembly and completed-body custody.
@@ -267,6 +273,7 @@ pub(super) struct PendingFeedback {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct PendingIngress {
     pub(super) generation: l2tunnel::record_bank::GenerationId,
+    pub(super) flow_byte_wait: Option<l2tunnel::record_engine::FlowByteWait>,
     pub(super) epoch: core::Epoch,
     pub(super) bytes: usize,
     pub(super) received: u64,
@@ -278,6 +285,7 @@ pub(super) struct Runtime {
     pub(super) wire_metrics: Option<wire_metrics::Observer>,
     pub(super) wire_sample: Option<wire_metrics::Sample>,
     pub(super) compact_arq_trace: Option<compact_arq_trace::Observer>,
+    pub(super) reverse_trace: Option<super::reverse_trace::Trace>,
     #[cfg(unix)]
     pub(super) proxy_bridge: Option<crate::proxy::common_bridge::Bridge>,
     pub(super) reuse_owner: Option<owner::StateCell<super::common_reuse::Installed>>,
@@ -687,12 +695,19 @@ impl Driver {
         // Common state has its own cell. Validate and charge the complete
         // payload before provisioning.
         std::alloc::Layout::array::<Runtime>(1).map_err(io::Error::other)?;
-        let serializer_plan = contract.catalog().descriptors().iter()
-            .filter(|descriptor| matches!(descriptor.direction(role).profile(),
+        let serializer_plan = contract
+            .catalog()
+            .descriptors()
+            .iter()
+            .filter(|descriptor| {
+                matches!(descriptor.direction(role).profile(),
                 l2tunnel::record_configuration::DirectionProfile::Rolling { config, .. }
-                if config.scheduler.source_wire == l2tunnel_fec::rolling::wire::SourceWire::TargetedNear8))
-            .map(|descriptor| descriptor.path_mtu()).max()
-            .map(super::common_io::SerializerPlan::new).transpose()?;
+                if config.scheduler.source_wire.is_near8())
+            })
+            .map(|descriptor| descriptor.path_mtu())
+            .max()
+            .map(super::common_io::SerializerPlan::new)
+            .transpose()?;
         let serializer_heap = serializer_plan
             .as_ref()
             .map(|plan| plan.heap_bytes())
@@ -774,6 +789,10 @@ impl Driver {
         let wire_metrics =
             wire_metrics::Observer::from_environment(input.cover.limits().max_packet_bytes)?;
         let compact_arq_trace = compact_arq_trace::Observer::from_environment()?;
+        let reverse_trace = super::reverse_trace::Trace::from_environment(
+            input.info.role == security::Role::Responder,
+            origin,
+        )?;
         let mut buffer_metrics =
             crate::buffer_metrics::Observer::from_environment_at("common", origin)?;
         if let Some(metrics) = &mut buffer_metrics {
@@ -935,6 +954,7 @@ impl Driver {
                 next_raw_buffer_sample: 0,
                 wire_sample: None,
                 compact_arq_trace,
+                reverse_trace,
                 #[cfg(unix)]
                 proxy_bridge: None,
                 reuse_owner,
@@ -999,6 +1019,7 @@ impl Driver {
                     reserve,
                     ip,
                     ingress: IngressBudget {
+                        observed_udp: false,
                         left: config.work.receive_packets,
                         refill: add(0, config.work.receive_interval)?,
                     },
@@ -1120,6 +1141,9 @@ impl Driver {
             rolling_ingress: self.config.rolling_ingress,
             rolling_input: state.engine(state.epoch())?.rolling_ingress_status(),
             rolling_repair_budget: state.engine(state.epoch())?.rolling_repair_budget(),
+            striped_sources: state.engine(state.epoch())?.striped_sources(),
+            rolling_native_reorder: state.engine(state.epoch())?.rolling_native_reorder(),
+            rolling_delivery: state.engine(state.epoch())?.rolling_delivery(),
             rolling_fragments: state.engine(state.epoch())?.fragment_policy(),
             fragment_ingress: state.engine(state.epoch())?.fragment_ingress_snapshot(),
             fragment_statistics: state.engine(state.epoch())?.fragment_statistics(),

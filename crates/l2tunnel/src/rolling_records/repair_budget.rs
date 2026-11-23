@@ -184,31 +184,50 @@ impl Budget {
         }
     }
 
-    pub(super) fn price_regular(
+    /// Price one regular repair. The return guard, when enabled, may displace it
+    /// before any retry credit is spent; the opportunity is still counted.
+    #[allow(clippy::too_many_arguments)] // Exact pricing inputs plus the separate local guard.
+    pub(super) fn price_regular<P: RecoveryPolicy>(
         &mut self,
         id: rolling::RepairId,
         support: rolling::Support,
-        compact: bool,
-        header_bytes: usize,
+        compact: Option<P>,
         framing: Option<codec::FragmentConfig>,
         overhead: usize,
+        guard: &mut return_guard::Guard,
+        now: Tick,
     ) -> Result<bool, rolling::Error> {
         let extent = self.extent(support);
-        let length = if compact {
-            rolling::wire::compact::repair_len(id, support.end, extent)?
+        let length = if let Some(policy) = compact {
+            P::Compact::repair_len(policy, id, support, extent)?
         } else {
-            header_bytes
+            P::HEADER_BYTES
                 .checked_add(extent)
                 .ok_or(rolling::Error::Length)?
         };
         let (_, wire_bytes) =
             wire_charge(framing, length, overhead).map_err(|_| rolling::Error::Length)?;
-        Ok(self.regular(wire_bytes as u64))
+        let wire_bytes = wire_bytes as u64;
+        if guard.enabled() {
+            self.opportunity(wire_bytes);
+            if guard.shed_repair(now, wire_bytes) {
+                return Ok(true);
+            }
+            return Ok(self.spend(wire_bytes));
+        }
+        Ok(self.regular(wire_bytes))
     }
-    fn regular(&mut self, wire_bytes: u64) -> bool {
+    fn opportunity(&mut self, wire_bytes: u64) {
         let status = &mut self.status;
         status.regular_opportunities = status.regular_opportunities.saturating_add(1);
         status.opportunity_wire_bytes = status.opportunity_wire_bytes.saturating_add(wire_bytes);
+    }
+    fn regular(&mut self, wire_bytes: u64) -> bool {
+        self.opportunity(wire_bytes);
+        self.spend(wire_bytes)
+    }
+    fn spend(&mut self, wire_bytes: u64) -> bool {
+        let status = &mut self.status;
         if wire_bytes > status.balance_half_bytes / 2 {
             return false;
         }
@@ -284,11 +303,14 @@ impl<P: RecoveryPolicy> Endpoint<P> {
         let Some(budget) = &mut self.repair_budget else {
             return P::send_step(&mut self.sender, rolling_tick(now), work).map_err(Error::Rolling);
         };
-        let compact = self.compact_feedback_overhead.is_some();
+        let compact = self
+            .compact_feedback_overhead
+            .map(|_| self.send_config.scheduler);
         let overhead = self.overhead;
         let framing = self.framing;
+        let guard = &mut self.return_guard;
         P::send_step_filtered(&mut self.sender, rolling_tick(now), work, |id, support| {
-            budget.price_regular(id, support, compact, P::HEADER_BYTES, framing, overhead)
+            budget.price_regular(id, support, compact, framing, overhead, guard, now)
         })
         .map_err(Error::Rolling)
     }

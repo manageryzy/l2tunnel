@@ -1,6 +1,6 @@
 # Python-to-Rust mode parity
 
-Status: parity inventory, with all 47 complete catalog acceptance gates still
+Status: parity inventory, with all 48 complete catalog acceptance gates still
 open. Protocol tests and finite Linux integration do not establish an entire
 Python family's behavioral or byte parity. Stable IDs in the [mode catalog](../config/mode-catalog.toml)
 identify acceptance work, not final wire identifiers. Source paths below are
@@ -315,7 +315,114 @@ targeted feedback and the existing 8192/128 global/local windows. This
 variant adds no default or separate acceptance credit for the existing C48
 throughput target. [Comparison and evidence](modules/frame-channel-experiment.md#negotiated-eight-source-forward-repair).
 
+Two optional forward near8 configurations on original UDP also have verified
+Linux single-flow delivery and final source drain. One bounds how long the
+TUN receiver waits for a gap before releasing later TCP segments. The other
+keeps immediate delivery and removes cumulatively confirmed columns from
+global equations. Their configuration digests differ. Neither has qualified
+for the original single-flow throughput and application latency targets.
+[Delivery trials](modules/frame-channel-experiment.md#inner-tcp-retransmissions-in-the-single-flow-near8-run)
+and [confirmed-prefix trials](modules/frame-channel-experiment.md#confirmed-source-bytes-in-global-equations).
+
+The C48 near8 UDP comparison can also select a fixed TCP-header context for
+forward native IP. Rust codec tests recover the original packet when other
+records between the context and the packet are missing, and after the context
+itself returns. Its directional digest and two wire bytes per dependent body
+distinguish it from the ordinary C48 configuration.
+[Measured scope](modules/frame-channel-experiment.md#fixed-anchor-ip-header-compression).
+
+The fixed-anchor C48 UDP comparison also has a negotiated reverse Packed
+ACK compression candidate. One Linux TUN run recovered every application
+byte and drained both endpoints. It reached 57.60 Mbit/s on one CUBIC flow
+with a 4 MiB application limit. The simulated FIFO reference reached
+77.78 Mbit/s and produced a different reverse ACK workload. Single-flow
+performance parity remains open.
+[Wire, application and recovery measurements](modules/frame-channel-experiment.md#negotiated-reverse-packed-ack-compression).
+
+The original UDP runtime also negotiates the independent forward near8
+overflow-credit policy (selector 10) with reverse selector 9. Protocol
+fixtures cover the additional equation, byte recovery and physical charging.
+The first same-binary Linux comparison confirmed negotiation and final drain.
+All additional rows were withheld or abandoned before submission. Native
+delivery by an additional row and its throughput effect remain unverified.
+[Selection and physical counters](modules/frame-channel-experiment.md#single-flow-startup-and-overflow-funded-near8).
+
+The single-flow C48 simulator can optionally restore its sender window after
+the first advancing partial ACK echoes an earlier transmission timestamp.
+The archived configurations keep their original endpoint behavior. The
+CompactARQ source review covers the new opt-in configuration and sender code.
+Its historical manifest and all five differential recovery traces retain their
+original values. The two-seed study and four-direction Linux capture leave
+the native single-flow target open.
+[Endpoint comparison](modules/frame-channel-experiment.md#single-flow-tcp-recovery-on-the-same-packet-history).
+
 ## Recovery and scheduling
+
+The mixed-packet `striped-cauchy` candidate places direct data and parity cells in
+each datagram. The functional Common Engine now sends and receives native
+Packed units through the tag 10 owner, with full-width feedback, bounded
+short groups and actual physical and native completion. Established
+Common-record UDP loopback covers authenticated named recovery. Normal
+service resource preflight accepts all four carrier plans. Linux UDP/TUN
+has single-flow loss and drain integration measurements with 500 µs and
+1,500 µs forward holds. The separate length-aware one-erasure XOR experiment
+has a Python byte codec and closed-loop simulations. The Rust tag 10
+measurements use the equal-width Cauchy format. The throughput and
+latency gates remain open. Its per-packet layout differs
+from the existing systematic block Cauchy and rolling C48 configurations.
+[Coding and delivery contract](modules/frame-channel-experiment.md#mixed-packets-and-local-erasure-recovery).
+
+The independent physical-path study applies the coding geometry to a single
+native packet before path-local batching. Each DATA packet can therefore
+carry coding members from multiple independent native packets. Shared Python
+and Rust fixtures cover the member bytes, nested entries, batched ACKs and
+named ordinal requests. The Python TCP study accounts for both directions on
+the shared bottleneck. Rust loopback exercises six connected authenticated
+UDP paths with injected member erasures. An isolated Linux TUN/UDP lab
+also exercises one TCP connection through six impaired paths with complete
+drain. Full product path association and
+the single-flow performance target remain open.
+[Independent physical paths](modules/frame-channel-experiment.md#independent-physical-paths-for-one-inner-flow).
+
+The optional shared-member comparison retains explicit replicas and original
+first-flight deadlines. Python and Rust implement a three-class rotation for
+fresh, physical-retry and named/quiet entries, with shared pending-member state.
+The first two Python seeds reduce first-flight service age but lose goodput;
+the candidate therefore has no performance acceptance. Whole-record custody,
+out-of-order delivery and recovery of old holes remain required.
+
+After correcting the Python candidate to use two MTU buffers and one DATA
+payment per slot per round, the two fixed seeds reach 12.643 and 47.916 Mbit/s;
+the latter has 667 steady inner retransmissions. The matching Linux policy
+reaches 40.064 Mbit/s with 1,339 steady inner retransmissions. Linux socket
+acceptance versus modeled serializer completion, real TUN scheduling and
+kernel TCP remain distinct evidence boundaries. The new receipts preserve
+both the earlier failed simulator schedule and the same-source control.
+
+The paced-recovery comparison charges an additional 14 Ethernet-header bytes
+in the shared directional link budget. Both implementations retain original
+admission deadlines, a single-frame burst allowance, blocked ciphertext custody
+and fair bounded service of ACK, request and DATA classes. Physical RTT uses
+new positive physical receipts, including late originals; logical delivery and
+forgotten ACK history are not RTT samples. The laboratory's shaper-then-loss
+option is a separate topology from the historical HTB/netem child arrangement.
+The completed same-binary Linux comparison records 27.074 Mbit/s for its control
+and 3.979 Mbit/s for the paced candidate, with application P99 of 1.618 and
+10.118 s respectively. The two Python paired seeds give 6.823 to 11.034 and
+7.348 to 40.160 Mbit/s. Neither the Linux regression nor the large seed
+sensitivity qualifies a default or establishes the 70 Mbit/s target. Original
+native custody and physical recovery debt drain in these finite runs.
+
+The forward 12/10 geometry has a completed impaired Linux UDP/TUN run.
+The raw-IP control ended before application admission. The 70 Mbit/s
+single-flow target and parity with an independently running TCP sender
+remain open. [Window and packet evidence](modules/frame-channel-experiment.md#single-flow-congestion-window-and-header-dependency).
+
+An independent short-group option in the Python study protects three
+already-due large sources across six datagrams and recovers from any two
+erasures. Rust currently emits independent split pairs for this case.
+The local Rust UDP fixture exposes the actual seal inputs and membership.
+[Capture replay and paired Python comparison](modules/frame-channel-experiment.md#erasure-protection-at-the-short-group-deadline).
 
 | Catalog ID | Existing Python implementation | Knobs and behavior that must survive the port | Rust milestone |
 | --- | --- | --- | --- |
@@ -357,6 +464,8 @@ complete legacy P-* gates open. The contracts in the table are unchanged.
 | `unified-duplex-mux` | `mux.py:DuplexMux`; `mux_tcp.py:UnifiedMuxMultiFlow/MuxTCP` | Same ingress classifier/arbiter for bulk and probes in both directions; FIFO per channel and round-robin admission; configurable 1..256 channels for unpacked records, 1..255 for packed records (channel255 is the container marker), current publication cap16. Reject an incompatible count before creating flows. `mapping=crc32` or `connection_round_robin`; learned reverse affinity comes from decoded frames. | M2 |
 | `payload-compression` | No general payload compressor in Python | Explicitly new work: disabled/pass-through baseline, bounded optional payload compression, expansion fallback, frame-length limits, no cross-peer unauthenticated dictionary state. Header compression above is the actual Python parity requirement. | M4 |
 
+Rust rolling TUN delivery divergence ([delivery policy](modules/delivery-policy.md)): on a targeted IP direction the default release keeps each inner TCP flow in sequence order but lets other flows and short records on the same channel pass a gap. The Python channel FIFO also blocks those other flows; with one flow per channel the two release the same order. The explicitly selected `Independent` release keeps the earlier gap-crossing behavior, which Python does not model. The local return-traffic guard sheds only extra copies and regular repairs and has no Python counterpart.
+
 The current `DuplexMux` validates only complete unfragmented Ethernet/IPv4/TCP frames. It rejects other frames; it is not a complete TAP classifier. The Rust library must add documented fallback routing for ARP, IPv6, UDP, VLAN, fragmented IP, and unknown EtherTypes, and a separate TUN IP-packet contract. TCP tuple affinity uses normalized endpoints; IPv6, fragment affinity, simultaneous opposite-side opens, idle eviction, and collision behavior require explicit tests. Python connection-round-robin raises on conflicting simultaneous assignments; that is a known limitation, not a sufficient production arbitration protocol.
 
 `raw_ipv4_crc32` is a byte-cost/framing simulator envelope. It is not raw TCP, TLS, L2TP, authentication, encryption, or a claim of passage through a middlebox. CRC32 protects accidental corruption, not hostile modification. Do not freeze the compact 15-bit source ID as the authenticated session format: session/epoch identity, replay limits, extended sequence space, direction-specific nonce domains, and stale datagrams must be specified first.
@@ -373,6 +482,7 @@ The current `DuplexMux` validates only complete unfragmented Ethernet/IPv4/TCP f
 | `direct-tcp-baseline` | `tcp.py:PlainTCP`; `tcp_syn_baseline.py` | Direct CUBIC/Reno with NewReno cumulative recovery, delayed ACK and RTO knobs; compare against actual OS TCP in integration tests. Python lacks Linux SACK/RACK-TLP/PRR/HyStart++ fidelity. | M5, benchmark only |
 | `quic-baseline` | `quic.py:QUIC`; `reliable_tunnel.py:RecordQUIC/ReliableTunnelMultiFlow` | Actual pinned aioquic transport with CUBIC/Reno; direct application or complete-L2 stream; separate TCP-over-QUIC shared ordered-stream reference. Preserve auxiliary probe-stream versus same-stream labels. | M5, comparison adapter |
 | `kcp-baseline` | `kcp.py:KCPContext`; `reliable_tunnel.py:RecordKCP/ReliableTunnelMultiFlow` | Actual pinned upstream C KCP; ordered messages, `window`, `nodelay`, `interval`, `resend`, `nocwnd`, MTU. Current inner-TCP reference shares a queue with probes. | M5, comparison adapter |
+| `kcp-like-l2` | `kcp.py:KCPContext` is a comparison, not the implementation oracle | [Selected Common recovery policy](modules/kcp-like-l2.md), conservative fast ACK and bounded timeout backoff; raw, header-compressed and LZ4 Ethernet. Independent complete stateless frames preserve old gaps. It does not claim upstream KCP framing, congestion control or ordered-delivery equivalence. | M3, explicit selection |
 
 For production TAP and transparent TUN, preserve endpoint TCP ACK/window behavior. Port ACK-generation/coalescing variants into explicitly owned TUN TCP-proxy or benchmark profiles; do not enable them by transparent header rewriting. Any supported optimization must validate frames and options and preserve meaningful duplicate ACKs. Outer carrier ACKs, inner TCP ACKs, and tunnel feedback are three different mechanisms and need separate configuration/counters.
 

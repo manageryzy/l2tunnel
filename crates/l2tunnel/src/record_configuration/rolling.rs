@@ -1,10 +1,7 @@
 //! Additive tag4/tag5 inside the unchanged CompleteV2 fixed directional slot.
 use super::*;
+use crate::record_engine::Geometry;
 use crate::rolling_records::recovery::RecoveryPolicy;
-use crate::{
-    codec::{aligned_sender, packed, packed_sender},
-    record_engine::Geometry,
-};
 
 pub(super) const ACTIVE_BYTES: usize = 352;
 
@@ -17,52 +14,29 @@ pub(super) fn encode<P: RecoveryPolicy>(
 ) -> Result<(), Error> {
     config.validate().map_err(|_| Error::Profile)?;
     let mut writer = Writer::new(output.get_mut(..ACTIVE_BYTES).ok_or(Error::Length)?);
-    let r = config.receiver;
-    let b = r.body;
-    let p = config.packing;
-    let s = config.scheduler;
-    for value in [
-        u64::from(config.native_policy.wire()),
-        integer(b.max_frame_bytes)?,
-        integer(b.symbol_bytes)?,
-        u64::from(b.elide_payload_length),
-        u64::from(b.predictive),
-        u64::from(b.timestamp_pair_dictionary),
-        integer(b.independent_short_frame_bytes)?,
-        u64::from(r.channels),
-        r.first_record.0,
-        r.first_source.0,
-        u64::from(r.record_window),
-        integer(r.source_window)?,
-        integer(r.lookahead_records)?,
-        integer(r.lookahead_bytes)?,
-        integer(r.lookahead_fragments)?,
-        integer(r.max_fragments_per_record)?,
-        r.lifetime_ticks,
-        integer(p.packing.symbol_bytes)?,
-        p.packing.hold_micros,
-        u64::from(p.max_units),
-        p.first_unit.0,
-        integer(p.work_limit)?,
-        config.codec_stage_micros,
-    ] {
+    packed_fields::encode(
+        &mut writer,
+        config.native_policy,
+        config.receiver,
+        config.packing,
+    )?;
+    writer.number(config.codec_stage_micros)?;
+    for value in config.scheduler.words() {
         writer.number(value)?;
     }
-    for value in s.words() {
-        writer.number(value)?;
-    }
-    for value in [integer(overhead)?, stall, u64::from(stream)] {
+    for value in [integer(overhead)?, stall, stream_word(config, stream)] {
         writer.number(value)?;
     }
     writer.finish()
 }
 
-fn boolean(reader: &mut Reader<'_>) -> Result<bool, Error> {
-    match reader.number()? {
-        0 => Ok(false),
-        1 => Ok(true),
-        _ => Err(Error::Scalar),
-    }
+/// Tags 4/5 carry only all-default delivery, so the upper half stays zero there.
+/// Tags 11/12 keep `release (8) | guard mode (8) | per_mille (16)` above the `u32` stream.
+fn stream_word<P: RecoveryPolicy>(config: rolling_records::DirectionConfig<P>, stream: u32) -> u64 {
+    let delivery = u64::from(config.native_release.wire()) << 24
+        | u64::from(config.return_guard.mode_wire()) << 16
+        | u64::from(config.return_guard.per_mille);
+    delivery << 32 | u64::from(stream)
 }
 
 fn decode(
@@ -73,43 +47,7 @@ fn decode(
         padding(input.get(ACTIVE_BYTES..).ok_or(Error::Length)?)?;
     }
     let mut reader = Reader::new(input.get(..ACTIVE_BYTES).ok_or(Error::Length)?);
-    let native_policy =
-        aligned::NativePolicy::from_wire(checked(reader.number()?)?).ok_or(Error::Prefix)?;
-    let body = aligned_body::Config {
-        max_frame_bytes: reader.size()?,
-        symbol_bytes: reader.size()?,
-        elide_payload_length: boolean(&mut reader)?,
-        predictive: boolean(&mut reader)?,
-        timestamp_pair_dictionary: boolean(&mut reader)?,
-        independent_short_frame_bytes: reader.size()?,
-    };
-    let receiver = aligned_receiver::Limits {
-        body,
-        channels: checked(reader.number()?)?,
-        first_record: aligned_receiver::RecordId(reader.number()?),
-        first_source: aligned_receiver::SourceId(reader.number()?),
-        record_window: checked(reader.number()?)?,
-        source_window: reader.size()?,
-        lookahead_records: reader.size()?,
-        lookahead_bytes: reader.size()?,
-        lookahead_fragments: reader.size()?,
-        max_fragments_per_record: reader.size()?,
-        lifetime_ticks: reader.number()?,
-    };
-    let packing = packed_sender::Config {
-        sender: aligned_sender::Config {
-            body,
-            channels: receiver.channels,
-            first_record: receiver.first_record,
-        },
-        packing: packed::Config {
-            symbol_bytes: reader.size()?,
-            hold_micros: reader.number()?,
-        },
-        max_units: checked(reader.number()?)?,
-        first_unit: aligned_receiver::SourceId(reader.number()?),
-        work_limit: reader.size()?,
-    };
+    let (native_policy, receiver, packing) = packed_fields::decode(&mut reader)?;
     let codec_stage_micros = reader.number()?;
     let recovery = fec::rolling::Config {
         window: reader.size()?,
@@ -143,6 +81,18 @@ fn decode(
         version if version == u64::from(fec::rolling::wire::TARGETED_NEAR8_VERSION) => {
             fec::rolling::wire::SourceWire::TargetedNear8
         }
+        version if version == u64::from(fec::rolling::wire::TARGETED_NEAR8_HOLD35_POLICY) => {
+            fec::rolling::wire::SourceWire::TargetedNear8Hold35
+        }
+        version if version == u64::from(fec::rolling::wire::TARGETED_NEAR8_CONFIRMED_POLICY) => {
+            fec::rolling::wire::SourceWire::TargetedNear8ConfirmedPrefix
+        }
+        version if version == u64::from(fec::rolling::wire::TARGETED_EXACT_ACK_LZ4_POLICY) => {
+            fec::rolling::wire::SourceWire::TargetedExactAckLz4
+        }
+        version if version == u64::from(fec::rolling::wire::TARGETED_NEAR8_HEADROOM_POLICY) => {
+            fec::rolling::wire::SourceWire::TargetedNear8Headroom
+        }
         _ => return Err(Error::Prefix),
     };
     let scheduler = fec::rolling::scheduler::Policy {
@@ -157,9 +107,18 @@ fn decode(
     };
     let overhead = reader.size()?;
     let stall = reader.number()?;
-    let stream = checked(reader.number()?)?;
+    let word = reader.number()?;
+    let stream = (word & u64::from(u32::MAX)) as u32;
+    let delivery = (word >> 32) as u32;
+    let native_release =
+        rolling_records::NativeRelease::from_wire((delivery >> 24) as u8).ok_or(Error::Prefix)?;
+    let return_guard =
+        rolling_records::ReturnGuard::from_wire((delivery >> 16) as u8, delivery as u16)
+            .ok_or(Error::Prefix)?;
     reader.finish()?;
     let config = rolling_records::DirectionConfig {
+        native_release,
+        return_guard,
         native_policy,
         receiver,
         packing,
@@ -170,13 +129,23 @@ fn decode(
     Ok((config, overhead, stall, stream))
 }
 
-pub(super) fn decode_pair(a: &[u8], b: &[u8]) -> Result<Profile, Error> {
-    pair(a, b, false)
+/// Decode tag 4 (`extended == false`) or tag 11.
+pub(super) fn decode_pair(a: &[u8], b: &[u8], extended: bool) -> Result<Profile, Error> {
+    pair(a, b, false, extended)
 }
-pub(super) fn decode_pair_with_copies(a: &[u8], b: &[u8]) -> Result<Profile, Error> {
-    pair(a, b, true)
+/// Decode tag 5 (`extended == false`) or tag 12.
+pub(super) fn decode_pair_with_copies(
+    a: &[u8],
+    b: &[u8],
+    extended: bool,
+) -> Result<Profile, Error> {
+    pair(a, b, true, extended)
 }
-fn pair(a: &[u8], b: &[u8], copies: bool) -> Result<Profile, Error> {
+/// Whether a pair requires an extended delivery tag.
+pub(super) fn extended<P: RecoveryPolicy>(config: rolling_records::Config<P>) -> bool {
+    !(config.forward.delivery_default() && config.reverse.delivery_default())
+}
+fn pair(a: &[u8], b: &[u8], copies: bool, extended_tag: bool) -> Result<Profile, Error> {
     let (forward, forward_overhead_bytes, stall, stream) = decode(a, copies)?;
     let (reverse, reverse_overhead_bytes, other_stall, other_stream) = decode(b, copies)?;
     if stall != other_stall || stream != other_stream {
@@ -192,6 +161,9 @@ fn pair(a: &[u8], b: &[u8], copies: bool) -> Result<Profile, Error> {
         native_stall_micros: stall,
     };
     config.validate().map_err(|_| Error::Profile)?;
+    if extended(config) != extended_tag {
+        return Err(Error::Prefix);
+    }
     if copies {
         let copies = rolling_records::CopyPolicies {
             forward: decode_copy(a.get(ACTIVE_BYTES..).ok_or(Error::Length)?)?,

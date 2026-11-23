@@ -58,7 +58,51 @@ pub enum NativePreparation {
     /// Same retained packet; caller output was not overwritten or deadline renewed.
     AlreadyPending(PreparedNative),
 }
+/// Requested and effective delivery policy of one endpoint generation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DeliveryStatus {
+    /// Requested release of the receive direction.
+    pub requested_release: NativeRelease,
+    /// Effective release of the receive direction after default resolution.
+    pub effective_release: EffectiveRelease,
+    /// Return guard of the send direction.
+    pub guard: ReturnGuardStatus,
+}
 impl<P: RecoveryPolicy> Endpoint<P> {
+    /// Requested/effective release order and return guard of this generation.
+    pub fn delivery_status(&self) -> DeliveryStatus {
+        DeliveryStatus {
+            requested_release: self.receive_config.native_release,
+            effective_release: self.receive_config.effective_release(),
+            guard: self.return_guard.status(),
+        }
+    }
+    /// Current generation's receiver-side bounded TCP reordering observations.
+    pub fn native_reorder_status(&self) -> Option<NativeReorderStatus> {
+        self.fin_order.hold_status()
+    }
+    /// Requested/effective return guard of the send direction and its window.
+    pub fn return_guard_status(&self) -> ReturnGuardStatus {
+        self.return_guard.status()
+    }
+    /// Add delivered peer bytes without a native packet, for guard tests.
+    #[cfg(test)]
+    pub(super) fn observe_delivered_for_test(&mut self, now: Tick, bytes: usize) {
+        self.return_guard.delivered(now, bytes);
+    }
+    /// Add accepted never-shed bytes without an output, for guard tests.
+    #[cfg(test)]
+    pub(super) fn observe_required_for_test(&mut self, now: Tick, bytes: usize) {
+        self.return_guard
+            .sent(now, return_guard::Class::Required, bytes);
+    }
+    /// Requested and effective native release order of the receive direction.
+    pub fn native_release_status(&self) -> (NativeRelease, EffectiveRelease) {
+        (
+            self.receive_config.native_release,
+            self.receive_config.effective_release(),
+        )
+    }
     /// Carry pending local halves across the authenticated generation switch.
     pub(crate) fn inherit_fin_order(&mut self, previous: &Self) {
         self.fin_order.inherit(&previous.fin_order);
@@ -102,7 +146,36 @@ impl<P: RecoveryPolicy> Endpoint<P> {
             receiver::ChannelId(u8::try_from(self.next_channel).map_err(|_| Error::Identity)?);
         let channel = self.records.next_retained_channel(cursor).unwrap_or(cursor);
         let policy = self.receive_config.native_policy;
-        let result = if self.fin_order.tracks_payload() && policy.is_ip() {
+        let result = if self.fin_order.holds_enabled() {
+            // The codec calls its dependency query and decision serially. Borrow
+            // only for each individual call so physical commit retains sole custody.
+            let ordering = std::cell::RefCell::new(&mut self.fin_order);
+            self.records.prepare_with_native_ordering(
+                channel,
+                receiver_tick(now),
+                work,
+                |token| ordering.borrow().changed(token),
+                |frame, short, early| {
+                    ordering
+                        .borrow_mut()
+                        .held_ip_decision(policy, frame, now.0, short, early)
+                },
+            )
+        } else if self.fin_order.tracks_payload()
+            && policy.is_ip()
+            && self.receive_config.effective_release() == EffectiveRelease::FlowOrdered
+        {
+            self.records.prepare_with_independent_packets(
+                channel,
+                receiver_tick(now),
+                work,
+                |token| self.fin_order.changed(token),
+                |frame, short| {
+                    self.fin_order
+                        .flow_ordered_ip_decision(policy, frame, now.0, short)
+                },
+            )
+        } else if self.fin_order.tracks_payload() && policy.is_ip() {
             self.records.prepare_with_independent_packets(
                 channel,
                 receiver_tick(now),
@@ -205,8 +278,10 @@ impl<P: RecoveryPolicy> Endpoint<P> {
             .ok_or(Error::Arithmetic)?;
         let timing = self.advance(now);
         self.statistics.committed = committed;
+        let delivered = self.prepared_native.map_or(0, PreparedNative::bytes);
         self.prepared_native = None;
         timing?;
+        self.return_guard.delivered(now, delivered);
         if let Some(delivery) = self.records.pending()
             && self.fin_order.tracks_payload()
         {

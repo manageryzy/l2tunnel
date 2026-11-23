@@ -20,6 +20,7 @@ fn allocate_instance() -> Result<u64, Error> {
         .map_err(|_| Error::Arithmetic)
 }
 
+mod ack_lz4;
 #[doc(hidden)]
 pub mod compact_wire;
 mod config;
@@ -29,13 +30,14 @@ mod deferred_feedback;
 mod endpoint;
 /// Bounded original lifetime observations for actual selected recovery owners.
 pub mod expiry;
-mod fin_order;
+pub(crate) mod fin_order;
 mod ingress;
 mod native;
 mod previewed;
 #[doc(hidden)]
 pub mod recovery;
 mod repair_budget;
+mod return_guard;
 use recovery::RecoveryPolicy;
 fn wire_charge(
     framing: Option<codec::FragmentConfig>,
@@ -57,15 +59,36 @@ mod tests;
 /// Exact optional retained-operation refusal intervals.
 pub mod waits;
 
-pub use config::{Config, DirectionConfig, OutputFraming};
+pub use config::{
+    Config, DirectionConfig, EffectiveRelease, GuardMode, NativeRelease, OutputFraming, ReturnGuard,
+};
 pub use copies::{COPY_POLICY_BYTES, CopyPolicies};
 pub use endpoint::{Endpoint, OutputId, PreparedOutput, Statistics, Step};
 pub use ingress::{IngressLimits, IngressStatus};
 pub use l2tunnel_aligned::NativePolicy;
 pub use l2tunnel_reliable::OutboundBudget;
-pub use native::{NativePreparation, NativeToken, PreparedNative};
+pub use native::{DeliveryStatus, NativePreparation, NativeToken, PreparedNative};
+/// Monotonic counters scoped to one receive-direction engine generation.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct NativeReorderStatus {
+    /// Bounded holds opened on the first eligible ahead-of-prefix segment.
+    pub starts: u64,
+    /// Holds released by their immutable soft deadline.
+    pub deadline_releases: u64,
+    /// Episodes entering bypass after exceeding the byte span.
+    pub span_releases: u64,
+    /// Ahead-of-prefix payloads physically written during bypass.
+    pub bypass_writes: u64,
+    /// Holds closed by physically committed contiguous bytes before bypass.
+    pub prefix_closes: u64,
+    /// Bypass episodes closed when the delivery prefix reached their saved edge.
+    pub bypass_prefix_closes: u64,
+    /// Flows entering untracked delivery when the exact range ledger filled.
+    pub range_overflows: u64,
+}
 pub use record_engine::{Context, Geometry, Tick};
 pub use repair_budget::RepairBudgetStatus;
+pub use return_guard::ReturnGuardStatus;
 
 /// Explicit local admission, retained ownership or authoritative engine failure.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

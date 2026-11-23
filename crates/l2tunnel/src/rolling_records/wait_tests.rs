@@ -38,6 +38,8 @@ fn observed<P: RecoveryPolicy>(config: Config<P>, role: Role) -> TestResult<Endp
 fn research_config(old: Config) -> Config<research::Config> {
     fn direction(old: DirectionConfig) -> DirectionConfig<research::Config> {
         DirectionConfig {
+            native_release: Default::default(),
+            return_guard: Default::default(),
             native_policy: old.native_policy,
             receiver: old.receiver,
             packing: old.packing,

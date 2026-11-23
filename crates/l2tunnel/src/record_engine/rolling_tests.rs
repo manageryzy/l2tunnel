@@ -27,6 +27,8 @@ pub(crate) fn fixture(
         let first_record = receiver::RecordId(if reverse { 19 } else { 7 });
         let first_source = receiver::SourceId(if reverse { 91 } else { 13 });
         rolling_records::DirectionConfig {
+            native_release: Default::default(),
+            return_guard: Default::default(),
             native_policy: if raw {
                 aligned::NativePolicy::RawIp
             } else {

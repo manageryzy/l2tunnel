@@ -1,57 +1,12 @@
 //! Strict additive tag9; tags1..8 and CompleteV2 length remain unchanged.
 use super::*;
-use crate::codec::{aligned_sender, packed, packed_sender};
 const ACTIVE_BYTES: usize = 352;
-fn boolean(reader: &mut Reader<'_>) -> Result<bool, Error> {
-    match reader.number()? {
-        0 => Ok(false),
-        1 => Ok(true),
-        _ => Err(Error::Scalar),
-    }
-}
-
 fn decode(
     input: &[u8],
 ) -> Result<(crate::research_records::DirectionConfig, usize, u64, u32), Error> {
     padding(input.get(ACTIVE_BYTES..).ok_or(Error::Length)?)?;
     let mut reader = Reader::new(input.get(..ACTIVE_BYTES).ok_or(Error::Length)?);
-    let native_policy =
-        aligned::NativePolicy::from_wire(checked(reader.number()?)?).ok_or(Error::Prefix)?;
-    let body = aligned_body::Config {
-        max_frame_bytes: reader.size()?,
-        symbol_bytes: reader.size()?,
-        elide_payload_length: boolean(&mut reader)?,
-        predictive: boolean(&mut reader)?,
-        timestamp_pair_dictionary: boolean(&mut reader)?,
-        independent_short_frame_bytes: reader.size()?,
-    };
-    let receiver = aligned_receiver::Limits {
-        body,
-        channels: checked(reader.number()?)?,
-        first_record: aligned_receiver::RecordId(reader.number()?),
-        first_source: aligned_receiver::SourceId(reader.number()?),
-        record_window: checked(reader.number()?)?,
-        source_window: reader.size()?,
-        lookahead_records: reader.size()?,
-        lookahead_bytes: reader.size()?,
-        lookahead_fragments: reader.size()?,
-        max_fragments_per_record: reader.size()?,
-        lifetime_ticks: reader.number()?,
-    };
-    let packing = packed_sender::Config {
-        sender: aligned_sender::Config {
-            body,
-            channels: receiver.channels,
-            first_record: receiver.first_record,
-        },
-        packing: packed::Config {
-            symbol_bytes: reader.size()?,
-            hold_micros: reader.number()?,
-        },
-        max_units: checked(reader.number()?)?,
-        first_unit: aligned_receiver::SourceId(reader.number()?),
-        work_limit: reader.size()?,
-    };
+    let (native_policy, receiver, packing) = packed_fields::decode(&mut reader)?;
     let codec_stage_micros = reader.number()?;
     let recovery = fec::rolling::Config {
         window: reader.size()?,
@@ -113,6 +68,8 @@ fn decode(
     let stream = checked(reader.number()?)?;
     reader.finish()?;
     let config = crate::research_records::DirectionConfig {
+        native_release: Default::default(),
+        return_guard: Default::default(),
         native_policy,
         receiver,
         packing,

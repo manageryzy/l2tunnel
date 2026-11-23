@@ -19,6 +19,7 @@ pub struct PreparedOutput {
     pub(super) source_copy: Option<scheduler::SourceCopy>,
     pub(super) retry_full_credit: Option<bool>,
     pub(super) prepared_at: Tick,
+    repeat_deadline: Option<Tick>,
     /// Exact authoritative scheduler output identity.
     pub id: OutputId,
     /// Actual protected-record kind for the carrier's authenticated metadata.
@@ -35,6 +36,9 @@ pub struct PreparedOutput {
     pub witnesses: usize,
 }
 impl PreparedOutput {
+    pub(crate) const fn has_requested_credit(self) -> bool {
+        self.retry_full_credit.is_some()
+    }
     pub(crate) fn is_near8(self) -> bool {
         matches!(self.id, OutputId::Data(scheduler::OutputId::Near8(_)))
     }
@@ -98,7 +102,7 @@ pub(super) struct ConstructionOptions {
 struct EncodedSource {
     id: rolling::SourceId,
     bytes: usize,
-    blocked_on_full_fresh_fifo: bool,
+    full_fresh_until: Option<Tick>,
 }
 
 /// One actual directional sender, receiver, compact record stage and record ledger.
@@ -120,12 +124,14 @@ pub struct Endpoint<P: RecoveryPolicy = scheduler::Policy> {
     pub(super) receive_scope: receiver::Scope,
     pub(super) sender: P::Sender,
     pub(super) repair_budget: Option<repair_budget::Budget>,
+    pub(super) return_guard: return_guard::Guard,
     pub(super) fin_order: fin_order::Guard,
     pub(super) incoming: P::Receiver,
     pub(super) ingress: Option<ingress::Ingress>,
     pub(super) packing: packed_sender::Sender,
     pub(super) records: receiver::Receiver,
     pub(super) source: Vec<u8>,
+    pub(super) ack_lz4: ack_lz4::Storage,
     // Only pump_send writes this slab. The packer keeps the sealed units
     // immutable until their exact recovery source is admitted and committed.
     encoded_source: Option<EncodedSource>,
@@ -138,12 +144,16 @@ pub struct Endpoint<P: RecoveryPolicy = scheduler::Policy> {
     pub(super) expiry_failure: Option<expiry::LocalFailure>,
     pub(super) statistics: Statistics,
     pub(super) prepared_output: Option<PreparedOutput>,
+    // Keep one optional physical repeat. Its logical ID coalesces at the sender.
+    gap_repeat: Option<(scheduler::GapRequest, Tick)>,
     pub(super) next_output: u64,
     pub(super) prepared_native: Option<PreparedNative>,
     pub(super) next_native: u64,
     pub(super) next_channel: u16,
     pub(super) receive_progress: bool,
     receive_unit: Option<receiver::SourceId>,
+    // Contiguous immutable Packed headers verified ahead of recovery handoff.
+    preview_chain: Option<(u32, receiver::SourceId)>,
     preview_next: u32,
     preview_end: u32,
     pub(super) previewed: previewed::Previewed,
@@ -317,7 +327,7 @@ impl<P: RecoveryPolicy> Endpoint<P> {
         }
         let source = bytes(source_bytes)?;
         let symbols = bytes(symbol_bytes)?;
-        let packing = (if send_config.native_policy == NativePolicy::IpHeaders {
+        let packing = (if send_config.native_policy.uses_ip_headers() {
             packed_sender::Sender::new_reserved_ip_with_copies
         } else {
             packed_sender::Sender::new_reserved_with_copies
@@ -330,19 +340,22 @@ impl<P: RecoveryPolicy> Endpoint<P> {
             copies.local(context.role),
         )
         .map_err(Error::Storage)?;
-        let records = (if receive_config.uses_ip_early_replay() {
-            receiver::Receiver::new_reserved_ip_with_early_replay
-        } else if receive_config.native_policy == NativePolicy::IpHeaders {
-            receiver::Receiver::new_reserved_ip
+        let receiver_capacity = codec::aligned_storage::Limits {
+            capacity_bytes: receiver_plan.capacity_bytes(),
+        };
+        let records = if receive_config.uses_standard_ip_replay_plan() {
+            receiver::Receiver::new_reserved_ip_with_early_replay(
+                receive_scope,
+                receive_config.receiver,
+                receiver_capacity,
+            )
         } else {
-            receiver::Receiver::new_reserved
-        })(
-            receive_scope,
-            receive_config.receiver,
-            codec::aligned_storage::Limits {
-                capacity_bytes: receiver_plan.capacity_bytes(),
-            },
-        )
+            receive_config.native_policy.reserved_receiver(
+                receive_scope,
+                receive_config.receiver,
+                receiver_capacity,
+            )
+        }
         .map_err(Error::Storage)?;
         let sender = send_config.scheduler.new_sender(
             rolling_scope(send_direction),
@@ -376,11 +389,16 @@ impl<P: RecoveryPolicy> Endpoint<P> {
                 .targeted()
                 .then(|| repair_budget::Budget::new(send_config.scheduler.recovery().window))
                 .transpose()?,
+            return_guard: return_guard::Guard::new(
+                send_config.return_guard,
+                send_config.effective_guard_per_mille(),
+            ),
             incoming,
             ingress,
             packing,
             records,
             source,
+            ack_lz4: ack_lz4::Storage::new(send_config, receive_config)?,
             encoded_source: None,
             symbols,
             overhead,
@@ -391,12 +409,14 @@ impl<P: RecoveryPolicy> Endpoint<P> {
             expiry_failure: None,
             statistics: Statistics::default(),
             prepared_output: None,
+            gap_repeat: None,
             next_output: 1,
             prepared_native: None,
             next_native: 1,
             next_channel: 0,
             receive_progress: false,
             receive_unit: Some(receive_config.receiver.first_source),
+            preview_chain: None,
             preview_next: 0,
             preview_end: 0,
             previewed: previewed::Previewed::new(receive_config)?,
@@ -446,6 +466,21 @@ impl<P: RecoveryPolicy> Endpoint<P> {
                 );
             }
             return self.fail(Error::Expired);
+        }
+        if let Some(deadline) = self.prepared_output.and_then(|p| p.repeat_deadline)
+            && now >= deadline
+        {
+            self.note_expiry(
+                expiry::LocalOwner::GapRequestCopy,
+                now,
+                deadline,
+                None,
+                None,
+            );
+            return self.fail(Error::Expired);
+        }
+        if self.gap_repeat.is_some_and(|(_, deadline)| now >= deadline) {
+            self.gap_repeat = None;
         }
         if let Some(deadline) = self.stage_deadline.filter(|deadline| now >= *deadline) {
             self.note_expiry(expiry::LocalOwner::CodecStage, now, deadline, None, None);
@@ -528,6 +563,9 @@ impl<P: RecoveryPolicy> Endpoint<P> {
         self.advance(now)?;
         let channel = receiver::ChannelId(u8::try_from(channel).map_err(|_| Error::Configuration)?);
         let result = match self.send_config.native_policy {
+            NativePolicy::FixedAnchorIpHeaders => self
+                .packing
+                .stage_fixed_anchor_headers_observed(channel, frame, now.0),
             NativePolicy::IpHeaders if self.send_config.scheduler.targeted() => self
                 .packing
                 .stage_refreshed_headers_observed(channel, frame, now.0),
@@ -588,6 +626,16 @@ impl<P: RecoveryPolicy> Endpoint<P> {
         Ok(())
     }
     fn pump_send(&mut self, now: Tick) -> Result<(), Error> {
+        // Only a charged fresh selection can free the slot. Its handoff clears
+        // this marker even if the residual grant cannot admit the sealed source.
+        // At its original incoming cap the scheduler must observe the expiry.
+        if self
+            .encoded_source
+            .and_then(|source| source.full_fresh_until)
+            .is_some_and(|due| now < due)
+        {
+            return Ok(());
+        }
         if !self.packing.has_pending_source() {
             return Ok(());
         }
@@ -604,7 +652,22 @@ impl<P: RecoveryPolicy> Endpoint<P> {
             }
             .map_err(Error::Sender)?,
         };
-        let copies = self.packing.pending_copies().map_err(Error::Sender)?;
+        let mut copies = self.packing.pending_copies().map_err(Error::Sender)?;
+        if copies > 1 && self.return_guard.enabled() {
+            let (_, each) = wire_charge(
+                self.framing,
+                P::HEADER_BYTES
+                    .checked_add(length)
+                    .ok_or(Error::Arithmetic)?,
+                self.overhead,
+            )?;
+            let extra = each
+                .checked_mul(usize::from(copies) - 1)
+                .ok_or(Error::Arithmetic)?;
+            if self.return_guard.shed_copies(now, extra) {
+                copies = 1;
+            }
+        }
         let admitted = self
             .packing
             .pending_admission_micros()
@@ -643,12 +706,23 @@ impl<P: RecoveryPolicy> Endpoint<P> {
             }
             Ok(_) => self.fail(Error::Identity),
             Err(error @ (rolling::Error::Busy | rolling::Error::Capacity)) => {
+                let full_fresh_until = if error == rolling::Error::Busy
+                    && self.send_config.scheduler.targeted()
+                    && state.queued_fresh == state.fresh_queue_limit
+                {
+                    let recovery = self.send_config.scheduler.recovery();
+                    Some(Tick(
+                        admitted
+                            .checked_add(recovery.job_ticks.min(recovery.debt_ticks))
+                            .ok_or(Error::Arithmetic)?,
+                    ))
+                } else {
+                    None
+                };
                 self.encoded_source = Some(EncodedSource {
                     id: expected,
                     bytes: length,
-                    blocked_on_full_fresh_fifo: error == rolling::Error::Busy
-                        && self.send_config.scheduler.targeted()
-                        && state.queued_fresh == state.fresh_queue_limit,
+                    full_fresh_until,
                 });
                 if let Some(waits) = self.waits.first_mut() {
                     let reason = if error == rolling::Error::Busy {
@@ -678,19 +752,53 @@ impl<P: RecoveryPolicy> Endpoint<P> {
             wire_bytes: 0,
             copies: 0,
         };
-        // The same slab belongs to one actual ordered handoff or one bounded
-        // preview preparation, never both. No preview admission is partial.
-        self.preview = None;
-        let result = admit_packed(
-            &mut self.records,
-            &mut self.receive_unit,
-            self.receive_config,
+        let config = self.receive_config;
+        let view = match packed_view(
+            config,
             self.receive_scope,
             id,
             bytes,
-            &mut self.symbols,
-            now,
             self.compact_feedback_overhead.is_some(),
+        ) {
+            Ok(view) => view,
+            Err(error) => return self.fail(error),
+        };
+        let width = config.receiver.body.symbol_bytes;
+        let mut scratch = self.symbols.as_mut_slice();
+        if let Some(preview) = self.preview {
+            // A partial preview owns the first count symbol slots. Nonoverlapping
+            // ordered input can use the spare suffix without restarting its copy.
+            let occupied = preview.count * width;
+            let all_retired = config.scheduler.targeted()
+                && self.records.status().source_floor.is_none_or(|floor| {
+                    floor
+                        .0
+                        .checked_sub(view.identity().first_unit.0)
+                        .is_some_and(|count| count >= view.len() as u64)
+                });
+            if preview.source != id && all_retired {
+                // admit_packed_view still checks the absolute ranges and policy;
+                // it skips all writes to an entirely retired symbol range.
+            } else if config.scheduler.targeted()
+                && preview.source != id
+                && view.len() * width <= scratch.len() - occupied
+            {
+                scratch = &mut scratch[occupied..];
+            } else {
+                // The ordered head can require the full negotiated slab. Its
+                // normal handoff retains priority; revisit the displaced source
+                // from its original committed bytes, never its overwritten slab.
+                self.preview_next = self.preview_next.min(preview.source.0);
+                self.preview = None;
+            }
+        }
+        let result = admit_packed_view(
+            &mut self.records,
+            &mut self.receive_unit,
+            config,
+            view,
+            scratch,
+            now,
         );
         let (blocked, heads_accepted) = match result {
             Ok(PackedAdmission::Complete) => {
@@ -730,10 +838,93 @@ impl<P: RecoveryPolicy> Endpoint<P> {
             self.preview_blocked = false;
         }
     }
+    // Ordered handoff still takes its normal turn. When it is crossing sources
+    // that preview already admitted, use spare work to reach the first missing
+    // aligned unit. Verify the intervening absolute unit ranges before allowing
+    // this lowest unit to advance the receiver floor ahead of ordered handoff.
+    fn preview_contiguous_floor(
+        &mut self,
+        now: Tick,
+        budget: &mut rolling::WorkBudget,
+    ) -> Result<bool, Error> {
+        let Some((ordered, floor)) = self.receive_unit.zip(self.records.status().source_floor)
+        else {
+            return Ok(false);
+        };
+        if ordered.0 >= floor.0 || budget.metadata == 0 {
+            return Ok(false);
+        }
+        let config = self.receive_config;
+        let scope = self.receive_scope;
+        let compact = self.compact_feedback_overhead.is_some();
+        let decoder = P::receive_state(&self.incoming, rolling_tick(now)).decoder;
+        let (mut source, mut first) = self
+            .preview_chain
+            .filter(|(id, _)| *id >= decoder.handoff_prefix)
+            .unwrap_or((decoder.handoff_prefix, ordered));
+        for _ in 0..config.packing.work_limit {
+            // Decoding the Packed header validates every enclosed unit. Ensure
+            // even a full envelope can be inspected before starting the parse.
+            if source >= decoder.decoded_prefix
+                || budget.metadata <= usize::from(config.packing.max_units)
+            {
+                break;
+            }
+            budget.metadata -= 1;
+            let id = rolling::SourceId(source);
+            let Some(bytes) = P::decoded_source(&self.incoming, id).map_err(Error::Rolling)? else {
+                break;
+            };
+            let view = packed_view(config, scope, id, bytes, compact)?;
+            if view.identity().first_unit != first {
+                return Err(Error::Identity);
+            }
+            budget.metadata -= view.len();
+            let end = first.0.checked_add(view.len() as u64);
+            if end.is_none_or(|end| end > floor.0) {
+                // The old units precede the first gap and need no symbol slab.
+                // Once this source changes custody, yield to ordinary handoff.
+                let stale = usize::try_from(floor.0.checked_sub(first.0).ok_or(Error::Identity)?)
+                    .map_err(|_| Error::Identity)?;
+                let copies = view
+                    .len()
+                    .checked_sub(stale)
+                    .ok_or(Error::Identity)?
+                    .checked_mul(config.receiver.body.symbol_bytes)
+                    .ok_or(Error::Arithmetic)?;
+                if budget.copies < copies {
+                    break;
+                }
+                budget.copies -= copies;
+                let mut preview_unit = Some(first);
+                let result = admit_packed_view(
+                    &mut self.records,
+                    &mut preview_unit,
+                    config,
+                    view,
+                    &mut self.symbols,
+                    now,
+                );
+                return match result {
+                    Ok(PackedAdmission::Complete | PackedAdmission::HeadsOnly(_)) => Ok(true),
+                    Err(error) if error.is_backpressure() => Ok(false),
+                    Err(error) => Err(error),
+                };
+            }
+            for unit in view.units().map_err(Error::Envelope)? {
+                check_policy(config, unit.bytes)?;
+            }
+            first = receiver::SourceId(end.ok_or(Error::Arithmetic)?);
+            source = source.checked_add(1).ok_or(Error::Arithmetic)?;
+            self.preview_chain = Some((source, first));
+        }
+        Ok(false)
+    }
     fn preview_receive(
         &mut self,
         now: Tick,
         budget: &mut rolling::WorkBudget,
+        after_handoff: bool,
     ) -> Result<bool, Error> {
         if !self.previews_sources()
             || P::receive_state(&self.incoming, rolling_tick(now)).feedback_building
@@ -760,6 +951,11 @@ impl<P: RecoveryPolicy> Endpoint<P> {
                     self.preview_rescan = false;
                 }
                 self.preview_next = self.preview_next.max(status.handoff_prefix);
+                if after_handoff {
+                    // Ordered service owns the next contiguous originals. Use this
+                    // spare opportunity only beyond its current published prefix.
+                    self.preview_next = self.preview_next.max(status.decoded_prefix);
+                }
                 if self.preview_next >= status.observed_end {
                     break;
                 }
@@ -782,6 +978,19 @@ impl<P: RecoveryPolicy> Endpoint<P> {
                     bytes,
                     self.compact_feedback_overhead.is_some(),
                 )?;
+                if after_handoff {
+                    // The next ordered source also owns this slab. Start no
+                    // partial copy here: one lookup, copy and validation per
+                    // unit, then one atomic admission, must fit this turn.
+                    let visits_left = 3 * view.len() + 1;
+                    if visits_left > config.packing.work_limit - visits
+                        || visits_left > budget.metadata
+                        || view.len() * width > budget.copies
+                    {
+                        self.preview_next = source.0;
+                        break;
+                    }
+                }
                 self.preview = Some(Preview {
                     source,
                     first_unit: view.identity().first_unit,
@@ -881,14 +1090,25 @@ impl<P: RecoveryPolicy> Endpoint<P> {
                         Err(error) => return Err(Error::Receiver(error)),
                     }
                 }
+                // Only this immutable outer source now proves its verified
+                // units. The unit at the floor still needs its ordered range.
+                if floor.is_none_or(|floor| {
+                    floor.0 < preview.first_unit.0
+                        || floor.0 - preview.first_unit.0 >= preview.count as u64
+                }) {
+                    self.previewed.mark(preview.source.0);
+                }
+                if after_handoff {
+                    return Ok(native_progress);
+                }
                 continue;
             }
             if preview.current.is_none() {
                 budget.metadata -= 1;
                 visits += 1;
-                // The first parse checked every unit and the entire absolute
-                // ID range. A retained proof can be looked up before parsing
-                // this same immutable recovery source again.
+                // Only retired units can be skipped solely by absolute ID.
+                // A distinct outer source may reuse a live unit with different
+                // bytes; let the record owner's normal proof check detect it.
                 if config.scheduler.targeted() {
                     let id = preview
                         .first_unit
@@ -897,8 +1117,9 @@ impl<P: RecoveryPolicy> Endpoint<P> {
                         .ok_or(Error::Identity)?;
                     if self
                         .records
-                        .source_observed(self.receive_scope, receiver::SourceId(id))
-                        .map_err(Error::Receiver)?
+                        .status()
+                        .source_floor
+                        .is_none_or(|floor| id < floor.0)
                     {
                         preview.unit += 1;
                         self.preview = Some(preview);
@@ -1051,14 +1272,14 @@ impl<P: RecoveryPolicy> Endpoint<P> {
             return Ok(used);
         };
         // A nonzero copy grant is required to transfer any fresh FIFO head.
-        if !source.blocked_on_full_fresh_fifo || used.copies == 0 {
+        if source.full_fresh_until.is_none() || used.copies == 0 {
             return Ok(used);
         }
         let state = P::send_state(&self.sender);
         if state.queued_fresh == state.fresh_queue_limit {
             return Ok(used);
         }
-        source.blocked_on_full_fresh_fifo = false;
+        source.full_fresh_until = None;
         let bytes = source.bytes;
         // Admission behind a queued or prepared predecessor copies just the
         // immutable serialized bytes into a preallocated FIFO slot. An idle
@@ -1077,8 +1298,9 @@ impl<P: RecoveryPolicy> Endpoint<P> {
     }
 
     /// Consume queued targeted inputs with this turn's remaining receive grant.
-    /// Yield at the first native opportunity or newly prepared feedback. The
-    /// sole sender step and all physical output remain owned by the outer turn.
+    /// Yield at newly prepared feedback. When the input FIFO is under pressure,
+    /// a native opportunity can share the rest of this grant with the decoder.
+    /// Each call still hands at most one source to the native record receiver.
     #[cfg(test)]
     pub(crate) fn step_queued(
         &mut self,
@@ -1095,6 +1317,10 @@ impl<P: RecoveryPolicy> Endpoint<P> {
         work: rolling::WorkBudget,
     ) -> Result<Step, Error> {
         let feedback = P::feedback(&self.incoming);
+        let drain_queue = self
+            .ingress
+            .as_ref()
+            .is_some_and(ingress::Ingress::under_pressure);
         let mut step = self.step_budgets(now, send_work, work)?;
         if !self.receive_config.scheduler.targeted() {
             return Ok(step);
@@ -1103,8 +1329,8 @@ impl<P: RecoveryPolicy> Endpoint<P> {
         // has a count bound, even when a duplicate needs no GF work.
         let limit = self.receive_config.packing.work_limit.min(8);
         for _ in 1..limit {
-            if step.source_handed
-                || step.native_progress
+            let native_ready = step.source_handed || step.native_progress;
+            if (native_ready && !drain_queue)
                 || P::feedback(&self.incoming) != feedback
                 || matches!(
                     step.receive.decode,
@@ -1128,13 +1354,17 @@ impl<P: RecoveryPolicy> Endpoint<P> {
                 metadata,
             };
             self.service_ingress(now)?;
-            let (mut receive, handed, native) = self.receive_turn(now, remaining)?;
+            let (mut receive, handed, native) = if native_ready {
+                (self.decoder_turn(now, remaining)?, false, false)
+            } else {
+                self.receive_turn(now, remaining)?
+            };
             receive.work.field += step.receive.work.field;
             receive.work.copies += step.receive.work.copies;
             receive.work.metadata += step.receive.work.metadata + 1;
             step.receive = receive;
-            step.source_handed = handed;
-            step.native_progress = native;
+            step.source_handed |= handed;
+            step.native_progress |= native;
         }
         Ok(step)
     }
@@ -1165,37 +1395,232 @@ impl<P: RecoveryPolicy> Endpoint<P> {
         }))
     }
 
-    fn receive_turn(
+    fn decoder_turn(
         &mut self,
         now: Tick,
-        work: rolling::WorkBudget,
-    ) -> Result<(scheduler::ReceiverStep, bool, bool), Error> {
+        mut work: rolling::WorkBudget,
+    ) -> Result<scheduler::ReceiverStep, Error> {
         if self.receive_progress {
             self.request_preview_scan();
         }
+        let independent = self.service_disjoint_sources(now, work)?;
+        work.copies -= independent.copies;
+        work.metadata -= independent.metadata;
         let mut receive =
             P::receive_step(&mut self.incoming, rolling_tick(now), work).map_err(Error::Rolling)?;
+        let published = matches!(receive.decode, rolling::DecodeStep::Accepted { .. });
         // An unchanged busy decoder cannot admit the same FIFO head. Resume
         // that head in the completion turn, including capacity rollback.
         if !matches!(receive.decode, rolling::DecodeStep::Pending(_))
             && let Some(owner) = &mut self.ingress
             && owner.waiting_on_decoder
         {
+            let last_source = (owner.queue.len() == 1)
+                .then(|| {
+                    owner
+                        .queue
+                        .front()
+                        .and_then(|packet| packet.metadata().held_source)
+                })
+                .flatten();
             owner.waiting_on_decoder = false;
             self.service_ingress(now)?;
+            if published
+                && !receive.feedback_ready
+                && let Some(id) = last_source
+            {
+                let state = P::receive_state(&self.incoming, rolling_tick(now));
+                // This final original is already in the decoder, so the FIFO
+                // continuation cannot see it. Above the observed horizon it
+                // has no basis coefficient. Keep half the remainder for native
+                // preview, and yield to any pending or due feedback.
+                if id.0 >= state.decoder.observed_end
+                    && state.decoder.pending_job
+                    && !state.feedback_building
+                    && state.feedback_due.is_none_or(|due| due > rolling_tick(now))
+                {
+                    let residual = rolling::WorkBudget {
+                        field: 0,
+                        copies: (work.copies - receive.work.copies) / 2,
+                        metadata: (work.metadata - receive.work.metadata) / 2,
+                    };
+                    if residual.copies > 0 && residual.metadata > 0 {
+                        let next = P::receive_step(&mut self.incoming, rolling_tick(now), residual)
+                            .map_err(Error::Rolling)?;
+                        receive.work.copies += next.work.copies;
+                        receive.work.metadata += next.work.metadata;
+                        receive.decode = next.decode;
+                        receive.feedback_ready = next.feedback_ready;
+                    }
+                }
+            }
         }
-        if matches!(receive.decode, rolling::DecodeStep::Accepted { .. }) {
+        if published {
             self.request_preview_scan();
         }
+        receive.work.copies += independent.copies;
+        receive.work.metadata += independent.metadata;
+        Ok(receive)
+    }
+    fn service_disjoint_sources(
+        &mut self,
+        now: Tick,
+        work: rolling::WorkBudget,
+    ) -> Result<rolling::WorkUsed, Error> {
+        let mut used = rolling::WorkUsed::default();
+        let Some(floor) = P::independent_source_floor(&self.incoming) else {
+            return Ok(used);
+        };
+        let mut observed = P::receive_state(&self.incoming, rolling_tick(now))
+            .decoder
+            .observed_end;
+        // Reserve at least half of every grant for the original equation.
+        let initial = rolling::WorkBudget {
+            metadata: work.metadata / 2,
+            copies: work.copies / 2,
+            field: 0,
+        };
+        let mut remaining = initial;
+        let mut committed = false;
+        for _ in 0..self.receive_config.packing.work_limit.min(8) {
+            if remaining.metadata == 0 || remaining.copies == 0 {
+                break;
+            }
+            let Some(owner) = self.ingress.as_ref() else {
+                break;
+            };
+            let index = owner.independent_cursor;
+            let Some(packet) = owner.queue.get(index) else {
+                break;
+            };
+            let input = *packet.metadata();
+            let input_bytes = packet.bytes().len();
+            if input.kind == EmissionKind::Feedback {
+                break;
+            }
+            remaining.metadata -= 1;
+            let view = self
+                .inspect_data(packet.bytes(), false)
+                .map_err(Error::Rolling)?;
+            let held = match view {
+                // Only earlier committed originals may establish this horizon.
+                // A repair which would first evidence a new gap keeps its FIFO
+                // position and its original debt cap. Remember every passed
+                // support when deciding whether a subsequent source is disjoint.
+                recovery::View::Repair { end, .. } if end <= observed => {
+                    let owner = self.ingress.as_mut().ok_or(Error::Identity)?;
+                    owner.independent_repair_end = owner.independent_repair_end.max(end);
+                    None
+                }
+                recovery::View::Source { id, .. } if id.0 < floor => None,
+                recovery::View::Repair { .. } => break,
+                recovery::View::Source { id, original, .. } => {
+                    if let Some(known) =
+                        P::decoded_source(&self.incoming, id).map_err(Error::Rolling)?
+                    {
+                        if remaining.copies < original.len() || remaining.metadata < original.len()
+                        {
+                            break;
+                        }
+                        remaining.copies -= original.len();
+                        remaining.metadata -= original.len();
+                        if known != original {
+                            return self.fail(Error::Rolling(rolling::Error::Conflict));
+                        }
+                        // Keep its original cap and duplicate feedback on the FIFO.
+                        self.ingress
+                            .as_mut()
+                            .ok_or(Error::Identity)?
+                            .independent_cursor += 1;
+                        continue;
+                    }
+                    if id.0 < owner.independent_repair_end {
+                        self.ingress
+                            .as_mut()
+                            .ok_or(Error::Identity)?
+                            .independent_cursor += 1;
+                        continue;
+                    }
+                    let cleanup = owner.completion_visits(index, input.deadline)?;
+                    if remaining.metadata < cleanup {
+                        break;
+                    }
+                    remaining.metadata -= cleanup;
+                    if P::commit_independent_source(
+                        &mut self.incoming,
+                        id,
+                        original,
+                        rolling_tick(input.received),
+                        rolling_tick(now),
+                        rolling_tick(input.original_cap),
+                        &mut remaining,
+                    )
+                    .map_err(Error::Rolling)?
+                    {
+                        observed = observed.max(id.0.saturating_add(1));
+                        Some(id)
+                    } else {
+                        remaining.metadata += cleanup;
+                        break;
+                    }
+                }
+            };
+            let owner = self.ingress.as_mut().ok_or(Error::Identity)?;
+            if held.is_some() {
+                owner.complete_at(index)?;
+                if let Some(tracked) = input.held_source {
+                    P::release_queued_source(&mut self.incoming, tracked);
+                }
+                if let Some(waits) = self.waits.first_mut() {
+                    waits.independent_ingress_completed(
+                        waits::ingress::Input {
+                            records_number: input.number,
+                            received: input.received,
+                            deadline: input.deadline,
+                            bytes: input_bytes,
+                            kind: waits::ingress::Kind::Source,
+                        },
+                        index == 0,
+                        now,
+                    );
+                }
+                committed = true;
+            } else {
+                owner.independent_cursor += 1;
+            }
+        }
+        if committed {
+            self.request_preview_scan();
+        }
+        used.metadata = initial.metadata - remaining.metadata;
+        used.copies = initial.copies - remaining.copies;
+        Ok(used)
+    }
+    fn receive_turn(
+        &mut self,
+        now: Tick,
+        work: rolling::WorkBudget,
+    ) -> Result<(scheduler::ReceiverStep, bool, bool), Error> {
+        let mut receive = self.decoder_turn(now, work)?;
         let (source_handed, mut native_progress) = self.pump_receive(now)?;
-        if !source_handed {
+        native_progress |= self.fin_order.expire_holds(now.0);
+        if !source_handed || self.receive_config.scheduler.targeted() {
             let mut remaining = rolling::WorkBudget {
                 field: work.field - receive.work.field,
                 copies: work.copies - receive.work.copies,
                 metadata: work.metadata - receive.work.metadata,
             };
             let before = remaining;
-            native_progress |= match self.preview_receive(now, &mut remaining) {
+            let catch_up_floor = self
+                .receive_unit
+                .zip(self.records.status().source_floor)
+                .is_some_and(|(ordered, floor)| ordered.0 < floor.0);
+            let preview = if source_handed && catch_up_floor && self.preview.is_none() {
+                self.preview_contiguous_floor(now, &mut remaining)
+            } else {
+                self.preview_receive(now, &mut remaining, source_handed)
+            };
+            native_progress |= match preview {
                 Ok(progress) => progress,
                 Err(error) => return self.fail(error),
             };
@@ -1205,6 +1630,38 @@ impl<P: RecoveryPolicy> Endpoint<P> {
         self.receive_progress = source_handed;
         Ok((receive, source_handed, native_progress))
     }
+    fn pending_data_extent(&self) -> Result<Option<(recovery::Data, usize)>, Error> {
+        let Some(data) = P::pending_data(&self.sender).map_err(Error::Rolling)? else {
+            return Ok(None);
+        };
+        let length = if self.compact_feedback_overhead.is_some() {
+            match self.with_ack_wire_source(rolling::wire::compact::data_len)? {
+                Some(length) => length,
+                None => P::Compact::data_len(self.send_config.scheduler, &self.sender)
+                    .map_err(Error::Rolling)?
+                    .ok_or(Error::Identity)?,
+            }
+        } else {
+            data.bytes
+        };
+        Ok(Some((data, length)))
+    }
+
+    /// Exact debit for ready DATA when it would win the next output selection.
+    pub(crate) fn ready_data_wire_bytes(&self) -> Result<Option<usize>, Error> {
+        if self.prepared_output.is_some()
+            || P::feedback(&self.incoming).is_some()
+            || self.gap_repeat.is_some()
+        {
+            return Ok(None);
+        }
+        self.pending_data_extent()?
+            .map(|(_, length)| {
+                wire_charge(self.framing, length, self.overhead).map(|(_, cost)| cost)
+            })
+            .transpose()
+    }
+
     /// Prepare one actual immutable output and reserve its exact wire debit once.
     /// Retain caller output/witnesses until confirm; AlreadyPending is returned as
     /// the same token without rewriting storage, changing PN or charging again.
@@ -1221,6 +1678,7 @@ impl<P: RecoveryPolicy> Endpoint<P> {
         if let Some(pending) = self.prepared_output {
             return Ok(Some(pending));
         }
+        let mut repeat = None;
         let (id, kind, length, source_copy) = if let Some(feedback) = P::feedback(&self.incoming) {
             (
                 OutputId::Feedback(feedback),
@@ -1234,8 +1692,16 @@ impl<P: RecoveryPolicy> Endpoint<P> {
                 },
                 None,
             )
+        } else if let Some((request, deadline)) = self.gap_repeat {
+            repeat = Some((request, deadline));
+            (
+                OutputId::Feedback(request.id),
+                EmissionKind::Feedback,
+                rolling::wire::compact::gap_len(request),
+                None,
+            )
         } else if allow_data {
-            let Some(data) = P::pending_data(&self.sender).map_err(Error::Rolling)? else {
+            let Some((data, length)) = self.pending_data_extent()? else {
                 return Ok(None);
             };
             let kind = match data.id {
@@ -1243,13 +1709,6 @@ impl<P: RecoveryPolicy> Endpoint<P> {
                 scheduler::OutputId::Repair(_) | scheduler::OutputId::Near8(_) => {
                     EmissionKind::Repair
                 }
-            };
-            let length = if self.compact_feedback_overhead.is_some() {
-                P::Compact::data_len(&self.sender)
-                    .map_err(Error::Rolling)?
-                    .ok_or(Error::Identity)?
-            } else {
-                data.bytes
             };
             (OutputId::Data(data.id), kind, length, data.source_copy)
         } else {
@@ -1276,7 +1735,9 @@ impl<P: RecoveryPolicy> Endpoint<P> {
             OutputId::Feedback(id) => Some(waits::Operation {
                 id: id.0,
                 bytes: length,
-                deadline: P::feedback_deadline(&self.incoming).map(|value| Tick(value.0)),
+                deadline: repeat
+                    .map(|(_, d)| d)
+                    .or_else(|| P::feedback_deadline(&self.incoming).map(|value| Tick(value.0))),
                 packets,
                 wire_bytes,
                 copies: 0,
@@ -1313,7 +1774,13 @@ impl<P: RecoveryPolicy> Endpoint<P> {
             .ok_or(Error::Arithmetic)?;
         let count = match id {
             OutputId::Feedback(_) => {
-                let encoded = if self.compact_feedback_overhead.is_some() {
+                let encoded = if let Some((request, _)) = repeat {
+                    rolling::wire::compact::encode_gap(
+                        self.receive_config.scheduler.recovery(),
+                        request,
+                        output,
+                    )
+                } else if self.compact_feedback_overhead.is_some() {
                     P::Compact::encode_feedback(&self.incoming, output)
                 } else {
                     P::encode_feedback(&self.incoming, output)
@@ -1325,20 +1792,36 @@ impl<P: RecoveryPolicy> Endpoint<P> {
             }
             OutputId::Data(_) => {
                 let encoded = if self.compact_feedback_overhead.is_some() {
-                    P::Compact::encode_data(&self.sender, output)
+                    match self.with_ack_wire_source(|source| {
+                        rolling::wire::compact::encode_data(source, output)
+                    })? {
+                        Some(length) => Ok(length),
+                        None => P::Compact::encode_data(
+                            self.send_config.scheduler,
+                            &self.sender,
+                            output,
+                        ),
+                    }
                 } else {
                     P::encode_data(&self.sender, output)
                 };
                 if encoded.map_err(Error::Rolling)? != length {
                     return self.fail(Error::Identity);
                 }
-                self.outgoing_units(&output[..length], witnesses)?
+                if self.send_config.scheduler.compresses_packed_acks()
+                    && let Some((id, original)) = P::pending_source_bytes(&self.sender)
+                {
+                    self.original_units(id, original, witnesses)?
+                } else {
+                    self.outgoing_units(&output[..length], witnesses)?
+                }
             }
         };
         let pending = PreparedOutput {
             instance: self.instance,
             serial: self.next_output,
             prepared_at: now,
+            repeat_deadline: repeat.map(|(_, deadline)| deadline),
             source_copy,
             retry_full_credit: if matches!(id, OutputId::Data(_)) {
                 P::requested_credit(&self.sender)
@@ -1354,6 +1837,9 @@ impl<P: RecoveryPolicy> Endpoint<P> {
             witnesses: count,
         };
         self.next_output = next;
+        if repeat.is_some() {
+            self.gap_repeat = None;
+        }
         self.prepared_output = Some(pending);
         budget.packets -= packets;
         budget.wire_bytes -= wire_bytes;
@@ -1439,10 +1925,12 @@ impl<P: RecoveryPolicy> Endpoint<P> {
                         budget.price_regular(
                             id,
                             support,
-                            self.compact_feedback_overhead.is_some(),
-                            P::HEADER_BYTES,
+                            self.compact_feedback_overhead
+                                .map(|_| self.send_config.scheduler),
                             self.framing,
                             self.overhead,
+                            &mut self.return_guard,
+                            now,
                         )
                     },
                 )
@@ -1455,7 +1943,13 @@ impl<P: RecoveryPolicy> Endpoint<P> {
                 rolling_tick(now),
                 pending.wire_bytes,
             ),
+            OutputId::Feedback(_) if pending.repeat_deadline.is_some() => Ok(()),
             OutputId::Feedback(id) if pending.source_copy.is_none() => {
+                if let Some(request) = self.receive_config.scheduler.repeatable_gap(&self.incoming)
+                    && let Some(deadline) = P::feedback_deadline(&self.incoming)
+                {
+                    self.gap_repeat = Some((request, Tick(deadline.0)));
+                }
                 P::confirm_feedback(&mut self.incoming, id, rolling_tick(now))
             }
             _ => Err(rolling::Error::Identity),
@@ -1467,6 +1961,16 @@ impl<P: RecoveryPolicy> Endpoint<P> {
         if let Some(budget) = &mut self.repair_budget {
             budget.accepted(pending);
         }
+        let class = match (pending.id, pending.source_copy) {
+            (OutputId::Data(scheduler::OutputId::Source(_)), Some(copy)) if copy.ordinal() > 1 => {
+                return_guard::Class::Extra
+            }
+            (OutputId::Data(scheduler::OutputId::Source(_)), Some(_)) => return_guard::Class::First,
+            // Targeted senders emit only regular equations; tails use an original.
+            (OutputId::Data(scheduler::OutputId::Repair(_)), _) => return_guard::Class::Extra,
+            _ => return_guard::Class::Required,
+        };
+        self.return_guard.sent(now, class, pending.wire_bytes);
         self.expire_confirmed_credit();
         Ok(())
     }
@@ -1493,6 +1997,42 @@ impl<P: RecoveryPolicy> Endpoint<P> {
     /// Retain already-opened input and its actual Records number/caller deadline.
     /// A number is observation metadata only; this owner creates no replay window.
     pub fn accept_authenticated_until(
+        &mut self,
+        received: Tick,
+        now: Tick,
+        original_deadline: Tick,
+        security_number: Option<u64>,
+        kind: EmissionKind,
+        bytes: &[u8],
+    ) -> Result<(), Error> {
+        if self.compact_feedback_overhead.is_some()
+            && self.receive_config.scheduler.compresses_packed_acks()
+            && kind == EmissionKind::Source(SourceForm::SystematicFec)
+        {
+            let mut scratch = std::mem::take(&mut self.ack_lz4.receive_packet);
+            let result = self.restore_ack_packet(bytes, &mut scratch).and_then(|n| {
+                self.accept_canonical_until(
+                    received,
+                    now,
+                    original_deadline,
+                    security_number,
+                    kind,
+                    n.map_or(bytes, |n| &scratch[..n]),
+                )
+            });
+            self.ack_lz4.receive_packet = scratch;
+            return result;
+        }
+        self.accept_canonical_until(
+            received,
+            now,
+            original_deadline,
+            security_number,
+            kind,
+            bytes,
+        )
+    }
+    fn accept_canonical_until(
         &mut self,
         received: Tick,
         now: Tick,
@@ -1541,7 +2081,7 @@ impl<P: RecoveryPolicy> Endpoint<P> {
                             scope,
                             Some((id, original)),
                         ),
-                        recovery::View::Repair { scope } => (EmissionKind::Repair, scope, None),
+                        recovery::View::Repair { scope, .. } => (EmissionKind::Repair, scope, None),
                     };
                 let expected = rolling::Scope {
                     direction: self.send_rolling_scope.direction ^ 1,
@@ -1550,6 +2090,30 @@ impl<P: RecoveryPolicy> Endpoint<P> {
                 if observed != kind || scope != expected {
                     return Err(Error::Identity);
                 }
+                if self.compact_feedback_overhead.is_some()
+                    && source.is_some_and(|(_, original)| original.first() == Some(&0))
+                {
+                    return Err(Error::Envelope(packed_envelope::Error::Malformed));
+                }
+                // The custody index rejects misses in constant time. Compare the actual
+                // source bytes before merging an independently authenticated copy.
+                let matches_queued = if let Some((id, original)) = source
+                    && P::holds_queued_source(&self.incoming, id)
+                {
+                    let (held, retained) = self
+                        .ingress
+                        .as_ref()
+                        .and_then(|owner| owner.held_source(id))
+                        .ok_or(Error::Identity)?;
+                    match self.inspect_data(held, false).map_err(Error::Rolling)? {
+                        recovery::View::Source {
+                            original: stored, ..
+                        } => Some((stored == original, retained)),
+                        recovery::View::Repair { .. } => return self.fail(Error::Identity),
+                    }
+                } else {
+                    None
+                };
                 if let Some(owner) = &mut self.ingress {
                     let policy = self.receive_config.scheduler.recovery();
                     let deadline = Tick(
@@ -1616,10 +2180,33 @@ impl<P: RecoveryPolicy> Endpoint<P> {
                             Err(error) => return self.fail(Error::Rolling(error)),
                         }
                     }
+                    if let Some((identical, retained)) = matches_queued {
+                        if !identical {
+                            return self.fail(Error::Rolling(rolling::Error::Conflict));
+                        }
+                        if retained.received <= received
+                            && retained.original_cap <= original_deadline
+                            && retained.deadline <= deadline
+                        {
+                            owner.note_coalesced_source();
+                            return Ok(());
+                        }
+                    }
+                    // Finishing a queued duplicate can leave an idle decoder
+                    // behind a full FIFO. Stage one old head before refusing
+                    // the new input. Elimination still needs its normal grant.
+                    if self.receive_config.scheduler.targeted()
+                        && owner.full_with_data_head()
+                        && !P::receive_state(&self.incoming, rolling_tick(now))
+                            .decoder
+                            .pending_job
+                    {
+                        self.service_ingress(now)?;
+                    }
                     let held_source = source
                         .map(|(id, _)| id)
                         .filter(|&id| P::tracks_queued_source(&self.incoming, id));
-                    owner.push(
+                    self.ingress.as_mut().ok_or(Error::Identity)?.push(
                         ingress::Input {
                             kind,
                             held_source,
@@ -1681,7 +2268,7 @@ impl<P: RecoveryPolicy> Endpoint<P> {
                     {
                         break;
                     }
-                    owner.queue.rotate_front().map_err(Error::Ingress)?;
+                    owner.rotate_front()?;
                 }
                 return Ok(());
             }
@@ -1809,7 +2396,7 @@ impl<P: RecoveryPolicy> Endpoint<P> {
                 id,
                 original,
             } => (scope, id, original),
-            recovery::View::Repair { scope } => {
+            recovery::View::Repair { scope, .. } => {
                 if scope != self.send_rolling_scope {
                     return Err(Error::Identity);
                 }
@@ -1819,6 +2406,16 @@ impl<P: RecoveryPolicy> Endpoint<P> {
         if scope != self.send_rolling_scope {
             return Err(Error::Identity);
         }
+        self.with_plain_output(id, original, |original| {
+            self.original_units(id, original, output)
+        })
+    }
+    fn original_units(
+        &self,
+        id: rolling::SourceId,
+        original: &[u8],
+        output: &mut [receiver::UnitWitness],
+    ) -> Result<usize, Error> {
         let view = packed_view(
             self.send_config,
             self.send_scope,
@@ -1862,6 +2459,10 @@ impl<P: RecoveryPolicy> Endpoint<P> {
             .chain(P::receive_deadline(&self.incoming).map(|t| Tick(t.0)))
             .chain(self.records.deadline().map(|t| Tick(t.0)))
             .chain(self.prepared_native.map(|native| native.deadline))
+            .chain(
+                self.prepared_output
+                    .and_then(|pending| pending.repeat_deadline),
+            )
             .min()
     }
     /// Earliest hard expiry or actual first-unit/tail/feedback service trigger.
@@ -1871,6 +2472,8 @@ impl<P: RecoveryPolicy> Endpoint<P> {
             .chain(P::send_wake(&self.sender).map(|t| Tick(t.0)))
             .chain(P::receive_wake(&self.incoming, rolling_tick(self.now)).map(|t| Tick(t.0)))
             .chain(self.packing.deadline_micros().map(Tick))
+            .chain(self.fin_order.hold_wake().map(Tick))
+            .chain(self.gap_repeat.map(|_| self.now))
             .min()
     }
     /// Actual resumable computation, excluding immutable output waiting for I/O.
@@ -1902,7 +2505,7 @@ impl<P: RecoveryPolicy> Endpoint<P> {
     /// Genuine pending/first-event feedback service requirement, not native delivery.
     pub fn feedback_opportunity(&self) -> Option<(Tick, usize)> {
         let status = P::receive_state(&self.incoming, rolling_tick(self.now));
-        if status.feedback_ready || status.feedback_building {
+        if self.gap_repeat.is_some() || status.feedback_ready || status.feedback_building {
             Some((self.now, P::FEEDBACK_BYTES))
         } else {
             status
@@ -1949,6 +2552,7 @@ impl<P: RecoveryPolicy> Endpoint<P> {
                 .is_none_or(|owner| owner.queue.is_empty())
             && self.packing.is_idle()
             && self.prepared_output.is_none()
+            && self.gap_repeat.is_none()
             && self.prepared_native.is_none()
             && send.drained
             && !receive.decoder.pending_job
@@ -2005,19 +2609,14 @@ fn admit_channel_heads(
 }
 
 // The exact ordered unit cursor is separate from the previewable record ledger.
-#[allow(clippy::too_many_arguments)]
-fn admit_packed<P: RecoveryPolicy>(
+fn admit_packed_view<P: RecoveryPolicy>(
     records: &mut receiver::Receiver,
     ordered_unit: &mut Option<receiver::SourceId>,
     config: DirectionConfig<P>,
-    scope: receiver::Scope,
-    id: rolling::SourceId,
-    bytes: &[u8],
+    view: packed_envelope::View<'_>,
     symbols: &mut [u8],
     now: Tick,
-    compact: bool,
 ) -> Result<PackedAdmission, Error> {
-    let view = packed_view(config, scope, id, bytes, compact)?;
     if Some(view.identity().first_unit) != *ordered_unit {
         return Err(Error::Identity);
     }

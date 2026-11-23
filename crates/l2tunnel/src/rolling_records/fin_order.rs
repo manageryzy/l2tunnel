@@ -2,6 +2,10 @@
 use super::{DirectionConfig, Error, NativePolicy, RecoveryPolicy};
 use l2tunnel_packet::{FlowKey, PacketKind, PacketLayer, ParseLimits, classify};
 
+#[path = "reorder_hold.rs"]
+mod reorder_hold;
+use reorder_hold::Holds;
+
 const FIN: u16 = 1;
 const SYN: u16 = 2;
 const RST: u16 = 4;
@@ -95,6 +99,17 @@ fn packet(policy: NativePolicy, bytes: &[u8]) -> Packet {
         end,
         ack,
     })
+}
+
+/// Which release rule `decide_packet` applies.
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum Release {
+    /// Existing TAP rule: TCP data in flow order; short FIN/RST may go early.
+    Ethernet,
+    /// Complete IP TCP data may cross sequence gaps; SYN/FIN/RST stay ordered.
+    Independent,
+    /// IP TCP data only when contiguous with its flow; SYN/FIN/RST stay ordered.
+    FlowOrdered,
 }
 
 const WAYS: usize = 4;
@@ -197,7 +212,7 @@ impl Guard {
             EarlyDecision::Wait(((version + 1) << 11) | index as u64)
         }
     }
-    pub(super) fn changed(&self, token: u64) -> bool {
+    pub(crate) fn changed(&self, token: u64) -> bool {
         let n = (token & 2047) as usize;
         let v = token >> 11;
         let Some(bucket) = self.edges.get(n / (WAYS + 1)) else {
@@ -211,46 +226,61 @@ impl Guard {
         };
         v != current + 1
     }
-    pub(super) fn decision(
+    pub(crate) fn decision(
         &self,
         policy: NativePolicy,
         bytes: &[u8],
         now: u64,
     ) -> super::receiver::EarlyDecision {
-        self.decide_packet(packet(policy, bytes), now, false, true)
+        self.decide_packet(&packet(policy, bytes), now, Release::Ethernet, true)
     }
 
     /// Linux can SACK a complete future TCP segment. Keep handshake, close,
     /// uncertain flow identity, and feedback covering a local FIN ordered.
-    pub(super) fn independent_ip_decision(
+    pub(crate) fn independent_ip_decision(
         &self,
         policy: NativePolicy,
         bytes: &[u8],
         now: u64,
         short: bool,
     ) -> super::receiver::EarlyDecision {
-        self.decide_packet(packet(policy, bytes), now, true, short)
+        self.decide_packet(&packet(policy, bytes), now, Release::Independent, short)
+    }
+
+    /// Release TCP data only in its own flow's sequence order. A segment that
+    /// starts after the flow edge waits until that edge changes; the codec still
+    /// delivers the channel head in record order, so expiry cannot strand it.
+    pub(crate) fn flow_ordered_ip_decision(
+        &self,
+        policy: NativePolicy,
+        bytes: &[u8],
+        now: u64,
+        short: bool,
+    ) -> super::receiver::EarlyDecision {
+        self.decide_packet(&packet(policy, bytes), now, Release::FlowOrdered, short)
     }
 
     fn decide_packet(
         &self,
-        packet: Packet,
+        packet: &Packet,
         now: u64,
-        native_reorders: bool,
+        release: Release,
         short: bool,
     ) -> super::receiver::EarlyDecision {
         use super::receiver::EarlyDecision;
-        if self.active() && !self.fin_permits(&packet) {
+        if self.active() && !self.fin_permits(packet) {
             return EarlyDecision::Ordered;
         }
+        let native_reorders = release == Release::Independent;
         match packet {
             Packet::Tcp(t)
-                if t.flags & SYN != 0 || (native_reorders && t.flags & (FIN | RST) != 0) =>
+                if t.flags & SYN != 0
+                    || (release != Release::Ethernet && t.flags & (FIN | RST) != 0) =>
             {
                 EarlyDecision::Ordered
             }
             Packet::Tcp(t) if t.payload != 0 => {
-                let idx = self.bucket(&t);
+                let idx = self.bucket(t);
                 let bucket = &self.edges[idx];
                 let base = idx * (WAYS + 1);
                 for (i, s) in bucket.slots.iter().enumerate() {
@@ -258,7 +288,7 @@ impl Guard {
                         && edge.key == t.source
                     {
                         if now.saturating_sub(edge.last) < self.lifetime
-                            && edge.permits(&t, native_reorders && t.flags & ACK != 0)
+                            && edge.permits(t, native_reorders && t.flags & ACK != 0)
                         {
                             return EarlyDecision::Allow;
                         }
@@ -272,7 +302,7 @@ impl Guard {
             _ => EarlyDecision::Ordered,
         }
     }
-    pub(super) fn native_commit(
+    pub(crate) fn native_commit(
         &mut self,
         policy: NativePolicy,
         bytes: &[u8],
@@ -309,6 +339,7 @@ impl Guard {
                 || (t.flags & SYN != 0 && e.syn != Some(t.seq))
         });
         if t.flags & RST != 0 {
+            self.holds.reset(idx, i);
             if existing.is_some() {
                 s.edge = None;
                 bump(&mut s.version);
@@ -316,6 +347,7 @@ impl Guard {
             }
         } else if fresh {
             if !early {
+                self.holds.reset(idx, i);
                 s.edge = Some(Edge::new(&t, now));
                 bump(&mut s.version);
                 bump(&mut b.version);
@@ -323,17 +355,19 @@ impl Guard {
         } else if let Some(e) = &mut s.edge {
             let before = (e.next, e.proven);
             e.commit(&t, now);
-            if before != (e.next, e.proven) {
+            let overflow = self.holds.committed(idx, i, e, &t, before.0);
+            if overflow || before != (e.next, e.proven) {
                 bump(&mut s.version);
             }
         }
     }
 }
 
-pub(super) struct Guard {
+pub(crate) struct Guard {
     fences: Vec<Fence>,
     edges: Vec<Bucket>,
     lifetime: u64,
+    holds: Holds,
     // An untracked FIN must never evict another live fence. On overflow, only
     // colliding flows require ordered ACKs until this generation is retired.
     ordered_buckets: u64,
@@ -352,32 +386,63 @@ impl Guard {
     }
     pub(super) fn planned_bytes<P: RecoveryPolicy>(direction: DirectionConfig<P>) -> usize {
         Self::slots(direction) * (size_of::<Fence>() + size_of::<Bucket>())
+            + Holds::planned_bytes(direction)
     }
     pub(super) fn new<P: RecoveryPolicy>(direction: DirectionConfig<P>) -> Result<Self, Error> {
+        Self::from_slots(
+            Self::slots(direction),
+            direction.receiver.lifetime_ticks,
+            Holds::new(direction)?,
+        )
+    }
+    /// Preserve local TCP close ordering and allow complete established IP segments across gaps.
+    pub(crate) fn for_mixed(
+        policy: NativePolicy,
+        limits: super::receiver::Limits,
+    ) -> Result<Self, Error> {
+        let slots = Self::mixed_slots(policy, limits);
+        Self::from_slots(slots, limits.lifetime_ticks, Holds::default())
+    }
+    fn mixed_slots(policy: NativePolicy, limits: super::receiver::Limits) -> usize {
+        if policy.is_ip() || limits.body.independent_short_frame_bytes > 0 {
+            usize::from(limits.channels).max(16)
+        } else {
+            0
+        }
+    }
+    pub(crate) fn mixed_heap_bytes(policy: NativePolicy, limits: super::receiver::Limits) -> usize {
+        Self::mixed_slots(policy, limits) * (size_of::<Fence>() + size_of::<Bucket>())
+    }
+    fn from_slots(slots: usize, lifetime: u64, holds: Holds) -> Result<Self, Error> {
         let mut fences = Vec::new();
         fences
-            .try_reserve_exact(Self::slots(direction))
+            .try_reserve_exact(slots)
             .map_err(|_| Error::Allocation)?;
         let mut edges = Vec::new();
         edges
-            .try_reserve_exact(Self::slots(direction))
+            .try_reserve_exact(slots)
             .map_err(|_| Error::Allocation)?;
-        edges.resize_with(Self::slots(direction), Bucket::default);
+        edges.resize_with(slots, Bucket::default);
         Ok(Self {
             fences,
             edges,
-            lifetime: direction.receiver.lifetime_ticks,
+            lifetime,
+            holds,
             ordered_buckets: 0,
         })
     }
-    pub(super) fn capacity_bytes(&self) -> usize {
-        self.fences.capacity() * size_of::<Fence>() + self.edges.capacity() * size_of::<Bucket>()
+    pub(crate) fn capacity_bytes(&self) -> usize {
+        self.fences.capacity() * size_of::<Fence>()
+            + self.edges.capacity() * size_of::<Bucket>()
+            + self.holds.capacity_bytes()
     }
     pub(super) fn active(&self) -> bool {
         !self.fences.is_empty() || self.ordered_buckets != 0
     }
-    pub(super) fn allocations(&self) -> usize {
-        usize::from(self.fences.capacity() > 0) + usize::from(!self.edges.is_empty())
+    pub(crate) fn allocations(&self) -> usize {
+        usize::from(self.fences.capacity() > 0)
+            + usize::from(!self.edges.is_empty())
+            + usize::from(self.holds_enabled())
     }
     pub(super) fn tracks_payload(&self) -> bool {
         !self.edges.is_empty()
@@ -391,7 +456,7 @@ impl Guard {
             }
         }
     }
-    pub(super) fn admitted(&mut self, policy: NativePolicy, bytes: &[u8]) {
+    pub(crate) fn admitted(&mut self, policy: NativePolicy, bytes: &[u8]) {
         if self.fences.capacity() == 0 {
             return;
         }

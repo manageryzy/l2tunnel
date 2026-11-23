@@ -32,6 +32,8 @@ fn selected_research(
         return Err("actual rolling composition absent".into());
     };
     let direction = |d: rolling_records::DirectionConfig| research_records::DirectionConfig {
+        native_release: Default::default(),
+        return_guard: Default::default(),
         native_policy: d.native_policy,
         receiver: d.receiver,
         packing: d.packing,

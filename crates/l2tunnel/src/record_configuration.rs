@@ -18,8 +18,10 @@ use l2tunnel_swift::{self as swift, records};
 use ring::digest;
 use std::{fmt, time::Duration};
 
+mod packed_fields;
 mod research;
 mod rolling;
+mod striped;
 
 /// Fixed magic/version/profile/duplex/reserved/MTU header size.
 pub const HEADER_BYTES: usize = 16;
@@ -199,6 +201,13 @@ impl CommonDirection {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[allow(clippy::large_enum_variant)] // Exact bounded Copy policy stays allocation-free.
 pub enum Profile {
+    /// Packed native units over shortened mixed erasure groups, tag10.
+    Striped {
+        /// Complete initiator-to-responder selection.
+        forward: crate::striped_records::Direction,
+        /// Complete responder-to-initiator selection.
+        reverse: crate::striped_records::Direction,
+    },
     /// Actual recursive/fallback/accumulator recovery and shared packed record body, tag9.
     Research {
         /// Both complete directional codec/research policies, geometry and native cap.
@@ -268,6 +277,8 @@ pub enum Profile {
 /// Borrowed exact directional record policy; no engine or admission authority.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DirectionProfile<'a> {
+    /// Mixed physical group and packed native body for this global direction.
+    Striped(&'a crate::striped_records::Direction),
     /// Actual selected research direction; no imported authentication authority.
     Research {
         /// Complete codec, native and research recovery policy.
@@ -308,6 +319,7 @@ impl DirectionProfile<'_> {
     pub fn channels(self) -> usize {
         match self {
             Self::Swift(config) => config.channels,
+            Self::Striped(config) => usize::from(config.receiver.channels),
             Self::PerConnectionCompact(config) => usize::from(config.owners),
             Self::Aligned(config) => usize::from(config.receiver.channels),
             Self::AlignedCompact(config) => usize::from(config.receiver.channels),
@@ -321,6 +333,7 @@ impl DirectionProfile<'_> {
     pub fn max_native(self) -> usize {
         match self {
             Self::Swift(config) => config.max_native,
+            Self::Striped(config) => config.receiver.body.max_frame_bytes,
             Self::PerConnectionCompact(config) => config.compact.receiver.body.max_frame_bytes,
             Self::Aligned(config) => config.receiver.body.max_frame_bytes,
             Self::AlignedCompact(config) => config.receiver.body.max_frame_bytes,
@@ -343,11 +356,13 @@ impl DirectionProfile<'_> {
             Self::Packed(config) => native_layer(config.base.native_policy),
             Self::Rolling { config, .. } => native_layer(config.native_policy),
             Self::Research { config, .. } => native_layer(config.native_policy),
+            Self::Striped(config) => native_layer(config.native_policy),
         }
     }
     fn validate(self) -> Result<(), Error> {
         match self {
             Self::Research { config, .. } => config.validate().map_err(|_| Error::Profile),
+            Self::Striped(config) => config.validate(),
             Self::Swift(config) => config.validate().map_err(|_| Error::Profile),
             Self::PerConnectionCompact(config) => config.validate().map_err(|_| Error::Profile),
             Self::Aligned(config) => config.validate().map_err(|_| Error::Profile),
@@ -376,6 +391,7 @@ impl<'a> DirectionView<'a> {
     pub fn native_policy(self) -> Option<aligned::NativePolicy> {
         Some(match self.profile {
             DirectionProfile::Swift(_) => return None,
+            DirectionProfile::Striped(config) => config.native_policy,
             DirectionProfile::PerConnectionCompact(config) => config.compact.native_policy,
             DirectionProfile::Aligned(config) => config.native_policy,
             DirectionProfile::AlignedCompact(config) => config.native_policy,
@@ -503,6 +519,10 @@ impl Descriptor {
                 native_stall_micros: config.native_stall_micros,
                 stream: *stream,
             },
+            Profile::Striped {
+                forward: a,
+                reverse: b,
+            } => DirectionProfile::Striped(if forward { a } else { b }),
             Profile::Rolling { config, stream } | Profile::RollingCopies { config, stream, .. } => {
                 DirectionProfile::Rolling {
                     config: if forward {
@@ -556,21 +576,50 @@ impl Descriptor {
         forward.profile.validate()?;
         reverse.profile.validate()?;
         match self.profile {
+            Profile::Striped { forward, reverse } => {
+                forward.validate_path(self.path_mtu)?;
+                reverse.validate_path(self.path_mtu)?;
+            }
             Profile::Rolling { config, .. } => {
-                if config.forward.scheduler.source_wire.is_near8()
-                    || config.reverse.scheduler.source_wire.is_near8()
+                if [
+                    config.forward.scheduler.source_wire,
+                    config.reverse.scheduler.source_wire,
+                ]
+                .into_iter()
+                .any(|wire| wire.is_near8() || wire.compresses_packed_acks())
                 {
                     return Err(Error::Profile);
                 }
                 config.validate().map_err(|_| Error::Profile)?
             }
-            Profile::Research { config, .. } => config.validate().map_err(|_| Error::Profile)?,
+            Profile::Research { config, .. } => {
+                // Tag 9 has no delivery encoding; only default values round-trip.
+                if rolling::extended(config) {
+                    return Err(Error::Profile);
+                }
+                config.validate().map_err(|_| Error::Profile)?
+            }
             Profile::RollingCopies { config, copies, .. } => {
+                use fec::rolling::wire::SourceWire;
                 let forward = config.forward.scheduler.source_wire;
                 let reverse = config.reverse.scheduler.source_wire;
+                let reverse_compatible = match reverse {
+                    SourceWire::TargetedExactAckLz4 => {
+                        matches!(
+                            forward,
+                            SourceWire::TargetedNear8 | SourceWire::TargetedNear8Headroom
+                        ) && config.forward.native_policy
+                            == aligned::NativePolicy::FixedAnchorIpHeaders
+                            && config.reverse.native_policy == aligned::NativePolicy::IpHeaders
+                            && aligned_body::lz4_available()
+                    }
+                    _ => !forward.is_near8() || reverse == SourceWire::TargetedExact,
+                };
                 if reverse.is_near8()
-                    || (forward.is_near8()
-                        && reverse != fec::rolling::wire::SourceWire::TargetedExact)
+                    || forward.compresses_packed_acks()
+                    || !reverse_compatible
+                    || (forward == SourceWire::TargetedNear8Hold35
+                        && !config.forward.native_policy.is_ip())
                 {
                     return Err(Error::Relation);
                 }
@@ -684,7 +733,7 @@ impl Descriptor {
             return Err(Error::Prefix);
         }
         let tag = reader.byte()?;
-        if !(1..=9).contains(&tag) {
+        if !(1..=12).contains(&tag) {
             return Err(Error::Prefix);
         }
         let duplex = match reader.byte()? {
@@ -708,10 +757,11 @@ impl Descriptor {
             match tag {
                 1 => padding(&slot[SWIFT_BYTES..])?,
                 2 => padding(&slot[ALIGNED_BYTES..])?,
-                4 | 9 => padding(&slot[rolling::ACTIVE_BYTES..])?,
+                4 | 9 | 11 => padding(&slot[rolling::ACTIVE_BYTES..])?,
                 6 => padding(&slot[aligned::COMPACT_CONFIG_BYTES..])?,
                 7 => padding(&slot[aligned::packed::COMPACT_CONFIG_BYTES..])?,
                 8 => padding(&slot[connection_records::DIRECTION_BYTES..])?,
+                10 => padding(&slot[striped::ACTIVE_BYTES..])?,
                 _ => {}
             }
         }
@@ -731,9 +781,15 @@ impl Descriptor {
                 forward: decode_packed(a)?,
                 reverse: decode_packed(b)?,
             },
-            4 => rolling::decode_pair(a, b)?,
+            4 => rolling::decode_pair(a, b, false)?,
+            11 => rolling::decode_pair(a, b, true)?,
             9 => research::decode_pair(a, b)?,
-            5 => rolling::decode_pair_with_copies(a, b)?,
+            10 => Profile::Striped {
+                forward: striped::decode(a)?,
+                reverse: striped::decode(b)?,
+            },
+            5 => rolling::decode_pair_with_copies(a, b, false)?,
+            12 => rolling::decode_pair_with_copies(a, b, true)?,
             6 => Profile::AlignedCompact {
                 forward: aligned::CompactConfig::decode(&a[..aligned::COMPACT_CONFIG_BYTES])
                     .map_err(|_| Error::Profile)?,
@@ -774,12 +830,15 @@ fn profile_tag(profile: Profile) -> u8 {
         Profile::Swift { .. } => 1,
         Profile::Aligned { .. } => 2,
         Profile::Packed { .. } => 3,
+        Profile::Rolling { config, .. } if rolling::extended(config) => 11,
         Profile::Rolling { .. } => 4,
+        Profile::RollingCopies { config, .. } if rolling::extended(config) => 12,
         Profile::RollingCopies { .. } => 5,
         Profile::AlignedCompact { .. } => 6,
         Profile::PackedCompact { .. } => 7,
         Profile::PerConnectionCompact { .. } => 8,
         Profile::Research { .. } => 9,
+        Profile::Striped { .. } => 10,
     }
 }
 
@@ -1263,6 +1322,7 @@ fn preflight_common_padding(input: &[u8]) -> Result<(), Error> {
 fn encode_profile(profile: DirectionProfile<'_>, output: &mut [u8]) -> Result<(), Error> {
     output.fill(0);
     match profile {
+        DirectionProfile::Striped(config) => striped::encode(*config, output),
         DirectionProfile::Swift(config) => {
             encode_swift(*config, output.get_mut(..SWIFT_BYTES).ok_or(Error::Length)?)
         }
