@@ -46,35 +46,74 @@ fn packet(number: u32) -> Vec<u8> {
     bytes
 }
 fn selected_contracts(kind: cover::Appearance) -> Result<[CommonTransactionContract; 2]> {
+    ingress_contracts(kind, false)
+}
+fn ingress_contracts(
+    kind: cover::Appearance,
+    tun_flow_limit: bool,
+) -> Result<[CommonTransactionContract; 2]> {
+    ingress_contracts_with(kind, tun_flow_limit, true)
+}
+
+/// Same contracts with ACK coalescing selected or left out of the resources.
+fn ingress_contracts_with(
+    kind: cover::Appearance,
+    tun_flow_limit: bool,
+    coalesce_acks: bool,
+) -> Result<[CommonTransactionContract; 2]> {
     use l2tunnel::record_configuration as c;
     let old = contracts(kind)?;
     let descriptors = old[0]
         .catalog()
         .descriptors()
         .iter()
+        .filter(|value| !tun_flow_limit || matches!(value.profile(), c::Profile::Swift { .. }))
         .map(|value| {
             let update = |role| -> Result<c::CommonDirection> {
                 let current = value.direction(role).common();
                 let mut pipeline = current.pipeline();
-                pipeline.queue.packets = 2;
-                if let l2tunnel_pipeline::Profile::TunDrr(mut qos) = pipeline.profile {
-                    qos.per_flow.packets = 2;
-                    pipeline.profile = l2tunnel_pipeline::Profile::TunDrr(qos);
-                }
+                let traffic = if tun_flow_limit {
+                    pipeline.profile =
+                        l2tunnel_pipeline::Profile::TunDrr(l2tunnel_pipeline::TunQosConfig {
+                            base_quantum_bytes: 1024,
+                            max_weight: 1,
+                            per_flow: l2tunnel_pipeline::QueueLimits {
+                                bytes: 1024,
+                                packets: 4,
+                            },
+                        });
+                    core::traffic::TrafficPolicy {
+                        layer: core::traffic::NetworkLayer::Tun,
+                        tcp: core::traffic::TcpControl::System,
+                        qos: core::traffic::Qos::WeightedDeficit,
+                    }
+                } else {
+                    pipeline.queue.packets = 2;
+                    if let l2tunnel_pipeline::Profile::TunDrr(mut qos) = pipeline.profile {
+                        qos.per_flow.packets = 2;
+                        pipeline.profile = l2tunnel_pipeline::Profile::TunDrr(qos);
+                    }
+                    current.traffic()
+                };
                 Ok(c::CommonDirection::new(
-                    current.traffic(),
+                    traffic,
                     pipeline,
                     current.bytes_per_second(),
                     current.burst_bytes(),
                     current.native_window(),
                 )?)
             };
+            let mut profile = *value.profile();
+            if tun_flow_limit && let c::Profile::Swift { forward, reverse } = &mut profile {
+                forward.layer = records::Layer::Ip;
+                reverse.layer = records::Layer::Ip;
+            }
             Ok::<_, Box<dyn std::error::Error + Send + Sync>>(c::Descriptor::new(
                 value.path_mtu(),
                 value.duplex(),
                 update(mg::Role::Client)?,
                 update(mg::Role::Server)?,
-                *value.profile(),
+                profile,
             )?)
         })
         .collect::<Result<Vec<_>>>()?;
@@ -86,7 +125,7 @@ fn selected_contracts(kind: cover::Appearance) -> Result<[CommonTransactionContr
     let catalog = Catalog::new(initial, &descriptors)?;
     let make = |value: &CommonTransactionContract| -> Result<CommonTransactionContract> {
         let mut resources = value.resources();
-        resources.ack_coalescing = Some(policy());
+        resources.ack_coalescing = coalesce_acks.then(policy);
         Ok(CommonTransactionContract::new_compact_wire(
             value.expected_configuration(),
             value.role(),
@@ -307,6 +346,17 @@ fn pending_decode_yields_to_original_ack_within_one_directional_grant() -> Resul
                     );
                     assert_eq!(ack.usage.held.packets, 1);
                     assert_eq!(ack.expiry, Some(engine::Tick(expires)));
+                    let (held, service, last_completed) = engine
+                        .earliest_held_ack_service()
+                        .ok_or("missing expired candidate")?;
+                    assert_eq!(held.deadline, Duration::from_micros(due));
+                    assert_eq!(
+                        service.first_due_service,
+                        Some(Duration::from_micros(expires))
+                    );
+                    assert_eq!(service.blocked, 0);
+                    assert_eq!(service.last_blocked, None);
+                    assert!(last_completed.is_none_or(|at| at < held.deadline));
                 } else {
                     assert_eq!(result?, due);
                     assert_eq!(ack.statistics.flushed, 1);
@@ -484,6 +534,130 @@ fn busy_carrier_progress_flushes_due_ack_before_next_outer_turn() -> Result {
             );
             Ok(())
         })
+}
+
+#[test]
+fn sending_reopens_a_capacity_blocked_native_read_before_select() -> Result {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?
+        .block_on(async {
+            let kind = cover::Appearance::QuicLike;
+            let mut fixture = Fixture::from_contracts(kind, selected_contracts(kind)?).await?;
+            let mut inputs = fixture.endpoints[0].driver.take_inputs()?;
+            assert!(read(&mut fixture, &mut inputs, &packet(100)).await?);
+            assert!(read(&mut fixture, &mut inputs, &packet(101)).await?);
+            assert!(!read(&mut fixture, &mut inputs, &packet(101)).await?);
+            let now = fixture.now;
+            let [sender, _peer] = fixture.endpoints;
+            let mut driver = sender.driver;
+            let mut socket = carrier::IoOwner::from(sender.socket);
+            let at = driver.origin + duration(now);
+            let before = driver.counters.native_read;
+            assert_eq!(
+                driver
+                    .performance
+                    .counters
+                    .native_ingress_shared_packet_refusals,
+                1
+            );
+            assert_eq!(
+                driver
+                    .performance
+                    .counters
+                    .native_ingress_flow_packet_refusals,
+                0
+            );
+            assert!(!driver.can_admit_native()?);
+            driver.send_and_retry_native_ingress(&mut socket, &inputs.native, now, at, || at)?;
+            assert!(driver.can_admit_native()?);
+            assert_eq!(driver.counters.native_read, before + 1);
+            driver.send_and_retry_native_ingress(&mut socket, &inputs.native, now, at, || at)?;
+            assert_eq!(driver.counters.native_read, before + 1);
+            Ok(())
+        })
+}
+
+#[tokio::test]
+async fn retained_tcp_data_retries_only_after_flow_bytes_are_available() -> Result {
+    let kind = cover::Appearance::QuicLike;
+    let mut fixture = Fixture::from_contracts(kind, ingress_contracts(kind, true)?).await?;
+    let mut input = fixture.endpoints[0].driver.take_inputs()?;
+    let mut bytes = packet(100)[14..].to_vec();
+    bytes.resize(600, 7);
+    bytes[2..4].copy_from_slice(&600_u16.to_be_bytes());
+    assert!(read(&mut fixture, &mut input, &bytes).await?);
+    assert!(!read(&mut fixture, &mut input, &bytes).await?);
+    let now = fixture.now;
+    let [endpoint, _peer] = fixture.endpoints;
+    let mut driver = endpoint.driver;
+    let before = driver.counters.native_read;
+    let pending = driver
+        .common
+        .as_ref()
+        .and_then(|r| r.pending_ingress)
+        .ok_or("missing input")?;
+    assert!(pending.flow_byte_wait.is_some());
+    for _ in 0..4 {
+        driver.service_common_ingress(now, &mut input.native)?;
+    }
+    assert_eq!(
+        driver
+            .performance
+            .counters
+            .native_ingress_flow_byte_refusals,
+        1
+    );
+    assert_eq!(
+        driver.common.as_ref().and_then(|r| r.pending_ingress),
+        Some(pending)
+    );
+    let mut socket = carrier::IoOwner::from(endpoint.socket);
+    let at = driver.origin + duration(now);
+    driver.send_and_retry_native_ingress(&mut socket, &input.native, now, at, || at)?;
+    assert_eq!(driver.counters.native_read, before + 1);
+    assert!(driver.can_admit_native()?);
+    Ok(())
+}
+
+#[tokio::test]
+async fn plain_pipeline_flow_byte_refusal_is_retained_backpressure_not_a_session_failure() -> Result
+{
+    // Without ACK coalescing the Pipeline refuses directly; a full per-flow
+    // queue under loss previously stopped the whole session as a protocol error.
+    let kind = cover::Appearance::QuicLike;
+    let contracts = ingress_contracts_with(kind, true, false)?;
+    let mut fixture = Fixture::from_contracts(kind, contracts).await?;
+    let mut input = fixture.endpoints[0].driver.take_inputs()?;
+    let mut bytes = packet(100)[14..].to_vec();
+    bytes.resize(600, 7);
+    bytes[2..4].copy_from_slice(&600_u16.to_be_bytes());
+    assert!(read(&mut fixture, &mut input, &bytes).await?);
+    assert!(!read(&mut fixture, &mut input, &bytes).await?);
+    let now = fixture.now;
+    let [endpoint, _peer] = fixture.endpoints;
+    let mut driver = endpoint.driver;
+    assert!(driver.terminal.is_none());
+    let before = driver.counters.native_read;
+    let pending = driver
+        .common
+        .as_ref()
+        .and_then(|r| r.pending_ingress)
+        .ok_or("refused original must stay retained")?;
+    assert!(pending.flow_byte_wait.is_some());
+    assert_eq!(
+        driver
+            .performance
+            .counters
+            .native_ingress_flow_byte_refusals,
+        1
+    );
+    let mut socket = carrier::IoOwner::from(endpoint.socket);
+    let at = driver.origin + duration(now);
+    driver.send_and_retry_native_ingress(&mut socket, &input.native, now, at, || at)?;
+    assert_eq!(driver.counters.native_read, before + 1);
+    assert!(driver.can_admit_native()?);
+    Ok(())
 }
 
 #[test]

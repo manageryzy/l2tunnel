@@ -128,7 +128,7 @@ impl Driver {
         let inspected = if engine.fragment_policy().is_some() {
             engine.inspect_fragment_kind(body)
         } else {
-            engine.inspect_peer(body)
+            engine.inspect_peer_class(body, opened.feedback)
         };
         let kind = match inspected {
             Ok(kind) => kind,
@@ -407,6 +407,57 @@ impl Driver {
         }
         result
     }
+
+    pub(super) fn yield_targeted_udp_batch(
+        &mut self,
+        batch: u64,
+        maximum: u64,
+        next_check: &mut u64,
+    ) -> io::Result<bool> {
+        if batch != *next_check || batch >= maximum {
+            return Ok(false);
+        }
+        let headroom = self.targeted_udp_receive_headroom(maximum - batch)?;
+        if headroom == 0 {
+            let count = &mut self.performance.counters.udp_rolling_pressure_yields;
+            *count = count.saturating_add(1);
+            return Ok(true);
+        }
+        *next_check = batch + headroom;
+        Ok(false)
+    }
+
+    /// One original UDP datagram can acquire at most one unfragmented Rolling
+    /// input slot. Recheck at the existing three-quarter queue pressure mark.
+    fn targeted_udp_receive_headroom(&self, remaining: u64) -> io::Result<u64> {
+        let mut room = remaining;
+        let state = self.common_state()?;
+        for epoch in self.common_epochs().into_iter().flatten() {
+            let engine = state.engine(epoch)?;
+            let local = engine
+                .configuration()
+                .descriptor()
+                .local(common_contract::mg_role(self.info.role));
+            let configuration::DirectionProfile::Rolling { config, .. } = local.receive().profile()
+            else {
+                continue;
+            };
+            if !config.scheduler.source_wire.is_targeted() || engine.fragment_policy().is_some() {
+                continue;
+            }
+            if let Some(q) = engine.rolling_ingress_status() {
+                let threshold = q.limits.slots - q.limits.slots / 4;
+                let headroom = threshold.saturating_sub(q.packets) as u64;
+                if headroom == 0 && engine.targeted_decode_feedback_ready().is_some() {
+                    return Ok(0);
+                }
+                // An idle decoder can start on the next input. Keep reading
+                // while rechecking a pressured FIFO until a job really exists.
+                room = room.min(headroom.max(1));
+            }
+        }
+        Ok(room)
+    }
     pub(super) fn can_admit_common_native(&self) -> io::Result<bool> {
         if self
             .common
@@ -434,7 +485,7 @@ impl Driver {
         Ok(!self
             .common
             .as_deref()
-            .is_some_and(|runtime| runtime.path.unavailable)
+            .is_some_and(|runtime| runtime.path.unavailable || runtime.pending_ingress.is_some())
             && state.can_admit_data()
             && usage.packets < policy.queue.packets
             && policy.queue.bytes.saturating_sub(usage.bytes)
@@ -505,6 +556,13 @@ impl Driver {
             self.counters.rejected_packets = self.counters.rejected_packets.saturating_add(1);
             return Ok(true);
         }
+        if let Some(trace) = self
+            .common
+            .as_deref_mut()
+            .and_then(|runtime| runtime.reverse_trace.as_mut())
+        {
+            trace.read(now, epoch.0, &output[..length]);
+        }
         let connection_cap = if self.connection_scope(self.source_scope)? {
             Some(add(before, self.config.native.stall_timeout)?.min(self.common_original_cap()?))
         } else {
@@ -535,21 +593,46 @@ impl Driver {
                     engine::Tick(deadline),
                 )
                 .map_err(protocol)?;
-        } else if let Some(original_cap) = connection_cap {
-            state
-                .entry(epoch)?
-                .ingest_borrowed_at(
-                    engine::Tick(before),
-                    engine::Tick(now),
-                    &output[..length],
-                    engine::Tick(original_cap),
-                )
-                .map_err(protocol)?;
         } else {
-            state
-                .entry(epoch)?
-                .enqueue_borrowed(engine::Tick(now), &output[..length])
-                .map_err(protocol)?;
+            let generation = state.entry(epoch)?.generation();
+            let admitted = if let Some(original_cap) = connection_cap {
+                state
+                    .entry(epoch)?
+                    .ingest_borrowed_at(
+                        engine::Tick(before),
+                        engine::Tick(now),
+                        &output[..length],
+                        engine::Tick(original_cap),
+                    )
+                    .map(|_| ())
+            } else {
+                state
+                    .entry(epoch)?
+                    .enqueue_borrowed(engine::Tick(now), &output[..length])
+                    .map(|_| ())
+            };
+            if let Err(error) = admitted {
+                // A full per-flow or shared queue is backpressure. The original
+                // was already read, so keep it in the native input and retry it
+                // exactly as the coalesced path does; never fail the session.
+                let deadline = match connection_cap {
+                    Some(cap) => cap,
+                    None => add(before, self.config.native.stall_timeout)?.min(self.lease),
+                };
+                return self.retain_refused_native(
+                    error,
+                    common::PendingIngress {
+                        generation,
+                        flow_byte_wait: None,
+                        epoch,
+                        bytes: length,
+                        received: before,
+                        deadline,
+                    },
+                    &output[..length],
+                    now,
+                );
+            }
         }
         self.counters.native_read = self.counters.native_read.saturating_add(1);
         Ok(true)
@@ -631,10 +714,18 @@ impl Driver {
                 .native_work[index] = remaining - 1;
             match result {
                 record_bank::NativePreparation::Ready(packet) => {
-                    self.common
+                    let runtime = self
+                        .common
                         .as_deref_mut()
-                        .ok_or_else(|| protocol("common scan contract"))?
-                        .native_work[index] = 0;
+                        .ok_or_else(|| protocol("common scan contract"))?;
+                    runtime.native_work[index] = 0;
+                    if let Some(trace) = &mut runtime.reverse_trace {
+                        let bytes = lease
+                            .output()?
+                            .get(..packet.bytes())
+                            .ok_or_else(|| protocol("prepared native length exceeds lease"))?;
+                        trace.native(epoch.0, packet.identity(), bytes)?;
+                    }
                     lease.publish(
                         common_native::CommonNative {
                             origin,
@@ -749,6 +840,9 @@ impl Driver {
         if let Ok(progress) = result.as_ref()
             && let Some(runtime) = self.common.as_deref_mut()
         {
+            if *progress && let Some(trace) = &mut runtime.reverse_trace {
+                trace.written(after, epoch.0, metadata.identity);
+            }
             runtime.buffer_event(
                 Site::NativeDeviceWrite,
                 Reason::SocketWrite,
@@ -867,6 +961,14 @@ impl Driver {
                     break;
                 };
                 if let Some(runtime) = self.common.as_deref_mut() {
+                    if let Some(trace) = &mut runtime.reverse_trace {
+                        trace.packed(
+                            now,
+                            epoch.0,
+                            admitted.permit.identity,
+                            admitted.metadata.timing,
+                        );
+                    }
                     buffer_metrics::admission_succeeded(runtime, now, scope, admitted.metadata);
                     let proxy = runtime.contract.proxy_binding().is_some();
                     if let Some(metrics) = runtime.wire_metrics.as_mut() {
@@ -975,11 +1077,6 @@ impl Driver {
                 .common
                 .as_deref_mut()
                 .ok_or_else(|| protocol("common sealed owner"))?;
-            runtime
-                .wire
-                .get_mut(..emission.bytes)
-                .ok_or_else(|| protocol("common pending body capacity"))?
-                .copy_from_slice(&self.buffers.frame[..emission.bytes]);
             #[cfg(unix)]
             let proxy_record = runtime.proxy_bridge.as_ref().and_then(|bridge| {
                 let identity = bridge.pending_identity()?;
@@ -1017,15 +1114,35 @@ impl Driver {
                     .ok_or_else(|| protocol("Common final record has no actual ARQ source"))?;
                 bridge.bind_final_source(unit.identity, source)?;
             }
+            if !compact_feedback
+                && fragment.is_none()
+                && let Some(trace) = &mut runtime.reverse_trace
+                && let Some(units) = runtime.witnesses.get(..emission.witnesses)
+            {
+                trace.selected(
+                    now,
+                    epoch.0,
+                    number.0,
+                    units,
+                    carrier
+                        .as_ref()
+                        .and_then(|token| token.rolling_data_label()),
+                    || {
+                        let owner::DataOwner::Common(state) = &self.owner;
+                        Some((
+                            state.engine(epoch).ok()?,
+                            &self.buffers.frame[..emission.bytes],
+                        ))
+                    },
+                );
+            }
             if let Some(trace) = runtime.compact_arq_trace.as_mut() {
                 let owner::DataOwner::Common(state) = &self.owner;
                 let packet = if fragment.is_none() {
                     state.engine(epoch).ok().and_then(|engine| {
                         trace.inspect(
-                            engine
-                                .configuration()
-                                .descriptor()
-                                .local(common_contract::mg_role(self.info.role)),
+                            engine,
+                            common_contract::mg_role(self.info.role),
                             true,
                             &self.buffers.frame[..emission.bytes],
                         )
@@ -1136,7 +1253,11 @@ impl Driver {
         } else {
             None
         };
-        let body = &runtime.wire[..pending.bytes];
+        let body = self
+            .buffers
+            .frame
+            .get(..pending.bytes)
+            .ok_or_else(|| protocol("common pending body capacity"))?;
         let result = if let Some(metadata) = metadata {
             self.records.seal_compact_with_carrier(
                 kind,
@@ -1145,7 +1266,7 @@ impl Driver {
                 body,
                 &metadata.aad(),
                 &mut self.buffers.seal,
-                &mut self.buffers.wire,
+                &mut runtime.wire,
             )
         } else if pending.feedback {
             self.records.seal_feedback_in(
@@ -1153,7 +1274,7 @@ impl Driver {
                 meta(self.outer, cover::Phase::Established),
                 body,
                 &mut self.buffers.seal,
-                &mut self.buffers.wire,
+                &mut runtime.wire,
             )
         } else if authenticated_data {
             self.records.seal_authenticated_data_in(
@@ -1161,7 +1282,7 @@ impl Driver {
                 meta(self.outer, cover::Phase::Established),
                 body,
                 &mut self.buffers.seal,
-                &mut self.buffers.wire,
+                &mut runtime.wire,
             )
         } else {
             self.records.seal_user_in(
@@ -1169,7 +1290,7 @@ impl Driver {
                 meta(self.outer, cover::Phase::Established),
                 body,
                 &mut self.buffers.seal,
-                &mut self.buffers.wire,
+                &mut runtime.wire,
             )
         };
         let sealed = match result {
@@ -1191,7 +1312,6 @@ impl Driver {
             self.counters.user_generation = Some(sealed.generation);
         }
         self.outer = self.outer.checked_add(1).ok_or_else(exhausted)?;
-        runtime.wire[..sealed.bytes].copy_from_slice(&self.buffers.wire[..sealed.bytes]);
         let pending = runtime
             .unsealed
             .take()
@@ -1487,6 +1607,11 @@ impl Driver {
                 let completed = sampled.as_ref().copied().unwrap_or(u64::MAX);
                 if let Ok(at) = sampled.as_ref() {
                     runtime.buffer_event(Site::CommonUserSlot, Reason::SocketWrite, *at, false);
+                    if !pending.feedback
+                        && let Some(trace) = &mut runtime.reverse_trace
+                    {
+                        trace.accepted(*at, pending.scope.epoch.0, pending.sealed.number.0);
+                    }
                 }
                 if let Some(trace) = self
                     .common
@@ -1639,6 +1764,19 @@ impl Driver {
         now: u64,
         original: Instant,
     ) -> io::Result<()> {
+        if !opened.feedback
+            && let Some(trace) = self
+                .common
+                .as_deref_mut()
+                .and_then(|r| r.reverse_trace.as_mut())
+        {
+            trace.opened(
+                now,
+                opened.scope.epoch.0,
+                opened.number.0,
+                opened.authenticated,
+            );
+        }
         // This method is reached only after the sole Records opener and route
         // check; short unkeyed data is deliberately outside authenticated traces.
         let trace_packet = if opened.authenticated {
@@ -1652,10 +1790,8 @@ impl Driver {
                         return None;
                     }
                     let packet = trace.inspect(
-                        engine
-                            .configuration()
-                            .descriptor()
-                            .local(common_contract::mg_role(self.info.role)),
+                        engine,
+                        common_contract::mg_role(self.info.role),
                         false,
                         &self.buffers.plain[..opened.bytes],
                     )?;
@@ -1704,12 +1840,14 @@ impl Driver {
             }
             self.counters.native_backpressure_drops =
                 self.counters.native_backpressure_drops.saturating_add(1);
+            self.trace_user_admission(opened, now, reverse_trace::Admission::Refused);
             return Ok(());
         }
         let epoch = core::Epoch(opened.scope.epoch.0);
         let state = self.common_state()?;
         let Some(reader) = state.peer().reader(epoch) else {
             self.counters.rejected_packets = self.counters.rejected_packets.saturating_add(1);
+            self.trace_user_admission(opened, now, reverse_trace::Admission::Refused);
             return Ok(());
         };
         if common_actions::record_scope(reader.scope) != opened.scope
@@ -1722,7 +1860,10 @@ impl Driver {
             .descriptor()
             .local(common_contract::mg_role(self.info.role));
         let body = &self.buffers.plain[..opened.bytes];
-        let kind = state.engine(epoch)?.inspect_peer(body).map_err(protocol)?;
+        let kind = state
+            .engine(epoch)?
+            .inspect_peer_class(body, opened.feedback)
+            .map_err(protocol)?;
         let staged_reader = reader.disposition == transaction::ReadDisposition::Staged;
         let deferred_decode = matches!(
             local.receive().profile(),
@@ -1732,6 +1873,11 @@ impl Driver {
         let queued_rolling_input = self.config.rolling_ingress.is_some()
             && deferred_decode
             && kind != engine::EmissionKind::Feedback;
+        let rolling_data = !opened.feedback
+            && matches!(
+                local.receive().profile(),
+                configuration::DirectionProfile::Rolling { .. }
+            );
         let width = usize::from(local.receive().channels());
         if kind == engine::EmissionKind::Feedback
             && self.retain_research_feedback(opened, received, now, original)?
@@ -1824,6 +1970,21 @@ impl Driver {
                 &mut self.buffers.plain[..opened.bytes],
             )
         };
+        if rolling_data
+            && self
+                .common
+                .as_ref()
+                .is_some_and(|r| r.reverse_trace.is_some())
+        {
+            let outcome = match &accepted {
+                Ok(()) => reverse_trace::Admission::Accepted,
+                Err(record_bank::Error::Engine(engine::Error::Rolling(
+                    l2tunnel::rolling_records::Error::Busy,
+                ))) if queued_rolling_input => reverse_trace::Admission::FifoFull,
+                Err(_) => reverse_trace::Admission::Refused,
+            };
+            self.trace_user_admission(opened, now, outcome);
+        }
         if let Some(packet) = trace_packet
             && let Some(trace) = self
                 .common
@@ -1889,11 +2050,42 @@ impl Driver {
                     self.counters.native_backpressure_drops.saturating_add(1);
                 Ok(())
             }
+            Err(record_bank::Error::Engine(
+                error @ engine::Error::Striped(
+                    l2tunnel_fec::Error::Capacity | l2tunnel_fec::Error::WindowBlocked,
+                ),
+            )) => {
+                // An authenticated future group outside the receive aperture
+                // remains sender-owned and eligible for named or quiet recovery.
+                if let Some(runtime) = self.common.as_deref_mut() {
+                    buffer_metrics::authenticated_input_dropped(runtime, now, kind, error);
+                }
+                self.counters.native_backpressure_drops =
+                    self.counters.native_backpressure_drops.saturating_add(1);
+                Ok(())
+            }
             Err(error) => Err(protocol(error)),
         }
     }
     pub(super) fn wake_common(&self, now: u64) -> io::Result<Instant> {
         Ok(self.wake_common_with_custody(now, false, false)?.at)
+    }
+    // Report the disposition at the dispatch tick. Successful input ownership
+    // also includes duplicate/stale consumption; it does not establish decode.
+    fn trace_user_admission(
+        &mut self,
+        opened: record::Opened,
+        now: u64,
+        outcome: reverse_trace::Admission,
+    ) {
+        if !opened.feedback
+            && let Some(trace) = self
+                .common
+                .as_deref_mut()
+                .and_then(|r| r.reverse_trace.as_mut())
+        {
+            trace.admission(now, opened.scope.epoch.0, opened.number.0, outcome);
+        }
     }
     pub(super) fn wake_common_with_custody(
         &self,
@@ -1903,6 +2095,7 @@ impl Driver {
     ) -> io::Result<SelectedWake> {
         let mut wake = self.lease;
         let mut work_ready = false;
+        let mut ready_output_at = None;
         if let Some(state) = self
             .common
             .as_deref()
@@ -2092,6 +2285,22 @@ impl Driver {
             if epoch.0 != self.source_scope.epoch.0 || engine.drained().map_err(protocol)? {
                 continue;
             }
+            if self
+                .common_state()?
+                .peer()
+                .reader(epoch)
+                .is_some_and(|reader| reader.disposition != transaction::ReadDisposition::Staged)
+                && let Some(cost) = engine.ready_rolling_data_wire_bytes().map_err(protocol)?
+            {
+                // A retained short source or its next physical copy needs only
+                // the credit the normal poll would debit, including fragments.
+                let at = self
+                    .bucket
+                    .ready_at(cost.checked_add(self.reserve).ok_or_else(exhausted)?)?;
+                work_ready |= at <= now;
+                ready_output_at = Some(at);
+                wake = wake.min(at);
+            }
             let logical = common_contract::maximum_body(local.send(), local.receive())?;
             let cost = self
                 .common_fragment_wire_cost(epoch, logical)?
@@ -2131,9 +2340,12 @@ impl Driver {
                 }
             }
         }
+        let idle_floor = now.checked_add(100).ok_or_else(exhausted)?;
         let floor = self
             .origin
-            .checked_add(duration(now.checked_add(100).ok_or_else(exhausted)?))
+            .checked_add(duration(
+                ready_output_at.map_or(idle_floor, |at| at.min(idle_floor)),
+            ))
             .ok_or_else(exhausted)?;
         // Keep the idle anti-spin floor, but do not send runnable bounded
         // protocol computation through the timer wheel on every work turn.
@@ -2285,10 +2497,8 @@ impl Driver {
                     return None;
                 }
                 trace.inspect(
-                    engine
-                        .configuration()
-                        .descriptor()
-                        .local(common_contract::mg_role(self.info.role)),
+                    engine,
+                    common_contract::mg_role(self.info.role),
                     false,
                     bytes,
                 )

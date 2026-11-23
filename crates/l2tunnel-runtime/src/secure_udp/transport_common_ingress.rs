@@ -5,6 +5,39 @@ use l2tunnel::{record_bank, record_engine as engine};
 use l2tunnel_pipeline::ack_coalescing as ack;
 
 impl Driver {
+    /// A send can move a MUX head after this turn has already tried the
+    /// retained native input. Reopen reads before the next readiness selection
+    /// when the issuing generation has actually made room.
+    pub(super) fn send_and_retry_native_ingress<R: raw_carrier::RawBacking>(
+        &mut self,
+        socket: &mut carrier::IoOwner<R>,
+        input: &[u8],
+        now: u64,
+        instant: Instant,
+        mut sample: impl FnMut() -> Instant,
+    ) -> io::Result<()> {
+        let before = if let Some(p) = self.common.as_deref().and_then(|r| r.pending_ingress) {
+            Some((
+                p,
+                self.common_state()?.engine(p.epoch)?.statistics().admitted,
+            ))
+        } else {
+            None
+        };
+        self.send_selected_io_sampled(socket, now, instant, &mut sample)?;
+        if let Some((p, prior)) = before
+            && self.terminal.is_none()
+            && self.common.as_deref().and_then(|r| r.pending_ingress) == Some(p)
+            && self.common_state()?.engine(p.epoch)?.statistics().admitted > prior
+        {
+            let at = clock(self.origin, sample())?;
+            if self.check_expiry(at)? {
+                self.retry_common_ingress(at, input)?;
+            }
+        }
+        Ok(())
+    }
+
     pub(super) fn service_common_protocol_stages(
         &mut self,
         mut now: u64,
@@ -60,13 +93,19 @@ impl Driver {
 
     /// One bounded pass per live generation per loop turn; never a second actor.
     pub(super) fn service_common_ingress(&mut self, now: u64, input: &mut [u8]) -> io::Result<()> {
-        if self.common.is_none() || self.config.ack_coalescing.is_none() {
+        let Some(runtime) = self.common.as_deref() else {
+            return Ok(());
+        };
+        // The plain path has no held ACKs but can retain one refused original.
+        if self.config.ack_coalescing.is_none() && runtime.pending_ingress.is_none() {
             return Ok(());
         }
         if !self.check_expiry(now)? {
             return Ok(());
         }
-        self.service_held_acks(now)?;
+        if self.config.ack_coalescing.is_some() {
+            self.service_held_acks(now)?;
+        }
         self.retry_common_ingress(now, input)?;
         Ok(())
     }
@@ -178,12 +217,16 @@ impl Driver {
         }
         runtime.pending_ingress = Some(common::PendingIngress {
             generation,
+            flow_byte_wait: None,
             epoch,
             bytes,
             received: before,
             deadline,
         });
         let now = sample()?;
+        if let Some(trace) = &mut runtime.reverse_trace {
+            trace.read(now, epoch.0, &output[..bytes]);
+        }
         if !self.check_expiry(now)? {
             return Ok(false);
         }
@@ -210,9 +253,16 @@ impl Driver {
         let bytes = input
             .get(..pending.bytes)
             .ok_or_else(|| protocol("retained native ingress length"))?;
+        let blocked = match pending.flow_byte_wait {
+            Some(wait) => wait.still_blocked(self.common_state()?.engine(pending.epoch)?),
+            None => false,
+        };
         let mut entry = self.common_state_mut()?.entry(pending.epoch)?;
         if entry.generation() != pending.generation {
             return Err(protocol("native ingress issuing generation replaced"));
+        }
+        if blocked {
+            return Ok(false);
         }
         match entry.ingest_borrowed_at(
             engine::Tick(pending.received),
@@ -249,24 +299,95 @@ impl Driver {
                 self.counters.native_read = self.counters.native_read.saturating_add(1);
                 Ok(true)
             }
-            Err(record_bank::Error::Engine(engine::Error::Ingress(
-                ack::Error::Capacity
-                | ack::Error::Pipeline(
-                    l2tunnel_pipeline::PipelineError::Budget(_)
-                    | l2tunnel_pipeline::PipelineError::Flow(l2tunnel_packet::FlowError::Capacity),
-                ),
-            ))) => {
-                if let Some(runtime) = self.common.as_deref_mut() {
-                    runtime.buffer_event(
-                        crate::buffer_metrics::Site::NativeIngress,
-                        crate::buffer_metrics::Reason::BufferCapacity,
-                        now,
-                        true,
-                    );
-                }
-                Ok(false)
+            Err(record_bank::Error::Engine(engine::Error::Ingress(cause))) => {
+                self.refuse_common_ingress(pending, bytes, now, cause)
             }
+            // Without ACK coalescing the plain Pipeline path reports the same
+            // finite admission refusals directly. They are backpressure on the
+            // retained original, never a protocol failure of the session.
+            Err(record_bank::Error::Engine(engine::Error::Pipeline(
+                cause @ (l2tunnel_pipeline::PipelineError::Budget(_)
+                | l2tunnel_pipeline::PipelineError::Flow(
+                    l2tunnel_packet::FlowError::Capacity,
+                )),
+            ))) => self.refuse_common_ingress(pending, bytes, now, ack::Error::Pipeline(cause)),
             Err(error) => Err(protocol(error)),
         }
+    }
+    /// Retain one original the plain (non-coalescing) path already read and the
+    /// Pipeline refused for a finite queue limit; any other refusal still fails.
+    pub(super) fn retain_refused_native(
+        &mut self,
+        error: record_bank::Error,
+        pending: common::PendingIngress,
+        bytes: &[u8],
+        now: u64,
+    ) -> io::Result<bool> {
+        use l2tunnel_pipeline::PipelineError;
+        let cause = match error {
+            record_bank::Error::Engine(engine::Error::Pipeline(
+                cause @ (PipelineError::Budget(_)
+                | PipelineError::Flow(l2tunnel_packet::FlowError::Capacity)),
+            )) => ack::Error::Pipeline(cause),
+            other => return Err(protocol(other)),
+        };
+        let runtime = self
+            .common
+            .as_deref_mut()
+            .ok_or_else(|| protocol("Common ingress owner missing"))?;
+        if runtime.pending_ingress.is_some() {
+            return Err(protocol("Common native read overwrote pending input"));
+        }
+        runtime.pending_ingress = Some(pending);
+        self.refuse_common_ingress(pending, bytes, now, cause)
+    }
+    /// Count one finite admission refusal and keep the original for retry.
+    fn refuse_common_ingress(
+        &mut self,
+        pending: common::PendingIngress,
+        bytes: &[u8],
+        now: u64,
+        cause: ack::Error,
+    ) -> io::Result<bool> {
+        use l2tunnel_pipeline::{Budget, PipelineError};
+        let flow_byte_wait =
+            if cause == ack::Error::Pipeline(PipelineError::Budget(Budget::FlowBytes)) {
+                self.common_state()?
+                    .engine(pending.epoch)?
+                    .flow_byte_wait(bytes)
+            } else {
+                None
+            };
+        let stats = &mut self.performance.counters;
+        let counter = match cause {
+            ack::Error::Capacity => &mut stats.native_ingress_ack_history_refusals,
+            ack::Error::Pipeline(PipelineError::Flow(l2tunnel_packet::FlowError::Capacity)) => {
+                &mut stats.native_ingress_flow_table_refusals
+            }
+            ack::Error::Pipeline(PipelineError::Budget(limit)) => match limit {
+                Budget::Bytes => &mut stats.native_ingress_shared_byte_refusals,
+                Budget::Packets => &mut stats.native_ingress_shared_packet_refusals,
+                Budget::FlowBytes => &mut stats.native_ingress_flow_byte_refusals,
+                Budget::FlowPackets => &mut stats.native_ingress_flow_packet_refusals,
+            },
+            _ => {
+                return Err(protocol(record_bank::Error::Engine(
+                    engine::Error::Ingress(cause),
+                )));
+            }
+        };
+        *counter = counter.saturating_add(1);
+        if let Some(runtime) = self.common.as_deref_mut() {
+            if let Some(pending) = &mut runtime.pending_ingress {
+                pending.flow_byte_wait = flow_byte_wait;
+            }
+            runtime.buffer_event(
+                crate::buffer_metrics::Site::NativeIngress,
+                crate::buffer_metrics::Reason::BufferCapacity,
+                now,
+                true,
+            );
+        }
+        Ok(false)
     }
 }
