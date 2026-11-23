@@ -17,6 +17,10 @@ import re
 import shutil
 import signal
 import stat
+import struct
+# Selected once by main() from --netem-seed / --loss-percent; defaults are the standard path.
+NETEM_SEED = 31248
+LOSS_PERCENT = 15
 import subprocess
 import sys
 import tempfile
@@ -27,12 +31,18 @@ try:
     from . import netns_lab as lab, proxy_native_smoke as bounded
     from . import secure_udp_native as credentials_helper
     from . import common_native_observe as observe
+    from . import common_native_single_flow as single
+    from . import common_python_reference as reference
+    from . import common_native_switch as switch_hook
     from .native_throughput import parse_tc_class, parse_tc_qdisc
 except ImportError:
     import netns_lab as lab
     import proxy_native_smoke as bounded
     import secure_udp_native as credentials_helper
     import common_native_observe as observe
+    import common_native_single_flow as single
+    import common_python_reference as reference
+    import common_native_switch as switch_hook
     from native_throughput import parse_tc_class, parse_tc_qdisc
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -86,7 +96,12 @@ def input_path(base, relative):
     return path
 
 
-def manifest_rows(path, selected):
+def native_layer(row):
+    cli = row['required_cli']['a']
+    return cli[cli.index('--layer') + 1]
+
+
+def manifest_rows(path, selected, *, require_python_comparable=False):
     document = read_json(path, MANIFEST_BYTES)
     require(document.get('version') == 1 and isinstance(document.get('rows'), list)
             and 0 < len(document['rows']) <= 256, 'bounded v1 matrix rows required')
@@ -106,6 +121,7 @@ def manifest_rows(path, selected):
             require(plan_value.get('backend') == 'common_records_v2' and plan_value.get('version') == 1,
                     'current complete Common plan required')
             require(row.get('expected_descriptor_hex') in plan_value.get('catalog', []), 'expected descriptor absent from supplied catalog')
+            reference.validate_row(row, require_comparable=require_python_comparable)
             for side in ('a', 'b'):
                 args = row['required_cli'][side]
                 require(isinstance(args, list) and len(args) % 2 == 0 and 0 < len(args) <= 32
@@ -113,8 +129,14 @@ def manifest_rows(path, selected):
                 keys = args[::2]
                 require(len(keys) == len(set(keys)) and set(keys) <= FIXED_CLI, 'unknown or repeated exporter CLI option')
                 options = dict(zip(keys, args[1::2]))
-                expected = {'--record-profile': 'common', '--duplex': 'full', '--layer': 'tun', '--noise-profile': 'ik'}
-                require(all(options.get(key) == value for key, value in expected.items()), 'row differs from current Full TUN Common selection')
+                layer = options.get('--layer')
+                require(layer in ('tun', 'tap'), 'unknown native CLI layer')
+                require(layer == row.get('layer', layer) and layer == native_layer(row),
+                        'native layer differs between manifest and endpoints')
+                expected = {'--record-profile': 'common', '--duplex': 'full', '--noise-profile': 'ik',
+                            '--max-packet': '1514' if layer == 'tap' else '1500', '--max-path-mtu': '1500'}
+                require(all(options.get(key) == value for key, value in expected.items()),
+                        'row differs from Full Common selection or native packet/MTU geometry')
                 require(options.get('--carrier') == {'udp': 'quic-like', 'raw': 'raw-packet', 'tls': 'tcp', 'quic': 'quic'}[row['carrier']], 'carrier selector mismatch')
             policy = row.get('carrier_policy')
             if row['carrier'] == 'udp':
@@ -139,6 +161,7 @@ def manifest_rows(path, selected):
                     require(int(marks[0], 0) == int(marks[1], 0), 'raw endpoint socket marks must match isolation policy')
         else:
             require(type(row.get('reason')) is str and row['reason'], 'refused plan requires explicit reason')
+            require(not require_python_comparable, 'refused plan cannot establish Python comparability')
         rows.append(row)
     require(not selected or selected <= seen, 'unknown requested row IDs')
     require(rows, 'no selected rows')
@@ -193,11 +216,15 @@ def exclusive_lab(lane=None):
 
 class Case:
     def __init__(self, row, spec, output, *, native_tun_txqueuelen=None, native_forward_tun_maxrate_mbit=None):
-        self.row, self.spec, self.output = row, spec, output
+        # Credential setup has no endpoint, interface or traffic manifest.
+        layer = None if row is None else native_layer(row)
+        self.row = {'id': 'credentials'} if row is None else row
+        self.spec, self.output = spec, output
         self.deadline = time.monotonic() + BOUNDS['case_seconds']
         self.children, self.commands = [], []
         self.command_index = 0
-        self.value = {'version': 1, 'id': row['id'], 'row': row, 'status': 'running', 'stage': 'preflight',
+        self.value = {'version': 1, 'id': self.row['id'], 'row': self.row, 'native_layer': layer,
+                      'status': 'running', 'stage': 'preflight',
                       'bounds': BOUNDS, 'phases': [], 'started_wall_ns': time.time_ns(), 'commands': self.commands,
                       'requested_native_tun_txqueuelen': native_tun_txqueuelen,
                       'requested_native_forward_tun_maxrate_mbit': native_forward_tun_maxrate_mbit}
@@ -334,7 +361,7 @@ def topology(case, state_dir):
             case.command(role, 'ip', 'link', 'set', interface, 'down')
         case.command('host_' + side, 'ip', 'address', 'flush', 'dev', 'eth0')
         case.command('host_' + side, 'ip', 'link', 'set', 'eth0', 'down')
-        case.command(role, 'ip', 'tuntap', 'add', 'dev', 'tun0', 'mode', 'tun')
+        case.command(role, 'ip', 'tuntap', 'add', 'dev', 'tun0', 'mode', case.value['native_layer'])
         case.command(role, 'ip', 'address', 'add', NATIVE[side] + '/24', 'dev', 'tun0')
         case.command(role, 'ip', 'link', 'set', 'tun0', 'mtu', '1500', *options, 'up')
     maxrate = case.value.get('requested_native_forward_tun_maxrate_mbit')
@@ -405,7 +432,10 @@ def native_tun_snapshot(case, role):
         qdiscs.append(row)
     require(isinstance(qdiscs, list) and qdiscs and all(isinstance(q, dict) and q.get('kind')
             and type(q.get('drops')) is int and q['drops'] >= 0 for q in qdiscs), 'missing native tun0 qdisc counters')
-    return {'interface': 'tun0', 'requested_txqueuelen': case.value['requested_native_tun_txqueuelen'],
+    if case.value['native_layer'] == 'tap':
+        require(link.get('link_type') == 'ether', 'owned TAP must report Ethernet link type')
+    return {'interface': 'tun0', 'native_layer': case.value['native_layer'], 'kernel_link_type': link.get('link_type'),
+            'requested_txqueuelen': case.value['requested_native_tun_txqueuelen'],
             'effective_txqueuelen': link['txqlen'], 'tx': tx, 'qdisc': qdiscs,
             'requested_fq_maxrate_mbit': case.value.get('requested_native_forward_tun_maxrate_mbit') if role == 'endpoint_a' else None,
             'effective_root_fq': root_fq,
@@ -419,9 +449,10 @@ def qdisc(case):
         classes, class_format = parse_tc_class(case.command(role, 'tc', '-s', '-j', 'class', 'show', 'dev', 'wan0'), 100 if side == 'a' else 10)
         qdiscs = parse_tc_qdisc(case.command(role, 'tc', '-s', '-d', '-j', 'qdisc', 'show', 'dev', 'wan0'))
         text = case.command(role, 'tc', '-d', 'qdisc', 'show', 'dev', 'wan0')
+        loss = re.search(r'\bloss (\d+(?:\.\d+)?)%', text)
         require(re.search(r'\bdelay 35(?:\.0+)?ms\b', text) is not None
-                and re.search(r'\bloss 15(?:\.0+)?%', text) is not None,
-                'effective owned netem delay/loss differs from35ms/15percent')
+                and (float(loss.group(1)) if loss else 0.0) == LOSS_PERCENT,
+                f'effective owned netem delay/loss differs from35ms/{LOSS_PERCENT}percent')
         # These counters belong only to the owned endpoint namespace. Record
         # before/after the workload; never infer a blocked interval from occupancy.
         observed_at = time.time_ns()
@@ -511,14 +542,15 @@ def readiness(case, binary, secrets, daemons):
         time.sleep(.1)
 
 
-def compare_probes(a, b, phase, *, paced=False):
+def compare_probes(a, b, phase, *, paced=False, single_flow=False, flow_count=None, credit=single.CREDIT):
     require(a.get('status') == b.get('status') == 'passed', 'TCP probe did not complete within original bounds')
-    require(a['clock'] == b['clock'] and len(a['flows']) == len(b['flows']) == 16, 'shared clock or flow count differs')
+    flows = flow_count or (1 if single_flow else 16)
+    require(a['clock'] == b['clock'] and len(a['flows']) == len(b['flows']) == flows, 'shared clock or flow count differs')
     for endpoint in (a, b):
-        require([flow.get('flow_id') for flow in endpoint['flows']] == list(range(16)), 'explicit complete flow IDs missing or out of order')
+        require([flow.get('flow_id') for flow in endpoint['flows']] == list(range(flows)), 'explicit complete flow IDs missing or out of order')
         identity = endpoint.get('flow_identity') or {}
         require(identity.get('format') == 'u32be-id-echo-v1'
-                and [item.get('flow_id') for item in identity.get('connections', [])] == list(range(16)),
+                and [item.get('flow_id') for item in identity.get('connections', [])] == list(range(flows)),
                 'actual premeasurement flow identity exchange missing')
     result = {}
     for direction, sender, receiver in [('a_to_b', a, b), ('b_to_a', b, a)]:
@@ -542,7 +574,90 @@ def compare_probes(a, b, phase, *, paced=False):
                 'unsubmitted_at_offer_cutoff': submitted['scheduled_records'] - expected,
                 'first_write_to_complete_read': delivered['first_write_to_complete_read'],
                 'scheduled_offer_to_complete_read': delivered['scheduled_offer_to_complete_read']}
+            if flow_count:
+                rows = []
+                for i in range(flows):
+                    server = receiver['flow_identity']['connections'][i]
+                    client = sender['flow_identity']['connections'][i]
+                    require(client['local'] == server['peer'] and client['peer'] == server['local'],
+                            'endpoint TCP socket tuple mismatch')
+                    share = credit // flows
+                    for endpoint, connection in ((sender, client), (receiver, server)):
+                        policy = endpoint['flow_credit'][i]
+                        require(connection['tcp_congestion'] == 'cubic'
+                                and connection['send_buffer_bytes'] == connection['receive_buffer_bytes'] == 2 * single.SOCKET_BUFFER
+                                and endpoint['paced_records']['aggregate_offered_mbit_s'] == single.RATE / 1e6
+                                and policy['outstanding_payload_cap'] == share
+                                and policy['max_outstanding_upper_bound'] <= share,
+                                'per-flow socket, pacing or credit policy mismatch')
+                    timing = delivered['per_flow'][i]
+                    source = submitted['per_flow'][i]
+                    received = receiver['flows'][i]
+                    require(timing['flow_id'] == i == source['flow_id']
+                            and timing['fully_read_records'] == source['fully_written_records']
+                            and timing['fully_read_records'] * 512 == received['received']
+                            and timing['partial_record_bytes'] == 0, 'per-flow delivery validation failed')
+                    edges = sender['flow_credit'][i]['steady_tcp_info_edges']
+                    targets = [sender['clock'][key] for key in ('measure_start_ns', 'end_ns')]
+                    require(len(edges) == 2 and [edge['target_ns'] for edge in edges] == targets
+                            and all(e['target_ns'] <= e['before_ns'] <= e['after_ns'] for e in edges)
+                            and edges[0]['after_ns'] < edges[1]['target_ns']
+                            and edges[0]['total_retrans'] <= edges[1]['total_retrans'],
+                            'per-flow TCP_INFO sample edges invalid')
+                    rows.append({**timing, 'four_tuple': {'sender': client['local'], 'receiver': client['peer']},
+                                 'measured_bytes': received['measured'], 'goodput_mbit_s': received['measured'] * 8 / 10_000_000,
+                                 'full_hash_verified': True,
+                                 'steady_retransmitted_segments': edges[1]['total_retrans'] - edges[0]['total_retrans'],
+                                 'retrans_read_lag_ms': [(e['after_ns'] - e['target_ns']) / 1e6 for e in edges]})
+                require(len({tuple(row['four_tuple']['sender']) for row in rows}) == flows, 'duplicate TCP tuple')
+                result[direction]['per_flow'] = rows
+            if single_flow:
+                for endpoint in (sender, receiver):
+                    connection, = endpoint['flow_identity']['connections']
+                    require(connection['tcp_congestion'] == 'cubic' and
+                            connection['send_buffer_bytes'] == connection['receive_buffer_bytes'] == 2 * single.SOCKET_BUFFER,
+                            'single-flow socket parameters differ')
+                    policy = endpoint['single_flow']
+                    require(policy['outstanding_payload_cap'] == credit and
+                            0 <= policy['max_outstanding_upper_bound'] <= credit and
+                            endpoint['max_bytes_per_flow_direction'] == single.TRANSFER_CAP and
+                            endpoint['paced_records']['aggregate_offered_mbit_s'] == single.RATE / 1e6,
+                            'single-flow workload or application credit differs')
+                edges = sender['single_flow']['steady_tcp_info_edges']
+                targets = [sender['clock'][key] for key in ('measure_start_ns', 'end_ns')]
+                require(len(edges) == 2 and [edge['target_ns'] for edge in edges] == targets
+                        and all(e['target_ns'] <= e['before_ns'] <= e['after_ns'] for e in edges)
+                        and edges[0]['after_ns'] < edges[1]['target_ns']
+                        and edges[0]['total_retrans'] <= edges[1]['total_retrans'],
+                        'single-flow steady counter edges invalid')
+                result[direction]['steady_tcp_retrans'] = {
+                    'segments': edges[1]['total_retrans'] - edges[0]['total_retrans'],
+                    'reads': edges, 'read_lag_ms': [(e['after_ns'] - e['target_ns']) / 1e6 for e in edges]}
     return result
+
+
+def validate_switch_flow_delivery(case, flow_rows, output, window):
+    switch = case.value.get('mode_switch', {})
+    require(switch.get('status') == 'passed', 'switch did not settle and replay on both peers')
+    requested, settled = switch['requested_ns'], switch['settled_ns']
+    require(window['measure_start_ns'] <= requested <= settled < window['end_ns'],
+            'switch did not settle within the original measurement window')
+    pair = struct.Struct('!QQ')
+    for row in flow_rows:
+        path = output / f"flow-{row['flow_id']:02}-record-times.bin"
+        require(path.stat().st_size == row['fully_read_records'] * pair.size, 'receiver record trace count differs')
+        before, spanning, after, after_drain = 0, 0, 0, 0
+        for sent, completed in pair.iter_unpack(path.read_bytes()):
+            before += window['measure_start_ns'] <= completed < requested
+            spanning += sent < requested <= completed
+            after += settled <= sent <= completed < window['end_ns']
+            after_drain += settled <= sent and completed >= window['end_ns']
+        row['switch_delivery'] = {
+            'completed_before_request_in_steady': before, 'attempted_before_request_completed_during_or_after': spanning,
+            'attempted_and_completed_after_settlement_in_steady': after, 'attempted_after_settlement_completed_in_drain': after_drain,
+            'record_trace': path.name, 'record_trace_sha256': file_hash(path),
+        }
+        require(before > 0 and after > 0, 'flow lacks steady deliveries on both sides of committed switch')
 
 
 def qualify_phase(result):
@@ -612,6 +727,43 @@ def analyze_captures(case):
                                     if result['status'] != 'passed'), 'passed')
     if case.value['status'] == 'passed' and case.value['data_status'] != 'passed':
         case.value.update(status=case.value['data_status'], error='capture observation incomplete')
+
+
+def observe_mixed_drain(case, binary, secrets, cleanup_deadline):
+    """Two independent, unchanged source-ledger observations after application EOF."""
+    report = case.value['post_eof_mixed_sources'] = {
+        'scope': 'after application EOF and capture stop, before the local disconnect requests',
+        'interval_ms': 100, 'requested_cap_ms': 4000, 'outcome': 'observation_bound_exhausted', 'samples': []}
+    end = min(time.monotonic() + 4, cleanup_deadline - 2, case.deadline)
+    previous = None
+    try:
+        while time.monotonic() < end:
+            pair = {}
+            for side in ('a', 'b'):
+                endpoint = status(case, binary, secrets, side, end)
+                require_ready(endpoint, case.row)
+                common = endpoint['state']['common']
+                sources = common.get('striped_sources')
+                if sources is None:
+                    report['outcome'] = 'unavailable'
+                    return
+                pair[side] = {'at_ns': time.monotonic_ns(), 'epoch': common['epoch'], **sources}
+            report['samples'].append(pair)
+            a, b = pair['a'], pair['b']
+            complete = a['epoch'] == b['epoch'] and all(
+                tx['send_direction'] == rx['receive_direction'] and tx['send_stream'] == rx['receive_stream']
+                and tx['send_outstanding'] == tx['send_retained'] == rx['receive_uncommitted_in_groups']
+                == rx['receive_uncommitted_through_sealed'] == 0
+                and tx['send_confirmed'] == rx['receive_confirmed'] == rx['receive_sealed']
+                for tx, rx in ((a, b), (b, a)))
+            signature = (a['epoch'], a['send_confirmed'], b['send_confirmed']) if complete else None
+            if signature is not None and signature == previous:
+                report['outcome'] = 'two_stable_zero_samples'
+                return
+            previous = signature
+            time.sleep(min(.1, max(0, end - time.monotonic())))
+    except Exception as error:
+        report.update(outcome='observation_failed', error=str(error))
 
 
 def disconnect_sessions(case, binary, secrets, deadline):
@@ -686,6 +838,9 @@ def disconnect_sessions(case, binary, secrets, deadline):
 
 def phase(case, name, binary, secrets, daemons):
     paced = getattr(case, 'paced_c48', False)
+    single_flow = getattr(case, 'single_flow_4m', False)
+    flow_count = getattr(case, 'flow_count', None)
+    credit = getattr(case, 'outstanding_credit_bytes', single.CREDIT)
     output = case.output / name
     output.mkdir()
     result = {'phase': name, 'status': 'running', 'cpu': [], 'status_samples': [], 'captures': {}}
@@ -694,14 +849,25 @@ def phase(case, name, binary, secrets, daemons):
     captures, probes = {}, []
     sample_wall = None
     try:
+        if single_flow or flow_count:
+            result['netem_seeds'] = {}
+            for side, seed in (('a', NETEM_SEED), ('b', NETEM_SEED ^ 0x9e3779b97f4a7c15)):
+                role = 'endpoint_' + side
+                result['netem_seeds'][side] = json.loads(case.command(
+                    role, sys.executable, ROOT / 'tools/common_native_netem_seed.py', case.spec.namespaces[role], str(seed),
+                    '--loss-percent', str(LOSS_PERCENT)))
         result['qdisc_before'] = qdisc(case)
         check_forward_tun_fq(case, result['qdisc_before'])
-        for side in ('a', 'b'):
+        for side in (() if getattr(case, 'no_capture', False) else ('a', 'b')):
             for kind, interface, addresses in [('wan', 'wan0', list(WAN.values())), ('native', 'tun0', list(NATIVE.values()))]:
                 label = name + '-' + side + '-' + kind
                 path = output / (side + '-' + kind + '.pcap')
+                ip_pair = ['ip', 'and', 'host', addresses[0], 'and', 'host', addresses[1]]
+                tap = kind == 'native' and case.value['native_layer'] == 'tap'
+                datalink = ['-y', 'EN10MB'] if tap else []
+                capture_filter = ['arp', 'or', '(', *ip_pair, ')'] if tap else ip_pair
                 args = ['tcpdump', '-Z', 'root', '--immediate-mode', '-n', '-s', str(observe.SNAPLEN), '-B', '8192', '-i', interface,
-                        '-c', str(observe.CAPTURE_PACKETS), '-w', '-', 'ip', 'and', 'host', addresses[0], 'and', 'host', addresses[1]]
+                        *datalink, '-c', str(observe.CAPTURE_PACKETS), '-w', '-', *capture_filter]
                 child = case.spawn('endpoint_' + side, label, args, capture=path)
                 captures[side + '_' + kind] = (child, addresses)
                 case.wait_marker(child, 'listening on', deadline)
@@ -712,12 +878,20 @@ def phase(case, name, binary, secrets, daemons):
             child = case.spawn('endpoint_' + side, name + '-probe-' + side,
                 [sys.executable, str(probe), role, '--phase', name, '--address', address, '--port', '24451',
                  '--deadline-ns', str(deadline_ns), '--clock', str(clock), '--result', str(output / (side + '.json')),
-                 *(['--packed-c48-workload'] if paced else [])])
+                 *(['--flow-count', str(flow_count)] if flow_count else ['--single-flow-4m'] if single_flow else ['--packed-c48-workload'] if paced else []),
+                 *(['--outstanding-credit-bytes', str(credit)] if single_flow or flow_count else []),
+                 *(['--trace-records'] if getattr(case, 'switch_during_phase', False) else [])])
             probes.append(child)
             if role == 'listen':
                 case.wait_marker(child, 'Listening', deadline)
         for child in probes:
             case.wait_marker(child, 'Connected', deadline)
+        if flow_count:
+            result['outer_kernel_sockets_before_workload'] = {}
+            for side in ('a', 'b'):
+                raw = case.command('endpoint_' + side, 'ss', '-Hnatu', deadline=deadline)
+                result['outer_kernel_sockets_before_workload'][side] = [
+                    line for line in raw.splitlines() if WAN[side] + ':' in line or WAN['b' if side == 'a' else 'a'] + ':' in line]
         mono_before, wall, mono_after = time.monotonic_ns(), time.time_ns(), time.monotonic_ns()
         start = mono_after + 500_000_000
         window = {'start_ns': start, 'measure_start_ns': start + 2_000_000_000, 'end_ns': start + 12_000_000_000}
@@ -726,11 +900,15 @@ def phase(case, name, binary, secrets, daemons):
         sample_wall = (window['measure_start_ns'] + offset, window['end_ns'] + offset)
         atomic_json(clock, window)
         next_cpu, next_status = 0, time.monotonic() + 2
+        switch_requested = getattr(case, 'switch_during_phase', False)
         while any(child['process'].poll() is None for child in probes):
             case.check(deadline)
             now = time.monotonic()
             for child in daemons.values():
                 require(child['process'].poll() is None, 'Common daemon exited during native workload')
+            if switch_requested and time.monotonic_ns() >= window['measure_start_ns'] + 3_000_000_000:
+                switch_requested = False
+                switch_hook.switch_during_phase(case, binary, secrets, deadline)
             if now >= next_cpu:
                 result['cpu'].append(observe.cpu_snapshot([(child['label'], child['process']) for child in case.children]))
                 next_cpu = now + .5
@@ -748,7 +926,10 @@ def phase(case, name, binary, secrets, daemons):
                 raise OutcomeError(probe_result.get('status', 'tool_failure'), 'native TCP probe ' + side + ': ' + probe_result.get('error', 'incomplete'))
         for child in probes:
             require(child['process'].returncode == 0, 'native TCP probe exit disagrees with passing result')
-        result['throughput'] = compare_probes(probe_results['a'], probe_results['b'], name, paced=paced)
+        result['throughput'] = compare_probes(probe_results['a'], probe_results['b'], name, paced=paced, single_flow=single_flow,
+                                              flow_count=flow_count, credit=credit)
+        if getattr(case, 'switch_during_phase', False):
+            validate_switch_flow_delivery(case, result['throughput']['a_to_b']['per_flow'], output, window)
         if paced:
             result['after_application_eof'] = {}
             for side in ('a', 'b'):
@@ -821,23 +1002,47 @@ def failure_status(error):
 
 
 def run_case(row, ordinal, args, binary, inputs, secrets, state_dir):
-    spec = lab.LabSpec(args.lab_id + '-' + str(ordinal))
+    spec = lab.LabSpec(args.lab_id + '-' + str(ordinal), loss_percent=LOSS_PERCENT)
     output = args.output / row['id']
     output.mkdir()
     case = Case(row, spec, output, native_tun_txqueuelen=getattr(args, 'native_tun_txqueuelen', None),
                 native_forward_tun_maxrate_mbit=getattr(args, 'native_forward_tun_maxrate_mbit', None))
-    case.paced_c48 = getattr(args, 'packed_c48_workload', False)
+    case.single_flow_4m = getattr(args, 'single_flow_4m', False)
+    case.flow_count = getattr(args, 'flow_count', None)
+    case.outstanding_credit_bytes = getattr(args, 'outstanding_credit_bytes', single.CREDIT)
+    case.no_capture = getattr(args, 'no_capture', False)
+    case.switch_during_phase = getattr(args, 'switch_during_phase', False)
+    case.paced_c48 = getattr(args, 'packed_c48_workload', False) or case.single_flow_4m or bool(case.flow_count)
     case.value['selected_phases'] = args.phases
     created = False
     try:
         case.value['stage'] = 'offline_preflight'
+        binding = reference.validate_row(row)
+        case.value['python_reference'] = binding
         for side in ('a', 'b'):
-            case.command(None, *daemon_command(row, side, binary, secrets, inputs, inspection=True))
+            inspection = case.command(None, *daemon_command(row, side, binary, secrets, inputs, inspection=True))
+            if row.get('python_reference') is not None:
+                binding['inspection'][side] = reference.validate_inspection(row, side, inspection)
+        if row.get('python_reference') is not None:
+            binding['status'] = 'validated_algorithm_configuration_only'
+        case.save()
         case.value['stage'] = 'topology'
         topology(case, state_dir)
         created = True
         if row['carrier'] == 'raw':
             raw_rules(case)
+        observe_rst = getattr(args, 'raw_rst_observation', False) and row['carrier'] == 'raw'
+        if observe_rst:
+            case.value['rst_rule_counters_before_transfer'] = {
+                side: case.command('endpoint_' + side, 'iptables', '-w', '1', '-nvxL', 'OUTPUT', '--line-numbers')
+                for side in ('a', 'b')}
+            tcp_tuple = ('tcp and ((src host 192.0.2.2 and src port 24440 and dst host 192.0.2.6 '
+                         'and dst port 24441) or (src host 192.0.2.6 and src port 24441 and dst host '
+                         '192.0.2.2 and dst port 24440))')
+            capture = case.spawn('router', 'outer-tcp-headers',
+                ['tcpdump', '-Z', 'root', '--immediate-mode', '-n', '-s', '96', '-B', '16384', '-i', 'a0',
+                 '-c', '500000', '-w', '-', tcp_tuple], capture=output / 'outer-tcp-headers.pcap')
+            case.wait_marker(capture, 'listening on', case.deadline)
         case.value['stage'] = 'authenticated_startup'
         metrics = output / 'metrics'
         metrics.mkdir()
@@ -846,11 +1051,27 @@ def run_case(row, ordinal, args, binary, inputs, secrets, state_dir):
             daemons[side] = case.spawn('endpoint_' + side, 'daemon-' + side,
                 daemon_command(row, side, binary, secrets, inputs), metrics=metrics / "wire")
         readiness(case, binary, secrets, daemons)
+        case.value['both_forwarding_observed_wall_ns'] = time.time_ns()
+        if row['carrier'] in ('raw', 'udp'):
+            case.value['post_auth_socket_evidence'] = {}
+            for side in ('a', 'b'):
+                role = 'endpoint_' + side
+                case.value['post_auth_socket_evidence'][side] = {
+                    'raw_sockets': case.command(role, 'ss', '-Hawnp').splitlines(),
+                    'kernel_tcp_sockets': case.command(role, 'ss', '-Hantp').splitlines(),
+                    'raw_socket_table': case.command(role, 'cat', '/proc/net/raw').splitlines(),
+                    'udp_sockets': case.command(role, 'ss', '-Haunp').splitlines(),
+                }
+            case.save()
         case.value['stage'] = 'native_workload'
         for name in args.phases:
             if not phase(case, name, binary, secrets, daemons):
                 # A failed connection is not restarted to manufacture later phases.
                 break
+        if observe_rst:
+            case.value['rst_rule_counters_after_transfer'] = {
+                side: case.command('endpoint_' + side, 'iptables', '-w', '1', '-nvxL', 'OUTPUT', '--line-numbers')
+                for side in ('a', 'b')}
         present = {value['phase'] for value in case.value['phases']}
         for name in args.phases:
             if name not in present:
@@ -865,6 +1086,8 @@ def run_case(row, ordinal, args, binary, inputs, secrets, state_dir):
         # Disconnect drops the actual Runtime; dropping the CLI supervisor alone
         # cannot establish graceful report publication or peer drain.
         cleanup_deadline = time.monotonic() + BOUNDS['cleanup_seconds']
+        if case.single_flow_4m and case.row.get('algorithm') == 'striped' and case.value['status'] == 'passed':
+            observe_mixed_drain(case, binary, secrets, cleanup_deadline)
         disconnect_sessions(case, binary, secrets, cleanup_deadline)
         if (output / 'metrics').is_dir():
             publication_deadline = min(cleanup_deadline, time.monotonic() + 2)
@@ -933,18 +1156,45 @@ def main(argv=None):
     parser.add_argument('--parallel-lane', choices=('udp', 'raw', 'tls', 'quic'),
                         help='Explicit concurrent carrier lane; fixed eight-CPU affinity and distinct owned lab prefix required')
     parser.add_argument('--apply', action='store_true')
-    parser.add_argument('--packed-c48-workload', action='store_true',
+    parser.add_argument('--no-capture', action='store_true', help='Retain daemon, endpoint TCP and qdisc counters without tcpdump')
+    parser.add_argument('--switch-during-phase', action='store_true', help='Request authenticated API4 switch three seconds into the sample')
+    parser.add_argument('--netem-seed', type=int, default=31248,
+                        help='Endpoint A netem seed for paced/flow-count phases; B uses seed XOR 0x9e3779b97f4a7c15')
+    parser.add_argument('--loss-percent', type=int, default=15, help='Independent random loss per direction (0..100)')
+    parser.add_argument('--raw-rst-observation', action='store_true',
+                        help='Raw rows: record RST-rule counters around the transfer and capture outer TCP headers at the router')
+    workload = parser.add_mutually_exclusive_group()
+    workload.add_argument('--packed-c48-workload', action='store_true',
                         help='Offer 512-byte timestamped application records at aggregate 76 Mbit/s on 16 CUBIC flows')
+    workload.add_argument('--single-flow-4m', action='store_true',
+                          help='Offer 90 Mbit/s on one CUBIC socket with 4 MiB (or --outstanding-credit-bytes) outstanding application payload and fixed directional netem seeds')
+    workload.add_argument('--flow-count', type=int, choices=(1, 4, 16),
+                          help='Split 90 Mbit/s offer and 4 MiB (or --outstanding-credit-bytes) unconfirmed application credit equally across these CUBIC sockets')
+    parser.add_argument('--outstanding-credit-bytes', type=int, default=single.CREDIT,
+                        help='Total unconfirmed application payload credit for --single-flow-4m/--flow-count (default 4 MiB)')
+    parser.add_argument('--require-python-comparable', action='store_true',
+                        help='Reject unbound or non-equivalent Python comparisons before network I/O; current named diagnostic profiles retain explicit differences')
     args = parser.parse_args(argv)
+    global NETEM_SEED, LOSS_PERCENT
+    if not 0 < args.netem_seed < 2**64:
+        parser.error('--netem-seed must be within 1..2**64-1')
+    if not 0 <= args.loss_percent <= 100:
+        parser.error('--loss-percent must be within 0..100')
+    NETEM_SEED, LOSS_PERCENT = args.netem_seed, args.loss_percent
     if args.native_tun_txqueuelen is not None and not 1 <= args.native_tun_txqueuelen <= MAX_TUN_TXQUEUELEN:
         parser.error(f'--native-tun-txqueuelen must be within 1..{MAX_TUN_TXQUEUELEN} packets')
     if args.native_forward_tun_maxrate_mbit is not None and not 1 <= args.native_forward_tun_maxrate_mbit <= MAX_FORWARD_TUN_MBIT:
         parser.error(f'--native-forward-tun-maxrate-mbit must be within 1..{MAX_FORWARD_TUN_MBIT} Mbit/s')
     args.phases = list(dict.fromkeys(args.phase or PHASES))
-    require(not args.packed_c48_workload or args.phases == ['forward'], 'paced C48 probe requires --phase forward')
+    require(not (args.packed_c48_workload or args.single_flow_4m or args.flow_count) or args.phases == ['forward'], 'paced TCP probe requires --phase forward')
+    require(not args.switch_during_phase or args.flow_count, 'switch study requires explicit --flow-count')
+    credit_problem = single.credit_error(args.outstanding_credit_bytes, args.flow_count or 1)
+    if credit_problem:
+        parser.error(credit_problem)
     require(re.fullmatch('[a-z][a-z0-9-]{0,14}', args.lab_id), 'lab prefix must fit owned namespace names')
     args.manifest, args.binary, args.output = (path.absolute() for path in (args.manifest, args.binary, args.output))
-    document, rows = manifest_rows(args.manifest, set(args.case))
+    document, rows = manifest_rows(args.manifest, set(args.case),
+                                   require_python_comparable=args.require_python_comparable)
     affinity = sorted(os.sched_getaffinity(0))
     if args.parallel_lane is not None:
         require(all(row.get('carrier') == args.parallel_lane for row in rows), 'parallel lane must contain only its carrier')
@@ -961,13 +1211,31 @@ def main(argv=None):
             'requested_native_tun_txqueuelen': args.native_tun_txqueuelen,
             'requested_native_forward_tun_maxrate_mbit': args.native_forward_tun_maxrate_mbit,
             'binary': str(args.binary), 'rows': rows, 'bounds': BOUNDS, 'phases': args.phases,
+            'native_layers': {row['id']: native_layer(row) for row in rows if row['status'] == 'ready'},
             'flows_per_phase': 16, 'warmup_seconds': 2, 'sample_seconds': 10,
             'workload': 'paced 512-byte TCP application records, 76 Mbit/s aggregate' if args.packed_c48_workload else 'saturating native TCP',
-            'network': {'forward_mbit_s': 100, 'reverse_mbit_s': 10, 'one_way_delay_ms': 35, 'loss_percent_each_direction': 15},
-            'captures': 'each endpoint WAN and native, both directions, full packets; each surface remains separate',
+            'network': {'forward_mbit_s': 100, 'reverse_mbit_s': 10, 'one_way_delay_ms': 35, 'loss_percent_each_direction': LOSS_PERCENT},
+            'raw_rst_observation': args.raw_rst_observation,
+            'captures': 'each endpoint WAN and native, both directions, full packets; native TAP also captures ARP separately from IPv4 byte totals',
             'measurement': 'application recv goodput; captured IPv4 byte totals and packet-size distributions; no p99-overhead inference',
             'parallel_lane': args.parallel_lane, 'cpu_affinity': affinity,
+            'require_python_comparable': args.require_python_comparable,
+            'comparison_scope': 'Native component measurements; named algorithm bindings retain explicit differences and do not imply exact Python/native equivalence',
             'execution': 'one expensive case per explicit carrier lane; lanes share host memory, I/O and kernel; no automatic retries or cap relaxation; dry run creates no namespace'}
+    if args.single_flow_4m:
+        plan.update(flows_per_phase=1, workload='one CUBIC socket, 512-byte timestamped records at 90 Mbit/s',
+                    outstanding_application_credit_bytes=args.outstanding_credit_bytes, transfer_cap_bytes=single.TRANSFER_CAP,
+                    socket_buffer_before_syn_bytes=single.SOCKET_BUFFER,
+                    netem_seeds={'a': NETEM_SEED, 'b': NETEM_SEED ^ 0x9e3779b97f4a7c15})
+    if args.flow_count:
+        plan.update(flows_per_phase=args.flow_count, workload='512-byte timestamped records, 90 Mbit/s aggregate, equally divided over CUBIC connections',
+                    outstanding_application_credit_bytes=args.outstanding_credit_bytes,
+                    per_flow_credit_bytes=args.outstanding_credit_bytes // args.flow_count,
+                    switch_during_phase=args.switch_during_phase, transfer_cap_bytes_per_flow=single.TRANSFER_CAP,
+                    socket_buffer_before_syn_bytes=single.SOCKET_BUFFER,
+                    netem_seeds={'a': NETEM_SEED, 'b': NETEM_SEED ^ 0x9e3779b97f4a7c15})
+    if args.no_capture:
+        plan['captures'] = 'disabled; application and endpoint TCP/daemon counters retained, no packet capture'
     if not args.apply:
         print(json.dumps(plan, indent=2, sort_keys=True))
         return 0
@@ -996,6 +1264,8 @@ def main(argv=None):
             result['binary_sha256'] = file_hash(binary)
             result['runner_source_sha256'] = {str(path.relative_to(ROOT)): file_hash(path) for path in
                 [Path(__file__).resolve(), ROOT / 'tools/common_native_probe.py', ROOT / 'tools/common_native_c48.py', ROOT / 'tools/common_native_observe.py',
+                 ROOT / 'tools/common_native_single_flow.py', ROOT / 'tools/common_native_netem_seed.py',
+                 ROOT / 'tools/common_python_reference.py', ROOT / 'tools/common_python_references.json',
                  ROOT / 'tools/netns_lab.py', ROOT / 'tools/throughput_probe.py',
                  ROOT / 'tools/proxy_native_smoke.py', ROOT / 'tools/secure_udp_native.py', ROOT / 'tools/native_throughput.py']}
             result['binary_source_binding'] = 'binary hash observed; use the separate parent build receipt for its source revision'
@@ -1011,7 +1281,7 @@ def main(argv=None):
                     result['input_sha256'][relative] = file_hash(destination)
             # Reuse maintained crypto APIs only; no retired CLI or wire code runs.
             result['credentials'] = credentials_helper.credentials(binary, secrets, time.monotonic() + 30)
-            credential_case = Case({'id': 'credentials'}, lab.LabSpec(args.lab_id), args.output)
+            credential_case = Case(None, lab.LabSpec(args.lab_id), args.output)
             result['tls_credentials'] = tls_credentials(credential_case, secrets)
             state_dir = Path('/run/l2tunnel-common-native-matrix-state')
             for ordinal, row in enumerate(rows):

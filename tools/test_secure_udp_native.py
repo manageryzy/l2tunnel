@@ -314,6 +314,28 @@ class HarnessContracts(unittest.TestCase):
             if mutation == 'duplicate': server['flows'][0]['peer'] = server['flows'][1]['peer']
             with self.subTest(mutation=mutation), self.assertRaises(ValueError): h.compare_probes(client, server, 'forward16')
 
+    def test_probe_long_run_limits_are_options_with_original_defaults(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / 'clock'
+            start = time.monotonic_ns() + 1_000_000_000
+            path.write_text(json.dumps({'start_ns': start, 'warmup_ns': 1_000_000_000, 'measure_ns': 90_000_000_000}))
+            with self.assertRaises(ValueError): p.clock_file(path, start + 120_000_000_000)
+            self.assertEqual(p.clock_file(path, start + 120_000_000_000, 90_000_000_000)[2], start + 91_000_000_000)
+        self.assertEqual((p.MAX_SAMPLES, p.ORIGINAL_SECONDS, p.MAX_MEASURE_NS), (96, 60, 30_000_000_000))
+        p.validate_limits(512, 180, 90)
+        for bad in ((0, 60, 30), (p.LIMIT_SAMPLES + 1, 60, 30), (96, 0, 30), (96, 60, 60), (96, p.LIMIT_SECONDS + 1, 30)):
+            with self.subTest(bad=bad), self.assertRaises(ValueError): p.validate_limits(*bad)
+        with patch.object(p, 'tcp', return_value={'status': 'passed'}) as tcp, contextlib.redirect_stdout(io.StringIO()):
+            base = ['tcp', 'listen', '--address', '198.18.0.2', '--clock', '/unused', '--workload', 'forward16']
+            self.assertEqual(p.main(base), 0)
+            self.assertEqual(tcp.call_args.kwargs, {'max_samples': 96, 'deadline_seconds': 60, 'max_measure_seconds': 30})
+            self.assertEqual(p.main([*base, '--max-samples', '512', '--deadline-seconds', '180', '--max-measure-seconds', '90']), 0)
+            self.assertEqual(tcp.call_args.kwargs, {'max_samples': 512, 'deadline_seconds': 180, 'max_measure_seconds': 90})
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(p.main(['tcp', 'listen', '--address', '127.0.0.1', '--clock', '/unused', '--workload',
+                                     'forward16', '--max-samples', '0']), 1)
+        self.assertIn('sample bound', output.getvalue())
+
     def test_each_original_namespace_is_anchored_and_must_change_before_mutation(self):
         descriptors = {'user': 11, 'net': 12, 'mnt': 13}
         original = {name: {'device': 1, 'inode': value} for name, value in descriptors.items()}

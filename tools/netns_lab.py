@@ -30,10 +30,13 @@ NETNS_DIRECTORY = Path("/run/netns")
 @dataclass(frozen=True)
 class LabSpec:
     lab_id: str = "demo"
+    loss_percent: int = 15
 
     def __post_init__(self) -> None:
         if not re.fullmatch(r"[a-z][a-z0-9-]{0,19}", self.lab_id):
             raise ValueError("lab ID must match [a-z][a-z0-9-]{0,19}")
+        if type(self.loss_percent) is not int or not 0 <= self.loss_percent <= 100:
+            raise ValueError("loss percent must be an integer within 0..100")
 
     @property
     def namespaces(self) -> dict[str, str]:
@@ -192,7 +195,7 @@ def build_plan(spec: LabSpec) -> list[Step]:
             "35ms",
             "loss",
             "random",
-            "15%",
+            f"{spec.loss_percent}%",
         )
 
     add(
@@ -219,7 +222,7 @@ def plan_document(spec: LabSpec) -> dict:
             "b_to_a_rate_mbps": 10,
             "one_way_delay_ms": 35,
             "base_rtt_ms": 70,
-            "iid_loss_percent_per_direction": 15,
+            "iid_loss_percent_per_direction": spec.loss_percent,
             "netem_queue_packets": 1000,
         },
         "commands": [list(step.argv) for step in build_plan(spec)],

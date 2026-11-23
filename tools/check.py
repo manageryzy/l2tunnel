@@ -36,7 +36,7 @@ def main() -> None:
     print(f'Validated {len(modes)} mode entries and Python tool syntax.', flush=True)
     if sys.platform == 'linux':
         run(sys.executable, 'tools/check_simulator.py', '--check-dependencies')
-        run(sys.executable, '-m', 'unittest', 'tools.test_generic_cli_native', 'tools.test_common_carrier_cli_native', 'tools.test_common_native_matrix', 'tools.test_common_matrix_report', '-v')
+        run(sys.executable, '-m', 'unittest', 'tools.test_generic_cli_native', 'tools.test_common_carrier_cli_native', 'tools.test_common_native_matrix', 'tools.test_common_native_cell', 'tools.test_common_native_switch_plans', 'tools.test_common_native_outer_tcp', 'tools.test_common_native_campaign', 'tools.test_native_perf_profile', 'tools.test_kcp_native_reference', 'tools.test_common_python_reference', 'tools.test_common_matrix_report', '-v')
     run(sys.executable, 'tools/check_checklists.py')
     run(sys.executable, '-m', 'unittest', 'tools.test_record_check', 'tools.test_buffer_metrics_report', 'tools.test_buffer_metrics_raw_custody', 'tools.test_buffer_metrics_rolling', 'tools.test_buffer_metrics_pipeline', 'tools.test_buffer_metrics_reliable', 'tools.test_buffer_metrics_handoff', 'tools.test_buffer_metrics_rolling_ingress', '-v')
     run(sys.executable, 'tools/check_smoltcp_source.py')
@@ -70,7 +70,7 @@ def main() -> None:
         shutil.rmtree(directory)
     if sys.platform == 'linux':
         run(sys.executable, '-m', 'unittest', 'tools.test_secure_udp_native', 'tools.test_secure_udp_capture_observations', '-v')
-        run(sys.executable, '-m', 'unittest', 'tools.test_netns_lab', 'tools.test_native_smoke', 'tools.test_raw_native_smoke', 'tools.test_raw_packet_native_smoke', 'tools.test_rolling_native_smoke', 'tools.test_udp_burst_probe', 'tools.test_proxy_native_smoke', 'tools.test_proxy_measured_native_smoke', 'tools.test_openvpn_drain_native_smoke', 'tools.test_native_throughput', 'tools.test_check_simulator', 'tools.test_selftest', '-v')
+        run(sys.executable, '-m', 'unittest', 'tools.test_netns_lab', 'tools.test_native_smoke', 'tools.test_raw_native_smoke', 'tools.test_raw_packet_native_smoke', 'tools.test_rolling_native_smoke', 'tools.test_udp_burst_probe', 'tools.test_proxy_native_smoke', 'tools.test_proxy_measured_native_smoke', 'tools.test_openvpn_drain_native_smoke', 'tools.test_native_throughput', 'tools.test_native_throughput_analysis', 'tools.test_native_throughput_profiles', 'tools.test_check_simulator', 'tools.test_selftest', '-v')
     else:
         print('Linux namespace harness tests skipped on this host.', flush=True)
     if sys.platform == 'linux':

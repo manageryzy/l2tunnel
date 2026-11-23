@@ -93,6 +93,101 @@ already-failed state can still win and remains a failed shutdown. No retry or
 terminal-error rewriting is performed. Primary workload/setup failures are
 preserved through cleanup.
 
+## Campaign options and helpers
+
+These were previously edited into per-campaign copies under `work/`; they are now
+options of the maintained runner:
+
+- `--flow-count 1|4|16` offers 512-byte timestamped records at 90 Mbit/s aggregate,
+  divided equally over that many CUBIC connections, and records per-flow record
+  latency (p50/p95/p99) and steady retransmissions. Requires `--phase forward`.
+- `--no-capture` keeps daemon, endpoint TCP and qdisc counters without tcpdump.
+- `--switch-during-phase` requests an authenticated API4 switch three seconds into
+  the sample (`common_native_switch.py`) for a two-member catalog row built by
+  `common_native_switch_plans.py`.
+- `--netem-seed N` sets endpoint A's netem seed (B uses `N ^ 0x9e3779b97f4a7c15`)
+  for paced and flow-count phases. `--loss-percent P` sets the independent random
+  loss of each direction (default 15); the topology, seed readback and qdisc
+  check all use the selected value.
+- `--raw-rst-observation` (raw rows) records RST-rule counters before and after the
+  transfer and captures outer TCP headers at the router.
+- `--outstanding-credit-bytes N` (default 4 MiB) sets the total unconfirmed application
+  payload credit for `--single-flow-4m` and `--flow-count`; each flow's equal share must
+  admit one 512-byte record. The value is forwarded to `common_native_probe.py`
+  (`--outstanding-credit-bytes`), checked against each endpoint's reported cap, and
+  recorded in the plan as `outstanding_application_credit_bytes` and
+  `per_flow_credit_bytes`. Earlier 512 KiB runs used an edited copy of
+  `common_native_single_flow.py`; they are now `--outstanding-credit-bytes 524288`.
+
+`common_native_cell.py` runs one forward cell in fresh outer net/mount namespaces
+(`sudo -n unshare --net --mount --fork --propagation private ... --apply`) and
+refuses a non-pristine outer network. It forwards `--outstanding-credit-bytes`
+(default 4 MiB) and records it in `outer-isolation.json`. `common_native_report.py
+--campaign DIR` verifies every `DIR/runs/*/*/result.json` and writes per-cell and
+per-flow tables under `DIR/reports/`; the cell table includes each run's recorded
+credit.
+
+`common_native_switch_plans.py --c48 C48 --base BASE --output NEW` builds the two-member
+catalog switch manifest. `--carrier udp|tls|raw` (repeatable, default `udp` and `tls`,
+the original output) and `--pair c48|base` (repeatable, default both) select rows;
+`--base` is required only with the `base` pair. Raw rows, like TLS rows, require
+identical per-side `carrier_policy` files in both source rows and copy them under the
+switch row's name. A raw-only selection keeps the original
+`closeout-live-raw-mode-switch` kind; `--kind` overrides it. The previous raw-only
+generator is `--carrier raw --pair c48`.
+
+`common_native_outer_tcp.py CASE_DIR --output NEW.json` reads the
+`outer-tcp-headers.pcap` and `outer-tcp-headers.log` written by
+`--raw-rst-observation`. It validates the tcpdump counters (no kernel drops, below the
+500,000-packet bound, exact record count), the case receipt and phase clock, and
+counts packets, pure ACKs, ACKs with payload, SYN, FIN, RST and TCP payload bytes per
+direction for the intervals before bilateral forwarding, before the sample, during the
+steady sample and after it, plus the whole capture. Per direction it follows the
+32-bit sequence space: first, last and maximum raw sequence, last and maximum relative
+segment end (payload plus SYN/FIN) from the first sequence, the space remaining before
+the relative sequence reaches 2^32, the raw space from the first sequence to 2^32, raw
+wraps, backward steps, segments starting below the highest end, forward gaps (count,
+bytes, largest and up to 16 examples) and RST, RST+ACK and RST-with-payload counts.
+The receipt's RST-rule counters are copied. `--pcap FILE` without a case directory
+analyzes a capture alone (no intervals); `--a-endpoint`/`--b-endpoint` (default
+`192.0.2.2:24440`/`192.0.2.6:24441`), `--snaplen` (96), `--max-packets` (500000),
+`--log`, `--no-log` and `--router-interface` (label, default `a0`) generalize the
+original fixed values. Ethernet and raw-IPv4 pcaps with microsecond or nanosecond
+timestamps are accepted.
+
+`common_native_campaign.py --schedule S.json --campaign DIR --binary DAEMON` runs a
+predeclared schedule serially. Each entry (`label`, `row` or `carrier` with `--stem`,
+optional `manifest`, `flows`, `seed`/`seeds`, `loss`, `credit_bytes`, `switch`,
+`capture`, `raw_rst_observation`, `txqueuelen`, `forward_maxrate_mbit`, `lab_id`,
+`binary_sha256`, `profile` and `extra` cell flags) becomes one
+`sudo -n unshare --net --mount --fork --propagation private /usr/bin/python3 -B
+tools/common_native_cell.py ... --output DIR/runs/LABEL --apply` command. Without
+`--apply` (or with `--dry-run`) it prints the commands and each entry's state and creates
+nothing. `--apply` needs a new `--batch NAME`; it takes `DIR/serial.lock` with `flock`,
+writes `DIR/reports/NAME/inputs.json` (schedule, binary, tool, manifest, plan and policy
+hashes), one `NAME/LABEL.log` per cell and the `NAME/receipts.jsonl` ledger (`label`,
+`row`, `concurrency`, `elapsed`, `requested`, `status`, `phase`, `rc`, `error`,
+`goodput`, `output`, plus seed, loss, credit, manifest hash, `retry_of` and failed
+`assertions`), and appends `DIR/trials.jsonl`. Closed runs are skipped so a batch
+resumes; an existing unclosed run stops it. `--retry-predata` re-runs as
+`LABEL-retry1` only cells whose original attempt failed before any phase started.
+After each cell the receipts are checked against the entry (isolation closed, binary
+unchanged and matching `--binary-sha256`/`binary_sha256`, plan netem seeds, loss,
+total and per-flow credit, 16 MiB pre-SYN buffers, and each endpoint's seed, loss and
+`--expected-delay-ms` 35 readback). A missing receipt (exit 2) or failed check
+(exit 3, unless `--continue-on-failure`) stops the batch after it is recorded.
+`--profile`, `--only LABEL` and `--manifest` select entries; per-campaign
+`schedule.json` files of the former `run_lab.py` are read directly with `--stem` and
+`--manifest`.
+
+`secure_udp_native_probe.py tcp` takes `--max-samples` (default 96 TCP_INFO samples),
+`--deadline-seconds` (default 60, the whole probe including connect and drain) and
+`--max-measure-seconds` (default 30, the largest accepted shared measurement window).
+Long-run KCP studies used 512/180/90; results record the selected `probe_limits`.
+The paced KCP comparison options (token-bucket pacing, window/nocwnd, queued-cost
+credit, native queue, inner-route `rto_min`, 60 s windows) are documented in
+`kcp_native_reference.md`.
+
 ## Metric definitions
 
 - **Application goodput** is unique bytes returned by the receiving application
@@ -193,3 +288,55 @@ is its latest started attempt, never the fastest or most successful result.
 Independent sessions retain their own binary/input/receipt provenance. Cumulative
 runtime histograms remain per session and direction; they are not merged or
 attributed to a phase. Unmeasured total encapsulation overhead remains null.
+
+## Owned-process perf profiling
+
+`native_perf_profile.py --mode kernel|clean|impaired --lab LAB --output NEW` samples
+only the two receipt-owned daemon PIDs of an already running native lab; it never
+starts a workload. It waits (default 75 s) for `LAB/reference-clock.json`, reads
+the PIDs from `LAB/receipt.json`, requires each to execute `LAB/l2tunnel-native`
+outside PID 1's network namespace, and records only inside the measured window
+shrunk by 2 s at each edge (the remaining interval must be 2–17 s). Without
+`--apply` it prints the planned perf command with PID/TID placeholders and
+touches nothing.
+
+`kernel` records `cycles:k` per thread with frame-pointer kernel address chains
+(16M cap), stops perf with SIGINT at the window end (5 s finalize bound, then
+terminate/kill) and keeps before/after host and owned-process `/proc` snapshots.
+`clean` runs `perf record ... -- sleep REMAINING` (8M cap, 25 s wall-clock cap)
+with no extra observation. `impaired` also verifies the build receipt, a pinned
+`--expected-binary-sha256`, helper hashes, the receipt plan/policy/clock contract
+and fresh user/net/mount namespaces. It attaches per TID with context-switch
+records (64M cap, 128 MiB `RLIMIT_FSIZE`), samples state/wchan of the eight most
+CPU-active owned threads every 250 ms, and falls back from `cycles` to
+`cpu-clock` only when the hardware event exits as unsupported within 1 s.
+
+Every value above is an option with the original as default. Results land in
+`NEW/profile.json` beside the perf data and log. They are diagnostic observations
+with observer overhead, never uninstrumented throughput qualification;
+`impaired` reports `recorded_unvalidated` until the parsed records are checked
+separately.
+
+## Saved native_throughput analysis
+
+`native_throughput_analysis.py analyze CASE_DIR... --output NEW_DIR` audits finalized
+`native_throughput.py` case directories offline (payload bytes/hash/EOF, shared clock,
+TCP_INFO raw-field decode, WAN/tc deltas, outer `ss`, copied helper/binary/build
+provenance) and writes `cases.csv`, `windows.csv`, `tcp_timeseries.csv`,
+`wan_intervals.csv`, `wan_coverage.csv`, `tc_deltas.csv`, `outer_tcp_timeseries.csv`,
+`internal_relay_targets.csv`, `report.md/html` and `input_manifest.json`. `--synthetic`
+forces fixture-only classification. Plan options default to the original lab:
+`--forward-target-mbps 80`, `--forward-capacity-mbps 100`, `--reverse-capacity-mbps 10`,
+`--max-measurement-seconds 10`, `--outer-endpoints 192.0.2.2 192.0.2.6`,
+`--outer-port 18443`, `--flow-counts 1 2 4`. `plot --report DIR --output NEW_DIR`
+renders PNG/SVG goodput, inner-window and outer-TCP figures (matplotlib, imported only
+after input bounds pass).
+
+`native_throughput_profiles.py analyze CASE_DIR... --output NEW_DIR [--baseline-report DIR]`
+re-audits the same cases and parses `runtime_profile` schema 1/2 lines from
+`a-daemon.log`/`b-daemon.log` into profile, interval, stage-timing, high-water,
+process-CPU, delivery-value, BDP policy-witness and matched-baseline CSVs. The BDP
+witness bounds are `--staged-native-max-bytes 1600` and
+`--baseline-local-queue-packets 64`; the plan options above also apply. `plot` renders
+credit-wait/high-water and delivery byte/service-RTT figures. Neither tool runs
+sockets, processes or namespaces; every output directory must be new.

@@ -81,6 +81,19 @@ class PlanTests(unittest.TestCase):
                 self.assertEqual(command[-2], "netns")
                 self.assertIn(command[-1], lab.LabSpec().namespaces.values())
 
+    def test_loss_percent_selects_netem_loss_and_rejects_out_of_range(self) -> None:
+        for loss in (0, 15):
+            spec = lab.LabSpec("loss-test", loss_percent=loss)
+            netem = [c for c in (s.argv for s in lab.build_plan(spec)) if "netem" in c]
+            self.assertEqual(len(netem), 2)
+            self.assertTrue(all(c[-3:] == ("loss", "random", f"{loss}%") for c in netem))
+            self.assertEqual(
+                lab.plan_document(spec)["parameters"]["iid_loss_percent_per_direction"], loss
+            )
+        for invalid in (-1, 101, 1.5, True):
+            with self.assertRaises(ValueError):
+                lab.LabSpec("loss-test", loss_percent=invalid)
+
     def test_invalid_names_never_reach_execution(self) -> None:
         for value in ("../host", "x;id", "", "a" * 21, "UPPER", "x/y", "--all"):
             with self.subTest(value=value), self.assertRaises(ValueError):

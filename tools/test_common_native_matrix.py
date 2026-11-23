@@ -43,18 +43,91 @@ def ipv4(source, destination, count):
     return bytes(packet)
 
 
-def pcap(packets):
-    value = bytearray(b'\xd4\xc3\xb2\xa1' + struct.pack('<HHIIII', 2, 4, 0, 0, 2048, 101))
+def pcap(packets, link=101):
+    value = bytearray(b'\xd4\xc3\xb2\xa1' + struct.pack('<HHIIII', 2, 4, 0, 0, 2048, link))
     for second, packet in packets:
         value += struct.pack('<IIII', second, 0, len(packet), len(packet)) + packet
     return bytes(value)
 
 
 class MatrixTests(unittest.TestCase):
+    def test_credentials_preflight_has_no_native_layer_but_traffic_requires_cli(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            case = matrix.Case(None, matrix.lab.LabSpec('cred-test'), output)
+            saved = json.loads((output / 'result.json').read_text())
+            self.assertEqual(saved['id'], 'credentials')
+            self.assertIsNone(saved['native_layer'])
+            secrets = output / 'secrets'
+            secrets.mkdir()
+            (secrets / 'cert.der').write_bytes(b'fixture')
+            with patch.object(case, 'command') as command:
+                receipt = matrix.tls_credentials(case, secrets)
+            self.assertEqual(receipt['own_certificate_sha256'], matrix.file_hash(secrets / 'cert.der'))
+            self.assertTrue(all(call.args[:2] == (None, 'openssl') for call in command.call_args_list))
+            self.assertEqual(command.call_count, 3)
+            with self.assertRaises(KeyError):
+                matrix.Case({'id': 'incomplete-traffic'}, None, output)
+
+    def test_post_eof_mixed_observation_requires_matching_peer_commits_and_stability(self):
+        case = SimpleNamespace(value={}, row={}, deadline=time.monotonic()+2)
+        pairs = []
+        for reverse_confirmation in (6, 7, 7):
+            for send, receive, tx, rx in [('forward','reverse',5,reverse_confirmation), ('reverse','forward',7,5)]:
+                sources = dict(send_direction=send, receive_direction=receive, send_stream=1, receive_stream=1,
+                               send_outstanding=0, send_retained=0, receive_uncommitted_in_groups=0,
+                               receive_uncommitted_through_sealed=0, send_confirmed=tx, receive_confirmed=rx,
+                               receive_sealed=rx)
+                pairs.append({'state': {'common': {'epoch': 2, 'striped_sources': sources}}})
+        with patch.object(matrix, 'status', side_effect=pairs), patch.object(matrix, 'require_ready'), patch.object(matrix.time, 'sleep'):
+            matrix.observe_mixed_drain(case, None, None, case.deadline + 2)
+        report = case.value['post_eof_mixed_sources']
+        self.assertEqual(report['outcome'], 'two_stable_zero_samples')
+        self.assertEqual(len(report['samples']), 3)
+
+    def test_single_flow_memory_observations_distinguish_missing_from_zero(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'proc-entry'
+            self.assertIsNone(probe.single.tcp_memory_scope(path)['tcp_mem_pages'])
+            self.assertTrue(all(v is None for v in probe.single.tcp_memory_counters(path).values()))
+            path.write_text('2 4 8\n')
+            self.assertEqual(probe.single.tcp_memory_scope(path)['tcp_mem_pages'],
+                             {'low': 2, 'pressure': 4, 'high': 8})
+            path.write_text('TcpExt: RcvPruned Other TCPMemoryPressures\nTcpExt: 0 62 3\n')
+            counters = probe.single.tcp_memory_counters(path)
+            self.assertEqual(counters['RcvPruned'], 0)
+            self.assertEqual(counters['TCPMemoryPressures'], 3)
+            self.assertIsNone(counters['TCPMemoryPressuresChrono'])
+            self.assertIsNone(counters['TCPHystartDelayDetect'])
+            path.write_text('TcpExt: TCPHystartDelayCwnd TCPHystartTrainDetect TCPHystartTrainCwnd TCPHystartDelayDetect\n'
+                            'TcpExt: 0 1 40 0\n')
+            counters = probe.single.tcp_memory_counters(path)
+            self.assertEqual([counters['TCPHystart' + field] for field in
+                              ('TrainDetect', 'TrainCwnd', 'DelayDetect', 'DelayCwnd')], [1, 40, 0, 0])
+            path.write_text('TcpExt: TCPMemoryPressures\nIpExt: 7\n')
+            self.assertIsNone(probe.single.tcp_memory_counters(path)['TCPMemoryPressures'])
+            self.assertIsNone(probe.single.tcp_memory_scope(path)['tcp_mem_pages'])
+
+    def test_single_flow_credit_counts_accepted_bytes_and_preserves_partial_record(self):
+        module = probe.single
+        clock = {'measure_start_ns': 1, 'end_ns': 2}
+        with patch.object(module, 'outstanding', side_effect=[0, module.CREDIT - 256, module.CREDIT - 512]):
+            window = module.Window(None, clock)
+            window.accepted(module.CREDIT)
+            self.assertFalse(window.allows(512))
+            self.assertEqual(window.needed, 512)
+            self.assertTrue(window.allows(window.needed))
+            window.accepted(384)
+            self.assertTrue(window.allows(128))
+            window.accepted(128)
+        self.assertEqual(window.report()['max_outstanding_upper_bound'], module.CREDIT)
+        self.assertEqual(window.report()['credit_denials'], 1)
+        self.assertGreater(module.TRANSFER_CAP, module.RATE * 12 // 8)
+
     def test_fq_duplicate_auxiliary_statistics_preserve_kernel_drop_evidence(self):
         link = '[{"ifname":"tun0","txqlen":768,"stats64":{"tx":{"packets":17,"bytes":1024,"dropped":2,"errors":0}}}]'
         raw = '[{"kind":"fq","drops":3,"throttled":4,"throttled":18}]'
-        case = SimpleNamespace(value={'requested_native_tun_txqueuelen': 768},
+        case = SimpleNamespace(value={'native_layer': 'tun', 'requested_native_tun_txqueuelen': 768},
                                command=lambda _, tool, *args: link if tool == 'ip' else raw)
         actual = matrix.native_tun_snapshot(case, 'endpoint_a')
         self.assertEqual(actual['qdisc'], [{'kind': 'fq', 'drops': 3}])
@@ -65,15 +138,16 @@ class MatrixTests(unittest.TestCase):
     def test_owned_tun_txqueuelen_and_distinct_device_qdisc_drops(self):
         tx = {'bytes': 42000, 'packets': 31, 'errors': 0, 'dropped': 27}
         native_qdisc = [{'kind': 'fq', 'handle': '1:', 'root': True, 'drops': 0}]
-        for requested, effective in ((None, 500), (640, 640), (640, 500)):
-            with self.subTest(requested=requested, effective=effective), ExitStack() as stack:
+        for layer, requested, effective in (('tun', None, 500), ('tun', 640, 640), ('tap', 640, 640), ('tun', 640, 500)):
+            with self.subTest(layer=layer, requested=requested, effective=effective), ExitStack() as stack:
                 commands = []
                 maxrate = 82 if requested is not None else None
 
                 def command(role, *argv):
                     commands.append((role, argv))
                     if argv == ('ip', '-j', '-s', 'link', 'show', 'dev', 'tun0'):
-                        return json.dumps([{'ifname': 'tun0', 'txqlen': effective, 'stats64': {'tx': tx}}])
+                        return json.dumps([{'ifname': 'tun0', 'link_type': 'ether' if layer == 'tap' else 'none',
+                                            'txqlen': effective, 'stats64': {'tx': tx}}])
                     if argv == ('tc', '-s', '-d', '-j', 'qdisc', 'show', 'dev', 'tun0'):
                         if maxrate is not None and role == 'endpoint_a':
                             return json.dumps([dict(native_qdisc[0], options={'maxrate': 10250000, 'limit': 10240, 'flow_limit': 1024})])
@@ -83,7 +157,7 @@ class MatrixTests(unittest.TestCase):
                     return ''
 
                 case = SimpleNamespace(spec=matrix.lab.LabSpec('tun-test'), deadline=0, command=command,
-                                       value={'requested_native_tun_txqueuelen': requested,
+                                       value={'native_layer': layer, 'requested_native_tun_txqueuelen': requested,
                                               'requested_native_forward_tun_maxrate_mbit': maxrate}, save=lambda: None)
                 for target, name, value in ((matrix.bounded, 'bounded_lab', None), (matrix.bounded, 'offloads', {}),
                                              (matrix, 'read_json', {}), (matrix, 'parse_tc_class', ([], 'test')),
@@ -101,6 +175,8 @@ class MatrixTests(unittest.TestCase):
                     'dev', 'tun0', 'root', 'fq', 'limit', '10240', 'flow_limit', '1024', 'maxrate', '82mbit'))])
                 for side, report in case.value['qdisc_before'].items():
                     snap = report['native_tun']
+                    self.assertEqual(snap['native_layer'], layer)
+                    self.assertEqual(snap['kernel_link_type'], 'ether' if layer == 'tap' else 'none')
                     self.assertEqual((snap['requested_txqueuelen'], snap['effective_txqueuelen']), (requested, effective))
                     self.assertEqual((snap['tx'], snap['qdisc']), (tx, native_qdisc))
                     shaped = side == 'a' and maxrate is not None
@@ -113,6 +189,10 @@ class MatrixTests(unittest.TestCase):
                         with patch.dict(fq, {key: fq[key] - 1}), self.assertRaisesRegex(ValueError, 'differ from request'):
                             matrix.check_forward_tun_fq(case, case.value['qdisc_before'])
                 for side in ('a', 'b'):
+                    self.assertIn(('endpoint_' + side, ('ip', 'tuntap', 'add', 'dev', 'tun0', 'mode', layer)), commands)
+                    self.assertIn(('endpoint_' + side, ('ip', 'link', 'set', 'br-lan', 'down')), commands)
+                    self.assertIn(('endpoint_' + side, ('ip', 'address', 'add', matrix.NATIVE[side] + '/24',
+                                                        'dev', 'tun0')), commands)
                     if requested is not None:
                         self.assertIn(('endpoint_' + side, ('ip', 'link', 'set', 'tun0', 'mtu', '1500',
                                                             'txqueuelen', str(requested), 'up')), commands)
@@ -390,6 +470,134 @@ class MatrixTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 matrix.input_path(root, '../other.json')
 
+    def test_tap_manifest_binds_both_ends_layer_and_ethernet_extent(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            value = row()
+            value['layer'] = 'tap'
+            for options in value['required_cli'].values():
+                options[options.index('--layer') + 1] = 'tap'
+                options[options.index('--max-packet') + 1] = '1514'
+            (root / 'plan.json').write_text(json.dumps({'version': 1, 'backend': 'common_records_v2',
+                                                        'catalog': [value['expected_descriptor_hex']]}))
+            manifest = root / 'manifest.json'
+            def load():
+                manifest.write_text(json.dumps({'version': 1, 'rows': [value]}))
+                return matrix.manifest_rows(manifest, set())[1][0]
+            self.assertEqual(matrix.native_layer(load()), 'tap')
+            with patch.dict(value, layer='tun'), self.assertRaisesRegex(ValueError, 'native layer'):
+                load()
+            for flag, bad in (('--layer', 'tun'), ('--layer', 'raw'), ('--max-packet', '1500'), ('--max-path-mtu', '1514')):
+                options = value['required_cli']['b']
+                at = options.index(flag) + 1
+                old, options[at] = options[at], bad
+                with self.subTest(flag=flag, bad=bad), self.assertRaises(ValueError):
+                    load()
+                options[at] = old
+
+    def test_tap_pcap_counts_ipv4_extent_and_keeps_arp_outside_ip_totals(self):
+        addresses = list(matrix.NATIVE.values())
+        mac = bytes.fromhex('020000000002020000000001')
+        arp = mac + b'\x08\x06' + bytes(46)
+        frame = mac + b'\x08\x00' + ipv4(*addresses, 1500)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'tap.pcap'
+            path.write_bytes(pcap([(1, arp), (2, frame)], link=1))
+            result = observe.capture_summary(path, addresses)
+        self.assertEqual((result['captured_packets'], result['non_ipv4_packets']), (2, 1))
+        self.assertEqual(result['whole_capture']['a_to_b']['ip_bytes'], 1500)
+
+    def test_dry_run_records_selected_seed_loss_and_raw_rst_observation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            value = row()
+            (root / 'plan.json').write_text(json.dumps({'version': 1, 'backend': 'common_records_v2', 'catalog': [value['expected_descriptor_hex']]}))
+            manifest = root / 'manifest.json'
+            manifest.write_text(json.dumps({'version': 1, 'rows': [value]}))
+            base = ['--manifest', str(manifest), '--binary', '/unused-binary', '--output', str(root / 'output'),
+                    '--phase', 'forward', '--flow-count', '4']
+            try:
+                output = io.StringIO()
+                with redirect_stdout(output):
+                    self.assertEqual(matrix.main([*base, '--netem-seed', '48761', '--loss-percent', '0',
+                                                  '--raw-rst-observation']), 0)
+                plan = json.loads(output.getvalue())
+                self.assertEqual(plan['network']['loss_percent_each_direction'], 0)
+                self.assertEqual(plan['netem_seeds'], {'a': 48761, 'b': 48761 ^ 0x9e3779b97f4a7c15})
+                self.assertTrue(plan['raw_rst_observation'])
+                self.assertFalse((root / 'output').exists())
+                output = io.StringIO()
+                with redirect_stdout(output):
+                    self.assertEqual(matrix.main(base), 0)
+                plan = json.loads(output.getvalue())
+                self.assertEqual(plan['network']['loss_percent_each_direction'], 15)
+                self.assertEqual(plan['netem_seeds']['a'], 31248)
+                self.assertFalse(plan['raw_rst_observation'])
+                for invalid in (['--loss-percent', '101'], ['--loss-percent', '-1'], ['--netem-seed', '0']):
+                    with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                        matrix.main([*base, *invalid])
+            finally:
+                matrix.NETEM_SEED, matrix.LOSS_PERCENT = 31248, 15
+
+    def test_dry_run_records_selected_outstanding_credit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            value = row()
+            (root / 'plan.json').write_text(json.dumps({'version': 1, 'backend': 'common_records_v2', 'catalog': [value['expected_descriptor_hex']]}))
+            manifest = root / 'manifest.json'
+            manifest.write_text(json.dumps({'version': 1, 'rows': [value]}))
+            base = ['--manifest', str(manifest), '--binary', '/unused-binary', '--output', str(root / 'output'),
+                    '--phase', 'forward']
+            try:
+                for extra, total, share in ((['--flow-count', '4'], 4 * 1024 * 1024, 1024 * 1024),
+                                            (['--flow-count', '1', '--outstanding-credit-bytes', '524288'], 524288, 524288),
+                                            (['--flow-count', '4', '--outstanding-credit-bytes', '524288'], 524288, 131072)):
+                    output = io.StringIO()
+                    with redirect_stdout(output):
+                        self.assertEqual(matrix.main([*base, *extra]), 0)
+                    plan = json.loads(output.getvalue())
+                    self.assertEqual((plan['outstanding_application_credit_bytes'], plan['per_flow_credit_bytes']), (total, share))
+                output = io.StringIO()
+                with redirect_stdout(output):
+                    self.assertEqual(matrix.main([*base, '--single-flow-4m', '--outstanding-credit-bytes', '524288']), 0)
+                self.assertEqual(json.loads(output.getvalue())['outstanding_application_credit_bytes'], 524288)
+                for invalid in (['--flow-count', '16', '--outstanding-credit-bytes', '4096'],
+                                ['--flow-count', '1', '--outstanding-credit-bytes', '0'],
+                                ['--flow-count', '1', '--outstanding-credit-bytes', str(2**32)]):
+                    with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                        matrix.main([*base, *invalid])
+            finally:
+                matrix.NETEM_SEED, matrix.LOSS_PERCENT = 31248, 15
+
+    def test_compare_probes_checks_the_selected_per_flow_credit(self):
+        clock = {'start_ns': 0, 'measure_start_ns': 10, 'end_ns': 20}
+
+        def endpoint(cap, sending):
+            connection = {'flow_id': 0, 'local': ['198.18.0.1', 4000] if sending else ['198.18.0.2', 24451],
+                          'peer': ['198.18.0.2', 24451] if sending else ['198.18.0.1', 4000],
+                          'tcp_congestion': 'cubic', 'send_buffer_bytes': 2 * probe.single.SOCKET_BUFFER,
+                          'receive_buffer_bytes': 2 * probe.single.SOCKET_BUFFER}
+            edges = [{'target_ns': 10, 'before_ns': 10, 'after_ns': 11, 'total_retrans': 0},
+                     {'target_ns': 20, 'before_ns': 20, 'after_ns': 21, 'total_retrans': 2}]
+            flow = {'flow_id': 0, 'sent': 512 if sending else 0, 'received': 0 if sending else 512,
+                    'sent_sha256': 'x', 'received_sha256': 'x', 'write_closed': True, 'eof': True,
+                    'measured': 0 if sending else 512}
+            timing = {'flow_id': 0, 'fully_read_records': 1, 'fully_written_records': 1, 'partial_record_bytes': 0}
+            return {'status': 'passed', 'clock': clock, 'flows': [flow],
+                    'flow_identity': {'format': 'u32be-id-echo-v1', 'connections': [connection]},
+                    'flow_credit': [{'outstanding_payload_cap': cap, 'max_outstanding_upper_bound': cap // 2,
+                                     'steady_tcp_info_edges': edges}],
+                    'paced_records': {'aggregate_offered_mbit_s': 90.0, 'fully_written_records': 1, 'started_records': 1,
+                                      'scheduled_records': 1, 'fully_read_records': 1, 'partial_receive_bytes': 0,
+                                      'first_write_to_complete_read': {}, 'scheduled_offer_to_complete_read': {},
+                                      'per_flow': [timing]}}
+
+        a, b = endpoint(524288, True), endpoint(524288, False)
+        result = matrix.compare_probes(a, b, 'forward', paced=True, flow_count=1, credit=524288)
+        self.assertEqual(result['a_to_b']['per_flow'][0]['steady_retransmitted_segments'], 2)
+        with self.assertRaisesRegex(Exception, 'credit policy mismatch'):
+            matrix.compare_probes(a, b, 'forward', paced=True, flow_count=1)
+
     def test_parallel_dry_run_requires_exact_carrier_prefix_and_disjoint_cpu_lane(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -470,6 +678,8 @@ class MatrixTests(unittest.TestCase):
     def test_capture_missing_or_dropped_counts_never_pass(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / 'capture.log'
+            path.write_text('1 packet captured\n1 packet received by filter\n0 packets dropped by kernel\n')
+            self.assertEqual(observe.capture_counters(path), {'captured': 1, 'filtered': 1, 'dropped': 0})
             path.write_text('3 packets captured\n3 packets received by filter\n1 packets dropped by kernel\n')
             with self.assertRaisesRegex(ValueError, 'drops'):
                 observe.capture_counters(path)

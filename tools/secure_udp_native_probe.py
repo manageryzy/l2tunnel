@@ -19,8 +19,14 @@ except ImportError:
     import throughput_probe as reference
 
 MAX_FLOWS = 16
+# Defaults for the bounded TCP probe. Long-run studies select larger values with
+# `tcp --max-samples/--deadline-seconds/--max-measure-seconds` (e.g. 512/180/90).
 MAX_SAMPLES = 96
 ORIGINAL_SECONDS = 60
+MAX_MEASURE_NS = 30_000_000_000
+# Hard ceilings for those options.
+LIMIT_SAMPLES = 4096
+LIMIT_SECONDS = 3600
 ICMP_SECONDS = 12
 ICMP_COUNT = 3
 ICMP_INTERVAL_NS = 200_000_000
@@ -208,7 +214,7 @@ def validate(flows: int, maximum: int, workload: str) -> None:
         raise ValueError('explicit forward-only or reverse-stress workload required')
 
 
-def clock_file(path: Path, deadline: int) -> tuple[int, int, int]:
+def clock_file(path: Path, deadline: int, max_measure_ns: int = MAX_MEASURE_NS) -> tuple[int, int, int]:
     while not path.exists():
         if time.monotonic_ns() >= deadline:
             raise TimeoutError('original probe deadline waiting for clock')
@@ -219,14 +225,14 @@ def clock_file(path: Path, deadline: int) -> tuple[int, int, int]:
     if set(value) != {'start_ns', 'warmup_ns', 'measure_ns'} or any(type(x) is not int for x in value.values()):
         raise ValueError('invalid common measurement clock')
     start, warmup, measure = (value[k] for k in ('start_ns', 'warmup_ns', 'measure_ns'))
-    if not (0 < warmup <= 10_000_000_000 and 0 < measure <= 30_000_000_000
+    if not (0 < warmup <= 10_000_000_000 and 0 < measure <= max_measure_ns
             and time.monotonic_ns() < start < start + warmup + measure < deadline):
         raise ValueError('late or infeasible common measurement clock')
     return start, start + warmup, start + warmup + measure
 
 
 def transfer(streams: list[socket.socket], start: int, measured: int, end: int,
-             deadline: int, maximum: int, send_enabled: bool) -> dict:
+             deadline: int, maximum: int, send_enabled: bool, max_samples: int = MAX_SAMPLES) -> dict:
     if not start < measured < end < deadline:
         raise ValueError('invalid original transfer window')
     state = []
@@ -249,7 +255,7 @@ def transfer(streams: list[socket.socket], start: int, measured: int, end: int,
             if now < start:
                 time.sleep(min((start - now) / 1e9, .01))
                 continue
-            if now >= next_sample and len(samples) < MAX_SAMPLES:
+            if now >= next_sample and len(samples) < max_samples:
                 usage = resource.getrusage(resource.RUSAGE_SELF)
                 samples.append({'at_ns': now, 'flows': [{**reference.tcp_info(stream),
                     'application_counters': {key: row[key] for key in ('sent', 'received', 'warmup', 'measured', 'postwindow')}}
@@ -309,9 +315,21 @@ def transfer(streams: list[socket.socket], start: int, measured: int, end: int,
         'tcp_info': samples, 'measurement': 'unique application bytes returned by recv during shared monotonic window'}
 
 
-def tcp(role: str, address: str, port: int, flows: int, maximum: int, clock: Path, workload: str) -> dict:
+def validate_limits(max_samples: int, deadline_seconds: int, max_measure_seconds: int) -> None:
+    if type(max_samples) is not int or not 1 <= max_samples <= LIMIT_SAMPLES:
+        raise ValueError(f'TCP_INFO sample bound must be 1..{LIMIT_SAMPLES}')
+    if type(deadline_seconds) is not int or not 1 <= deadline_seconds <= LIMIT_SECONDS:
+        raise ValueError(f'probe deadline must be 1..{LIMIT_SECONDS} seconds')
+    if type(max_measure_seconds) is not int or not 1 <= max_measure_seconds < deadline_seconds:
+        raise ValueError('measurement bound must be at least 1 second and below the probe deadline')
+
+
+def tcp(role: str, address: str, port: int, flows: int, maximum: int, clock: Path, workload: str, *,
+        max_samples: int = MAX_SAMPLES, deadline_seconds: int = ORIGINAL_SECONDS,
+        max_measure_seconds: int = MAX_MEASURE_NS // 1_000_000_000) -> dict:
     validate(flows, maximum, workload)
-    deadline = time.monotonic_ns() + ORIGINAL_SECONDS * 1_000_000_000
+    validate_limits(max_samples, deadline_seconds, max_measure_seconds)
+    deadline = time.monotonic_ns() + deadline_seconds * 1_000_000_000
     streams, listener = [], None
     try:
         if role == 'listen':
@@ -337,11 +355,13 @@ def tcp(role: str, address: str, port: int, flows: int, maximum: int, clock: Pat
             stream.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             stream.setsockopt(socket.IPPROTO_TCP, socket.TCP_CONGESTION, b'cubic')
         print('Connected', flush=True)
-        start, measured, end = clock_file(clock, deadline)
+        start, measured, end = clock_file(clock, deadline, max_measure_seconds * 1_000_000_000)
         result = transfer(streams, start, measured, end, deadline, maximum,
-                          role == 'connect' or workload == 'reverse-stress')
+                          role == 'connect' or workload == 'reverse-stress', max_samples)
         return {'role': role, 'workload': workload, 'max_bytes_per_direction_flow': maximum,
-                'original_deadline_ns': deadline, **result}
+                'original_deadline_ns': deadline, 'probe_limits': {
+                    'max_tcp_info_samples': max_samples, 'deadline_seconds': deadline_seconds,
+                    'max_measure_seconds': max_measure_seconds}, **result}
     finally:
         for stream in streams:
             stream.close()
@@ -424,6 +444,12 @@ def main(argv=None) -> int:
     bulk.add_argument('--max-bytes', type=int, default=256 * 1024 * 1024)
     bulk.add_argument('--clock', type=Path, required=True)
     bulk.add_argument('--workload', choices=('forward16', 'reverse-stress'), required=True)
+    bulk.add_argument('--max-samples', type=int, default=MAX_SAMPLES,
+                      help=f'TCP_INFO samples retained at 500 ms spacing (default {MAX_SAMPLES})')
+    bulk.add_argument('--deadline-seconds', type=int, default=ORIGINAL_SECONDS,
+                      help=f'Whole probe deadline including connect and drain (default {ORIGINAL_SECONDS})')
+    bulk.add_argument('--max-measure-seconds', type=int, default=MAX_MEASURE_NS // 1_000_000_000,
+                      help=f'Largest accepted shared measurement window (default {MAX_MEASURE_NS // 1_000_000_000})')
     for command in ('udp-echo', 'udp-probe'):
         child = sub.add_parser(command)
         child.add_argument('--address', required=True)
@@ -442,7 +468,9 @@ def main(argv=None) -> int:
             value = icmp_probe(args.source, args.address, args.deadline_ns,
                                progress=lambda row: print(json.dumps(row), flush=True))
         elif args.command == 'tcp':
-            value = tcp(args.role, args.address, args.port, args.flows, args.max_bytes, args.clock, args.workload)
+            value = tcp(args.role, args.address, args.port, args.flows, args.max_bytes, args.clock, args.workload,
+                        max_samples=args.max_samples, deadline_seconds=args.deadline_seconds,
+                        max_measure_seconds=args.max_measure_seconds)
         elif args.command == 'udp-echo':
             value = udp_echo(args.address, args.port, args.ready)
         else:
