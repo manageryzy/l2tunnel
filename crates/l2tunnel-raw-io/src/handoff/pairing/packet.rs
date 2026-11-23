@@ -15,6 +15,7 @@ mod diagnostics;
 mod send_timing;
 pub use send_timing::{SendTimingSnapshot, SendTimingTotal};
 mod gate;
+mod sequence;
 mod setup_proof;
 mod transaction;
 pub use diagnostics::{
@@ -280,7 +281,7 @@ pub enum Error {
     Capacity,
     /// The original absolute transition or fixed active liveness deadline expired.
     Expired,
-    /// A checked offset, nonce, byte count or no-wrap allowance is exhausted.
+    /// A checked `u64` offset, nonce or byte count is exhausted.
     Exhausted,
     /// The maintained TLS object failed the exclusive terminal predicate.
     TlsFreeze,

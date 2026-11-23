@@ -152,9 +152,6 @@ impl<I: PacketIo> Detached<I> {
             .checked_add(payload_len as u64)
             .ok_or(Error::Exhausted)?;
         let reserve = kind.reserved_cells() * (u64::from(policy.mtu) - 40);
-        if end >= u64::from(u32::MAX - f.local) {
-            return Err(Error::Exhausted);
-        }
         if end
             > f.peer_retired
                 .checked_add(f.peer_horizon)
@@ -183,14 +180,8 @@ impl<I: PacketIo> Detached<I> {
         if protected.bytes.len() != payload_len {
             return Err(Error::Proof);
         }
-        let sequence = f
-            .local
-            .checked_add(u32::try_from(f.allocated).map_err(|_| Error::Exhausted)?)
-            .ok_or(Error::Exhausted)?;
-        let ack = f
-            .peer
-            .checked_add(u32::try_from(f.retired).map_err(|_| Error::Exhausted)?)
-            .ok_or(Error::Exhausted)?;
+        let sequence = crate::handoff::pairing::packet::sequence::wire(f.local, f.allocated);
+        let ack = crate::handoff::pairing::packet::sequence::wire(f.peer, f.retired);
         let mut bytes = vec![0; payload_len + 40];
         packet::encode(
             config,
@@ -876,14 +867,6 @@ impl<I: PacketIo + Send + 'static> PacketSetup<'_, I> {
         let horizon = horizon(self.policy, wire_window, t.local_window_shift)?;
         let peer_scale = t.peer_window_shift.unwrap_or(0);
         let peer_horizon = horizon_bytes(self.policy, t.peer_window_bytes as u64, peer_scale)?;
-        let reserve = 8 * (u64::from(self.policy.mtu) - 40);
-        let required = reserve
-            .checked_add(u64::from(self.policy.minimum_transfer_bytes))
-            .and_then(|n| n.checked_add(32 * (u64::from(self.policy.mtu) - 40)))
-            .ok_or(Error::Exhausted)?;
-        if u64::from(u32::MAX - local) <= required || u64::from(u32::MAX - peer) <= required {
-            return Err(Error::Exhausted);
-        }
         let pair = self.paired.as_ref().ok_or(Error::Proof)?;
         let actual = pair.info.lanes[i].ok_or(Error::Proof)?;
         let proof = wire::LaneProof {

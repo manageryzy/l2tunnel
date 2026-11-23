@@ -772,3 +772,92 @@ async fn compact_final_raw_blocked_bootstrap_ciphertext_cannot_outlive_original_
     assert!(b.record().is_none());
     Ok(())
 }
+
+/// Move both directions' handoff bases so the next bytes sit `margin` below 2^32,
+/// as if the kernel had chosen initial sequence numbers near the top.
+fn rebase_near_wrap(a: &PacketCarrier<Link>, b: &PacketCarrier<Link>, margin: u32) -> R {
+    let a_io = &a.lanes[0].as_ref().ok_or("a lane")?.io.state;
+    let b_io = &b.lanes[0].as_ref().ok_or("b lane")?.io.state;
+    let mut a_state = lock(a_io)?;
+    let mut b_state = lock(b_io)?;
+    let a_fence = a_state.fence.as_mut().ok_or("a fence")?;
+    let b_fence = b_state.fence.as_mut().ok_or("b fence")?;
+    assert_eq!((a_fence.local, a_fence.peer), (b_fence.peer, b_fence.local));
+    let a_base = (u32::MAX - margin).wrapping_sub(a_fence.allocated as u32);
+    let b_base = (u32::MAX - margin).wrapping_sub(b_fence.allocated as u32);
+    a_fence.local = a_base;
+    b_fence.peer = a_base;
+    b_fence.local = b_base;
+    a_fence.peer = b_base;
+    Ok(())
+}
+
+async fn deliver(
+    sender: &mut PacketCarrier<Link>,
+    receiver: &mut PacketCarrier<Link>,
+    kind: FinalKind,
+) -> R<super::super::super::compact::FinalMetadata> {
+    let (metadata, _) = make_final(sender, PairLane::First, kind, None)?;
+    poll_fn(|cx| {
+        for carrier in [&mut *sender, &mut *receiver] {
+            if let Poll::Ready(Err(error)) = carrier.poll_progress(cx) {
+                return Poll::Ready(Err(error));
+            }
+        }
+        match receiver.final_input(PairLane::First) {
+            Ok(Some(_)) => Poll::Ready(Ok(())),
+            Ok(None) => Poll::Pending,
+            Err(error) => Poll::Ready(Err(error)),
+        }
+    })
+    .await?;
+    sender
+        .take_sent_record(PairLane::First)?
+        .ok_or("send receipt")?;
+    let input = receiver.final_input(PairLane::First)?.ok_or("input")?;
+    assert_eq!(input.metadata(), metadata);
+    drop(input);
+    // make_final signs every record, so the verifier's fact is authenticated;
+    // non-data kinds are refused without it.
+    receiver.commit_final_input(
+        PairLane::First,
+        metadata,
+        Some(FinalAcceptance::record((), true)),
+    )?;
+    Ok(metadata)
+}
+
+#[tokio::test]
+async fn compact_final_raw_records_cross_the_32_bit_sequence_wrap_in_both_directions() -> R {
+    let (mut a, mut b) = selected(false, Arc::new(Fault::default())).await?;
+    rebase_near_wrap(&a, &b, 300)?;
+    let (mut a_sent, mut b_sent) = (Vec::new(), Vec::new());
+    for _ in 0..20 {
+        a_sent.push(deliver(&mut a, &mut b, FinalKind::Data).await?);
+        b_sent.push(deliver(&mut b, &mut a, FinalKind::Feedback).await?);
+    }
+    let a_numbers: Vec<u32> = a_sent.iter().map(|m| m.sequence).collect();
+    let b_numbers: Vec<u32> = b_sent.iter().map(|m| m.sequence).collect();
+    for numbers in [&a_numbers, &b_numbers] {
+        assert_eq!(numbers[0], u32::MAX - 300, "started below the wrap");
+        assert!(
+            numbers.last().is_some_and(|n| *n < 2_000),
+            "wire numbers wrapped"
+        );
+        assert!(numbers.windows(2).all(|w| w[1] == w[0].wrapping_add(37)));
+    }
+    // Positions kept counting past the old 2^32 - base limit on both sides.
+    for (carrier, received) in [(&a, 20 * 37), (&b, 20 * 37)] {
+        let state = lock(&carrier.lanes[0].as_ref().ok_or("lane")?.io.state)?;
+        let fence = state.fence.as_ref().ok_or("fence")?;
+        assert!(u64::from(u32::MAX - fence.local) < fence.allocated);
+        assert!(fence.retired >= received);
+    }
+    // Old duplicates from before and after the wrap are refused by the receiver;
+    // the recovered position is behind its retired edge, never a new range.
+    let state = lock(&b.lanes[0].as_ref().ok_or("lane")?.io.state)?;
+    for old in [a_sent[0], a_sent[10], a_sent[19]] {
+        assert!(state.validate_final(old).is_err());
+    }
+    Ok(())
+}

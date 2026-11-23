@@ -99,6 +99,18 @@ an upstream getter. The driver adds checked complete TLS ciphertext/bridge count
 queued raw packets and its retained WouldBlock packet. Snapshot sequence fields
 are not cryptographic packet numbers. See the [concrete stack seam proposal](raw-stack-handoff.md).
 
+The authenticated Hello proofs compare each side's accepted peer window with
+the window the peer last advertised. The accepted view may be smaller than that
+advertisement, never larger (2026-11-22, owner decision). TCP never resends a
+pure window update. A native run at 15% loss lost one, leaving a view of
+1,048,416 against an advertised 1,048,576, and the earlier exact-match rule then
+failed setup permanently. A smaller view only shrinks this side's send horizon,
+because the horizon is derived from that view. A view above the advertisement
+means a shrunk window and is still refused. Identity, byte totals, sequence
+frontiers, options and scales still require exact equality.
+[Proof rule tests](../../crates/l2tunnel-raw-io/src/handoff/pairing/phase_wire.rs),
+[actual paired setup with a stale view](../../crates/l2tunnel-raw-io/src/handoff/pairing/packet/transaction_tests.rs).
+
 ## Proposed ownership API
 
 Keep existing `TcpEngine`, `bridge`, `open`, `open_marked` and `Driver::run`
@@ -276,17 +288,31 @@ closing, occupies its own sequence unit. No different packet may reuse a byte
 range. The only identical-range copies are the finite cached transition/close
 controls described below; those retain exact ciphertext and nonce.
 
-The first qualification profile stops **before the first wire sequence wrap**.
-After snapshot, negotiate the smaller remaining per-direction budget, reserving
-space for all bounded transition/drain/close copies. Reject activation if that
-budget cannot hold transition reserves and the configured minimum useful
-transfer. The final authoritative budget is available only after actual consume;
-this startup-only primitive therefore fails terminally after Seal if it is
-insufficient. It does not promise pre-Seal retained fallback and must not reset
-sequence. Exhaustion after commit freezes admission and requests finite drain.
-Supporting wire wrap is a separate gate requiring authenticated extended-offset
-mapping, serial-distance proofs below `2^31`, old-duplicate tests and middlebox
-experiments. A large `u64` alone does not solve 32-bit wire ambiguity.
+Wire sequence and acknowledgment numbers wrap modulo `2^32` (2026-11-22, owner
+decision after a native run exhausted the earlier no-wrap budget). Previously
+the profile stopped before the first wire wrap, so each direction could carry
+only `2^32 - bootstrap_tx` bytes: on average 2 GiB and as little as a few
+megabytes, which ended a 16-flow raw session after about two seconds when the
+kernel chose a bootstrap sequence near the top. The mapping now is:
+
+- the sender writes `(bootstrap + offset) mod 2^32` from its `u64` offset
+  (`packet/sequence.rs::wire`);
+- the receiver recovers the unique `u64` offset within `2^31` of the position it
+  already holds: its retired edge for SEQ, its sent edge for ACK
+  (`sequence::position`). Every caller then applies the unchanged horizon
+  bounds, at most `65535 << 14` bytes, far below `2^31`, so a recovered offset
+  is never ambiguous;
+- the mapping is authenticated: setup-phase records carry the `u64` offset in
+  the authenticated header and the wire number must equal its mapping, and final
+  records bind SEQ/ACK in their associated data;
+- old duplicates map behind the retired edge and are refused by the existing
+  range and horizon checks.
+
+No field or byte is added. Nonce and datagram usage ceilings are unchanged and
+never reset. The handoff no longer refuses bootstrap sequences near `2^32`; the
+proof's `available` field keeps its fixed `2^32 - next` value for wire
+compatibility but is no longer a budget. Middlebox behavior across a wrap is not
+yet observed (MOD-RAWPHASE-13).
 
 For an active lane, let `T` be the next actual-send offset, `A` the peer's latest
 authenticated retirement frontier and `R` its advertised right edge. Data of
@@ -330,7 +356,7 @@ Proposed first lab limits, all checked and digest-bound before authentication:
 | Old-prefix response | One coalesced ACK per lane, at most 4/s, expires with the original transition deadline |
 | Liveness | One authenticated nonce probe outstanding per lane, 5-second interval and 15-second reply deadline; duplicate/stale replies do not refresh it |
 | Reordering | Existing 128-packet protected replay limit plus explicit byte bound; no allocation from peer-provided offsets |
-| Key/sequence use | Existing datagram packet/byte usage ceilings plus smaller no-wire-wrap budget; exhaustion never resets nonce/counters |
+| Key/sequence use | Existing datagram packet/byte usage ceilings; wire SEQ/ACK wrap modulo `2^32` with serial recovery below `2^31`; exhaustion never resets nonce/counters |
 | Close | 30-second absolute application-drain deadline; fixed bounded close-tail retention and retries, separately negotiated before use |
 
 These are proposal bounds, not measured safe values for arbitrary paths. Exact
@@ -430,7 +456,7 @@ close, recovery, runtime, native and path gates are not implied by those tests.
 - [ ] [MOD-RAWPHASE-10] Review and implement exact finite shutdown/close-tail state with no FIN/RST at handoff/drop; preserve failure outcomes and no false maintained clean-close result.
 - [ ] [MOD-RAWPHASE-11] Independently verify single original tuple/SYN/sequence boundary, authentic byte fences, physical packet accounting, options and no plaintext payload with two-ended captures.
 - [ ] [MOD-RAWPHASE-12] Qualify scoped clean/impaired TAP/TUN, NDP/ARP, namespace NAT/conntrack, port reuse, PMTU and abrupt-peer cases; preserve failed/unrun receipts and unchanged predeclared bounds.
-- [ ] [MOD-RAWPHASE-13] Qualify real aggregate congestion/pacing and any 32-bit wrap/timestamp extensions before general-network capability exposure.
+- [ ] [MOD-RAWPHASE-13] Qualify real aggregate congestion/pacing and any 32-bit wrap/timestamp extensions before general-network capability exposure. Wire wrap is implemented and contract-tested ([serial mapping](../../crates/l2tunnel-raw-io/src/handoff/pairing/packet/sequence.rs), [paired carriers crossing `2^32` both ways with old-duplicate refusal](../../crates/l2tunnel-raw-io/src/handoff/pairing/packet/compact_tests.rs)); native and middlebox qualification remain open.
 - [ ] [MOD-RAWPHASE-14] Run focused parser/state/ownership tests, strict lint/docs and coordinated source-stable aggregate; expose no CLI/native capability before the applicable gates pass.
 
 Design inspection: current engine/driver/auth/datagram/recovery source and pinned

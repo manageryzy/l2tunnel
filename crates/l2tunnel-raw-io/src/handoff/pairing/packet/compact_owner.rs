@@ -184,9 +184,6 @@ impl<I: PacketIo + Send + 'static> PacketCarrier<I> {
             .allocated
             .checked_add(protected_bytes as u64)
             .ok_or(Error::Exhausted)?;
-        if end >= u64::from(u32::MAX - f.local) {
-            return Err(Error::Exhausted);
-        }
         let reserve = kind.reserve() * (u64::from(self.policy.mtu) - 40);
         let allowed_end = f
             .peer_retired
@@ -210,14 +207,8 @@ impl<I: PacketIo + Send + 'static> PacketCarrier<I> {
             lane: index as u8,
             sender: if self.info.is_client { 1 } else { 2 },
             kind,
-            sequence: f
-                .local
-                .checked_add(u32::try_from(f.allocated).map_err(|_| Error::Exhausted)?)
-                .ok_or(Error::Exhausted)?,
-            acknowledgment: f
-                .peer
-                .checked_add(u32::try_from(f.retired).map_err(|_| Error::Exhausted)?)
-                .ok_or(Error::Exhausted)?,
+            sequence: crate::handoff::pairing::packet::sequence::wire(f.local, f.allocated),
+            acknowledgment: crate::handoff::pairing::packet::sequence::wire(f.peer, f.retired),
             window: u16::try_from(f.local_horizon >> owner.proof.scale)
                 .map_err(|_| Error::Proof)?,
             payload_bytes: u16::try_from(protected_bytes).map_err(|_| Error::Capacity)?,
@@ -272,7 +263,8 @@ impl<I: PacketIo + Send + 'static> PacketCarrier<I> {
         }
         let mut state = lock(&owner.io.state)?;
         let f = state.fence.as_ref().ok_or(Error::Proof)?;
-        if u64::from(metadata.sequence.checked_sub(f.local).ok_or(Error::Proof)?) != f.allocated
+        if metadata.sequence
+            != crate::handoff::pairing::packet::sequence::wire(f.local, f.allocated)
             || token.end
                 != f.allocated
                     .checked_add(protected.len() as u64)
@@ -293,12 +285,12 @@ impl<I: PacketIo + Send + 'static> PacketCarrier<I> {
         let retired = if metadata.kind == FinalKind::Data {
             owner.retirement_reported
         } else {
-            u64::from(
-                metadata
-                    .acknowledgment
-                    .checked_sub(f.peer)
-                    .ok_or(Error::Proof)?,
+            crate::handoff::pairing::packet::sequence::position(
+                f.peer,
+                metadata.acknowledgment,
+                f.retired,
             )
+            .ok_or(Error::Proof)?
         };
         let kind = match token.control {
             Some(FinalControl::Window) => wire::Kind::Window,

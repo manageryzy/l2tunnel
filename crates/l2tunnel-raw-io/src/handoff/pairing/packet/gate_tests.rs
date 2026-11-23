@@ -1,5 +1,5 @@
 //! Packet-kernel tests do not construct a TLS freeze or transferable owner.
-use super::super::super::test_support::{R, raw};
+use super::super::super::test_support::{R, inputs, raw};
 use super::*;
 const TX: [u8; 16] = [9; 16];
 fn fixture() -> R<(GateState, PacketSealer)> {
@@ -181,6 +181,51 @@ fn outer(protected: &[u8], sequence: u32, ack: u32, window: u16) -> R<Vec<u8>> {
     let mut output = vec![0; 40 + protected.len()];
     packet::encode(raw(false, 0), sequence, ack, window, protected, &mut output)?;
     Ok(output)
+}
+#[test]
+fn bare_acks_reach_the_bootstrap_and_leave_packet_phase_delivery_independent() -> R {
+    let (RawInputs::Full(local), RawInputs::Full(mut peer), _) = inputs(false) else {
+        return Err("expected full input pair".into());
+    };
+    let (mut state, mut sealer) = fixture()?;
+    let fence = state.fence.take();
+    let budget = Arc::new(Mutex::new(Budget::new(state.policy, Instant::now())));
+    let mut gate = GateIo::new(local.io, state, budget);
+    let mut buffer = vec![0; 65_536];
+
+    let bootstrap_ack = outer(&[], 2000, 1000, 32768)?;
+    peer.io.send(&bootstrap_ack)?;
+    assert_eq!(gate.receive(&mut buffer)?, Some(bootstrap_ack.len()));
+    assert_eq!(&buffer[..bootstrap_ack.len()], &bootstrap_ack);
+
+    lock(&gate.state)?.fence = fence;
+    for (seq, ack, window) in [
+        (1900, 1000, 32768),
+        (0, u32::MAX, 0),
+        (u32::MAX, 0, u16::MAX),
+    ] {
+        peer.io.send(&outer(&[], seq, ack, window)?)?;
+        assert_eq!(gate.receive(&mut buffer)?, None);
+    }
+    {
+        let state = lock(&gate.state)?;
+        let fence = state.fence.as_ref().ok_or("fence")?;
+        assert_eq!((fence.retired, fence.peer_retired), (0, 0));
+        assert_eq!(state.opener.as_ref().ok_or("opener")?.usage().packets, 0);
+        assert_eq!(state.ranges.occupied_bytes(), 0);
+        assert!(state.old_reply.is_none() && state.incoming.is_empty());
+        assert_eq!(state.rejected_packets, 0);
+    }
+    let protected = seal(&mut sealer, wire::Kind::Data, 0, b"next record")?;
+    peer.io.send(&outer(&protected, 2000, 1000, 32768)?)?;
+    assert_eq!(gate.receive(&mut buffer)?, None);
+    let mut state = lock(&gate.state)?;
+    assert_eq!(state.opener.as_ref().ok_or("opener")?.usage().packets, 1);
+    assert_eq!(
+        state.incoming.pop_front().ok_or("received cell")?.body,
+        b"next record"
+    );
+    Ok(())
 }
 #[test]
 fn mirror_rejections_preserve_original_opener_replay_and_usage() -> R {
@@ -407,7 +452,8 @@ fn old_prefix_responder_accepts_wrapped_consumed_bytes_but_never_crossings_or_ac
     state.fence.as_mut().ok_or("fence")?.peer = 5;
     state.fence.as_mut().ok_or("fence")?.receive_prefix = 10;
     let duplicate = outer(b"old", u32::MAX - 2, 1000, 32768)?;
-    state.old(&duplicate, Instant::now())?;
+    let duplicate = packet::inspect(state.config, &duplicate)?;
+    state.old(duplicate, Instant::now())?;
     let reply = state.old_reply.take().ok_or("old reply")?;
     let inspected = packet::inspect(raw(false, 0), &reply)?;
     assert_eq!(
@@ -424,10 +470,10 @@ fn old_prefix_responder_accepts_wrapped_consumed_bytes_but_never_crossings_or_ac
         outer(b"too old", u32::MAX - 20, 1000, 32768)?,
         outer(b"", 3, 1000, 32768)?,
     ] {
-        state.old(&bytes, Instant::now())?;
+        state.old(packet::inspect(state.config, &bytes)?, Instant::now())?;
         assert!(state.old_reply.is_none());
     }
-    state.old(&duplicate, state.deadline)?;
+    state.old(duplicate, state.deadline)?;
     assert!(state.old_reply.is_none());
     Ok(())
 }
@@ -492,7 +538,7 @@ fn early_hello_proof_diagnostic_retains_exact_window_refusal_without_adoption() 
         return Err("missing early release proof diagnostic".into());
     };
     assert!(value.sequence_matches && value.acknowledgment_matches);
-    assert!(value.within_local_horizon && value.within_sequence_space);
+    assert!(value.within_local_horizon);
     assert!(!value.window_matches && !value.right_edge_matches);
     assert_eq!(
         (value.expected_window, value.observed_window),
@@ -539,7 +585,8 @@ fn complementary_diagnostic_keeps_identity_sequence_and_scale_refusals_separate(
             0 => other.session[0] ^= 1,
             1 => other.receive += 1,
             2 => other.peer_scale = 1,
-            _ => other.peer_window -= 1,
+            // A smaller (stale) view is accepted; a larger one is refused.
+            _ => other.peer_window += 1,
         }
         assert!(matches!(local.complementary(other), Err(Error::Proof)));
         let SetupProofFailure::Hello(value) =

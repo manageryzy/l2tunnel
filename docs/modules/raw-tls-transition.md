@@ -206,7 +206,7 @@ The existing bridge proof additionally requires both stream-direction equalities
 empty retained queues and raw popped bytes/packets equal to actual successful
 atomic sends. Physical send acceptance is not peer receipt. Logical snapshots
 use the maintained checked poll time; this is not an atomic wall-clock snapshot.
-All no-wrap/horizon/window restrictions from the packet-phase design still apply.
+All horizon/window restrictions from the packet-phase design still apply; wire SEQ/ACK wrap modulo `2^32` as specified there.
 
 ## Classifier, quarantine and packet ownership
 
@@ -296,7 +296,7 @@ exact unpolled `RawInputs`. After attachment every setup failure or owner drop i
 terminal, including before Seal; there is no implemented reusable retained-owner
 variant or Abort/AbortAck. Choosing retained mode or fallback therefore occurs
 before this factory or through a new independently authenticated connection.
-The final no-wrap capacity is authoritative only after actual consume and can
+The final horizon capacity is authoritative only after actual consume and can
 reject terminally after Seal. This explicitly supersedes the earlier pre-Seal
 rollback target; no copied sequence observation can provide that authority.
 

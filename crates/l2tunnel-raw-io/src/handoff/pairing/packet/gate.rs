@@ -284,7 +284,6 @@ impl GateState {
                     .checked_add(p.payload.len() as u64)
                     .ok_or(Error::Exhausted)?;
                 if h.transaction != tx
-                    || end >= u64::from(u32::MAX - f.peer)
                     || end > f.retired.saturating_add(f.local_horizon)
                     || end.saturating_add(f.local_horizon) < f.retired
                     || h.retired > f.sent
@@ -293,13 +292,9 @@ impl GateState {
                             .checked_add(f.peer_horizon)
                             .ok_or(Error::Exhausted)?
                     || p.sequence
-                        != f.peer
-                            .checked_add(u32::try_from(h.offset).map_err(|_| Error::Exhausted)?)
-                            .ok_or(Error::Exhausted)?
+                        != crate::handoff::pairing::packet::sequence::wire(f.peer, h.offset)
                     || p.acknowledgment
-                        != f.local
-                            .checked_add(u32::try_from(h.retired).map_err(|_| Error::Exhausted)?)
-                            .ok_or(Error::Exhausted)?
+                        != crate::handoff::pairing::packet::sequence::wire(f.local, h.retired)
                     || p.window
                         != u16::try_from(f.peer_horizon >> f.peer_scale)
                             .map_err(|_| Error::Proof)?
@@ -488,13 +483,9 @@ impl GateState {
                 if h.transaction != tx
                     || h.retired != 0
                     || h.right_edge != horizon
-                    || end >= u64::from(u32::MAX - proof.next)
                     || end > horizon
                     || p.sequence
-                        != proof
-                            .next
-                            .checked_add(u32::try_from(h.offset).map_err(|_| Error::Exhausted)?)
-                            .ok_or(Error::Exhausted)?
+                        != crate::handoff::pairing::packet::sequence::wire(proof.next, h.offset)
                     || p.acknowledgment != proof.receive
                     || p.window
                         != u16::try_from(horizon >> proof.scale).map_err(|_| Error::Proof)?
@@ -551,28 +542,22 @@ impl GateState {
             .offset
             .checked_add(early.wire_len)
             .ok_or(Error::Exhausted)?;
-        if early.sequence
-            != f.peer
-                .checked_add(u32::try_from(h.offset).map_err(|_| Error::Exhausted)?)
-                .ok_or(Error::Exhausted)?
+        if early.sequence != crate::handoff::pairing::packet::sequence::wire(f.peer, h.offset)
             || early.ack != f.local
             || early.window
                 != u16::try_from(f.peer_horizon >> f.peer_scale).map_err(|_| Error::Proof)?
             || h.right_edge != f.peer_horizon
             || end > f.local_horizon
-            || end >= u64::from(u32::MAX - f.peer)
         {
             if self.proof_failure.is_none() {
                 self.proof_failure = Some(SetupProofFailure::EarlyHelloRelease(SetupEarlyProof {
-                    sequence_matches: u32::try_from(h.offset)
-                        .ok()
-                        .and_then(|offset| f.peer.checked_add(offset))
-                        == Some(early.sequence),
+                    sequence_matches: crate::handoff::pairing::packet::sequence::wire(
+                        f.peer, h.offset,
+                    ) == early.sequence,
                     acknowledgment_matches: early.ack == f.local,
                     window_matches: u64::from(early.window) == f.peer_horizon >> f.peer_scale,
                     right_edge_matches: h.right_edge == f.peer_horizon,
                     within_local_horizon: end <= f.local_horizon,
-                    within_sequence_space: end < u64::from(u32::MAX - f.peer),
                     expected_window: f.peer_horizon >> f.peer_scale,
                     observed_window: early.window,
                     expected_right_edge: f.peer_horizon,
@@ -587,7 +572,7 @@ impl GateState {
         self.incoming.push_back(early.cell);
         Ok(())
     }
-    fn old(&mut self, bytes: &[u8], now: Instant) -> Result<(), Error> {
+    fn old(&mut self, p: packet::Packet<'_>, now: Instant) -> Result<(), Error> {
         if now >= self.deadline
             || self.old_reply.is_some()
             || self
@@ -597,9 +582,6 @@ impl GateState {
             return Ok(());
         }
         let Some(f) = self.fence.as_ref() else {
-            return Ok(());
-        };
-        let Ok(p) = packet::inspect(self.config, bytes) else {
             return Ok(());
         };
         if !p.old_data_shape() {
@@ -710,6 +692,10 @@ impl<I: PacketIo> PacketIo for GateIo<I> {
             s.reject().map_err(io::Error::other)?;
             return Ok(None);
         }
+        // Empty segments, including pure ACKs, belong to the original TCP bootstrap.
+        if p.payload.is_empty() {
+            return Ok(s.fence.is_none().then_some(n));
+        }
         if s.final_context.is_some() && super::compact::FinalKind::inspect(p.payload).is_some() {
             s.ingest_final(&out[..n]).map_err(io::Error::other)?;
             return Ok(None);
@@ -729,7 +715,7 @@ impl<I: PacketIo> PacketIo for GateIo<I> {
             return Ok(None);
         }
         if s.fence.is_some() {
-            s.old(&out[..n], Instant::now()).map_err(io::Error::other)?;
+            s.old(p, Instant::now()).map_err(io::Error::other)?;
             return Ok(None);
         }
         Ok(Some(n))

@@ -237,8 +237,13 @@ impl LaneProof {
             || self.read != other.written
             || self.next != other.receive
             || self.receive != other.next
-            || self.peer_window != (u32::from(other.window) << other.scale)
-            || other.peer_window != (u32::from(self.window) << self.scale)
+            // A frozen view of the peer's window may be older and smaller than
+            // its last advertisement: pure window updates are never resent, so
+            // one lost under loss leaves a stale view. Sending within the
+            // smaller view is conservative; a view above the advertisement
+            // (a shrunk window) is still refused.
+            || self.peer_window > (u32::from(other.window) << other.scale)
+            || other.peer_window > (u32::from(self.window) << self.scale)
             || self.options != other.options
             || self.scale
                 != if other.peer_scale == 255 {
@@ -396,6 +401,102 @@ mod tests {
         bytes[279] = 1;
         assert!(Hello::parse(&bytes).is_err());
         assert!(a.complementary(LaneProof { read: 122, ..b }).is_err());
+        Ok(())
+    }
+    #[test]
+    fn stale_smaller_peer_window_views_pass_but_larger_views_are_refused() -> Result<(), Error> {
+        // The failed lab handoff: one side's last view of a 4096 << 8 window
+        // was 1_048_416 because the final pure window update was lost.
+        let a = LaneProof {
+            lane: 0,
+            bulk: 0,
+            role: 1,
+            options: 1,
+            session: [1; 16],
+            written: 123,
+            read: 234,
+            una: 1000,
+            next: 1000,
+            receive: 2000,
+            ack: 2000,
+            window: 4096,
+            scale: 8,
+            peer_scale: 8,
+            peer_window: 1_048_576,
+            mss: 1460,
+            available: u32::MAX - 1000,
+            counters: [9; 32],
+        };
+        let b = LaneProof {
+            role: 2,
+            written: 234,
+            read: 123,
+            una: 2000,
+            next: 2000,
+            receive: 1000,
+            ack: 1000,
+            available: u32::MAX - 2000,
+            ..a
+        };
+        a.complementary(b)?;
+        let stale = 1_048_416;
+        for (x, y) in [
+            (
+                LaneProof {
+                    peer_window: stale,
+                    ..a
+                },
+                b,
+            ),
+            (
+                a,
+                LaneProof {
+                    peer_window: stale,
+                    ..b
+                },
+            ),
+            (
+                LaneProof {
+                    peer_window: stale,
+                    ..a
+                },
+                LaneProof {
+                    peer_window: stale,
+                    ..b
+                },
+            ),
+            (
+                LaneProof {
+                    peer_window: 0,
+                    ..a
+                },
+                b,
+            ),
+        ] {
+            x.complementary(y)?;
+            y.complementary(x)?;
+        }
+        for (x, y) in [
+            (
+                LaneProof {
+                    peer_window: 1_048_577,
+                    ..a
+                },
+                b,
+            ),
+            (
+                a,
+                LaneProof {
+                    peer_window: 1_048_577,
+                    ..b
+                },
+            ),
+            // The peer advertised less than this side last observed.
+            (a, LaneProof { window: 4095, ..b }),
+        ] {
+            assert!(matches!(x.complementary(y), Err(Error::Proof)));
+            assert!(matches!(y.complementary(x), Err(Error::Proof)));
+        }
         Ok(())
     }
 }

@@ -10,6 +10,7 @@ struct Fault {
     drops: Mutex<Vec<usize>>,
     phases: AtomicUsize,
     drop_final_controls: AtomicBool,
+    staged_final_controls: Mutex<Vec<Vec<u8>>>,
     final_control_packets: AtomicUsize,
     final_control_bytes: AtomicUsize,
     blocked: AtomicBool,
@@ -54,7 +55,17 @@ impl PacketIo for Link {
             }
             return Err(io::ErrorKind::WouldBlock.into());
         }
-        if bytes.get(40) == Some(&1) {
+        // This PacketIo carries the entire setup and final phases. A TLS segment
+        // can start with the compact control route by chance. Only packets the
+        // fixture actually staged as protected final controls are fault targets.
+        if self
+            .fault
+            .staged_final_controls
+            .lock()
+            .map_err(|_| io::Error::other("test lock"))?
+            .iter()
+            .any(|packet| packet == bytes)
+        {
             self.fault
                 .final_control_packets
                 .fetch_add(1, Ordering::SeqCst);
@@ -1489,11 +1500,26 @@ mod transition_reservation {
 }
 
 #[tokio::test(start_paused = true)]
-async fn actual_pair_hello_loss_reports_stale_window_proof_without_weakening_authentication() -> R {
+async fn actual_pair_hello_loss_accepts_a_stale_smaller_window_view() -> R {
+    actual_pair_hello_loss_with_adjusted_window_view(false).await
+}
+
+#[tokio::test(start_paused = true)]
+async fn actual_pair_hello_loss_reports_a_larger_window_view_without_weakening_authentication() -> R
+{
+    actual_pair_hello_loss_with_adjusted_window_view(true).await
+}
+
+/// Freeze the client's view of the server window one scaled unit below
+/// (`larger == false`) or above the server's advertisement, then run actual
+/// encrypted Hello loss and retry.
+async fn actual_pair_hello_loss_with_adjusted_window_view(larger: bool) -> R {
     let (c, s, member, allow) = support::fixture()?;
     let (a_input, b_input, _) = support::inputs(false);
     let af = Arc::new(Fault::default());
     let bf = Arc::new(Fault::default());
+    // The first client Hello leaves before the proof is adjusted below, so it
+    // must be lost; its retry then carries the adjusted proof.
     af.drops.lock().map_err(|_| "fault lock")?.push(1);
     bf.drops.lock().map_err(|_| "fault lock")?.extend([1, 2]);
     let mut a = begin_packet_client(
@@ -1536,19 +1562,63 @@ async fn actual_pair_hello_loss_reports_stale_window_proof_without_weakening_aut
     // Fault injection models a frozen peer observation preceding a legal TCP
     // window update. This fixture proves branch attribution after real encrypted
     // Hello loss/retry; it does not claim to reproduce smoltcp's window timing.
-    lane.proof.peer_window = actual_peer_window
-        .checked_sub(1u32 << shift)
-        .ok_or("window")?;
+    lane.proof.peer_window = if larger {
+        actual_peer_window.checked_add(1u32 << shift)
+    } else {
+        actual_peer_window.checked_sub(1u32 << shift)
+    }
+    .ok_or("window")?;
     {
         let mut state = lock(&lane.io.state)?;
         state.local_proof = Some(lane.proof);
-        state.fence.as_mut().ok_or("fence")?.peer_horizon =
-            super::horizon_bytes(carrier.policy, u64::from(lane.proof.peer_window), shift)?;
+        // Hello retries take new sequence space, and this 16-cell fixture fits
+        // the retry only at the true window. The stale case therefore adjusts
+        // only the proved view; production derives both from the same view
+        // with a ~1 MiB window, where a few hundred bytes leave ample room.
+        if larger {
+            state.fence.as_mut().ok_or("fence")?.peer_horizon =
+                super::horizon_bytes(carrier.policy, u64::from(lane.proof.peer_window), shift)?;
+        }
     }
     let mut hello = wire::Hello::parse(&carrier.local_hello)?;
     hello.lanes[0] = Some(lane.proof);
     carrier.local_hello = hello.encode()?;
     let stale_peer_window = lane.proof.peer_window;
+    if !larger {
+        // A stale smaller view is conservative: the server accepts the proved
+        // view after the actual Hello retry and both setups become ready.
+        let mut ready = [false; 2];
+        poll_fn(|cx| {
+            for (index, setup) in [&mut a, &mut b].into_iter().enumerate() {
+                if !ready[index]
+                    && let Poll::Ready(result) = Pin::new(setup).poll(cx)
+                {
+                    match result {
+                        Ok(_) => ready[index] = true,
+                        Err(error) => return Poll::Ready(Err(error)),
+                    }
+                }
+            }
+            if ready == [true; 2] {
+                Poll::Ready(Ok(()))
+            } else {
+                Poll::Pending
+            }
+        })
+        .await?;
+        assert!(
+            af.phases.load(Ordering::SeqCst) >= 2,
+            "actual Hello retry required"
+        );
+        for snapshot in [a.diagnostic_snapshot(), b.diagnostic_snapshot()] {
+            assert_eq!(snapshot.outcome, SetupOutcome::Ready);
+            let gate = snapshot.lanes[0].ok_or("lane")?.gate.ok_or("gate")?;
+            assert_eq!(gate.proof_failure, None);
+            assert!(!gate.faulted);
+        }
+        assert!(stale_peer_window < actual_peer_window);
+        return Ok(());
+    }
     poll_fn(|cx| {
         if let Poll::Ready(result) = Pin::new(&mut a).poll(cx) {
             return Poll::Ready(Err(match result {

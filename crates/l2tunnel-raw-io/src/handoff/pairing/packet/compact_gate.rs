@@ -200,7 +200,19 @@ impl GateState {
             return self.reject();
         }
         let fence = self.fence.as_ref().ok_or(Error::Proof)?;
-        let retired = u64::from(metadata.acknowledgment - fence.local);
+        // validate_final above recovered both positions; recompute them identically.
+        let retired = crate::handoff::pairing::packet::sequence::position(
+            fence.local,
+            metadata.acknowledgment,
+            fence.sent,
+        )
+        .ok_or(Error::Proof)?;
+        let offset = crate::handoff::pairing::packet::sequence::position(
+            fence.peer,
+            metadata.sequence,
+            fence.retired,
+        )
+        .ok_or(Error::Proof)?;
         self.incoming.push_back(Cell {
             received_at: Instant::now(),
             final_metadata: Some(metadata),
@@ -212,7 +224,7 @@ impl GateState {
                     wire::Kind::Data
                 },
                 transaction: self.transaction,
-                offset: u64::from(metadata.sequence - fence.peer),
+                offset,
                 retired,
                 right_edge: retired
                     .checked_add(fence.peer_horizon)
@@ -238,13 +250,18 @@ impl GateState {
             return Err(Error::Proof);
         }
         let f = self.fence.as_ref().ok_or(Error::Proof)?;
-        let offset = u64::from(metadata.sequence.checked_sub(f.peer).ok_or(Error::Proof)?);
-        let retired = u64::from(
-            metadata
-                .acknowledgment
-                .checked_sub(f.local)
-                .ok_or(Error::Proof)?,
-        );
+        let offset = crate::handoff::pairing::packet::sequence::position(
+            f.peer,
+            metadata.sequence,
+            f.retired,
+        )
+        .ok_or(Error::Proof)?;
+        let retired = crate::handoff::pairing::packet::sequence::position(
+            f.local,
+            metadata.acknowledgment,
+            f.sent,
+        )
+        .ok_or(Error::Proof)?;
         let end = offset
             .checked_add(u64::from(metadata.payload_bytes))
             .ok_or(Error::Exhausted)?;
@@ -253,8 +270,7 @@ impl GateState {
             .checked_add(f.local_horizon)
             .ok_or(Error::Exhausted)?;
         let reserve = metadata.kind.reserve() * (u64::from(self.policy.mtu) - 40);
-        if end >= u64::from(u32::MAX - f.peer)
-            || end > right.saturating_sub(reserve)
+        if end > right.saturating_sub(reserve)
             || end.saturating_add(f.local_horizon) < f.retired
             || retired > f.sent
             || metadata.window
@@ -272,15 +288,24 @@ impl GateState {
     ) -> Result<u64, Error> {
         self.validate_final(metadata)?;
         let f = self.fence.as_mut().ok_or(Error::Proof)?;
-        let offset = u64::from(metadata.sequence - f.peer);
+        let offset = crate::handoff::pairing::packet::sequence::position(
+            f.peer,
+            metadata.sequence,
+            f.retired,
+        )
+        .ok_or(Error::Proof)?;
         let end = offset + u64::from(metadata.payload_bytes);
         self.ranges
             .commit(offset, end, f.retired.max(end), f.local_horizon)?;
         f.retired = f.retired.max(end);
         if metadata.kind != FinalKind::Data {
-            f.peer_retired = f
-                .peer_retired
-                .max(u64::from(metadata.acknowledgment - f.local));
+            let acknowledged = crate::handoff::pairing::packet::sequence::position(
+                f.local,
+                metadata.acknowledgment,
+                f.sent,
+            )
+            .ok_or(Error::Proof)?;
+            f.peer_retired = f.peer_retired.max(acknowledged);
         }
         Ok(f.retired)
     }

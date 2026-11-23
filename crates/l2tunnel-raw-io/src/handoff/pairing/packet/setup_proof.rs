@@ -26,9 +26,9 @@ pub struct SetupHelloProof {
     pub stream_bytes_match: bool,
     /// Opposite next/receive sequence frontiers matched.
     pub sequence_matches: bool,
-    /// Local frozen peer observation matched the peer's actual advertised window.
+    /// Local frozen peer observation was at most the peer's advertised window.
     pub local_peer_window_matches: bool,
-    /// Peer frozen peer observation matched the local actual advertised window.
+    /// Peer frozen peer observation was at most the local advertised window.
     pub peer_peer_window_matches: bool,
     /// TCP option capability matched.
     pub options_match: bool,
@@ -65,8 +65,6 @@ pub struct SetupEarlyProof {
     pub right_edge_matches: bool,
     /// This already authenticated extent fitted the existing local horizon.
     pub within_local_horizon: bool,
-    /// This extent fitted the original remaining sequence space.
-    pub within_sequence_space: bool,
     /// Unscaled window required by the existing fence.
     pub expected_window: u64,
     /// Unscaled window in the actual authenticated early packet.
@@ -109,8 +107,8 @@ impl SetupProofFailure {
                 && local.session == peer.session,
             stream_bytes_match: local.written == peer.read && local.read == peer.written,
             sequence_matches: local.next == peer.receive && local.receive == peer.next,
-            local_peer_window_matches: local.peer_window == peer_scaled_window,
-            peer_peer_window_matches: peer.peer_window == local_scaled_window,
+            local_peer_window_matches: local.peer_window <= peer_scaled_window,
+            peer_peer_window_matches: peer.peer_window <= local_scaled_window,
             options_match: local.options == peer.options,
             scales_match: local.scale
                 == if peer.peer_scale == 255 {
