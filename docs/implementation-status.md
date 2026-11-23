@@ -665,6 +665,17 @@ wire-ingress queue storage from recovery support and qualifying full8192-support
 recovery, repair CPU cost and feedback-induced Busy loss before lifting the
 current128 runtime guard. The fast-path tests do not satisfy those gates.
 
+Rolling TUN delivery policy ([DP-01..DP-08](modules/delivery-policy.md)), 2026-11-22:
+targeted IP directions now release inner TCP data in per-flow order by default
+instead of across sequence gaps, and a local return-traffic guard (default 100‰ of
+delivered peer bytes) sheds extra source copies and regular repairs while the
+direction acts as a return path. Both are authenticated per-direction values
+(tags 11/12, digest extension); default configurations keep their tag 4/5 bytes.
+This is contract-tested in library, runtime-snapshot and client-core status code.
+It addresses the diagnosed bimodal single-flow throughput
+([mechanism](../work/raw-udp-near8-repeat-20261122/reports/mechanism.md)) but has
+no native measurement yet; DP-08 is the owner's run.
+
 The [audit inventory](../work/deep-audit26/checked-index.json) is navigation for
 unreviewed evidence, not a completion percentage. Confirmed discrepancies require
 behavioral fixes and regressions; descriptions and evidence links alone do not

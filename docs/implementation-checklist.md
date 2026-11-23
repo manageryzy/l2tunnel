@@ -1,5 +1,11 @@
 # Implementation checklist and evidence ledger
 
+The isolated Reliable retry-enrichment draft is described in
+[the receive contract](modules/reliable.md#receive-path-and-authentication-boundary).
+It reuses canonical direct sources in uniquely mapped existing FEC generations;
+no generation, deadline, work or ARQ cap changes. Compilation, focused checks and
+native qualification remain pending. Existing CWC and Python parity gates stay open.
+
 The selected [Block FEC systematic extent correction](modules/compact-wire-cleanup.md#exact-block-fec-systematic-extents-2026-11-17)
 removes separately observed coded fill and passes the required batch18 continuation.
 The [native18 observations](modules/buffer-observability.md#native18-exact-source-fill-and-remaining-admission-stalls)
@@ -230,6 +236,28 @@ staged episodes. Cauchy still exhausts its original phase bound; Rolling still
 expires, with no qualified throughput in either case. Full BP-05/BP-10 and
 matrix coverage remain open. No original quota, timer, work allowance, recovery
 behavior or full parent definition changes.
+
+The [six-blocker batch](modules/python-behavior-alignment.md#six-blocker-correction-batch-2026-11-18)
+implements source-bound named-reference checks, explicit selection of independent
+CompactARQ rather than ordinary Cauchy, retry enrichment of live Cauchy generations,
+and cooperative Rolling/Research work continuation. The queue-service correction
+preserves the original budgets and lifetimes. Cauchy passed one native forward run. Rolling still exhausted the decoder lifetime after 4.991 seconds in local ingress. The named Compact workload exhausted its local status query. The initial aggregate hit three proxy handoff deadlines. All three passed isolated on the same binary, and the remaining check stages passed separately. The two updated recovery suites passed 242 cases and workspace Clippy passed. Full PBA, BP and matrix acceptance remain open.
+
+The [Rolling queue residence](modules/common-rolling-ingress.md#local-queue-residence)
+measurement covers direct and queued decoder admissions and terminal retained ages.
+The first measured forward run exceeded the 100 ms target. The third run
+recorded zero threshold crossings in both directions and later terminated at a
+separate sender CodecStage deadline. The fourth run exceeded the forward
+queue threshold again and the sender exhausted EncoderDebt. The sixth original-plan
+run exceeded 100 ms on 1,659 of 10,080 forward admissions after the row-accounting
+and GF updates. All 930 reverse admissions met the threshold. RWI-03 remains open.
+
+RWI-03 also has a [full-FIFO regression](../work/c48-parity-20261119/native/tun-ring-fix-20261119/inner-retrans-analysis/full-queue-idle-head-green.log).
+A duplicate at the head can finish without starting a new decode job. When
+the targeted FIFO fills with the decoder idle, the endpoint now stages its
+oldest data input before accepting the arrival. The regression checks the
+old input's identity, arrival, expiry and storage bound. Native throughput
+and the count of avoided refusals require a run of the changed endpoint.
 
 This remains the persistent progress ledger. Unchecked work is required;
 a design, enum, successful build or deleted implementation does not complete a
@@ -639,6 +667,10 @@ The explicit fixed and measured Common proxy slices retain complete follow-up in
 [measured retained composition](modules/common-tcp-proxy-measured.md). Parent proxy,
 switching and platform gates retain their definitions.
 
+Rolling TUN native release order and the return-traffic guard are tracked in
+[DP-01..DP-08](modules/delivery-policy.md). DP-01..DP-07 are contract-tested;
+the owner's native qualification DP-08 is open, so FIX-04 is unchanged.
+
 The current behavior-alignment work is tracked in
 [named Python compositions](modules/python-behavior-alignment.md), alongside
 [TCP carrier naming](modules/tcp-carrier-naming.md) and
@@ -1003,6 +1035,7 @@ integration or performance acceptance.
 - [ ] [CONN-09] Implement and qualify the requested HTTPS-like real TCP/TLS handshake followed by ACK-independent custom TCP-shaped packets on the original ports and sequence space, with configurable SNI and independent own-server trust. Preserve the separate real HTTPS framing/ALPN compatibility work and its MOD-HTTPS-* gates; it is not a substitute for the raw path. Separately implement and qualify the requested L2TP cover.
 - [ ] [CONN-10] Complete UDP-* gates for OpenVPN-like, QUIC-header appearance and the new minimal media appearance, including standalone same-socket authentication; TCP-bootstrapped UDP alone is incomplete. Preserve the original OpenVPN wire-handshake gate and genuine QUIC compatibility evidence as distinct contracts.
 - [ ] [CONN-11] Qualify raw TCP packet ownership, sequence/ACK/options/RST/PMTU/NAT behavior in isolated target-path tests. The original-carrier Common composition has separate [RCC-01..04](modules/raw-common-carrier.md) implementation and acceptance gates.
+  [Standalone ACK handling and Linux closeout evidence](modules/raw-common-carrier.md#standalone-acks-after-packet-handoff) cover the original bootstrap and the established raw packet phase on owned endpoints.
 - [ ] [CONN-12] Publish effective carrier/cover/security/duplex capabilities and reasons for unsupported combinations.
 - [ ] [CONN-13] Complete SEC-01..SEC-12 for the shared point-to-point secure session, common AEAD/protection and fixed management service; require selected-carrier continuity, bounded automatic recovery and exact failure/restart/key-generation semantics before enabling a new client path.
 
@@ -1048,6 +1081,17 @@ integration or performance acceptance.
 - [ ] [TEST-10] Run real OS TCP, QUIC and pinned KCP baselines with matching channel/probe policies and labeled congestion settings.
 - [ ] [TEST-11] Fuzz parsers, reassembly, management, VXLAN and flow/context boundaries; enforce memory/CPU/time limits.
 - [ ] [TEST-12] Save source/config hashes, same-window goodput/byte cost/latency, CPU/RSS, queues, drops, confirmation and unsupported outcomes.
+- [x] [PBL-01] Measure independent and strict native handoff at 6/5, then strict and TCP-data ordering with the scheduled 12/8 Linux lab endpoint. Record same-window single-flow goodput, inner TCP retransmissions, application P99 and final group custody. Evidence: [Five Linux rows and scope](modules/frame-channel-experiment.md#native-delivery-order-and-sender-pacing-in-the-linux-path-bundle).
+- [x] [PBL-02] Validate the explicit earned-credit capacity, including a one-frame start, actual socket charging and unchanged custody on blocked sends. Measure the two-frame selection with the same 12/8 workload and report first-payment delay, application P99 and goodput. Evidence: [Linux control](../work/fec-native-order-20261121/burst2-12-8-v1/result.json) and [focused example](../work/fec-native-order-20261121/rank-burst-v1/example-attempt2.log).
+- [x] [PBL-03] Validate optional positive physical-rank suppression across multiple paths, mixed-group datagrams, frozen sends, lost logical receipts and old gaps. Measure paid repair bytes, logical drain and same-window single-flow performance on Linux. Evidence: [Paid costs in three Linux arms](../work/fec-native-order-20261121/burst2-three-arms-service-cost-v1.json) and [focused custody checks](../work/fec-native-order-20261121/rank-burst-v1). The throughput and broader integrated gates remain open.
+- [x] [PBL-04] Validate opt-in preference for the oldest overdue unpaid canonical group across paths. Retain bounded ordinary DATA service, control and old-hole recovery, and compare actual original payment span, goodput, application P99 and inner TCP retransmissions at 12/8 and 6/5. Evidence: [Matched Linux comparison](../work/fec-native-order-20261121/frontier-pair-vs-rank-original-paid-open-v1.json), [same-record TCP prefix timings](../work/fec-native-order-20261121/frontier-four-arms-application-header-native-prefix-v1.json) and [focused scheduling checks](../work/fec-native-order-20261121/frontiers-v1/example-attempt2.log). Throughput qualification remains open.
+- [x] [PBL-05] Service one due egress opportunity after a successful input on the paced Linux path-bundle adapter. Preserve the shared byte budget, immutable reservations, bounded fair selection and socket-writability handling. Measure sender payments, application P99, goodput and inner retransmissions against both frontier controls. Evidence: [12/8 Linux result](../work/fec-native-order-20261121/checkpoint-12-8-v1/result.json), [6/5 Linux result](../work/fec-native-order-20261121/checkpoint-6-5-v1/result.json) and [focused checks](../work/fec-native-order-20261121/checkpoint-v1/commands.jsonl). The single-flow throughput target remains open.
+- [x] [PBL-06] Avoid redundant logical member scans and identical timeout deadline updates for repeated ACKs in the isolated Linux adapter. Preserve new logical retirement, physical RTT/selective-gap processing, old-hole recovery, late frozen payment and clock validation. Compare the same 12/8 and 6/5 native arms with the input-checkpoint controls. Evidence: [focused checks](../work/fec-native-order-20261121/ack-cost-v1/commands.jsonl), [native traces, costs and counters](../work/fec-native-order-20261121/ack-cost-paid-ack-stage-pair-v2.json) and [full Linux workspace gate 04](../work/c48-parity-20261119/native/tun-ring-fix-20261119/inner-retrans-analysis/kcp-fec-scheduler-gate-20261121-04/result.json). 12/8 improved and 6/5 regressed in this single-seed pair. Throughput qualification remains open.
+- [x] [PBL-OBS-01] Capture optional pre-adapter IPv4 ARP observations at both ends of both owned underlay veth pairs. Verify process identity, timestamps, loss counters, cold and final neighbor-table snapshots and namespace cleanup without adding UDP traffic. Evidence: [matched 6/5 observer arm](../work/fec-native-order-20261121/arp-observer-6-5-v1/result.json) and [independent audit](../work/fec-native-order-20261121/arp-observer-6-5-audit-v1.json).
+- [x] [PBL-07] Gate the isolated established-key UDP experiment's native handoff on authenticated per-path challenge replies and start the TCP probe only after both peers report readiness. Preserve shared pacing, late peer replies and bounded cleanup. Account every paid setup byte separately and compare startup with the ungated control. Evidence: [focused endpoint and harness checks](../work/fec-native-order-20261121/authenticated-ready-v1/commands.jsonl), [6/5 readiness and payment](../work/fec-native-order-20261121/authenticated-ready-6-5-v1/result.json) and [12/8 readiness and payment](../work/fec-native-order-20261121/authenticated-ready-12-8-v1/result.json). The [full local gate 05](../work/c48-parity-20261119/native/tun-ring-fix-20261119/inner-retrans-analysis/kcp-fec-scheduler-gate-20261121-05/result.json) passed. Throughput qualification remains open.
+- [x] [PBL-08] Evaluate one optional repeat round for the first 128 groups per direction after all original shards have been paid. Preserve shared pacing, priority of ordinary traffic and old-hole recovery. Verify actual payment, rank cancellation, the 35 ms eligibility deadline and both matched native throughput and latency controls. Evidence: [six-arm actual payment and recovery comparison](../work/fec-native-order-20261121/initial-128-actual-low-load-six-arm-v1.json), [full local gate 07](../work/c48-parity-20261119/native/tun-ring-fix-20261119/inner-retrans-analysis/kcp-fec-scheduler-gate-20261121-07/result.json) and [policy boundaries](modules/frame-channel-experiment.md#one-additional-round-during-idle-startup-capacity-pbl-08). The fair 6/5 case reached 46.803 Mbit/s with zero steady inner retries; 12/8 latency regressed. The option remains off and throughput qualification remains open.
+- [x] [PBL-OBS-02] Add optional bounded router UDP packet taps and queue/process scheduling observations to the owned shaper-before-loss lab. Validate namespace identity, incomplete-sample refusal, packet drops and cleanup. Evidence: [four-surface native audit](../work/fec-native-order-20261121/underlay-observed-12-8-four-surface-audit-v1.json) and [observer checks](../work/kcp-native-reference-trace-build-20261121-v1/observer-focused.log). This run does not establish the cause of the earlier host-wide sampling gap.
+- [x] [PBL-09] Evaluate explicitly selected transfer of stale unfrozen physical repair members to a different path's actually paid named repair. Preserve new-path loss recovery, independent replicas, frozen sends, original shards and old-gap custody. Verify mixed-member retirement and measure same-parameter throughput, application P99 and actual repair bytes before any default decision. Evidence: [focused checks](../work/fec-native-order-20261121/named-transfer-v1/focused-rust.log), [native comparison](../work/fec-native-order-20261121/named-transfer-pair-v1.json) and [aggregate gate 08](../work/c48-parity-20261119/native/tun-ring-fix-20261119/inner-retrans-analysis/kcp-fec-scheduler-gate-20261121-08/result.json). Wire cost decreased, but the longest old-gap wait increased. This finite evaluation keeps the option off and does not close the single-flow throughput target.
 - [ ] [TEST-13] Run remote Linux/Windows CI and Android compile gates; keep native device execution as a separate gate.
 - [ ] [TEST-14] Run native Windows TAP/Wintun and Android VpnService/protect/lifecycle tests, not only cross-compilation.
 
@@ -1129,26 +1173,69 @@ preserved the original equations and old-hole recovery. The original-socket
 pair delivered 42.85/47.96 Mbit/s and the strict payload-credit pair delivered
 63.86/65.44 Mbit/s. All four drained. These trials leave TEST-12 open.
 
+TEST-12 also records a [four-direction TUN trace and same-event Python
+replay](modules/frame-channel-experiment.md#single-flow-tcp-recovery-on-the-same-packet-history).
+The single-flow selector-6 Linux run delivered 33.145 Mbit/s with a
+1329.651 ms application P99 and 441 steady inner retransmissions. It drained
+both directions. The replay checks receiver ACK timing and the optional
+sender timestamp predicate. Throughput and latency parity remain open.
+
 ## Per-mode parity implementation gates
 
 Each P-* gate means the named algorithm/codec/workload adapter is implemented and
 has its matrix-specific focused tests. Integration coverage is additionally gated
 by TEST-* and release checks. Workload-only ACK/TCP knobs and research diagnostics
 must keep their documented scope; never enable them by mutating TAP endpoint TCP.
-A checkbox must agree with `config/mode-catalog.toml` status. All are currently
-planned. New mode IDs require new checklist entries automatically.
+A checkbox must agree with `config/mode-catalog.toml` status. Each entry below
+records its own completion scope. New mode IDs require new checklist entries automatically.
 
 - [ ] [P-legacy-arq] Implement and validate `legacy-arq` (M3); preserve its [parity contract](mode-parity.md).
 - [ ] [P-legacy-block-fec] Implement and validate `legacy-block-fec` (M3); preserve its [parity contract](mode-parity.md).
+- [ ] [P-striped-cauchy] Integrate and validate the `striped-cauchy` physical packet profile (M3), including both wire directions, actual authenticated carrier admission, bounded shortened groups, immediate systematics, residual retries, and the single-flow throughput and latency comparison. [Component and model evidence](modules/frame-channel-experiment.md#mixed-packets-and-local-erasure-recovery).
+  The UDP single-flow implementation distinguishes new-gap naming from paid
+  repeats and reports how many groups split for lack of inputs, MTU, or a
+  remaining singleton after a partial seal. [Captured packet and dependency evidence](modules/frame-channel-experiment.md#mixed-packets-and-local-erasure-recovery).
+  The 12/10 UDP/TUN run reached 4.018 Mbit/s and the raw-header control
+  ended before data admission. The single-flow target remains open.
+  [Window evolution and individual retransmissions](modules/frame-channel-experiment.md#single-flow-congestion-window-and-header-dependency).
+  The Rust sender exposes each actual sealing decision. The Python short-group
+  study can protect three sources across six mixed members on the same
+  deadline. Linux wire integration of this format and the target throughput
+  remain open. [Short-group erasure replay and paired results](modules/frame-channel-experiment.md#erasure-protection-at-the-short-group-deadline).
 - [ ] [P-legacy-sliding-fec] Implement and validate `legacy-sliding-fec` (M3); preserve its [parity contract](mode-parity.md). Additive real-byte protocol component: [legacy scheduling, wire and integration limits](modules/legacy-sliding.md); complete Common/runtime/platform/performance gates remain open.
 - [ ] [P-legacy-hybrid-fec] Implement and validate `legacy-hybrid-fec` (M3); preserve its [parity contract](mode-parity.md). Additive real-byte protocol component: [legacy scheduling, wire and integration limits](modules/legacy-sliding.md); complete Common/runtime/platform/performance gates remain open.
 - [ ] [P-compact-rlnc] Implement and validate `compact-rlnc` (M3); preserve its [parity contract](mode-parity.md).
 - [ ] [P-compact-arq] Implement and validate `compact-arq` (M3); preserve its [parity contract](mode-parity.md).
+- [x] [P-kcp-like-l2] Implement and validate explicitly selected KCP-like raw/compressed L2 over Common, including negotiated parameters, paid-attempt retry timing, bounded old-hole custody, independent stateless delivery, real shared-service lifecycle and comparison evidence. Evidence: [design and validation](modules/kcp-like-l2.md#completed-local-verification), including the full local gate and Linux UDP/TAP execution. Native performance fails the target; this does not close `P-kcp-baseline`, `TEST-12` or other carrier/platform execution gates.
 - [ ] [P-first-flight-arq] Implement and validate `first-flight-arq` (M3); preserve its [parity contract](mode-parity.md).
 - [ ] [P-bounded-gap-arq] Implement and validate `bounded-gap-arq` (M3); preserve its [parity contract](mode-parity.md).
 - [ ] [P-compact-block-fec] Implement and validate `compact-block-fec` (M3); preserve its [parity contract](mode-parity.md).
 - [ ] [P-local-global-rlnc] Implement and validate `local-global-rlnc` (M3); preserve its [parity contract](mode-parity.md).
 - [ ] [P-path-scheduling] Implement and validate `path-scheduling` (M3); preserve its [parity contract](mode-parity.md).
+  - The independent physical-path bundle implements configurable N/K, a separate
+    batch capacity and deadline per path, cumulative/selective batched receipts,
+    ACK piggyback and named repair. Six connected UDP sockets exercise the
+    Rust components. The 6/5 controlled Linux TUN comparison drained both
+    directions at 0.956 Mbit/s with 55 steady inner TCP retransmissions.
+    The optional physical selective-repeat sender reached 28.633 Mbit/s
+    with 83 steady inner retransmissions and drained all physical and native
+    debt. An offline geometry study evaluates configurable loss/retry goals.
+    An optional shared-member/fair scheduler is implemented for comparison;
+    transmitter custody and overdue-batching regressions pass. Performance
+    acceptance remains open: its fixed 6/5 Linux arm reached 40.064 Mbit/s
+    but had 1,339 steady inner retransmissions and a 2.028 s application P99.
+    The two Python seeds also diverge substantially. All measured native and
+    physical debt drains; these outcomes do not close the performance gate.
+    The explicit paced experiment implements a shared directional byte budget,
+    bounded physical ACK repetition, logical page rescanning and RTT-based
+    deadlines. Its shaper-then-loss harness preserves erased-byte charging;
+    the same-binary control and candidate both drain all accepted debt, but
+    candidate goodput falls from 27.074 to 3.979 Mbit/s and application P99
+    rises from 1.618 to 10.118 s. Source-side queueing is resolved in this draw;
+    the early TCP window collapse and performance acceptance remain open.
+    Keep production session joining, service configuration,
+    and the impaired single-flow performance gate open.
+    [Component and closed-loop evidence](modules/frame-channel-experiment.md#independent-physical-paths-for-one-inner-flow).
 - [ ] [P-legacy-fragment-packing] Implement and validate `legacy-fragment-packing` (M2); preserve its [parity contract](mode-parity.md).
 - [ ] [P-compact-cross-frame] Implement and validate `compact-cross-frame` (M2); preserve its [parity contract](mode-parity.md).
 - [ ] [P-full-l2] Implement and validate `full-l2` (M2); preserve its [parity contract](mode-parity.md).
@@ -1233,3 +1320,288 @@ Linux namespace trials verified SACK, exact payload and final drain. The
 same-release light observer measured 1.035 ms P99 from all dependencies ready
 to completed TUN write. End-to-end single-flow throughput and application P99
 regressed against the FIFO control, leaving performance qualification open.
+
+FIX-04 and TEST-12 also track the [receiver admission and lost gap request on a single TCP stream](modules/frame-channel-experiment.md#receiver-admission-and-a-lost-gap-request-on-a-single-tcp-stream).
+The same authenticated event tape distinguishes a lost reverse request and
+insufficient received equations from a locally refused systematic source.
+Receiver changes, closed-loop measurements and outstanding targets are recorded
+under that experiment.
+
+FIX-04 and TEST-12 track the [single-flow sender TUN ring investigation](modules/frame-channel-experiment.md#sender-tun-ring-pressure-on-one-linux-tcp-flow).
+Common retries an already-read packet when sending frees capacity in its
+issuing MUX. The native experiment distinguishes kernel ring loss, admission
+backpressure, and TCP delivery latency. Single-flow performance qualification
+remains open.
+
+FIX-04 and TEST-12 track the [byte-level race between outer repair, inner
+retransmission and the returning cumulative ACK](modules/frame-channel-experiment.md#inner-tcp-retransmissions-in-the-single-flow-near8-run).
+Two native steady intervals account for every repeated sender TCP segment
+in the sample. These observations leave the single-flow goodput and latency
+acceptance gates open.
+
+FIX-04 and TEST-12 also cover systematic input refused by the full receive
+FIFO while a global repair is active. In one traced native run, repair 3968
+held the decoder for 20.726 ms. The later refusal of source 36123 prolonged
+recovery of a TCP segment that Linux retransmitted. The
+[decoder tests](../crates/l2tunnel-fec/src/rolling/decoder/independent/tests.rs)
+exercise independent commitment beyond the repair's support, the original
+deadline, old-gap recovery, conflicting duplicates and capacity rollback.
+The receiver uses the existing source storage and work allowance. The
+same-release pair using this receiver had zero coding FIFO refusals and
+zero sender TUN drops. The bounded-delivery run fell to 11.18 Mbit/s after
+CUBIC left slow start at 48 MSS. The immediately delivered control reached
+34.83 Mbit/s after exiting at 353 MSS. A first [original-UDP
+confirmed-prefix comparison](modules/frame-channel-experiment.md#confirmed-source-bytes-in-global-equations)
+verified the negotiated format, application hash and old-gap drain and
+delivered 13.19 Mbit/s. The native throughput and latency gates remain open.
+
+FIX-04 also covers a local repair that held the decoder when the same
+source 36123 was refused. Ten earlier queued repairs extended beyond the
+active job's horizon. On this saved FIFO, earlier originals covered every
+one of those repair ends before a later original crossed it. The receive
+scan now applies this rule to local and global regular repairs, preserves
+the debt cap of the original that first evidenced each range and leaves
+overlapping sources in FIFO order. A pending repair that first observes a
+new range stops the scan. A contract test fills the FIFO, frees slots
+during the active local repair and checks all ten native packets after
+recovery. [Original FIFO geometry](../work/c48-parity-20261119/native/tun-ring-fix-20261119/inner-retrans-analysis/kernel-decoder-fences.json)
+and [receive regression](../crates/l2tunnel/src/rolling_records/ingress_tests.rs).
+
+FIX-04 and TEST-12 also track the targeted sender's full fresh-source
+FIFO. The sender retains the sealed original across zero-progress turns,
+reopens on the first slot release and preserves its admission deadline.
+The Common service API reports the resource that refused native input.
+The scheduling regression covers repeated turns, residual work and the
+original expiry. Single-flow throughput and application latency remain open.
+[Sender and observation details](modules/frame-channel-experiment.md#crossing-buffered-repairs-with-independent-sources).
+
+FIX-04 and TEST-12 now have a protected UDP regression for a ready short
+physical copy. Both immediate affordability and a one-byte credit deficit
+are covered. End-to-end single-flow performance qualification remains open.
+[Short-copy wake and capture evidence](modules/frame-channel-experiment.md#waking-the-sender-for-the-next-short-physical-copy).
+
+FIX-04 and TEST-12 include a bounded ACK-holder cursor that revisits a sole
+pending original at its deadline. The protected UDP runs now tie reverse
+source/copy labels and socket acceptance to real TUN packets and CUBIC startup
+samples. Linux single-flow throughput, steady inner retransmissions and
+application P99 remain open.
+[Reverse-carrier measurements](modules/frame-channel-experiment.md#following-an-inner-ack-through-the-reverse-carrier).
+
+The same tasks cover classification reuse and the real FlowBytes wait for a
+retained TUN packet. The focused test checks same-turn reopen without growing
+the queue. Frozen b78b47d measured 44.02 and 39.79 Mbit/s across two reverse
+burst choices; both recovered all observed byte gaps. Native throughput and
+latency targets remain open.
+
+The retained-packet wait now also covers profiles without ACK coalescing
+(2026-11-22). Previously that plain path read a TUN packet and stopped the
+whole session with `Engine(Pipeline(Budget(FlowBytes)))` when the per-flow
+queue was full. In the 2026-11-22 campaign this ended Swift FEC and Aligned
+Cauchy single-flow runs at 15% loss. A finite Pipeline queue or flow-table
+refusal now keeps the packet as the one pending original. The plain path
+stops reading and retries the packet after sends or at ingress service,
+within the same stall deadline as the coalesced path.
+[Plain-path retention test](../crates/l2tunnel-runtime/src/secure_udp/transport_common_ingress_tests.rs).
+
+FIX-04 and TEST-12 include a same-skb Linux receive verdict and a bounded
+UDP receive-service change. A matched 64 KiB reverse-burst workload on the
+candidate measured 8.34 Mbit/s and 6961.44 ms first-write-to-read P99.
+The earlier tree measured 56.80 Mbit/s and 690.82 ms under the same
+observation. All final byte gaps closed. The single-flow gate remains open.
+[Native byte-level comparison](modules/frame-channel-experiment.md#receive-service-and-inner-tcp-timestamp-validation).
+
+FIX-04 and TEST-12 now have a same-packet-number ordinary-repair rank
+replay and a controlled Linux-TCP-through-Python check. The traced native
+single flow delivered 51.568 Mbit/s with 864.720 ms write-to-read P99,
+369 steady inner repeats and zero final debt. Exact row membership locates
+two holes whose named retries made their missing source solvable. The
+throughput, latency and retransmission qualification remains open. An
+isolated sender refresh-interval comparison produced 49.642 Mbit/s,
+768.998 ms write-to-read P99 and 91 steady repeats with zero final debt.
+[Rank replay and endpoint observations](modules/frame-channel-experiment.md#separating-insufficient-repair-rank-from-linux-retransmission-timing).
+
+The [fixed-anchor native-IP comparison](modules/frame-channel-experiment.md#fixed-anchor-ip-header-compression)
+adds protocol coverage for explicit context selection and old-hole recovery,
+plus a Linux UDP single-flow pair. Fixed anchors delivered 20.697 Mbit/s,
+2248.718 ms first-write-to-read P99 and 518 steady inner repeats. A receiver
+kernel verdict matched the original data for 406 repeats to TCP timestamp
+rejection. FIX-04 and TEST-12 retain their throughput and latency gates.
+
+For FIX-04 and TEST-12, fixed-anchor lookahead now skips the body of a frame
+already delivered out of order when scanning later records. Three archived
+output sequences replayed 21,504 matching native frames with byte-exact
+delivery and zero retained records at the end. In the longest replay,
+preparation took 31.425 ms over 14,336 frames, down from 37.741 ms.
+This isolated receiver measurement schedules complete records in the observed
+delivery order. The Linux latency gate remains open.
+
+For FIX-04 and TEST-12, a focused rolling Endpoint regression withholds
+sources 0 and 7 from a 12-source flight. One repair and the eventual arrival
+of source 0 recover source 7. With spare receive work, the endpoint delivers
+source 7 on the recovery turn, seven service turns earlier than in the
+previous implementation. All 12 records deliver once and ordered handoff
+advances on every turn. Linux timing for this change remains unmeasured.
+
+FIX-04 and TEST-12 now have separate Python socket-credit and TCP-issue
+clocks, validated against three recorded Linux application workloads.
+The FIFO producer comparison drained at 77.783 Mbit/s; the early-delivery
+simulator retained 3,066 unconfirmed writes at its drain deadline. Linux
+showed both receive socket starvation and late reverse cumulative ACKs.
+Single-flow Linux throughput, tail latency and inner retransmission parity
+remain open. [Producer, matched runs and recovery timing](modules/frame-channel-experiment.md#single-flow-socket-credit-and-the-two-directions-of-recovery).
+
+The FIX-04/TEST-12 UDP observer supports both directions on one connection,
+with a post-preparation sample and a separate observed device write. A
+bidirectional UDP fixture passed. In a historical single-flow Linux trace,
+343 preceding records waited in the reverse MUX when one SACK arrived.
+Its wait from MUX entry to packer admission reached 81.093 ms.
+
+FIX-04 and TEST-12 now track [negotiated reverse Packed ACK compression](modules/frame-channel-experiment.md#negotiated-reverse-packed-ack-compression).
+The bounded source codec, physical-byte charging, independent copies,
+named retry and ordinary repair paths are implemented. The protocol tests
+recover all native ACKs after losing three systematic copies. The new
+configuration has its own authenticated selection. One [Linux TUN/UDP
+pair](modules/frame-channel-experiment.md#negotiated-reverse-packed-ack-compression)
+integration-tested physical send sizes, positive byte delivery with zero
+final holes and drained recovery state. The candidate reached 57.603 Mbit/s
+with 769.205 ms write-to-read P99 and 109 steady sender-TUN repeats.
+Single-flow goodput, retransmission and latency qualification remains open.
+
+FIX-04 and TEST-12 now compare independent application writes and inner
+stream segmentation. The [model runs and complete Linux steady
+trace](modules/frame-channel-experiment.md#inner-tcp-packetization-and-steady-forward-recovery)
+identify actual fragment counts and reconcile every steady inner repeat
+in the traced run. The original throughput and delivery targets stay open.
+
+One subsequent original-UDP run exercised the full-FIFO/idle-decoder fix.
+Per-packet admission and same-SKB Linux verdicts distinguish local recovery
+FIFO drops, network losses and the TCP timestamp rejection of late originals.
+All 1,459 steady TCP repeats had trace coverage, including 296 repeats
+where the first byte Linux still lacked had previously arrived at its TUN
+and failed PAWS. Its 55.757 Mbit/s and 1,164.158 ms write-to-read P99
+leave FIX-04, RWI-03 and single-flow TEST-12 performance open.
+[Full replay](../work/c48-parity-20261119/native/tun-ring-fix-20261119/inner-retrans-analysis/acklz47-cubic-revq-forward-records-verdict-seed31248-65b207a/per-pn-refusal-attribution.json)
+and [kernel receive cursor](../work/c48-parity-20261119/native/tun-ring-fix-20261119/inner-retrans-analysis/acklz47-cubic-revq-forward-records-verdict-seed31248-65b207a/kernel-prefix-at-retry-paws.json).
+
+FIX-04/RWI-03 now have one [Linux integration sample](../work/c48-parity-20261119/native/tun-ring-fix-20261119/inner-retrans-analysis/acklz48-cubic-revq-forward-records-verdict-seed31248-1da52ce/arm-evidence.json)
+that exercised both UDP pressure yields and the updated native receiver.
+Goodput was 61.442 Mbit/s, write-to-read P99 was 728.437 ms and 48 steady
+TCP repeats were captured. Actual socket drops (22) and the 157.329 ms P99
+from accepted-input first solvability to native readiness still need work.
+The original single-flow throughput requirement remains open.
+
+FIX-04 and TEST-12 now exercise a final queued systematic source and a
+committed fixed-anchor TCP delta during ongoing ordered handoff. The
+receiver uses the remaining turn budget and the existing symbol slab.
+One test recovers an older source exclusively by repair. A second releases
+a delta while a lower source is missing and verifies exact once-only
+delivery after that hole is filled. A diagnostic observer correlates named
+gap requests at each physical and authenticated boundary.
+[Fixed-anchor regression](../work/c48-parity-20261119/native/tun-ring-fix-20261119/inner-retrans-analysis/committed-anchor-preview-order-gate.json)
+and [source and repair checks](../work/c48-parity-20261119/native/tun-ring-fix-20261119/inner-retrans-analysis/direct-systematic-fifo-public-probe.log).
+
+The first native run of this receiver plus named feedback tracing regressed
+to 22.051 Mbit/s, 1,626.523 ms write-to-complete-read P99 and 178 steady
+inner repeats. The final TCP and FEC gaps cleared. FIX-04, RWI-03 and the
+single-flow TEST-12 performance requirement remain open.
+[Native sample](../work/c48-parity-20261119/native/tun-ring-fix-20261119/inner-retrans-analysis/acklz49-cubic-revq-forward-records-verdict-seed31248-017c72c/arm-evidence.json)
+and [crossing acknowledgments](../work/c48-parity-20261119/native/tun-ring-fix-20261119/inner-retrans-analysis/acklz49-cubic-revq-forward-records-verdict-seed31248-017c72c/steady-forward-retry-causal-join.json).
+The old scheduler with the same observer reached 31.169 Mbit/s and
+1,297.582 ms P99 with 314 steady TCP repeats. Each configuration has a
+single sample under this comparison.
+[Matched configurations and limits](../work/c48-parity-20261119/native/tun-ring-fix-20261119/inner-retrans-analysis/acklz50-cubic-revq-forward-records-verdict-seed31248-f805267/matched-receive-comparison.json).
+
+FIX-04/RWI-03 and TEST-12 also track the physical-poll credit refill and
+bounded gap discovery from authenticated receiver FIFO inputs. The protocol
+fixture covers an in-progress equation, an older missing source and two held
+copies of distinct originals. A lower-overhead native reference on the
+preceding release achieved 71.517 Mbit/s, 661.422 ms write-to-read P99 and
+35 steady inner repeats. Single-flow throughput and retransmission parity
+with the original Python reference remain open.
+[Protocol and native evidence](modules/frame-channel-experiment.md#sender-credit-and-authenticated-gap-discovery).
+
+FIX-04/RWI-03 and TEST-12 retain their original single-flow targets.
+The independent forward selector 10 completed a Linux same-binary comparison
+with the original selector 6. Its additional physical IP byte count was
+zero. A separate low-window run localized at least 6787.909 ms of P99
+first-byte send delay to the Linux TCP unsent queue. The first causal outer
+loss in that particular run remains unidentified.
+[Startup bounds, recovery counters and gate status](modules/frame-channel-experiment.md#single-flow-startup-and-overflow-funded-near8).
+
+Two default-stack setup regressions while constructing other Common record
+engines exposed the cost of embedding the optional near8 owner in the
+shared engine type. Construction now reserves a single fallible heap slot
+only when near8 is selected and includes it in planned and observed storage.
+Both original setup cases passed on their normal stacks. The same-batch UDP
+clock regression checks that subsequent polls earn elapsed credit exactly
+once and do not charge an already sealed source twice. The local workspace
+gate passed after these changes. The Linux bandwidth results above used
+the preceding frozen builds.
+[Local workspace gate](../work/c48-parity-20261119/native/tun-ring-fix-20261119/inner-retrans-analysis/full-current-19/result.json).
+
+TEST-12 remains open. On the later matched Linux single-flow trial the
+post-decode delivery change passed native byte and drain checks. Its steady
+goodput was 29.780 Mbit/s with 567 inner retransmissions and a 1602.276 ms
+write-to-read P99. The baseline was 33.145 Mbit/s with 441 retransmissions
+and a 1329.651 ms P99. The Python endpoint option and finite SACK transport
+prototype are separate simulator evidence.
+[Window, wire cost and recovery evidence](modules/frame-channel-experiment.md#single-flow-tcp-recovery-on-the-same-packet-history).
+
+The later full local check returned exit 1 on the Common Compact TCP proxy
+graceful drain deadline. The identical binary passed the isolated proxy
+case. The simulator passed 1754 tests and two subtests separately.
+[Full run](../work/c48-parity-20261119/native/tun-ring-fix-20261119/inner-retrans-analysis/full-current-23/combined-check.log),
+[isolated proxy case](../work/c48-parity-20261119/native/tun-ring-fix-20261119/inner-retrans-analysis/full-current-23/proxy-isolated.log)
+and [simulator run](../work/c48-parity-20261119/native/tun-ring-fix-20261119/inner-retrans-analysis/full-current-23/simulator-only.log).
+
+FIX-04/RWI-03 now have a public receiver regression for an unpublished
+named-retry span whose member is decoded while an earlier span is frozen.
+TEST-12 retains the single-flow throughput, latency, inner retransmission
+and final drain gates. Larger symbols left all 26,088 full TCP segments
+fragmented in the checked Linux input. Matching fragment-tail packing in
+Python improved goodput on two seeds, with a 6.64 s P99 on the held-out seed.
+[Receiver and packetization evidence](modules/frame-channel-experiment.md#single-flow-fragment-cost-and-stale-gap-requests).
+
+The full local gate passed on the gap-request change. The Linux candidate
+stopped on the reverse ACK hold deadline before completing its 10 s steady
+window. FIX-04 and TEST-12 remain open.
+[Local gate](../work/c48-parity-20261119/native/tun-ring-fix-20261119/inner-retrans-analysis/full-current-24/result.json)
+and [failed Linux arm](../work/c48-parity-20261119/native/tun-ring-fix-20261119/inner-retrans-analysis/burst-targeted-pair-failure-v2.json).
+
+The follow-up Linux arm with ACK service diagnostics completed independently
+of the full workspace gate. It reached 67.184 Mbit/s at 667.147 ms
+application P99 with 170 inner retransmissions, zero TUN drops and complete
+drain. The original 77.783 Mbit/s Python comparison remains open.
+[Single-flow run](../work/c48-parity-20261119/native/tun-ring-fix-20261119/inner-retrans-analysis/acklz49-light-burst-custody-seed31248-1ee5ce3/burst-application-evidence.json)
+and [completed local workspace gate](../work/c48-parity-20261119/native/tun-ring-fix-20261119/inner-retrans-analysis/full-current-25/result.json).
+
+FIX-04 and TEST-12 now have an exact capture comparison of the native
+header encoder, a source-level accounting of avoided Packed scratch
+writes, and a dated request-loss explanation for 17 inner retransmissions.
+The comparison keeps the 4 MiB application limit, per-flow MUX admission,
+independent delivery and old-gap recovery.
+[Sender and recovery evidence](modules/frame-channel-experiment.md#sender-service-cost-and-repeated-gap-feedback).
+
+The three-file Rust candidate reached 69.927 Mbit/s with 577.295 ms
+application P99 and 15 steady retransmissions in one completed Linux
+single-flow run. The opt-in Python fragment-tail behavior is accessible
+from the normal C48 study CLI. The experimental previous-gap echo did
+not improve goodput consistently across two Python seeds. FIX-04 and
+TEST-12 retain their full acceptance scope.
+[Native and Python experiments](modules/frame-channel-experiment.md#sender-service-cost-and-repeated-gap-feedback)
+and [local workspace check after source bindings were finalized](../work/c48-parity-20261119/native/tun-ring-fix-20261119/inner-retrans-analysis/full-current-27/result.json).
+
+FIX-04 and TEST-12 also track an independent mixed-packet erasure profile.
+The Rust and Python codecs have exhaustive small-group recovery evidence
+including every eight-of-ten subset. Intact members expose their original
+bytes immediately. Cross-group Rust custody, explicit physical acceptance,
+authenticated named retries and cumulative receipts now have a two-socket
+UDP loopback check. The tag 10 descriptor and functional Common Engine bind
+the full-width feedback, both timers and actual native record custody.
+The normal service now accepts the complete reserved owner for both roles
+on all four carriers. A second impaired Linux UDP/TUN arm completed all
+15,091 application writes and both outer source ledgers drained. It delivered
+2.455 Mbit/s. [Native integration and outstanding performance gate](modules/frame-channel-experiment.md#reserved-mixed-packet-service-and-first-native-single-flow).
+The fixed-anchor simulator also has a byte-exact Rust record fixture
+and two-seed model results for rolling and mixed recovery.
+[Packet layout and evidence](modules/frame-channel-experiment.md#mixed-packets-and-local-erasure-recovery).
