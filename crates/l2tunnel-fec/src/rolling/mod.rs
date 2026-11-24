@@ -16,7 +16,7 @@ pub mod near8;
 pub mod scheduler;
 pub mod storage;
 pub mod wire;
-pub use decoder::{Begin, DecodeStep, Decoder, DecoderStatus};
+pub use decoder::{AbandonStatus, Begin, DecodeStep, Decoder, DecoderStatus};
 pub use encoder::{Encoder, EncoderStatus};
 
 /// Maximum fixed support; this does not change the sealed-block source limit.

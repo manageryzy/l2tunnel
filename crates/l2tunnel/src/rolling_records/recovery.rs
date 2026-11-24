@@ -81,6 +81,15 @@ pub trait RecoveryPolicy: sealed::Sealed + Copy + Eq {
     fn compresses_packed_acks(self) -> bool {
         false
     }
+    /// Receiver hole-abandonment cap in ticks; zero when the receiver never
+    /// passes over an unrecoverable source (every family except research).
+    fn abandon_ticks(self) -> u64 {
+        0
+    }
+    /// The receiver may pass over unrecoverable sources.
+    fn abandons_holes(self) -> bool {
+        self.abandon_ticks() != 0
+    }
     fn targeted(self) -> bool {
         false
     }
@@ -668,6 +677,9 @@ impl RecoveryPolicy for scheduler::Policy {
 }
 
 impl RecoveryPolicy for research::Config {
+    fn abandon_ticks(self) -> u64 {
+        self.abandon_ticks
+    }
     type Compact = compact_wire::Research;
     type Sender = research::Sender;
     type Receiver = research::Receiver;
@@ -724,7 +736,7 @@ impl RecoveryPolicy for research::Config {
             ]),
             self.feedback_ticks,
             self.memory_bytes as u64,
-            0,
+            self.abandon_ticks,
             0,
             0,
         ]
@@ -809,7 +821,8 @@ impl RecoveryPolicy for research::Config {
             decoder: x.decoder,
             feedback_building: false,
             feedback_ready: x.feedback.is_some(),
-            work_pending: x.feedback.is_none() && x.feedback_event.is_some(),
+            // A due hole abandonment or receipt repeat is genuine receive work.
+            work_pending: (x.feedback.is_none() && x.feedback_event.is_some()) || r.service_due(n),
             feedback_events: x.feedback_event.is_some(),
             feedback_due: x.feedback_event.map(|_| n),
         }
@@ -971,6 +984,7 @@ impl RecoveryPolicy for research::Config {
             .feedback_due
             .into_iter()
             .chain(r.deadline())
+            .chain(r.service_wake())
             .min()
     }
 }

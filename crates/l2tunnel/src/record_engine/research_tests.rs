@@ -28,7 +28,16 @@ fn policies() -> [research::Profile; 3] {
     ]
 }
 fn configuration(profile: research::Profile) -> TestResult<configuration::Configuration> {
-    let original = super::rolling_tests::fixture(false, rolling::wire::SourceWire::Exact)?;
+    configuration_with(profile, 0, None)
+}
+/// `native` selects the IP fixture with that native policy.
+fn configuration_with(
+    profile: research::Profile,
+    abandon_ticks: u64,
+    native: Option<aligned::NativePolicy>,
+) -> TestResult<configuration::Configuration> {
+    let original =
+        super::rolling_tests::fixture(native.is_some(), rolling::wire::SourceWire::Exact)?;
     let configuration::Profile::Rolling { config, stream } = *original.descriptor().profile()
     else {
         return Err("fixture family".into());
@@ -36,7 +45,7 @@ fn configuration(profile: research::Profile) -> TestResult<configuration::Config
     let direction = |d: rolling_records::DirectionConfig| research_records::DirectionConfig {
         native_release: Default::default(),
         return_guard: Default::default(),
-        native_policy: d.native_policy,
+        native_policy: native.unwrap_or(d.native_policy),
         receiver: d.receiver,
         packing: d.packing,
         codec_stage_micros: d.codec_stage_micros,
@@ -45,6 +54,7 @@ fn configuration(profile: research::Profile) -> TestResult<configuration::Config
             profile,
             feedback_ticks: 100,
             memory_bytes: 16 << 20,
+            abandon_ticks,
         },
     };
     let config = research_records::Config {
@@ -550,3 +560,169 @@ fn later_feedback_cannot_rewrite_delayed_source_completion_and_physical_token_re
 
 #[path = "research_order_tests.rs"]
 mod precise_order;
+
+/// RRP-08: continuous traffic in both directions with 15% loss of every
+/// emission kind, longer than `debt_ticks`. Unrecoverable holes are abandoned;
+/// the session never ends and native bytes keep flowing.
+#[test]
+fn lossy_continuous_research_sessions_abandon_holes_and_never_expire() -> TestResult {
+    // Abandonment loses records: only an anchored or stateless native policy
+    // keeps later records decodable.
+    for (policy, native) in policies().into_iter().flat_map(|policy| {
+        [
+            (policy, aligned::NativePolicy::FixedAnchorIpHeaders),
+            (policy, aligned::NativePolicy::RawIp),
+        ]
+    }) {
+        // Below the fixture's one-second send-stage cap.
+        let c = configuration_with(policy, 200_000, Some(native))?;
+        let mut a = build(c, Role::Client)?;
+        let mut b = build(c, Role::Server)?;
+        let mut ab = Lossy::new((1 << 48) + 17, 0x1234_5678);
+        let mut ba = Lossy::new((1 << 56) + 91, 0x9abc_def0);
+        let mut delivered = [0_u64; 2];
+        let mut next = 0_u16;
+        // 12 s at one packet per direction every 2 ms (debt_ticks is 10 s);
+        // deterministic 15% loss of every emission, both directions.
+        let mut late = [0_u64; 2];
+        for turn in 0..6_000_u64 {
+            let now = Tick(turn * 2_000);
+            let snapshot = |a: &Engine, b: &Engine| {
+                format!(
+                    "\nA records={:?}\nA research={:?}\nB records={:?}\nB research={:?}",
+                    debug_records(a),
+                    a.research_status(),
+                    debug_records(b),
+                    b.research_status()
+                )
+            };
+            let mut failed = None;
+            for (name, owner) in [("a", &mut a), ("b", &mut b)] {
+                let bytes = packet(true, 2101 + next % 64, 600, (next % 200) as u8 + 1);
+                match owner.enqueue_borrowed(now, &bytes) {
+                    Ok(_) => {}
+                    // A full common queue is ordinary pressure here.
+                    Err(Error::Pipeline(_)) => {}
+                    Err(error) => {
+                        return Err(format!("{policy:?} {native:?} enqueue {error:?}").into());
+                    }
+                }
+                if let Err(error) = owner.admit_borrowed_observed(now) {
+                    failed = Some(format!("{name} admit {error:?}"));
+                    break;
+                }
+            }
+            if let Some(error) = failed {
+                return Err(
+                    format!("{policy:?} {native:?} t={turn} {error}{}", snapshot(&a, &b)).into(),
+                );
+            }
+            next = next.wrapping_add(1);
+            a.step(now, work())
+                .map_err(|e| format!("{policy:?} {native:?} t={turn} step a {e:?}"))?;
+            b.step(now, work())
+                .map_err(|e| format!("{policy:?} {native:?} t={turn} step b {e:?}"))?;
+            for _ in 0..4 {
+                a.step(now, work())
+                    .map_err(|e| format!("{policy:?} {native:?} t={turn} step a {e:?}"))?;
+                b.step(now, work())
+                    .map_err(|e| format!("{policy:?} {native:?} t={turn} step b {e:?}"))?;
+                ab.transfer(now, &mut a, &mut b)
+                    .map_err(|e| format!("{policy:?} {native:?} t={turn} a->b {e}"))?;
+                ba.transfer(now, &mut b, &mut a)
+                    .map_err(|e| format!("{policy:?} {native:?} t={turn} b->a {e}"))?;
+            }
+            for (index, owner) in [&mut a, &mut b].into_iter().enumerate() {
+                let mut output = [0; 1024];
+                while let NativePreparation::Ready(p) = owner
+                    .prepare_native(now, 128, Tick(u64::MAX), &mut output)
+                    .map_err(|e| format!("{policy:?} {native:?} t={turn} native {e:?}"))?
+                {
+                    owner.commit_native(now, p.token())?;
+                    delivered[index] += 1;
+                    // Delivery continues after debt_ticks (10 s).
+                    late[index] += u64::from(turn >= 5_000);
+                }
+            }
+        }
+        let (_, ra) = a.research_status().ok_or("research status")?;
+        let (_, rb) = b.research_status().ok_or("research status")?;
+        assert!(ab.dropped > 0 && ba.dropped > 0);
+        // With this fixture's 16-source window, each unrecoverable hole stalls
+        // the sender for up to the 200 ms cap; liveness, not rate, is checked.
+        assert!(
+            late[0] > 0 && late[1] > 0,
+            "{policy:?} {native:?} {delivered:?}"
+        );
+        assert_eq!((ra.terminal, rb.terminal), (None, None));
+        assert!(
+            ra.abandon.abandoned + rb.abandon.abandoned > 0,
+            "{policy:?} {ra:?} {rb:?}"
+        );
+    }
+    Ok(())
+}
+
+struct Lossy {
+    number: u64,
+    state: u64,
+    dropped: u64,
+}
+impl Lossy {
+    fn new(number: u64, seed: u64) -> Self {
+        Self {
+            number,
+            state: seed,
+            dropped: 0,
+        }
+    }
+    fn transfer(
+        &mut self,
+        now: Tick,
+        sender: &mut Engine,
+        peer: &mut Engine,
+    ) -> Result<(), String> {
+        let mut body = [0; 1500];
+        let mut units = witnesses();
+        let mut budget = OutboundBudget {
+            packets: 1,
+            wire_bytes: 1500,
+        };
+        let Some(emission) = sender
+            .poll(now, self.number, true, &mut body, &mut budget, &mut units)
+            .map_err(|e| format!("poll {e:?}"))?
+        else {
+            return Ok(());
+        };
+        let token = sender.pending_carrier_output().ok_or("token")?;
+        sender
+            .confirm_carrier_output(now, token)
+            .map_err(|e| format!("confirm {e:?}"))?;
+        self.state = self
+            .state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        if (self.state >> 33) % 100 < 15 {
+            self.dropped += 1;
+        } else {
+            peer.accept_authenticated_at(
+                now,
+                now,
+                emission.security_number,
+                emission.kind,
+                &mut body[..emission.bytes],
+            )
+            .map_err(|e| format!("accept {:?} {e:?}", emission.kind))?;
+        }
+        self.number = self.number.checked_add(1).ok_or("number exhausted")?;
+        Ok(())
+    }
+}
+
+/// Record-layer status for failure diagnostics.
+fn debug_records(engine: &Engine) -> Option<receiver::Status> {
+    match &engine.owner {
+        Owner::Research(endpoint) => Some(endpoint.record_status()),
+        _ => None,
+    }
+}

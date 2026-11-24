@@ -43,6 +43,7 @@ fn selected_research(
             profile: policy,
             feedback_ticks: 100,
             memory_bytes: 16 << 20,
+            abandon_ticks: 0,
         },
     };
     let descriptor = original[3].descriptor();

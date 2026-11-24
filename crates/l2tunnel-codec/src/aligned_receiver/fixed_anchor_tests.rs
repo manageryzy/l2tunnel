@@ -258,3 +258,111 @@ fn fixed_anchor_real_sender_recovers_fragmented_context_and_explicit_or_elided_n
     }
     Ok(())
 }
+
+/// RRP-08: after the recovery owner abandons a source, a channel head skips
+/// the record lost with it, a delta whose anchor was lost is discarded rather
+/// than failing the receiver, and later records deliver. Without a declared
+/// loss the same gap only waits.
+#[test]
+fn declared_loss_skips_lost_heads_and_discards_orphaned_deltas() -> TestResult {
+    let (frame, context) = fixture()?;
+    let delta = |distance| [11, distance, 9, 0, 3, 0, 1, 2, 0xf0];
+    for reserved in [false, true] {
+        for compact in [false, true] {
+            let mut rx = selected(limits(128), reserved, compact)?;
+            let usage = rx.storage_usage();
+            add(&mut rx, 0, 0, 0, &[2, 0, 1, 55])?;
+            take(&mut rx, 0, &[55], false)?;
+            // Source 1 carried context record 1 and is never admitted.
+            add(&mut rx, 2, 0, 2, &delta(1))?;
+            assert_eq!(prepare(&mut rx)?, Prepared::Idle);
+            assert_eq!(rx.expected(ChannelId(0))?, Some(RecordId(1)));
+            assert_eq!(rx.status().source_floor, Some(SourceId(1)));
+            // A declared loss below an already-admitted unit is a no-op for
+            // the floor but still enables loss handling.
+            rx.abandon_sources(SourceId(1), Tick(1))?;
+            assert_eq!(rx.status().loss, LossStatus::default());
+            rx.abandon_sources(SourceId(2), Tick(1))?;
+            assert_eq!(rx.status().source_floor, Some(SourceId(3)));
+            assert_eq!(prepare(&mut rx)?, Prepared::Idle);
+            assert_eq!(rx.expected(ChannelId(0))?, Some(RecordId(3)));
+            assert_eq!(
+                rx.status().loss,
+                LossStatus {
+                    abandoned_units: 1,
+                    dropped_records: 1,
+                    skipped_records: 1,
+                }
+            );
+            assert_eq!(rx.status().failure, None);
+            // A fresh anchor and its delta deliver normally afterwards.
+            add(&mut rx, 3, 0, 3, &context)?;
+            add(&mut rx, 4, 0, 4, &delta(1))?;
+            assert_eq!(prepare(&mut rx)?, Prepared::Progress);
+            take(&mut rx, 4, &frame, false)?;
+            assert_eq!(rx.status().retained_records, 0);
+            assert_eq!(rx.storage_usage(), usage);
+        }
+    }
+    Ok(())
+}
+
+/// RRP-08: a later fragment of a record whose first fragment went with an
+/// abandoned source is stale, keeps its unit proof and never fails the
+/// receiver. A batch that fails after such a drop restores the loss counters.
+#[test]
+fn declared_loss_makes_orphaned_fragments_stale_and_rolls_back_counters() -> TestResult {
+    let tail = |record: u64| {
+        let mut body = vec![4];
+        body.extend_from_slice(&200_u16.to_be_bytes());
+        body.extend_from_slice(&120_u16.to_be_bytes());
+        body.extend_from_slice(&[7; 80]);
+        unit(0, record, &body, true)
+    };
+    for reserved in [false, true] {
+        let mut rx = selected(limits(128), reserved, false)?;
+        add(&mut rx, 0, 0, 0, &[2, 0, 1, 55])?;
+        take(&mut rx, 0, &[55], false)?;
+        // Without a declared loss an orphaned tail is ordinary custody.
+        let mut strict = selected(limits(128), reserved, false)?;
+        strict.admit_authenticated(identity(1, 1), &tail(1), Tick(1))?;
+        assert_eq!(strict.status().retained_records, 1);
+        // Source 1 carried record 1's first fragment and was abandoned.
+        rx.abandon_sources(SourceId(2), Tick(1))?;
+        let before = rx.status();
+        let stale = tail(1);
+        let bad = unit(0, 3, &[0xee], true);
+        let mut outcomes = [Admission::Duplicate; 2];
+        assert!(
+            rx.admit_batch_authenticated_into(
+                &[
+                    AuthenticatedSymbol {
+                        identity: identity(2, 1),
+                        bytes: &stale,
+                    },
+                    AuthenticatedSymbol {
+                        identity: identity(3, 3),
+                        bytes: &bad,
+                    },
+                ],
+                Tick(1),
+                &mut outcomes,
+            )
+            .is_err()
+        );
+        assert_eq!(rx.status(), before);
+        assert_eq!(
+            rx.admit_authenticated(identity(2, 1), &stale, Tick(1))?,
+            Admission::StaleRecord
+        );
+        let status = rx.status();
+        assert_eq!(
+            (status.source_floor, status.retained_records, status.failure),
+            (Some(SourceId(3)), 0, None)
+        );
+        assert_eq!(status.loss.dropped_records, before.loss.dropped_records + 1);
+        add(&mut rx, 3, 0, 2, &[2, 0, 1, 22])?;
+        take(&mut rx, 2, &[22], false)?;
+    }
+    Ok(())
+}

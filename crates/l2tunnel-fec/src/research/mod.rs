@@ -16,7 +16,7 @@ mod sender;
 pub mod storage;
 pub mod wire;
 pub use policy::{Profile, RepairMode};
-pub use receiver::{Receiver, ReceiverStatus, ReceiverStep};
+pub use receiver::{AbandonReasons, Receiver, ReceiverStatus, ReceiverStep};
 pub use sender::{FeedbackDisposition, Output, OutputId, Sender, SenderStatus};
 
 /// Complete immutable local resource and negotiated algorithm configuration.
@@ -32,6 +32,10 @@ pub struct Config {
     pub feedback_ticks: u64,
     /// Complete conservative owner bound including its inline wrapper.
     pub memory_bytes: usize,
+    /// Receiver gives up on an unrecoverable oldest hole after at most this
+    /// many ticks (definite and projected triggers may act earlier); zero
+    /// disables abandonment. Bound in the authenticated configuration.
+    pub abandon_ticks: u64,
 }
 impl Config {
     /// Validate all scalar limits and the conservative recursive retention span.
@@ -41,6 +45,7 @@ impl Config {
         if self.recovery.window < self.profile.minimum_window()?
             || self.feedback_ticks == 0
             || self.feedback_ticks >= self.recovery.debt_ticks
+            || self.abandon_ticks >= self.recovery.debt_ticks
             || self.memory_bytes == 0
             || self.memory_bytes > rolling::MAX_MEMORY
         {

@@ -57,8 +57,11 @@ fn decode(
         profile,
         feedback_ticks: reader.number()?,
         memory_bytes: reader.size()?,
+        // Formerly reserved zero: zero keeps every earlier vector valid and
+        // means abandonment is off.
+        abandon_ticks: reader.number()?,
     };
-    for _ in 0..3 {
+    for _ in 0..2 {
         if reader.number()? != 0 {
             return Err(Error::Padding);
         }

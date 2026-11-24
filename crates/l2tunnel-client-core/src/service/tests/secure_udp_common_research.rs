@@ -81,6 +81,7 @@ fn selected(hosts: &[Arc<Host>; 2]) -> Result<Selected> {
                 // or the Python study's separately specified five-ms policy.
                 feedback_ticks: 1,
                 memory_bytes: 16 << 20,
+                abandon_ticks: 0,
             },
         }
     };

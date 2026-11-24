@@ -156,6 +156,7 @@ pub(super) fn assert_matches(r: &Receiver) {
         compacted_record_capacity: r.compacted_slots,
         pending_bytes: r.pending.map(|pending| pending.written),
         failure: r.failure,
+        loss: r.loss,
     };
     for record in r.records.iter().flatten() {
         status.retained_records += 1;

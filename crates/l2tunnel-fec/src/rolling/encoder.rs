@@ -128,6 +128,11 @@ impl Encoder {
             explicit: None,
         })
     }
+    pub(crate) fn sliding_requested_storage(
+        config: Config,
+    ) -> Result<storage::Usage, storage::Error> {
+        Self::requested_storage(config)?.join(storage::requested::<Tick>(config.window)?)
+    }
     pub(crate) fn sliding_memory_bound(config: Config) -> Result<usize, Error> {
         add(
             Self::memory_bound(config)?,
@@ -190,7 +195,7 @@ impl Encoder {
     pub fn admit_source(&mut self, original: &[u8], now: Tick) -> Result<SourceId, Error> {
         self.admit_source_in(original, now, now, Admission::Idle)
     }
-    pub(super) fn admit_source_created(
+    pub(crate) fn admit_source_created(
         &mut self,
         original: &[u8],
         created: Tick,
@@ -726,6 +731,11 @@ impl Encoder {
         self.next_repair += 1;
         self.job = None;
         Ok(())
+    }
+    /// Original debt deadline of the oldest unconfirmed source; with
+    /// per-source tracking it moves as receipts advance.
+    pub(crate) fn debt(&self) -> Option<Tick> {
+        self.debt
     }
     /// Original earliest owned deadline; no timer is renewed by polling.
     pub fn deadline(&self) -> Option<Tick> {

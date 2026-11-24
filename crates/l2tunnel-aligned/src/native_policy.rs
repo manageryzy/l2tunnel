@@ -55,6 +55,12 @@ impl NativePolicy {
     pub const fn uses_ip_headers(self) -> bool {
         matches!(self, Self::IpHeaders | Self::FixedAnchorIpHeaders)
     }
+    /// Whether a lost record leaves every later record decodable: stateless
+    /// bodies, or deltas that name an explicit anchor (a delta whose anchor
+    /// was lost is discarded). Chained header contexts do not survive loss.
+    pub const fn survives_record_loss(self) -> bool {
+        !matches!(self, Self::EthernetHeaders | Self::IpHeaders)
+    }
     /// Whether the native device supplies IP packets rather than Ethernet frames.
     pub const fn is_ip(self) -> bool {
         self.uses_ip_headers() || matches!(self, Self::RawIp | Self::Lz4Ip)

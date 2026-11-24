@@ -52,6 +52,7 @@ fn research_config(old: Config) -> Config<research::Config> {
                 },
                 feedback_ticks: old.scheduler.feedback_ticks,
                 memory_bytes: old.scheduler.memory_bytes,
+                abandon_ticks: 0,
             },
         }
     }

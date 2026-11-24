@@ -757,6 +757,7 @@ fn selected_compact_wire_research_packed_source_feedback_and_exact_native_identi
                 profile,
                 feedback_ticks: 100,
                 memory_bytes: 16 << 20,
+                abandon_ticks: 0,
             },
         };
         let base = config(true, rolling::wire::SourceWire::Exact);

@@ -25,6 +25,7 @@ struct Globals {
     staged: DecoderState,
     retention: Retention,
     deadlines: cache::Checkpoint,
+    loss: LossStatus,
 }
 
 #[cfg(test)]
@@ -284,6 +285,8 @@ impl Receiver {
             pending: None,
             last_time: None,
             failure: None,
+            loss_mode: false,
+            loss: LossStatus::default(),
             reserved: Some(Reserved {
                 records: free_records,
                 compacted,
@@ -538,6 +541,7 @@ impl Receiver {
             staged: self.staged.checkpoint(),
             retention: self.retention,
             deadlines: self.deadlines.checkpoint(),
+            loss: self.loss,
         };
         let r = self.reserved.as_mut().ok_or(Error::Storage)?;
         if r.active != (index == 1).then_some(0) || r.journals[index].globals.is_some() {
@@ -662,6 +666,7 @@ impl Receiver {
             self.pending = globals.pending;
             self.last_time = globals.last_time;
             self.failure = globals.failure;
+            self.loss = globals.loss;
             self.retention = globals.retention;
             self.deadlines.restore(globals.deadlines);
             self.staged.restore(globals.staged);

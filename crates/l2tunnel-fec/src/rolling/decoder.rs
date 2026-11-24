@@ -2,6 +2,8 @@ use super::gf_batch::xor_scaled;
 use super::*;
 use crate::field;
 
+mod abandon;
+pub use abandon::AbandonStatus;
 #[cfg(test)]
 mod expiry_detail_tests;
 mod independent;
@@ -239,6 +241,9 @@ struct Job {
     deadline: Tick,
     debt: Option<Tick>,
     recovered: usize,
+    // The input includes an abandoned source with a nonzero coefficient; it
+    // commits only its history and observation, never an equation.
+    dropped: bool,
 }
 /// Initial packet staging result; Staged is not yet committed recovery receipt.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -352,6 +357,7 @@ pub struct Decoder {
     expiry_failure: Option<expiry::Failure>,
     explicit: Option<explicit::DecoderState>,
     sliding: Option<lifetimes::Sliding>,
+    abandon: abandon::AbandonStatus,
 }
 // The outer step already paid the first metadata visit. A coefficient chunk
 // stops before the row end; the following transition keeps its separate visit.
@@ -595,6 +601,7 @@ impl Decoder {
             expiry_failure: None,
             explicit: None,
             sliding: None,
+            abandon: abandon::AbandonStatus::default(),
         })
     }
     fn time(&mut self, now: Tick) -> Result<(), Error> {
@@ -720,6 +727,7 @@ impl Decoder {
             deadline: job_end,
             debt,
             recovered: 0,
+            dropped: false,
         });
         Ok(Begin::Staged)
     }
@@ -819,6 +827,11 @@ impl Decoder {
         if self.known[slot].get(&self.decisions, None)? == Some(id.0) {
             let data = &self.known_data[slot * self.width..(slot + 1) * self.width];
             let len = usize::from(u16::from_be_bytes([data[0], data[1]]));
+            if len == 0 {
+                // Abandoned before this original arrived.
+                self.abandon.late_originals += 1;
+                return Ok(Some(Begin::Stale));
+            }
             return if len == original.len() && data[2..2 + len] == *original {
                 Ok(Some(Begin::Duplicate))
             } else {
@@ -1385,6 +1398,12 @@ impl Decoder {
                             .ok_or(Error::Identity)?;
                         let extent =
                             add(2, usize::from(u16::from_be_bytes([prefix[0], prefix[1]])))?;
+                        if extent == 2 {
+                            // Abandoned source: its value is unknown forever.
+                            job.dropped = true;
+                            job.phase = Phase::Advance;
+                            return Ok(Action::Continue);
+                        }
                         if !(3..=width).contains(&extent) {
                             return Err(Error::Identity);
                         }
@@ -2018,6 +2037,7 @@ impl Decoder {
                 self.decisions.commit(job.ticket)?;
                 self.active = None;
                 self.live = self.shadow;
+                self.abandon.dropped_repairs += u64::from(job.dropped);
                 self.debt = if self.live.prefix < self.live.observed {
                     job.debt
                 } else {
@@ -2121,6 +2141,9 @@ impl Decoder {
         }
         let vector = &self.known_data[slot * self.width..(slot + 1) * self.width];
         let length = usize::from(u16::from_be_bytes([vector[0], vector[1]]));
+        if length == 0 {
+            return None;
+        }
         Some((SourceId(self.handoff), &vector[2..2 + length]))
     }
     pub(super) fn repair_in_progress(&self) -> bool {
@@ -2144,6 +2167,9 @@ impl Decoder {
         }
         let vector = &self.known_data[slot * self.width..(slot + 1) * self.width];
         let length = usize::from(u16::from_be_bytes([vector[0], vector[1]]));
+        if length == 0 {
+            return Ok(None);
+        }
         let end = 2usize.checked_add(length).ok_or(Error::Length)?;
         if length > self.config.max_payload || end > vector.len() {
             return Err(Error::Length);
@@ -2158,6 +2184,7 @@ impl Decoder {
         }
         let old_prefix = self.live.prefix;
         self.handoff = self.handoff.checked_add(1).ok_or(Error::Exhausted)?;
+        self.skip_abandoned_handoff()?;
         // A pending job owns a snapshot of prefix metadata; only its separate
         // handoff watermark may change until the bank is atomically committed.
         if self.job.is_none()
@@ -2293,6 +2320,9 @@ mod systematic_work_tests;
 
 #[cfg(test)]
 mod decoded_source_tests;
+
+#[cfg(test)]
+mod abandon_tests;
 
 #[cfg(test)]
 mod feedback_tests;

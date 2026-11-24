@@ -64,21 +64,30 @@ impl Receiver {
             || self.live_anchor(entry.channel, id).is_some())
     }
 
+    /// `Some(continue)` after staging, or `None` when a head delta whose
+    /// anchor was lost to a declared loss was discarded.
     pub(super) fn stage_fixed_anchor(
         &mut self,
         slot: usize,
         remaining: &mut usize,
-    ) -> Result<bool, Error> {
+    ) -> Result<Option<bool>, Error> {
         let entry = self.records[slot].as_ref().ok_or(Error::Malformed)?;
         if entry.early_delivered || entry.bytes.first() != Some(&aligned_body::FIXED_ANCHOR_TAG) {
-            return Ok(true);
+            return Ok(Some(true));
         }
         let id = target(entry.id, &entry.bytes)?;
         let channel = entry.channel;
         let index = usize::from(channel.0);
         if let Some(header) = self.anchors[index].get(id) {
             self.staged.restore(header.clone());
-            return Ok(true);
+            return Ok(Some(true));
+        }
+        let head = self.channels[index].expected == Some(entry.id);
+        if self.loss_mode && head && self.live_anchor(channel, id).is_none() {
+            // The anchor was lost: this delta can never decode.
+            self.retire(slot)?;
+            self.loss.dropped_records += 1;
+            return Ok(None);
         }
         let Some(anchor_slot) = self.live_anchor(channel, id) else {
             // Early selection waits for the exact anchor. At the channel head,
@@ -97,6 +106,6 @@ impl Receiver {
             self.channels[index].preview = Some(Preview::from_anchor(id, self.staged.checkpoint()));
             *remaining -= 1;
         }
-        Ok(*remaining != 0)
+        Ok(Some(*remaining != 0))
     }
 }

@@ -16,6 +16,7 @@ fn config(profile: Profile) -> Config {
         profile,
         feedback_ticks: 50,
         memory_bytes: rolling::MAX_MEMORY,
+        abandon_ticks: 0,
         recovery: rolling::Config {
             window,
             local_window: 128,

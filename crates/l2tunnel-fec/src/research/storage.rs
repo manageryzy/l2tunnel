@@ -14,28 +14,30 @@ impl Plan {
     pub fn for_sender(config: Config) -> Result<Self, Error> {
         config.validate()?;
         if Sender::memory_bound(config)? > config.memory_bytes
-            || rolling::Encoder::memory_bound(config.recovery)? > config.recovery.memory_bytes
+            || rolling::Encoder::sliding_memory_bound(config.recovery)?
+                > config.recovery.memory_bytes
         {
             return Err(Error::Capacity);
         }
         Ok(Self {
             config,
             receiver: false,
-            usage: rolling::Encoder::requested_storage(config.recovery)?,
+            usage: rolling::Encoder::sliding_requested_storage(config.recovery)?,
         })
     }
     /// Plan all existing decoder banks, transaction metadata, history and scratch.
     pub fn for_receiver(config: Config) -> Result<Self, Error> {
         config.validate()?;
         if Receiver::memory_bound(config)? > config.memory_bytes
-            || rolling::Decoder::memory_bound(config.recovery)? > config.recovery.memory_bytes
+            || rolling::Decoder::sliding_memory_bound(config.recovery)?
+                > config.recovery.memory_bytes
         {
             return Err(Error::Capacity);
         }
         Ok(Self {
             config,
             receiver: true,
-            usage: rolling::Decoder::requested_storage(config.recovery)?,
+            usage: rolling::Decoder::sliding_requested_storage(config.recovery)?,
         })
     }
     /// Exact requested retained allocation capacities; allocator/RSS overhead is excluded.

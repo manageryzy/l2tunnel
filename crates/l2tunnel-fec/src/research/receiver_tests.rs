@@ -21,6 +21,7 @@ fn config(profile: Profile) -> Result<Config, Error> {
         profile,
         feedback_ticks: 5,
         memory_bytes: rolling::MAX_MEMORY,
+        abandon_ticks: 0,
     })
 }
 fn scope() -> Scope {

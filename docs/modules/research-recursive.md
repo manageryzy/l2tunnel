@@ -227,6 +227,160 @@ catalog-bound handshake. RRP-03, all original P-* definitions, the asynchronous
 carrier ordering requirement, complete native/platform/failure/resource and
 Python wire-byte/throughput gates remain open pending their full acceptance.
 
+## Hole abandonment (owner decisions 2026-11-24)
+
+Status: **contract-tested** (RRP-04..07); native evidence (RRP-08) pending.
+
+### Problem
+
+Every research row failed every native cell of `work/full-matrix-20261123`,
+including 0% loss. Traced cause (`work/credit-20261123c/cells/r1`, the same on the
+pre-credit build `o1`): the sender's `ResearchDebt` deadline is the earliest
+`created + debt_ticks` since its pipe last fully drained and is cleared only when
+`prefix == next_source`; the nested `rolling::Encoder::new` and the receiver's
+`rolling::Decoder::new` keep the same since-drain deadline. Continuous traffic
+never fully drains, so a healthy session dies `debt_ticks` (10 s in the plans)
+after the workload starts; the trace showed 888 sources in flight with the
+receiver confirming promptly. Making the deadline per-source alone is not
+enough: this family has no retransmission, so one source the FEC cannot repair
+blocks in-order handoff and expires the session anyway.
+
+### Decisions
+
+- The receiver gives up on a hole it cannot repair ("receiver skips"); a lost
+  packet becomes ordinary loss that inner TCP retransmits end to end. Data loss
+  alone never ends the session.
+- The give-up point is adaptive with a time cap: `abandon_ticks`, a new
+  research `Config` field bound into the authenticated configuration, default
+  1 s in exported plans. It occupies the formerly reserved zero word 16 of the
+  tag-9 descriptor, so zero (every earlier vector) means abandonment is off.
+- Equations that include an abandoned source are eliminated, and later repairs
+  that include it are dropped ("Eliminate, drop late", owner decision
+  2026-11-24). Keeping such equations in place is impossible because the
+  decoder reuses the column for source `h + W`.
+
+### Abandon rule
+
+Only the oldest missing source `h = prefix` is ever abandoned, at the first of:
+
+1. **Definite**: no repair the sender can still send includes `h`, and no
+   staged job remains. For `Recursive { fresh_interval: 0 }` with taps, a
+   repair's support starts at `recursive_start(serial)`, independent of
+   receipts; once a received repair serial has `recursive_start > h`, no later
+   one includes `h`. Profiles with fresh, global or dense slots (fallback,
+   accumulator, dense controls) always cover the unconfirmed prefix, so this
+   test never fires for them.
+2. **Projected**: with `D` the decoder deficit over `[prefix, observed)` (unknown
+   columns minus rank, `feedback_state`) and `r` the measured arrival rate of
+   repairs whose support includes `h`, the hole is abandoned when
+   `age(h) + D / r >= abandon_ticks`. Each covering repair adds at most one rank,
+   so the cap would be reached anyway. Without a covering arrival since the hole
+   appeared, `r` is unknown and only the cap applies.
+3. **Cap**: `age(h) >= abandon_ticks`, where age starts when a later source or
+   repair first shows `h` missing (`observed > h`).
+
+Repairs are earned only as sources are sent; with no traffic no repair arrives,
+and the cap bounds the stall. A later hole in the same cohort (below the
+observed end when the cohort's first hole was seen) keeps the cohort's age, a
+conservative lower bound. The covering-repair rate restarts for each new oldest
+hole. The receiver exposes the cap time as a soft wake (`abandon_wake`) and a
+due abandonment as receive work, so the record endpoint services it without
+traffic. Each abandonment schedules a receipt.
+
+### Decoder mechanics (`rolling/decoder/abandon.rs`)
+
+- Abandonment is its own atomic decoder transaction (one decision ticket),
+  refused with `Busy` while a GF job is staged.
+- Every retained row pivots on an unknown column at or above the prefix and is
+  reduced on every other pivot, so the oldest unknown column `h` is nonzero at
+  most in the row pivoted on it. That row is dropped (rank falls by one).
+- Column `h` is then marked known with a zero-length vector. No valid original
+  has length zero, so the marker needs no extra storage. Prefix, eviction and
+  `feedback_state` arithmetic treat it as resolved.
+- `pending_source` and `decoded_source` never expose it; the handoff skips it.
+  A late original for it is `Stale` (counted), never a conflict.
+- A later repair with a nonzero coefficient on it is dropped whole while
+  substituting known columns. It still commits its history and observation.
+- The receipt's `prefix` means "recovered or abandoned"; the wire is unchanged.
+
+### Deadlines
+
+- Sender: the nested encoder tracks per-source debt (the existing
+  `source_deadlines` tree used by the targeted and sliding constructors), and
+  the research sender's `debt_end` follows the oldest unconfirmed source. It
+  then fires only when receipts stop for `debt_ticks`.
+- Receiver: the nested decoder uses the existing per-source `lifetimes::Sliding`
+  debt. With abandonment `prefix` advances at least every `abandon_ticks`, so it
+  fires only when the sender stops.
+
+### Observability
+
+`ReceiverStatus` adds abandoned sources by reason (definite, projected, cap),
+dropped repairs and rows, late originals, the current hole and its age, and the
+covering-repair count. The runtime snapshot carries it as `research_receiver`
+and Common status reports it as `research_recovery`.
+
+### Record layer after abandonment (owner decision 2026-11-24)
+
+Abandoning a source also loses the record units it carried. The first native
+15% runs showed both daemons ending with `Rolling(Identity)`: the record
+endpoint required unit continuity between handoffs. Decision "Anchored
+compression": research rows use `FixedAnchorIpHeaders`, whose deltas name an
+explicit anchor within 8 records, instead of chained header contexts. The
+sender does not react; the receiver alone:
+
+- detects a handoff gap (`next_handoff`) and declares the lost unit range to the
+  record receiver (`aligned_receiver::Receiver::abandon_sources`), which clears
+  stale unit proofs, advances the contiguous floor, discards incomplete records
+  and enters loss mode;
+- in loss mode lets each channel's expected record jump to the next retained
+  record (`skip_lost_head`), discards a delta whose anchor was lost, and marks a
+  later fragment of a record whose first fragment was lost `StaleRecord`; the
+  endpoint accepts that outcome only for an owner that abandons holes;
+- counts abandoned units, dropped and skipped records in `LossStatus`, which
+  every rollback path (journal and owned batch) restores.
+
+Configuration rejects abandonment with a context-chained policy
+(`EthernetHeaders`, `IpHeaders`, `NativePolicy::survives_record_loss`) and an
+`abandon_ticks` that is not below the peer's `codec_stage_micros`, since a hole
+waiting for the cap must not expire the held send stage first.
+
+### Receipt repeats (owner decision 2026-11-24)
+
+Receipts are triggered only by arriving packets. A window-blocked sender whose
+last receipt was lost therefore received no packet that could trigger another,
+and both sides waited until the send-stage cap ended the session (reproduced by
+the deterministic 15% loss engine test with both receivers fully caught up).
+Decision "Receiver repeats":
+
+- After each taken receipt the receiver schedules a repeat at doubling
+  intervals of 4, 8, 16, then 64 `feedback_ticks`, eight repeats at most (about
+  0.4 s in all at the plans' 1 ms). Any arriving input, or a receipt with new
+  information, restarts the sequence; duplicates are harmless at the sender.
+- A notice suppressed by the `feedback_ticks` rate limit used to be dropped.
+  It is now reported at the end of the window when the receipt would carry new
+  information (for example an abandonment), and still dropped for duplicates.
+- Both are soft service wakes (`service_wake`, `service_due`), never expiries.
+  `ReceiverStatus.receipt_repeats` counts the repeats.
+
+### Parity
+
+The Python references define coefficients, supports, scheduling and receipt
+cadence (`studies/rtt_*.py`); none models hard deadlines or abandonment, so
+coefficient and support parity are unchanged. Loss behavior now differs from
+the study's "insufficient rank until the hard deadline" note above, which this
+section supersedes for runtime behavior.
+
+### Tasks
+
+- [ ] [RRP-04] Per-source sender and receiver debt: research sender and nested encoder follow the oldest unconfirmed source; the receiver's decoder uses sliding per-source debt. Test: continuous traffic for longer than `debt_ticks` with prompt receipts never expires; stopped receipts still expire at `debt_ticks`.
+- [ ] [RRP-05] Decoder abandonment: versioned `abandoned` flag, header count, prefix and handoff skip, `feedback_state`, late-decode discard, eviction cleanup. Tests: abandon a pivot and a free column; a later repair containing the abandoned column still recovers others; eviction with lingering rows; atomicity against a pending job.
+- [ ] [RRP-06] Research receiver abandon rule: `abandon_ticks` config field (validated, digest-bound), definite, projected and cap triggers, covering-repair rate. Tests per trigger and per profile family.
+- [ ] [RRP-07] Status and metrics: abandoned by reason, late decodes, hole age, rate, through Common status.
+- [ ] [RRP-08] Runtime and native evidence: a lossy Common research session longer than `debt_ticks` delivers with abandoned counts and no terminal; the four research rows rerun natively at 0% and 15%.
+- [ ] [RRP-09] Record-layer loss after abandonment: handoff-gap detection, `abandon_sources`, channel head skip, orphaned delta and fragment discard, `LossStatus` with rollback, configuration refusal of chained policies; research plan rows use `FixedAnchorIpHeaders`. Tests: codec loss and rollback cases; engine test under 15% loss with anchored and raw IP policies.
+- [ ] [RRP-10] Receipt repeats and trailing rate-limited receipts. Tests: bounded doubling repeat schedule; duplicates generate nothing; an abandonment inside the rate window is reported at its end.
+
 ## Component ledger
 
 These component gates do not complete or narrow the parent P-* mode tasks.

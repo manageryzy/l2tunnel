@@ -136,7 +136,7 @@ impl Sender {
     /// Conservative total reservation, excluding caller buffers and allocator metadata.
     pub fn memory_bound(config: Config) -> Result<usize, Error> {
         config.validate()?;
-        rolling::Encoder::memory_bound(config.recovery)?
+        rolling::Encoder::sliding_memory_bound(config.recovery)?
             .checked_add(std::mem::size_of::<Self>())
             .ok_or(Error::Exhausted)
     }
@@ -147,7 +147,9 @@ impl Sender {
             return Err(Error::Capacity);
         }
         Ok(Self {
-            encoder: rolling::Encoder::new(config.recovery, scope, now)?,
+            // Per-source debt: the deadline follows the oldest unconfirmed
+            // source, so steady traffic with prompt receipts never expires it.
+            encoder: rolling::Encoder::new_sliding(config.recovery, scope, now)?,
             config,
             scope,
             pending: None,
@@ -240,11 +242,14 @@ impl Sender {
         if now >= output_end || now >= debt_end {
             return Err(Error::Expired);
         }
-        let id = self.encoder.admit_source(original, now)?;
+        // Debt counts from original creation, as `debt_end` above.
+        let id = self
+            .encoder
+            .admit_source_created(original, created_at, now)?;
         self.pending = Some(Pending::Source(id));
         self.available_at = Some(now);
         self.output_end = Some(output_end);
-        self.debt_end = Some(self.debt_end.map_or(debt_end, |old| old.min(debt_end)));
+        self.debt_end = self.encoder.debt();
         Ok(id)
     }
 
@@ -479,9 +484,7 @@ impl Sender {
             .or_else(|error| self.fail(error))?;
         self.feedback = Some(feedback);
         self.feedback_at = Some(received);
-        if feedback.prefix == self.encoder.status().next_source {
-            self.debt_end = None;
-        }
+        self.debt_end = self.encoder.debt();
         Ok(FeedbackDisposition::Applied)
     }
 

@@ -75,6 +75,7 @@ fn research_plans(hosts: &[Arc<Host>; 2]) -> Result<(CarrierPlans, Vec<Arc<Probe
                 profile: policy,
                 feedback_ticks: 1,
                 memory_bytes: 16 << 20,
+                abandon_ticks: 0,
             },
         }
     };

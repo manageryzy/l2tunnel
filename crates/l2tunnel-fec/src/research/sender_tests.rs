@@ -20,6 +20,7 @@ fn config(profile: Profile) -> Config {
         profile,
         feedback_ticks: 5,
         memory_bytes: 1 << 20,
+        abandon_ticks: 0,
     }
 }
 
@@ -207,9 +208,12 @@ fn original_creation_deadlines_survive_backpressure_work_and_partial_feedback() 
     sender.admit_source(&[2], Tick(10), Tick(20))?;
     sender.confirm_output(OutputId::Source(SourceId(1)), Tick(20))?;
     sender.receive_feedback(feedback(1, 1, 2), Tick(900))?;
-    assert_eq!(sender.deadline(), Some(Tick(1000)));
+    // Per-source debt: the receipt confirmed source 0, so the deadline moves
+    // to source 1's own original creation (10) plus `debt_ticks`, never later.
+    assert_eq!(sender.deadline(), Some(Tick(1010)));
+    sender.step(Tick(1009), WorkBudget::default())?;
     assert_eq!(
-        sender.step(Tick(1000), WorkBudget::default()),
+        sender.step(Tick(1010), WorkBudget::default()),
         Err(Error::Expired)
     );
 
@@ -384,5 +388,61 @@ fn actual_feedback_arrival_orders_repair_prefix_without_clock_rewind_or_renewed_
         Err(Error::Identity)
     );
     assert_eq!(unsent.status().sent_sources, 0);
+    Ok(())
+}
+
+/// Steady traffic with prompt receipts runs far past `debt_ticks` (1000)
+/// without expiring; once receipts stop, the oldest unconfirmed source still
+/// expires `debt_ticks` after its own creation (RRP-04).
+#[test]
+fn per_source_debt_survives_steady_traffic_and_still_expires_without_receipts() -> TestResult {
+    let mut sender = Sender::new(accumulator(), scope(), Tick(0))?;
+    let mut next = 0;
+    let mut receipt = 0;
+    let mut confirmed = 0;
+    // One source every 20 ticks for 5000 ticks; a receipt confirms everything
+    // older than 100 ticks.
+    for step in 0..250_u64 {
+        let now = Tick(step * 20);
+        if let Some(output) = sender.pending_output()
+            && matches!(output.id(), OutputId::Repair(_))
+        {
+            let id = output.id();
+            sender.confirm_output(id, now)?;
+        }
+        sender.admit_source(&[next as u8], now, now)?;
+        sender.confirm_output(OutputId::Source(SourceId(next)), now)?;
+        next += 1;
+        let target = next.saturating_sub(5);
+        if target > confirmed {
+            receipt += 1;
+            sender.receive_feedback(feedback(receipt, target, next), now)?;
+            confirmed = target;
+        }
+        finish(&mut sender, now, 64).or_else(|error| match error {
+            Error::WorkLimit => Ok(()),
+            other => Err(other),
+        })?;
+    }
+    assert_eq!(sender.status().terminal, None);
+    // The debt deadline is the oldest unconfirmed source's creation plus
+    // `debt_ticks`, far later than the first source's.
+    let oldest = u64::from(confirmed) * 20;
+    let debt = sender.expiry_snapshot().candidates[4].ok_or("research debt")?;
+    assert_eq!(debt.at, Tick(oldest + 1000));
+    assert!(debt.at > Tick(1000));
+    // Without further receipts it still expires.
+    let mut now = 5000;
+    let result = loop {
+        if let Err(error) = sender.step(Tick(now), WorkBudget::default()) {
+            break error;
+        }
+        now += 10;
+        if now > oldest + 2000 {
+            return Err("debt never expired".into());
+        }
+    };
+    assert_eq!(result, Error::Expired);
+    assert!(now <= oldest + 1000, "{now}");
     Ok(())
 }

@@ -204,6 +204,16 @@ impl<P: RecoveryPolicy> DirectionConfig<P> {
         {
             return Err(Error::Configuration);
         }
+        // A recovery owner that abandons holes loses records; only a policy
+        // whose later records stay decodable may be paired with it.
+        // The peer's held send stage must outlive one abandonment cap, or a
+        // hole that waits for the cap expires the session first.
+        if self.scheduler.abandons_holes()
+            && (!self.native_policy.survives_record_loss()
+                || self.scheduler.abandon_ticks() >= self.codec_stage_micros)
+        {
+            return Err(Error::Configuration);
+        }
         if self.scheduler.compresses_packed_acks()
             && (self.native_policy != NativePolicy::IpHeaders
                 || !codec::aligned_body::lz4_available()

@@ -152,6 +152,9 @@ pub struct Endpoint<P: RecoveryPolicy = scheduler::Policy> {
     pub(super) next_channel: u16,
     pub(super) receive_progress: bool,
     receive_unit: Option<receiver::SourceId>,
+    // Next source the recovery owner hands off; a larger handed identity means
+    // the sources between were abandoned (research only).
+    next_handoff: u32,
     // Contiguous immutable Packed headers verified ahead of recovery handoff.
     preview_chain: Option<(u32, receiver::SourceId)>,
     preview_next: u32,
@@ -416,6 +419,7 @@ impl<P: RecoveryPolicy> Endpoint<P> {
             next_channel: 0,
             receive_progress: false,
             receive_unit: Some(receive_config.receiver.first_source),
+            next_handoff: 0,
             preview_chain: None,
             preview_next: 0,
             preview_end: 0,
@@ -763,6 +767,21 @@ impl<P: RecoveryPolicy> Endpoint<P> {
             Ok(view) => view,
             Err(error) => return self.fail(error),
         };
+        if id.0 != self.next_handoff {
+            // Only an owner that abandons holes may skip, and only forward.
+            if id.0 < self.next_handoff || !config.scheduler.abandons_holes() {
+                return self.fail(Error::Identity);
+            }
+            let first = view.identity().first_unit;
+            if self.receive_unit.is_none_or(|unit| first.0 < unit.0) {
+                return self.fail(Error::Identity);
+            }
+            if let Err(error) = self.records.abandon_sources(first, receiver_tick(now)) {
+                return self.fail(Error::Receiver(error));
+            }
+            self.receive_unit = Some(first);
+            self.next_handoff = id.0;
+        }
         let width = config.receiver.body.symbol_bytes;
         let mut scratch = self.symbols.as_mut_slice();
         if let Some(preview) = self.preview {
@@ -807,6 +826,7 @@ impl<P: RecoveryPolicy> Endpoint<P> {
                 if let Err(error) = result {
                     return self.fail(error);
                 }
+                self.next_handoff = id.0.checked_add(1).ok_or(Error::Arithmetic)?;
                 if let Some(waits) = self.waits.first_mut() {
                     waits.progress(waits::Site::DecodedHandoff, operation, now);
                 }
@@ -858,6 +878,10 @@ impl<P: RecoveryPolicy> Endpoint<P> {
         let scope = self.receive_scope;
         let compact = self.compact_feedback_overhead.is_some();
         let decoder = P::receive_state(&self.incoming, rolling_tick(now)).decoder;
+        // An abandoned range is reconciled at the ordered handoff first.
+        if decoder.handoff_prefix != self.next_handoff {
+            return Ok(false);
+        }
         let (mut source, mut first) = self
             .preview_chain
             .filter(|(id, _)| *id >= decoder.handoff_prefix)
@@ -2681,9 +2705,13 @@ fn admit_packed_view<P: RecoveryPolicy>(
         }
         value => value.map_err(Error::Receiver)?,
     };
+    // After an abandoned source, a fragment whose record start was lost is
+    // stale by design; only an owner that abandons holes produces that.
+    let lossy = config.scheduler.abandons_holes();
     if admitted != count
         || outcomes[..count].iter().any(|a| {
             !(matches!(a, receiver::Admission::Accepted)
+                || lossy && matches!(a, receiver::Admission::StaleRecord)
                 || preview
                     && matches!(
                         a,

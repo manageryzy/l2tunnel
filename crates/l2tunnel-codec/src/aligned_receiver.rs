@@ -282,6 +282,20 @@ pub struct Status {
     pub pending_bytes: Option<usize>,
     /// Sticky terminal expiry/semantic error.
     pub failure: Option<Error>,
+    /// Loss declared by the enclosing recovery owner (`abandon_sources`).
+    pub loss: LossStatus,
+}
+/// Records and units given up because the recovery owner abandoned sources.
+/// Each lost native packet is ordinary loss that inner TCP retransmits.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct LossStatus {
+    /// Unit identities declared lost.
+    pub abandoned_units: u64,
+    /// Records discarded: incomplete at a loss, fragments whose start was
+    /// lost, or deltas whose anchor was lost.
+    pub dropped_records: u64,
+    /// Channel heads moved past records lost entirely.
+    pub skipped_records: u64,
 }
 /// One externally authenticated symbol borrowed for atomic ledger admission.
 /// The selected exact-unit or padded geometry and existing identity rules apply.
@@ -421,6 +435,10 @@ pub struct Receiver {
     last_time: Option<Tick>,
     failure: Option<Error>,
     reserved: Option<storage::Reserved>,
+    // Set by the first `abandon_sources`: a channel head may then skip a
+    // record that can no longer arrive (see that method).
+    loss_mode: bool,
+    loss: LossStatus,
 }
 // Compatibility-only original field types; never used as reservation authority.
 #[allow(dead_code)]
@@ -547,6 +565,8 @@ impl Receiver {
             last_time: None,
             failure: None,
             reserved: None,
+            loss_mode: false,
+            loss: LossStatus::default(),
         })
     }
     /// Preflight exact-unit parsing before this receiver has accepted time or input.
@@ -634,6 +654,7 @@ impl Receiver {
         let floor = self.floor;
         let last_time = self.last_time;
         let retention = self.retention;
+        let loss = self.loss;
         let deadlines = self.deadlines.checkpoint();
         let mut outcomes = Vec::with_capacity(symbols.len());
         for symbol in symbols {
@@ -646,6 +667,7 @@ impl Receiver {
                     self.floor = floor;
                     self.last_time = last_time;
                     self.retention = retention;
+                    self.loss = loss;
                     self.deadlines.restore(deadlines);
                     return Err(error);
                 }
@@ -710,6 +732,8 @@ impl Receiver {
         shadow.pending = self.pending;
         shadow.last_time = self.last_time;
         shadow.failure = self.failure;
+        shadow.loss_mode = self.loss_mode;
+        shadow.loss = self.loss;
         shadow.retention = self.retention;
         shadow.deadlines.restore(self.deadlines.checkpoint());
         Ok(shadow)
@@ -869,6 +893,16 @@ impl Receiver {
                             Admission::Accepted
                         }
                     }
+                }
+                Err(_)
+                    if self.loss_mode
+                        && parsed.fragments != 0
+                        && parsed.offset / parsed.capacity != 0 =>
+                {
+                    // Its first fragment was lost or discarded at a declared
+                    // loss; it can never complete. The unit proof is still kept.
+                    self.loss.dropped_records += 1;
+                    Admission::StaleRecord
                 }
                 Err(position) => {
                     self.reserve(
@@ -1059,6 +1093,13 @@ impl Receiver {
                 Some(id) => id,
                 None => return Ok(Prepared::Idle),
             };
+            if self.loss_mode {
+                self.skip_lost_head(channel, expected)?;
+            }
+            let expected = match self.expected(channel)? {
+                Some(id) => id,
+                None => return Ok(Prepared::Idle),
+            };
             let Some((position, anchor)) = self.select_record(channel, expected, &selection)?
             else {
                 return Ok(Prepared::Idle);
@@ -1066,8 +1107,11 @@ impl Receiver {
             let slot = usize::from(self.ordered_slots[position]);
             let index = usize::from(channel.0);
             if self.mode == ReceiverMode::FixedIpAnchors {
-                if !self.stage_fixed_anchor(slot, &mut remaining)? {
-                    return Ok(Prepared::Progress);
+                match self.stage_fixed_anchor(slot, &mut remaining)? {
+                    Some(true) => {}
+                    Some(false) => return Ok(Prepared::Progress),
+                    // A head delta whose anchor was lost was discarded.
+                    None => continue,
                 }
             } else if let Some(anchor) = anchor {
                 if !self.stage_prefix(index, anchor, position, &mut remaining)? {
@@ -1266,6 +1310,7 @@ impl Receiver {
             compacted_record_capacity: self.compacted_slots,
             pending_bytes: self.pending.map(|p| p.written),
             failure: self.failure,
+            loss: self.loss,
         }
     }
     /// Exact retained proofs and records, with one indexed head lookup per channel.
@@ -1402,6 +1447,95 @@ impl Receiver {
         } else {
             Ok(())
         }
+    }
+    /// Declare every unit below `end` lost (RRP-08, owner decision 2026-11-24).
+    ///
+    /// The enclosing recovery owner abandoned the sources carrying them, so they
+    /// will never be admitted. The unit floor moves to `end`, stale proofs in
+    /// the range are released, and every incomplete record is discarded: in the
+    /// ordered source stream its missing fragments were in the lost range. From
+    /// now on a channel whose expected record is absent while a later record on
+    /// it is retained skips ahead (in-order arrival proves the absent one lost),
+    /// a non-first fragment of an absent record is stale, and a head delta whose
+    /// anchor was lost is discarded. Context-chained header policies cannot
+    /// recover from loss; the configuration must select an anchored or
+    /// stateless native policy before the owner may abandon sources.
+    pub fn abandon_sources(&mut self, end: SourceId, now: Tick) -> Result<(), Error> {
+        self.check_time(now)?;
+        let floor = self.floor.ok_or(Error::Exhausted)?;
+        self.loss_mode = true;
+        self.last_time = Some(now);
+        if end.0 <= floor.0 {
+            return Ok(());
+        }
+        let window = self.limits.source_window as u64;
+        for offset in 0..(end.0 - floor.0).min(window) {
+            let slot = ((floor.0 + offset) % window) as usize;
+            if self.proofs[slot]
+                .as_ref()
+                .is_some_and(|proof| proof.source.0 < end.0)
+            {
+                self.touch_proof(slot)?;
+                if let Some(proof) = self.proofs[slot].take() {
+                    self.retention.remove_proof(&proof);
+                    self.deadlines
+                        .remove(proof.deadline, self.retention.is_empty());
+                    self.recycle_proof(proof)?;
+                }
+            }
+        }
+        self.loss.abandoned_units += end.0 - floor.0;
+        self.floor = Some(end);
+        self.advance_sources()?;
+        let pending = self.pending.map(|p| p.slot);
+        for slot in 0..self.records.len() {
+            if Some(slot) != pending
+                && self.records[slot]
+                    .as_ref()
+                    .is_some_and(|record| !record.complete())
+            {
+                self.discard(slot)?;
+                self.loss.dropped_records += 1;
+            }
+        }
+        Ok(())
+    }
+    /// Move a channel head past records that can no longer arrive.
+    fn skip_lost_head(&mut self, channel: ChannelId, expected: RecordId) -> Result<(), Error> {
+        let Err(position) = self.record_position(channel, expected) else {
+            return Ok(());
+        };
+        let Some(&slot) = self.ordered_slots.get(position) else {
+            return Ok(());
+        };
+        let Some(next) = self.records[usize::from(slot)].as_ref() else {
+            return Err(Error::Malformed);
+        };
+        if next.channel != channel || next.id <= expected {
+            return Ok(());
+        }
+        let next = next.id;
+        let index = usize::from(channel.0);
+        self.touch_channel(index)?;
+        self.loss.skipped_records += next.0 - expected.0;
+        self.channels[index].expected = Some(next);
+        Ok(())
+    }
+    /// Release one retained record without delivery or head movement.
+    pub(super) fn discard(&mut self, slot: usize) -> Result<(), Error> {
+        let entry = self.records[slot].as_ref().ok_or(Error::Malformed)?;
+        let position = self
+            .record_position(entry.channel, entry.id)
+            .map_err(|_| Error::Malformed)?;
+        self.touch_record(slot, false)?;
+        self.ordered_slots.remove(position);
+        if let Some(record) = self.records[slot].take() {
+            self.retention.remove_record(&record);
+            self.deadlines
+                .remove(record.deadline, self.retention.is_empty());
+            self.recycle_record(record)?;
+        }
+        Ok(())
     }
     fn retire(&mut self, slot: usize) -> Result<(), Error> {
         let entry = self.records[slot].as_ref().ok_or(Error::Malformed)?;
