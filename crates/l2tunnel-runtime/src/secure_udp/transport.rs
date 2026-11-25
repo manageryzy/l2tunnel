@@ -120,6 +120,7 @@ mod remote_meters;
 mod tunnel_tests;
 pub use carrier_switch::{
     CarrierSwitchError, CarrierSwitchOutcome, CarrierSwitchSnapshot, CarrierTarget,
+    UdpSocketProtector,
 };
 pub use common::{
     ChannelMeterSnapshot, CommonControlHandle, CommonControlRequests, CommonSnapshot,

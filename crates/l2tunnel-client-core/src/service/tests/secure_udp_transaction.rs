@@ -1742,6 +1742,119 @@ async fn lease_expiry_and_peer_outage_trigger_bounded_fresh_auth_recovery() -> R
     Ok(())
 }
 
+/// CL-29: `udp_socket_protector` is invoked for both initial connect and every
+/// standby UDP socket opened during make-before-break live carrier switching,
+/// and a failed protection aborts only the switch while preserving the session.
+#[tokio::test]
+async fn udp_socket_protector_covers_initial_and_live_carrier_switch_sockets() -> Result {
+    use crate::local::{OperationAction, OperationRequest};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    let hosts = support::hosts();
+    let TransactionPlans { plans, .. } =
+        transaction_plans(l2tunnel_cover::Appearance::QuicLike, &hosts)?;
+    let [client_plan, server_plan] = plans;
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let allow = Arc::new(AtomicBool::new(true));
+    let calls_cb = calls.clone();
+    let allow_cb = allow.clone();
+    let client_plan = client_plan.with_udp_socket_protector(move |_sock| {
+        let calls = calls_cb.clone();
+        let allow = allow_cb.clone();
+        async move {
+            calls.fetch_add(1, Ordering::SeqCst);
+            if allow.load(Ordering::SeqCst) {
+                Ok(())
+            } else {
+                Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "VpnService refused standby socket",
+                ))
+            }
+        }
+    })?;
+
+    let (client, client_run) = channel();
+    let (server, server_run) = channel();
+    let client_task = tokio::spawn(client_run);
+    let server_task = tokio::spawn(server_run);
+
+    let server_connect = server
+        .connect(server_plan, server.next_key().map_err(submit)?)
+        .map_err(submit)?;
+    let client_connect = client
+        .connect(client_plan, client.next_key().map_err(submit)?)
+        .map_err(submit)?;
+    tokio::try_join!(
+        connected(&server, server_connect),
+        connected(&client, client_connect)
+    )?;
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "initial connect must protect the outer UDP socket"
+    );
+
+    // Live carrier switch must invoke the protector on the newly opened standby UDP socket.
+    let switched = client
+        .operations_request(OperationRequest::new(OperationAction::CarrierSwitch {
+            target: "media-like".into(),
+        }))
+        .await;
+    assert!(switched.ok, "protected live switch failed: {switched:?}");
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        2,
+        "live carrier switch must protect the standby UDP socket before connect/probe"
+    );
+
+    // Refusing protection on a second switch must fail the switch cleanly without killing the session.
+    allow.store(false, Ordering::SeqCst);
+    let refused = client
+        .operations_request(OperationRequest::new(OperationAction::CarrierSwitch {
+            target: "tls-like".into(),
+        }))
+        .await;
+    assert!(
+        !refused.ok,
+        "switch with refused socket protection must fail cleanly"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 3);
+
+    // Active session must still deliver packets over the existing protected socket.
+    let pkt = packet(0x9a, 384);
+    hosts[0].send(&pkt)?;
+    timeout(Duration::from_secs(2), async {
+        let mut out = [0_u8; 1601];
+        loop {
+            let read = {
+                let app = hosts[1]
+                    .application
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                app.as_ref().ok_or("device closed")?.recv(&mut out)
+            };
+            match read {
+                Ok(n) => {
+                    assert_eq!(&out[..n], pkt);
+                    return Ok::<(), Error>(());
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+    })
+    .await??;
+
+    client_task.abort();
+    server_task.abort();
+    let _ = tokio::join!(client_task, server_task);
+    Ok(())
+}
+
 struct DirGuard(std::path::PathBuf);
 impl Drop for DirGuard {
     fn drop(&mut self) {

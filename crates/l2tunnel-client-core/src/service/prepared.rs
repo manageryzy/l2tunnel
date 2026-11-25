@@ -240,8 +240,7 @@ pub struct Prepared {
     pub(super) data: Arc<Data>,
     pub(super) udp_socket_protector: Option<UdpSocketProtector>,
 }
-type Protection = std::pin::Pin<Box<dyn std::future::Future<Output = io::Result<()>> + Send>>;
-type UdpSocketProtector = Arc<dyn Fn(&tokio::net::UdpSocket) -> Protection + Send + Sync>;
+type UdpSocketProtector = l2tunnel_runtime::secure_udp::transport::UdpSocketProtector;
 impl Prepared {
     /// Whether this plan connects to a peer or accepts members.
     pub fn role(&self) -> local::Role {

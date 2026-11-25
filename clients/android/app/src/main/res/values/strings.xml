@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">l2tunnel</string>
+    <string name="vpn_channel_name">l2tunnel VPN Service</string>
+    <string name="vpn_channel_desc">Shows the active tunnel connection status and allows disconnecting.</string>
+    <string name="action_connect">Connect</string>
+    <string name="action_reconnect">Reconnect</string>
+    <string name="action_disconnect">Disconnect</string>
+    <string name="action_switch_quic">QUIC-like</string>
+    <string name="action_switch_media">Media-like</string>
+    <string name="action_switch_tls">TLS-like</string>
+</resources>

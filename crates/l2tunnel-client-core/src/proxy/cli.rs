@@ -1,4 +1,5 @@
 //! Shared current Common proxy presentation.
+#[cfg(target_os = "linux")]
 use super::*;
 #[cfg(target_os = "linux")]
 #[path = "cli_service.rs"]

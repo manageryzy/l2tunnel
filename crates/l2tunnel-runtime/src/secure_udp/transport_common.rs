@@ -415,6 +415,7 @@ pub struct CommonControlRequests(
     pub(super) std::sync::Arc<super::remote_meters::Shared>,
     pub(super) std::sync::Arc<super::rate_budget::Shared>,
     pub(super) std::sync::Arc<super::carrier_switch::Shared>,
+    pub(super) Option<super::carrier_switch::UdpSocketProtector>,
 );
 impl CommonControlRequests {
     /// Let the session set its device MTU around live inner-size switches
@@ -422,6 +423,17 @@ impl CommonControlRequests {
     #[must_use]
     pub fn with_device_mtu(mut self, setter: std::sync::Arc<dyn super::DeviceMtu>) -> Self {
         self.2 = Some(setter);
+        self
+    }
+
+    /// Require platform protection (e.g. Android `VpnService.protect`) on every
+    /// freshly bound standby UDP socket opened during live carrier switching.
+    #[must_use]
+    pub fn with_udp_socket_protector(
+        mut self,
+        protector: super::carrier_switch::UdpSocketProtector,
+    ) -> Self {
+        self.6 = Some(protector);
         self
     }
 }
@@ -454,7 +466,15 @@ pub fn common_channel() -> (CommonControlHandle, CommonControlRequests) {
             rate_budget.clone(),
             carrier_switch.clone(),
         ),
-        CommonControlRequests(receiver, tests, None, meters, rate_budget, carrier_switch),
+        CommonControlRequests(
+            receiver,
+            tests,
+            None,
+            meters,
+            rate_budget,
+            carrier_switch,
+            None,
+        ),
     )
 }
 

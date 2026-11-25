@@ -23,9 +23,16 @@
 //!    socket and leaves the active carrier untouched.
 
 use std::collections::VecDeque;
+use std::future::Future;
 use std::io;
 use std::net::{SocketAddr, UdpSocket as StdUdpSocket};
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
+
+/// Async platform callback invoked to protect every freshly bound standby UDP
+/// socket (e.g. Android `VpnService.protect`) before connecting or probing.
+pub type UdpSocketProtector =
+    Arc<dyn Fn(&UdpSocket) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send>> + Send + Sync>;
 
 use l2tunnel_cover::{
     Appearance, Config as CoverConfig, ConnectionId, ConnectionIds, Limits as CoverLimits,
@@ -449,6 +456,11 @@ enum InitiatorPhase {
         frame: [u8; FRAME_BYTES],
         submitted: bool,
     },
+    /// Authenticated Ready received; awaiting async standby bind + protect + connect.
+    PendingBind {
+        peer_addr: SocketAddr,
+        token: [u8; 32],
+    },
     /// Bound standby UDP socket; probing until L2CA arrives.
     Probing {
         socket: UdpSocket,
@@ -476,6 +488,12 @@ struct InitiatorActive {
     phase: InitiatorPhase,
 }
 
+struct ResponderPending {
+    id: u32,
+    target: CarrierTarget,
+    deadline_us: u64,
+}
+
 struct ResponderStandby {
     id: u32,
     target: CarrierTarget,
@@ -491,7 +509,9 @@ struct ResponderStandby {
 /// Session-loop side of live carrier switching.
 pub(super) struct Port {
     shared: Option<Arc<Shared>>,
+    protector: Option<UdpSocketProtector>,
     initiator: Option<InitiatorActive>,
+    responder_pending: Option<ResponderPending>,
     responder: Option<ResponderStandby>,
     outgoing: VecDeque<([u8; FRAME_BYTES], u64)>,
     effective_cover: Appearance,
@@ -504,6 +524,7 @@ pub(super) struct Port {
 impl Port {
     pub(super) fn new(
         shared: Option<Arc<Shared>>,
+        protector: Option<UdpSocketProtector>,
         initial_cover: Appearance,
         local_addr: SocketAddr,
         peer_addr: SocketAddr,
@@ -511,7 +532,9 @@ impl Port {
     ) -> Self {
         Self {
             shared,
+            protector,
             initiator: None,
+            responder_pending: None,
             responder: None,
             outgoing: VecDeque::with_capacity(MAX_OUTGOING),
             effective_cover: initial_cover,
@@ -554,12 +577,19 @@ impl Port {
         };
         if let Some(active) = &self.initiator {
             consider(active.deadline_us);
-            if matches!(
-                active.phase,
-                InitiatorPhase::Probing { .. } | InitiatorPhase::Committing { .. }
-            ) {
-                consider(now.saturating_add(POLL_WAKE_US));
+            match &active.phase {
+                InitiatorPhase::PendingBind { .. } => consider(now),
+                InitiatorPhase::Probing {
+                    last_probe_us: 0, ..
+                } => consider(now),
+                InitiatorPhase::Probing { .. } | InitiatorPhase::Committing { .. } => {
+                    consider(now.saturating_add(POLL_WAKE_US));
+                }
+                InitiatorPhase::Proposed { .. } => {}
             }
+        }
+        if self.responder_pending.is_some() {
+            consider(now);
         }
         if let Some(standby) = &self.responder {
             consider(standby.deadline_us);
@@ -588,18 +618,6 @@ fn bind_standby_udp(local_ip: std::net::IpAddr) -> io::Result<(UdpSocket, Socket
     Ok((sock, addr))
 }
 
-fn bind_connected_standby_udp(
-    local_ip: std::net::IpAddr,
-    peer: SocketAddr,
-) -> io::Result<(UdpSocket, SocketAddr)> {
-    let std_sock = StdUdpSocket::bind(SocketAddr::new(local_ip, 0))?;
-    std_sock.set_nonblocking(true)?;
-    std_sock.connect(peer)?;
-    let addr = std_sock.local_addr()?;
-    let sock = UdpSocket::from_std(std_sock)?;
-    Ok((sock, addr))
-}
-
 impl super::Driver {
     pub(super) fn install_carrier_switch<R: super::raw_carrier::RawBacking>(
         &mut self,
@@ -611,9 +629,11 @@ impl super::Driver {
         }
         let super::Requests::Common(requests) = requests;
         let shared = requests.as_ref().map(|req| req.5.clone());
+        let protector = requests.as_ref().and_then(|req| req.6.clone());
         let is_udp = matches!(socket, IoOwner::Udp(_));
         self.carrier_switch = Some(Box::new(Port::new(
             shared,
+            protector,
             self.cover.appearance(),
             self.info.local_addr,
             self.info.peer_addr,
@@ -737,6 +757,54 @@ impl super::Driver {
                         deadline_us,
                         phase: InitiatorPhase::Proposed { frame, submitted },
                     });
+                }
+                InitiatorPhase::PendingBind { peer_addr, token } => {
+                    let bound = match bind_standby_udp(port.local_addr.ip()) {
+                        Ok((sock, local_addr)) => {
+                            let protected = match &port.protector {
+                                Some(protect) => protect(&sock).await,
+                                None => Ok(()),
+                            };
+                            match protected {
+                                Ok(()) => match sock.connect(peer_addr).await {
+                                    Ok(()) => Ok((sock, local_addr)),
+                                    Err(err) => Err(err),
+                                },
+                                Err(err) => Err(err),
+                            }
+                        }
+                        Err(err) => Err(err),
+                    };
+                    match bound {
+                        Ok((standby, local_addr)) => {
+                            let mut last_probe_us = 0;
+                            let mut seq = 1_u32;
+                            if let Ok(probe) =
+                                encode_probe(target, &token, true, PROBE_MAGIC_REQ, id, seq)
+                            {
+                                let _ = standby.try_send(&probe);
+                                last_probe_us = now;
+                            } else {
+                                seq = 0;
+                            }
+                            port.initiator = Some(InitiatorActive {
+                                id,
+                                target,
+                                deadline_us,
+                                phase: InitiatorPhase::Probing {
+                                    socket: standby,
+                                    local_addr,
+                                    peer_addr,
+                                    token,
+                                    last_probe_us,
+                                    seq,
+                                },
+                            });
+                        }
+                        Err(_) => {
+                            port.complete_initiator(Err(CarrierSwitchError::BindFailed));
+                        }
+                    }
                 }
                 InitiatorPhase::Probing {
                     socket: standby,
@@ -915,7 +983,58 @@ impl super::Driver {
             self.receive_selected_with_arrival(&packet, now, now, instant, instant)?;
         }
 
-        // 4. Drive responder standby probing & commit swap.
+        // 4. Bind & protect any pending responder standby socket, then drive probing & commit swap.
+        if let Some(pending) = port.responder_pending.take()
+            && now < pending.deadline_us
+        {
+            let bound = match (bind_standby_udp(port.local_addr.ip()), random_token()) {
+                (Ok((sock, local_addr)), Ok(token)) => match &port.protector {
+                    Some(protect) => match protect(&sock).await {
+                        Ok(()) => Ok((sock, local_addr, token)),
+                        Err(err) => Err(err),
+                    },
+                    None => Ok((sock, local_addr, token)),
+                },
+                _ => Err(io::Error::other("standby bind failed")),
+            };
+            match bound {
+                Ok((sock, local_addr, token)) => {
+                    let ready = WireFrame {
+                        kind: KIND_READY,
+                        target: pending.target,
+                        code: CODE_OK,
+                        id: pending.id,
+                        port: local_addr.port(),
+                        token,
+                    }
+                    .encode();
+                    port.responder = Some(ResponderStandby {
+                        id: pending.id,
+                        target: pending.target,
+                        socket: sock,
+                        local_addr,
+                        peer_addr: None,
+                        token,
+                        deadline_us: pending.deadline_us,
+                        commit_pending: false,
+                        seq: 0,
+                    });
+                    port.push_outgoing(ready, pending.deadline_us);
+                }
+                Err(_) => {
+                    let refuse = WireFrame {
+                        kind: KIND_REFUSE,
+                        target: pending.target,
+                        code: CODE_BIND_FAILED,
+                        id: pending.id,
+                        port: 0,
+                        token: [0_u8; 32],
+                    }
+                    .encode();
+                    port.push_outgoing(refuse, pending.deadline_us);
+                }
+            }
+        }
         if let Some(mut standby) = port.responder.take() {
             let mut buf = [0_u8; 256];
             for _ in 0..8 {
@@ -1035,7 +1154,7 @@ impl super::Driver {
                     }
                     .encode();
                     port.push_outgoing(refuse, deadline_us);
-                } else if port.responder.is_some() {
+                } else if port.responder.is_some() || port.responder_pending.is_some() {
                     let refuse = WireFrame {
                         kind: KIND_REFUSE,
                         code: CODE_BUSY,
@@ -1044,40 +1163,11 @@ impl super::Driver {
                     .encode();
                     port.push_outgoing(refuse, deadline_us);
                 } else {
-                    match (bind_standby_udp(port.local_addr.ip()), random_token()) {
-                        (Ok((sock, local_addr)), Ok(token)) => {
-                            let ready = WireFrame {
-                                kind: KIND_READY,
-                                target: frame.target,
-                                code: CODE_OK,
-                                id: frame.id,
-                                port: local_addr.port(),
-                                token,
-                            }
-                            .encode();
-                            port.responder = Some(ResponderStandby {
-                                id: frame.id,
-                                target: frame.target,
-                                socket: sock,
-                                local_addr,
-                                peer_addr: None,
-                                token,
-                                deadline_us,
-                                commit_pending: false,
-                                seq: 0,
-                            });
-                            port.push_outgoing(ready, deadline_us);
-                        }
-                        _ => {
-                            let refuse = WireFrame {
-                                kind: KIND_REFUSE,
-                                code: CODE_BIND_FAILED,
-                                ..frame
-                            }
-                            .encode();
-                            port.push_outgoing(refuse, deadline_us);
-                        }
-                    }
+                    port.responder_pending = Some(ResponderPending {
+                        id: frame.id,
+                        target: frame.target,
+                        deadline_us,
+                    });
                 }
             }
             KIND_READY => {
@@ -1090,21 +1180,10 @@ impl super::Driver {
                         port.complete_initiator(Err(CarrierSwitchError::Malformed));
                     } else {
                         let peer_addr = SocketAddr::new(port.peer_addr.ip(), frame.port);
-                        match bind_connected_standby_udp(port.local_addr.ip(), peer_addr) {
-                            Ok((sock, local_addr)) => {
-                                active.phase = InitiatorPhase::Probing {
-                                    socket: sock,
-                                    local_addr,
-                                    peer_addr,
-                                    token: frame.token,
-                                    last_probe_us: 0,
-                                    seq: 0,
-                                };
-                            }
-                            Err(_) => {
-                                port.complete_initiator(Err(CarrierSwitchError::BindFailed));
-                            }
-                        }
+                        active.phase = InitiatorPhase::PendingBind {
+                            peer_addr,
+                            token: frame.token,
+                        };
                     }
                 }
             }

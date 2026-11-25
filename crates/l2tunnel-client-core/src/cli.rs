@@ -434,12 +434,12 @@ pub fn main_entry(args: impl IntoIterator<Item = String>) -> ExitCode {
                     "inspection command must match the explicit plan backend",
                 ));
             }
-            #[cfg(unix)]
+            #[cfg(target_os = "linux")]
             return secure_udp_frontend::inspect(&options);
-            #[cfg(not(unix))]
+            #[cfg(not(target_os = "linux"))]
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
-                "generic transaction plan construction is implemented on Unix only",
+                "generic transaction plan inspection CLI is implemented on Linux only",
             ));
         }
         if local_api {

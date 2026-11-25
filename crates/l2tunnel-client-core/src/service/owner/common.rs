@@ -51,6 +51,10 @@ pub(super) async fn establish(
     check(deadline)?;
     let (switcher, requests) = transport::common_channel();
     let requests = crate::service::device_mtu::tune(&plan.data.attachment, &profile, requests);
+    let requests = match &plan.udp_socket_protector {
+        Some(protector) => requests.with_udp_socket_protector(protector.clone()),
+        None => requests,
+    };
     let backend = Arc::new(SecureUdpCommonBackend {
         requested: profile,
         info,

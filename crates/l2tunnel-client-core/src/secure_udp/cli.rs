@@ -1,10 +1,12 @@
 //! Explicit same-socket carrier presentation through the shared lifecycle service.
 use super::*;
+use crate::secure_udp;
 #[cfg(test)]
 use crate::secure_udp::common_fixture::Resources;
+#[cfg(target_os = "linux")]
+use crate::secure_udp::credentials;
 #[cfg(test)]
 use crate::secure_udp::datagram_profile::public_digest;
-use crate::secure_udp::{self, credentials};
 use l2tunnel_handshake as hs;
 use l2tunnel_runtime::secure_udp::establish;
 #[cfg(test)]
@@ -946,6 +948,7 @@ impl Selection {
     }
 }
 
+#[cfg(target_os = "linux")]
 pub(super) fn inspect(options: &BTreeMap<String, String>) -> io::Result<()> {
     let role = required(options, "--role")?;
     if !matches!(role, "connect" | "serve") {
@@ -1262,6 +1265,7 @@ pub(super) fn prepare(
     Ok(plan)
 }
 
+#[cfg(target_os = "linux")]
 pub(super) async fn execute(
     command: &str,
     options: &BTreeMap<String, String>,

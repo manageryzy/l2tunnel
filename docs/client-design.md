@@ -65,8 +65,8 @@ protocol crates remain independent of Tokio, OS handles, clocks and privileges.
 | Existing `apps/l2tunneld` | Listener/server lifecycle and administrative endpoint | Reuses `client-core`; rejects client-only operations |
 | Existing `apps/l2tunnelctl` | Grouped CLI commands and machine-readable `--json` output | Uses local API v5 over Unix sockets and Windows named pipes |
 | Existing `crates/l2tunnel-desktop-ui` (`l2tunnel-linux-gui`, `l2tunnel-windows-gui`) | Nonprivileged `egui`/`eframe` desktop GUI (profiles, connection, live tuning, speed budget, tunnel tests, devices, routes, statistics/meters, management, events) | Calls local API v5 only; no second protocol engine; SOCKS5 & live carrier switch remain open |
-| Existing `apps/l2tunnel-android` | `rlib`/`cdylib` plus `l2tunnel-android-service` binary with abstract-Unix-socket `ScmRights` TUN handoff & `protect` callback | No JNI or Kotlin shell yet |
-| Planned `clients/android` | Kotlin application, VpnService lifecycle, permission UI, notifications and platform credential adapter | Calls the shared Rust core; Android GUI is independent of desktop toolkit choice |
+| Existing `apps/l2tunnel-android` | `rlib`/`cdylib` plus `l2tunnel-android-service` binary with abstract-Unix-socket `ScmRights` TUN handoff & `protect` callback, Local API v5 (`serve_service`), bounded auto-recovery, and standby carrier-switch socket protection | Cross-compiled for `arm64-v8a` and `x86_64`; physical Android device qualification remains open |
+| Implemented `clients/android` | Core Kotlin `VpnService` (`L2TunnelVpnService`), UID-verified `FdBrokerServer`, `LocalApiV5Client`, debounced `NetworkChangeCoordinator`, `AndroidVpnProfile` (explicit TAP/VXLAN L2 refusal), and minimal Material 3 connect/status `MainActivity` | JVM unit-tested and debug APK assembled with `arm64-v8a`/`x86_64` native binaries; full Compose UI, Keystore credential UI (`CL-31`), and physical Android device runs (`CL-35`) remain open |
 | Existing `tools/fake_local_service.py` & unit fixtures | Fake v5 local service backend and scripted client workflows | CLI/GUI contract parity tests before privileged native validation |
 
 ### Shared core and local control API
@@ -300,16 +300,38 @@ the chosen driver artifact and terms before packaging.
   lifecycle/notification behavior for supported Android versions, and revocation
   handling. Standard operation is TUN/L3; no root, raw-socket or TAP capability is
   presumed. Keep unsupported L2/VXLAN attachment scenarios explicit.
+  Progress (2026-11-25, cross-compiled + host/JVM unit-tested; no physical Android
+  device run yet): `clients/android` implements `MainActivity` (`VpnService.prepare()`,
+  API 33+ `POST_NOTIFICATIONS`), `L2TunnelVpnService` (`Builder` L3 TUN, foreground
+  `specialUse` notification, `onRevoke()` cleanup), and `AndroidVpnProfile` (explicit
+  `UnsupportedLayerException` refusal for TAP/VXLAN, matched by `UdpClientProfile::load`
+  in `l2tunnel-client-core`), packaged into `app-debug.apk` with stripped `arm64-v8a`
+  and `x86_64` `libl2tunnel_android_service.so`.
 - [ ] [CL-29] Protect every outer/control socket with `VpnService.protect()`
   before connecting/sending through the VPN path, including newly joined lanes
   and reconnect sockets. Specify JNI ownership, descriptor close/dup rules,
   callback threads, cancellation and process death. Fail connection setup when
   protection or the descriptor handoff fails.
+  Progress (2026-11-25, host-tested + cross-compiled; no physical Android device run
+  yet): `FdBrokerServer` (`clients/android`) verifies `peerCredentials.uid == myUid()`,
+  handles `M`/`P`/`T`/`R`, closes received `ParcelFileDescriptor` handles in `finally`,
+  and `l2tunnel-runtime` (`transport_carrier_switch.rs`) now invokes
+  `udp_socket_protector` on every standby UDP socket opened during make-before-break
+  live carrier switching before `connect()`/`try_send()` (tested by
+  `udp_socket_protector_covers_initial_and_live_carrier_switch_sockets` and
+  `broker_protect_and_open_tun_round_trip_and_reject_bad_replies`).
 - [ ] [CL-30] Implement Android network-change, background/foreground, permission
   revocation and reconnect behavior with bounded work and battery-aware retry
   limits. Test Wi-Fi/mobile transitions and app recreation without duplicate
   tunnels, retained packet descriptors or route loops. Validate always-on/lockdown
   behavior only if included in the declared supported configuration.
+  Progress (2026-11-25, host/JVM unit-tested; no physical Android device run yet):
+  `l2tunnel-android-service` now serves full Local API v5 (`serve_service`) with
+  battery-aware bounded auto-recovery (`8` attempts, `2s..=60s`) and ephemeral
+  `0.0.0.0:0`/`[::]:0` mobile bind support; `NetworkChangeCoordinator` +
+  `ConnectivityManager.NetworkCallback` debounce transitions (`1.5 s`, max `6`
+  reconnects per `5 min`) and `L2TunnelVpnService` enforces single-tunnel
+  `AtomicBoolean` guarding. Physical Wi-Fi/cellular transition testing remains open.
 - [ ] [CL-31] Add Android credential-provider integration and a UI using the
   same configuration/operation contracts as desktop. Select supported key types
   and storage behavior after provider capability testing; never assume that a

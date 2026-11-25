@@ -174,29 +174,164 @@ async fn run(directory: PathBuf, path: PathBuf, name: String) -> io::Result<()> 
         })?;
     let api = local::Server::bind(path)?;
     let (handle, owner) = service::channel();
+    // Battery-aware bounded automatic fresh-auth recovery (CL-30 / CL-38):
+    // handles lease expiry, counter exhaustion, and transient mobile outages
+    // without unbounded background loops. Explicit user commands cancel it.
+    handle.set_auto_recovery(service::AutoRecoveryPolicy {
+        enabled: true,
+        max_attempts: 8,
+        initial_backoff: Duration::from_secs(2),
+        max_backoff: Duration::from_secs(60),
+    });
     let submit_error = |_| io::Error::other("Common service operation rejected");
     let key = handle.next_key().map_err(submit_error)?;
     let operation = handle.connect(plan, key).map_err(submit_error)?.operation;
     let mut byte = [0];
-    let lifecycle = async {
-        match handle.wait(operation).await.map_err(submit_error)? {
-            service::Completed::Connected { generation } => {
-                // Signal readiness only after authentication, TUN attachment and runtime observation.
+    let ready_signal = async {
+        // Wait for initial connection establishment and notify VpnService (`R`),
+        // then stay idle so Local API v5 (status, reconnect, live tuning, live
+        // carrier switch, meters, tunnel tests) and bounded auto-recovery remain
+        // active for the lifetime of the VpnService monitor connection (`M`).
+        if let Ok(service::Completed::Connected { .. }) = handle.wait(operation).await {
+            let _ = tokio::task::spawn_blocking(move || -> io::Result<()> {
                 let mut observed = open(&ready_name)?;
-                observed.write_all(b"R")?;
-                let _ = handle
-                    .wait_stopped(generation)
-                    .await
-                    .map_err(submit_error)?;
-                Err(io::Error::other("Common session stopped"))
-            }
-            _ => Err(io::Error::other("UDP client setup failed")),
+                observed.write_all(b"R")
+            })
+            .await;
         }
+        std::future::pending::<io::Result<()>>().await
     };
     tokio::select! {
-        result = lifecycle => result,
+        result = ready_signal => result,
         result = parent.read(&mut byte) => result.map(|_| ()),
-        result = api.serve(|request| handle.request(request)) => result,
+        result = api.serve_service(handle.clone()) => result,
         _ = owner => Err(io::Error::other("Common owner stopped")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::thread;
+
+    fn unique_abstract_name(tag: &str) -> String {
+        static SEQ: AtomicUsize = AtomicUsize::new(1);
+        format!(
+            "l2tunnel-android-test-{}-{}-{}",
+            tag,
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        )
+    }
+
+    fn bind_abstract_listener(name: &str) -> io::Result<OwnedFd> {
+        let fd = net::socket_with(
+            net::AddressFamily::UNIX,
+            net::SocketType::STREAM,
+            net::SocketFlags::CLOEXEC,
+            None,
+        )?;
+        let addr = net::SocketAddrUnix::new_abstract_name(name.as_bytes())?;
+        net::bind(&fd, &addr)?;
+        net::listen(&fd, 8)?;
+        Ok(fd)
+    }
+
+    #[test]
+    fn broker_protect_and_open_tun_round_trip_and_reject_bad_replies() -> io::Result<()> {
+        let name = unique_abstract_name("broker");
+        let listener = bind_abstract_listener(&name)?;
+        let (hold_tx, hold_rx) = std::sync::mpsc::channel::<OwnedFd>();
+        let server_thread = thread::spawn(move || -> io::Result<()> {
+            // 1. Protect accepted: receive 1 FD via ScmRights, verify command 'P', reply '1'.
+            let conn = net::accept_with(&listener, net::SocketFlags::CLOEXEC)?;
+            let mut cmd = [0_u8; 1];
+            let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(1))];
+            let mut control = RecvAncillaryBuffer::new(&mut space);
+            let msg = net::recvmsg(
+                &conn,
+                &mut [IoSliceMut::new(&mut cmd)],
+                &mut control,
+                net::RecvFlags::CMSG_CLOEXEC,
+            )?;
+            assert_eq!(msg.bytes, 1);
+            assert_eq!(cmd, *b"P");
+            let mut got_fd = false;
+            for item in control.drain() {
+                if let RecvAncillaryMessage::ScmRights(fds) = item {
+                    got_fd = fds.count() == 1;
+                }
+            }
+            assert!(got_fd, "expected 1 protected FD via ScmRights");
+            let mut s = UnixStream::from(conn);
+            s.write_all(b"1")?;
+            drop(s);
+
+            // 2. Protect refused: reply '0'.
+            let conn = net::accept_with(&listener, net::SocketFlags::CLOEXEC)?;
+            let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(1))];
+            let mut control = RecvAncillaryBuffer::new(&mut space);
+            let _ = net::recvmsg(
+                &conn,
+                &mut [IoSliceMut::new(&mut cmd)],
+                &mut control,
+                net::RecvFlags::CMSG_CLOEXEC,
+            )?;
+            let mut s = UnixStream::from(conn);
+            s.write_all(b"0")?;
+            drop(s);
+
+            // 3. TUN handoff: receive 'T', send '1' + 1 pipe FD via ScmRights.
+            let conn = net::accept_with(&listener, net::SocketFlags::CLOEXEC)?;
+            let mut s = UnixStream::from(conn);
+            s.read_exact(&mut cmd)?;
+            assert_eq!(cmd, *b"T");
+            let (rx_fd, tx_fd) = rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC)?;
+            let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(1))];
+            let mut control = SendAncillaryBuffer::new(&mut space);
+            let fds = [rx_fd.as_fd()];
+            assert!(control.push(SendAncillaryMessage::ScmRights(&fds)));
+            let sent = net::sendmsg(
+                &s,
+                &[IoSlice::new(b"1")],
+                &mut control,
+                net::SendFlags::NOSIGNAL,
+            )?;
+            assert_eq!(sent, 1);
+            // Keep write end alive on the main thread until after open_tun checks O_NONBLOCK.
+            let _ = hold_tx.send(tx_fd);
+            drop(rx_fd);
+            Ok(())
+        });
+
+        // Test 1: protect accepted
+        let udp = std::net::UdpSocket::bind("127.0.0.1:0")?;
+        protect(&name, udp.as_fd())?;
+
+        // Test 2: protect refused -> PermissionDenied
+        let refused = protect(&name, udp.as_fd());
+        assert_eq!(
+            refused.err().map(|e| e.kind()),
+            Some(io::ErrorKind::PermissionDenied)
+        );
+
+        // Test 3: open_tun succeeds and sets O_NONBLOCK on the received FD
+        let mut tun = open_tun(&name)?;
+        let _keep_pipe_open = hold_rx
+            .recv()
+            .map_err(|_| io::Error::other("pipe write end channel closed"))?;
+        let mut buf = [0_u8; 16];
+        assert_eq!(
+            tun.receive(&mut buf)?,
+            None,
+            "received TUN FD must be O_NONBLOCK and yield WouldBlock (None) when empty"
+        );
+        drop(tun);
+
+        server_thread
+            .join()
+            .map_err(|_| io::Error::other("broker thread panicked"))??;
+        Ok(())
     }
 }
