@@ -314,6 +314,7 @@ async fn slow_receiver(initial: usize) -> Result {
                 narrow,
                 mtu,
                 rate,
+                rate,
                 u64::try_from(burst)?,
                 range,
             )?);
@@ -750,5 +751,41 @@ async fn credit_window_records_timed_waits_and_histograms_only_under_demand() ->
             > 0,
         "{policy_pacing}"
     );
+    Ok(())
+}
+
+/// High-BDP receive allowance stays at 106 KiB at <= 100 Mbit/s, scales to
+/// 20 ms of wire budget (up to 4 MiB) for > 100 Mbit/s on large sockets, and
+/// always stays strictly `<= SO_RCVBUF / 2` on unprivileged 212 KiB sockets.
+#[test]
+fn high_bdp_bounded_allowance_respects_rate_cap_and_socket_readback() -> Result {
+    use crate::secure_udp::transport::credit::{State, bounded_allowance};
+    // <= 100 Mbit/s stays at 106_496 B even on a 64 MiB socket.
+    assert_eq!(bounded_allowance(64 << 20, 12_500_000), 106_496);
+    // 200 Mbit/s (25 MB/s) -> 500 KB; 500 Mbit/s -> 1.25 MB; 1000 Mbit/s -> 2.5 MB.
+    assert_eq!(bounded_allowance(64 << 20, 25_000_000), 500_000);
+    assert_eq!(bounded_allowance(64 << 20, 62_500_000), 1_250_000);
+    assert_eq!(bounded_allowance(64 << 20, 125_000_000), 2_500_000);
+    // Above 1.6 Gbit/s, hard-capped at 4 MiB to prevent bufferbloat.
+    assert_eq!(bounded_allowance(256 << 20, 500_000_000), 4 << 20);
+    // Unprivileged 212_992 B kernel socket stays capped at readback / 2 = 106_496 B.
+    assert_eq!(bounded_allowance(212_992, 125_000_000), 106_496);
+
+    // Live rate raise updates `State`'s receiver allowance when readback is known.
+    let cfg = l2tunnel_flow_control::session_credit::Config {
+        floor_datagrams: 64,
+        ceiling_datagrams: 2_048,
+        floor_bytes: 128 << 10,
+        ceiling_bytes: 4 << 20,
+        period: Duration::from_millis(10),
+        idle_period: Duration::from_millis(250),
+    };
+    let mut state = State::new(cfg, 1500, 12_500_000, 12_500_000, 64 << 10, 1 << 20)?;
+    state.observe_receive_buffer(64 << 20)?;
+    assert_eq!(state.snapshot(0).receiver.allowance_bytes, 106_496);
+    state.raise_ceiling_for_rates(6_250_000, 62_500_000);
+    assert_eq!(state.snapshot(0).receiver.allowance_bytes, 1_250_000);
+    state.raise_ceiling_for_rates(12_500_000, 125_000_000);
+    assert_eq!(state.snapshot(0).receiver.allowance_bytes, 2_500_000);
     Ok(())
 }

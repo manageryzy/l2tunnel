@@ -14,8 +14,21 @@ use l2tunnel_flow_control::session_credit::{self as sc, Applied, Gate};
 /// stalls, not a reason to let more data into the path (a 16 MiB allowance
 /// flooded the bottleneck queue in the 2026-11-24 native cells).
 const FALLBACK_ALLOWANCE: u64 = 106_496;
+/// Hard cap on rate-scaled receive allowance for high-BDP (> 100 Mbit/s) links
+/// (20 ms of wire budget up to 4 MiB, always strictly `<= SO_RCVBUF / 2`).
+const MAX_BOUNDED_ALLOWANCE: u64 = 4 << 20;
 /// Largest receive buffer requested (1 GiB): Linux doubles it into an `int`.
 const MAX_RECEIVE_BUFFER: usize = 1 << 30;
+
+pub(crate) fn bounded_allowance(readback_bytes: u64, receive_rate: u64) -> u64 {
+    let socket_half = readback_bytes / 2;
+    let target = if receive_rate <= 12_500_000 {
+        FALLBACK_ALLOWANCE
+    } else {
+        (receive_rate / 50).clamp(FALLBACK_ALLOWANCE, MAX_BOUNDED_ALLOWANCE)
+    };
+    target.min(socket_half).max(1)
+}
 
 fn at(micros: u64) -> Duration {
     Duration::from_micros(micros)
@@ -84,6 +97,7 @@ pub(crate) struct State {
     config: sc::Config,
     max_datagram: u64,
     send_rate: u64,
+    receive_rate: u64,
     burst: u64,
     range: u64,
     receiver: sc::Receiver,
@@ -97,6 +111,7 @@ impl State {
         config: sc::Config,
         path_mtu: usize,
         send_rate: u64,
+        receive_rate: u64,
         burst: u64,
         range: u64,
     ) -> io::Result<Self> {
@@ -121,6 +136,7 @@ impl State {
             config,
             max_datagram,
             send_rate,
+            receive_rate,
             burst,
             range,
             receiver: sc::Receiver::new(config, max_datagram, FALLBACK_ALLOWANCE)
@@ -131,15 +147,17 @@ impl State {
             counters: Counters::default(),
         })
     }
-    /// Replace the fallback allowance with half the socket's real buffer, at
-    /// most the fallback, before any data was processed.
+    /// Replace the fallback allowance with the bounded rate-scaled socket
+    /// allowance (106 KiB at <= 100 Mb/s, up to 20 ms of `receive_rate` capped
+    /// at 4 MiB and `bytes / 2` for high-BDP links).
     pub(crate) fn observe_receive_buffer(&mut self, bytes: usize) -> io::Result<()> {
+        let readback = u64::try_from(bytes).map_err(invalid)?;
+        self.counters.receive_buffer_readback = Some(readback);
+        let allowance = bounded_allowance(readback, self.receive_rate);
         if self.counters.allowance_readback || self.receiver.status(Duration::ZERO).processed != 0 {
+            self.receiver.set_allowance(allowance);
             return Ok(());
         }
-        let allowance = u64::try_from(bytes / 2)
-            .map_err(invalid)?
-            .min(FALLBACK_ALLOWANCE);
         self.receiver =
             sc::Receiver::new(self.config, self.max_datagram, allowance).map_err(credit_error)?;
         self.counters.allowance_readback = true;
@@ -188,6 +206,11 @@ impl State {
     /// speed budget exceeds the 100 Mbit/s baseline so high-BDP (200-1000 Mb/s
     /// at 70 ms RTT + 15% loss) sessions never stall on the initial plan cap.
     pub(crate) fn raise_ceiling_for_rates(&mut self, send_rate: u64, receive_rate: u64) {
+        self.receive_rate = receive_rate;
+        if let Some(readback) = self.counters.receive_buffer_readback {
+            self.receiver
+                .set_allowance(bounded_allowance(readback, receive_rate));
+        }
         let peak = send_rate.max(receive_rate);
         if peak <= 12_500_000 {
             return;

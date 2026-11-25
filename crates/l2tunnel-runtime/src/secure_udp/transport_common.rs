@@ -1307,6 +1307,7 @@ impl Driver {
                         .ok_or_else(|| invalid("common data requires session receiver credit"))?,
                     config.path_mtu,
                     send_rate,
+                    local_policy.receive().common().bytes_per_second(),
                     u64::try_from(burst).map_err(invalid)?,
                     credit_range,
                 )?),

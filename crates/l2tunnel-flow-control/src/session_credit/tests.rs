@@ -693,3 +693,41 @@ fn high_bdp_live_rate_and_ceiling_scaling_unlocks_gigabit_bursts() -> TestResult
     );
     Ok(())
 }
+
+/// Updating the receiver allowance live changes future `bytes_above` and
+/// datagram grants without resetting `processed`, `serial`, or `limit`, and
+/// ignores zero.
+#[test]
+fn receiver_set_allowance_updates_future_grants_without_resetting_state() -> TestResult {
+    let mut cfg = config();
+    cfg.ceiling_bytes = 32 << 20;
+    cfg.ceiling_datagrams = 16_384;
+    let mut receiver = Receiver::new(cfg, DATAGRAM, 106_496)?;
+    for i in 0..40_u64 {
+        receiver.processed(i, DATAGRAM, ms(i))?;
+    }
+    let first = receiver.issue(ms(50), Some(ms(70)))?;
+    assert_eq!(first.serial, 1);
+    assert_eq!(receiver.status(ms(50)).allowance_bytes, 106_496);
+
+    // Zero is ignored.
+    receiver.set_allowance(0);
+    assert_eq!(receiver.status(ms(50)).allowance_bytes, 106_496);
+
+    // Raising allowance increases subsequent grant without losing processed/serial.
+    receiver.set_allowance(1_250_000);
+    assert_eq!(receiver.status(ms(50)).allowance_bytes, 1_250_000);
+    let second = receiver.issue(ms(60), Some(ms(70)))?;
+    assert_eq!(second.serial, 2);
+    assert_eq!(second.processed, first.processed);
+    assert!(second.limit >= first.limit);
+    assert!(
+        second.bytes_above >= 1_250_000,
+        "expected bytes_above >= 1_250_000, got {}",
+        second.bytes_above
+    );
+    // Clamped to MAX_CEILING_BYTES.
+    receiver.set_allowance(u64::MAX);
+    assert_eq!(receiver.status(ms(60)).allowance_bytes, MAX_CEILING_BYTES);
+    Ok(())
+}

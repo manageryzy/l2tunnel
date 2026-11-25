@@ -363,6 +363,14 @@ impl Receiver {
             .max(self.config.ceiling_bytes)
             .min(MAX_CEILING_BYTES);
     }
+    /// Update the static socket-headroom allowance live (bounded to `[1, MAX_CEILING_BYTES]`)
+    /// without resetting `processed`, `serial`, or previously issued limits.
+    pub fn set_allowance(&mut self, allowance_bytes: u64) {
+        if allowance_bytes == 0 {
+            return;
+        }
+        self.allowance_bytes = allowance_bytes.min(MAX_CEILING_BYTES);
+    }
     /// Drain estimate over the completed bins since the first processed
     /// datagram, at most 175 ms: (bytes/s, datagrams/s). Datagrams follow the
     /// processed packet number (lost packets included); bytes are scaled by

@@ -92,12 +92,21 @@ allocation:
   numbers, so it must cover what the sender has in flight, lost packets
   included; counting only arrivals shrank the window by the loss rate every
   round trip.
-- `allowance`: half of the data socket's actual `SO_RCVBUF`, read back once from
-  the kernel at runtime entry (`socket2::SockRef::recv_buffer_size`), capped
-  at 106,496 bytes. Linux reports twice the set value, and small datagrams cost
-  more than their length, so half is the payload it can hold without drops.
-  The raw and carrier paths have no UDP socket to read and use 106,496 bytes,
-  half of Linux's default receive buffer; status reports which one is in use.
+- `allowance`: bounded socket-headroom allowance derived from the data socket's
+  actual `SO_RCVBUF` (`socket2::SockRef::recv_buffer_size`) and the negotiated
+  receive rate (`bounded_allowance` in `transport_common_credit.rs`):
+  `106,496` bytes for receive budgets `<= 100 Mbit/s`, and `receive_rate / 50`
+  (20 ms of wire budget) clamped to `[106,496 B, 4 MiB]` for high-BDP links
+  `> 100 Mbit/s`, always strictly capped at `SO_RCVBUF / 2`. Linux reports
+  twice the set value, and small datagrams cost more than their length, so
+  `SO_RCVBUF / 2` keeps unprivileged 212 KiB sockets at 106,496 bytes without
+  drops, while the 4 MiB hard cap avoids the 16 MiB bufferbloat observed in
+  `work/credit-20261124b/RESULTS.md` and eliminates the multi-second 106 KiB
+  ramp stalls measured on 200–1000 Mbit/s real-kernel netns cells
+  (`work/high-bdp-20261125/RESULTS.md`). The raw and carrier paths have no UDP
+  socket to read and use 106,496 bytes; status reports which one is in use.
+  Live `RateBudgetV1` updates adjust `allowance` in place via
+  `Receiver::set_allowance` without resetting `processed` or `serial`.
 - Receive and send buffers: before that read-back, `credit_observe_udp` requests
   a receive buffer of `ceiling_bytes` and a send buffer up to 4 MiB (using
   `SO_RCVBUFFORCE` and `SO_SNDBUFFORCE` on Linux when `net.core.rmem_max`/
