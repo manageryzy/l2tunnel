@@ -819,6 +819,15 @@ impl Driver {
             try_native_write(ready, packet.bytes())
         };
         if matches!(&result, Ok(true)) {
+            let rx_bytes = packet.bytes().len() as u64;
+            let rx_channel = metadata.identity.channel_index();
+            let rx_flow = {
+                let owner::DataOwner::Common(state) = &self.owner;
+                state
+                    .engine(epoch)
+                    .ok()
+                    .and_then(|eng| eng.lookup_flow_id(packet.bytes()))
+            };
             // Whole device acceptance is irreversible. Commit the actual token,
             // recycle bytes and count it before sampling a possibly failing clock.
             let owner::DataOwner::Common(state) = &mut self.owner;
@@ -835,10 +844,14 @@ impl Driver {
                 .saturating_add(1);
             committed?;
             let visits = self.common_state()?.engine(epoch)?.native_scan_visits();
-            self.common
+            let runtime = self
+                .common
                 .as_deref_mut()
-                .ok_or_else(|| protocol("common scan contract"))?
-                .native_work[(epoch.0 % 2) as usize] = visits;
+                .ok_or_else(|| protocol("common scan contract"))?;
+            runtime.native_work[(epoch.0 % 2) as usize] = visits;
+            runtime
+                .mux_counters
+                .record_rx(rx_channel, rx_flow, rx_bytes, before);
         } else if matches!(&result, Ok(false)) {
             self.performance.counters.native_write_would_block = self
                 .performance
@@ -971,6 +984,7 @@ impl Driver {
                     .entry(epoch)?
                     .admit_borrowed_diagnosed(engine::Tick(now), |refusal| {
                         if let Some(runtime) = self.common.as_deref_mut() {
+                            runtime.mux_counters.record_tx_refused(refusal.channel);
                             buffer_metrics::admission_refused(runtime, now, scope, refusal);
                         }
                     })
@@ -979,6 +993,12 @@ impl Driver {
                     break;
                 };
                 if let Some(runtime) = self.common.as_deref_mut() {
+                    runtime.mux_counters.record_tx(
+                        admitted.metadata.binding.channel,
+                        admitted.metadata.binding.id.0,
+                        admitted.permit.encoding.original_native_bytes as u64,
+                        now,
+                    );
                     if let Some(trace) = &mut runtime.reverse_trace {
                         trace.packed(
                             now,

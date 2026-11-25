@@ -246,4 +246,117 @@ impl Engine {
             _ => None,
         }
     }
+
+    /// Payload bytes currently queued in Pipeline/MUX for one sending channel.
+    pub fn channel_queued_bytes(&self, channel: u16) -> usize {
+        self.pipeline.channel_queued_bytes(channel)
+    }
+
+    /// Look up the local Pipeline flow ID matching a native packet's canonical
+    /// symmetric flow key, without mutating Pipeline state or idle timers.
+    pub fn lookup_flow_id(&self, packet: &[u8]) -> Option<u64> {
+        let classified = self.pipeline.classify(packet).ok()?;
+        self.pipeline
+            .flow(&classified.key)
+            .map(|snap| snap.binding.id.0)
+    }
+
+    /// Snapshot protocol-specific recovery/coding counters without mutation or I/O.
+    pub fn recovery_metrics(&self) -> RecoveryMetrics {
+        match &self.owner {
+            Owner::Swift(owned) => {
+                let engine = owned.engine();
+                let count = engine
+                    .send_config()
+                    .channels
+                    .max(engine.receive_config().channels);
+                let mut channels = Vec::with_capacity(count);
+                for index in 0..count {
+                    if let Some(stats) = engine.channel_stats(index) {
+                        channels.push(SwiftChannelMetrics {
+                            channel: index as u16,
+                            send: stats.send,
+                            receive: stats.receive,
+                        });
+                    }
+                }
+                RecoveryMetrics::Swift { channels }
+            }
+            Owner::Aligned(endpoint) => RecoveryMetrics::Reliable {
+                arq: endpoint.arq_statistics(),
+                reliable: endpoint.statistics(),
+            },
+            Owner::Packed(endpoint) => RecoveryMetrics::Reliable {
+                arq: endpoint.arq_statistics(),
+                reliable: endpoint.statistics(),
+            },
+            Owner::Rolling(endpoint) => {
+                let st = endpoint.statistics();
+                RecoveryMetrics::Rolling {
+                    admitted: st.admitted,
+                    handed: st.handed,
+                    committed: st.committed,
+                }
+            }
+            Owner::Research(_) | Owner::Striped(_) | Owner::Connections(_) => {
+                RecoveryMetrics::Other
+            }
+        }
+    }
+}
+
+/// Per-channel Swift sender and receiver statistics for CSR publication (`MCSR-05`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SwiftChannelMetrics {
+    /// Zero-based Swift channel index.
+    pub channel: u16,
+    /// Current send-direction observation, when this channel sends.
+    pub send: Option<swift::records::SenderObservation>,
+    /// Current receive-direction counters, when this channel receives.
+    pub receive: Option<swift::ReceiverStats>,
+}
+
+/// Read-only protocol recovery/coding snapshot for CSR publication (`MCSR-05`).
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub enum RecoveryMetrics {
+    /// Swift per-channel ARQ + sliding-window FEC counters.
+    Swift {
+        /// Indexed active channels across send and receive widths.
+        channels: Vec<SwiftChannelMetrics>,
+    },
+    /// Aligned or Packed Reliable (selective-repeat ARQ + Cauchy block FEC) counters.
+    Reliable {
+        /// Underlying ARQ statistics.
+        arq: l2tunnel_recovery::Statistics,
+        /// Reliable FEC/envelope statistics.
+        reliable: l2tunnel_reliable::Statistics,
+    },
+    /// Rolling FEC endpoint statistics.
+    Rolling {
+        /// Native frames admitted.
+        admitted: u64,
+        /// Complete outputs handed to carrier.
+        handed: u64,
+        /// Whole native writes committed.
+        committed: u64,
+    },
+    /// Other profile families (Research receiver is published via `research_receiver`).
+    #[default]
+    Other,
+}
+
+impl ProfileIdentity {
+    /// Zero-based channel or owner index for per-channel RX metering (`MCSR-07`).
+    pub fn channel_index(self) -> u16 {
+        match self {
+            Self::Swift(identity) => identity.channel.index() as u16,
+            Self::Connection(identity) => identity.owner.index(),
+            Self::UnreliableNative(identity) => identity.owner.index(),
+            Self::Aligned(identity)
+            | Self::Packed(identity)
+            | Self::Rolling(identity)
+            | Self::Striped(identity)
+            | Self::Research(identity) => identity.channel.0 as u16,
+        }
+    }
 }

@@ -1072,6 +1072,11 @@ impl Pipeline {
         self.usage
     }
 
+    /// Payload bytes currently queued on one MUX channel.
+    pub fn channel_queued_bytes(&self, channel: u16) -> usize {
+        self.mux.channel_queued_bytes(channel)
+    }
+
     /// Count of live registrations, including idle learned entries.
     pub fn registered_flows(&self) -> usize {
         self.states.len()

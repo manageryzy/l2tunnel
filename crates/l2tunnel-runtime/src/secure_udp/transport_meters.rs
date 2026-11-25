@@ -8,14 +8,22 @@
 
 use std::sync::Arc;
 
+use l2tunnel::record_engine::RecoveryMetrics;
 use l2tunnel_meters::{Limits, Table, TableError, catalog};
 
+use super::common::{ChannelMeterSnapshot, FlowMeterSnapshot};
 use super::{CommonSnapshot, CreditSnapshot};
 
 /// Shortest interval between CSR rebuilds (meter-csr decision 17).
 pub(super) const REBUILD_INTERVAL_US: u64 = 100_000;
-/// Registers outside the collector, with room to spare.
-const FIXED_ENTRIES: usize = 128;
+/// Registers outside the collector and per-channel/per-flow tables, with room to spare.
+const FIXED_ENTRIES: usize = 192;
+/// Registers per MUX channel (`tx` + `rx` directional registers).
+const PER_CHANNEL_MUX: usize = 8;
+/// Registers per inner flow (`tx` + `rx` + `state`).
+const PER_FLOW_MUX: usize = 6;
+/// Registers per Swift recovery channel (`swift.sender`, `swift.receiver`, `recovery.arq`).
+const PER_RECOVERY_CHANNEL: usize = 24;
 /// Registers per collector key outside its wait blocks: samples, three
 /// gauges per unit and three refusal totals.
 const PER_KEY: usize = 16;
@@ -92,6 +100,178 @@ fn credit(table: &mut Table, value: &CreditSnapshot) -> Result<(), TableError> {
     Ok(())
 }
 
+fn mux_channels(table: &mut Table, channels: &[ChannelMeterSnapshot]) -> Result<(), TableError> {
+    for ch in channels {
+        let base = format!("mux.channel.ch{}", ch.channel);
+        for (name, field) in [
+            ("tx.packets", ch.tx_packets),
+            ("tx.bytes", ch.tx_bytes),
+            ("tx.admitted", ch.tx_admitted),
+            ("tx.refused", ch.tx_refused),
+            ("tx.queued_bytes", ch.tx_queued_bytes),
+            ("rx.packets", ch.rx_packets),
+            ("rx.bytes", ch.rx_bytes),
+        ] {
+            table.put(format_args!("{base}.{name}"), field)?;
+        }
+    }
+    Ok(())
+}
+
+fn mux_flows(table: &mut Table, flows: &[FlowMeterSnapshot]) -> Result<(), TableError> {
+    for flow in flows {
+        let base = format!("mux.flow{}", flow.flow);
+        for (name, field) in [
+            ("tx.packets", flow.tx_packets),
+            ("tx.bytes", flow.tx_bytes),
+            ("rx.packets", flow.rx_packets),
+            ("rx.bytes", flow.rx_bytes),
+            ("state", flow.state),
+        ] {
+            table.put(format_args!("{base}.{name}"), field)?;
+        }
+    }
+    Ok(())
+}
+
+fn recovery(table: &mut Table, snapshot: &CommonSnapshot) -> Result<(), TableError> {
+    match &snapshot.recovery_metrics {
+        RecoveryMetrics::Swift { channels } => {
+            for ch in channels {
+                let idx = ch.channel;
+                if let Some(send) = ch.send {
+                    let s = send.stats;
+                    let repairs = s.repairs.saturating_add(s.tail_repairs);
+                    table.put(format_args!("swift.sender.ch{idx}.retries"), s.retransmits)?;
+                    table.put(format_args!("swift.sender.ch{idx}.repairs_sent"), repairs)?;
+                    table.put(
+                        format_args!("swift.sender.ch{idx}.feedback"),
+                        ch.receive.map_or(0, |r| r.feedback),
+                    )?;
+                    for (name, field) in [
+                        ("records", s.sources),
+                        ("retransmits", s.retransmits),
+                        ("rto", 0),
+                        ("acks", 0),
+                        ("replay_rejects", 0),
+                        ("deadline_losses", 0),
+                    ] {
+                        table.put(format_args!("recovery.arq.ch{idx}.tx.{name}"), field)?;
+                    }
+                }
+                if let Some(rx) = ch.receive {
+                    let repairs_sent = ch
+                        .send
+                        .map_or(0, |s| s.stats.repairs.saturating_add(s.stats.tail_repairs));
+                    for (name, field) in [
+                        ("repairs_sent", repairs_sent),
+                        ("repairs_used", rx.useful_repairs),
+                        ("decode_failures", rx.useless_repairs),
+                        ("feedback", rx.feedback),
+                        ("deadline_losses", 0),
+                    ] {
+                        table.put(format_args!("swift.receiver.ch{idx}.{name}"), field)?;
+                    }
+                    for (name, field) in [
+                        ("records", rx.sources.saturating_add(rx.recovered)),
+                        ("retransmits", 0),
+                        ("rto", 0),
+                        ("acks", rx.feedback),
+                        ("replay_rejects", rx.duplicates),
+                        ("deadline_losses", 0),
+                    ] {
+                        table.put(format_args!("recovery.arq.ch{idx}.rx.{name}"), field)?;
+                    }
+                }
+            }
+        }
+        RecoveryMetrics::Reliable { arq, reliable } => {
+            let rto = arq.retransmissions.saturating_sub(arq.fast_retransmissions);
+            for (name, field) in [
+                ("records", arq.transmissions),
+                ("retransmits", arq.retransmissions),
+                ("rto", rto),
+                ("acks", arq.feedback_received),
+                ("replay_rejects", 0),
+                ("deadline_losses", reliable.expired_generations),
+            ] {
+                table.put(format_args!("reliable.compact_arq.ch0.tx.{name}"), field)?;
+            }
+            for (name, field) in [
+                ("records", arq.received_unique),
+                ("retransmits", 0),
+                ("rto", 0),
+                ("acks", arq.feedback_sent),
+                ("replay_rejects", arq.duplicates),
+                ("deadline_losses", reliable.expired_generations),
+            ] {
+                table.put(format_args!("reliable.compact_arq.ch0.rx.{name}"), field)?;
+            }
+            for (name, field) in [
+                ("repairs_sent", reliable.repair_packets),
+                ("repairs_used", reliable.repaired_unique_sources),
+                ("decode_failures", reliable.skipped_fec_packets),
+                ("feedback", reliable.feedback_packets),
+                ("deadline_losses", reliable.expired_generations),
+            ] {
+                table.put(format_args!("reliable.decoder.ch0.{name}"), field)?;
+            }
+            table.put_str(
+                "fec.decoder.ch0.repairs_used",
+                reliable.repaired_unique_sources,
+            )?;
+            table.put_str(
+                "fec.decoder.ch0.decode_failures",
+                reliable.skipped_fec_packets,
+            )?;
+        }
+        RecoveryMetrics::Rolling { .. } => {
+            for (name, field) in [
+                ("repairs_sent", 0),
+                ("repairs_used", 0),
+                ("decode_failures", 0),
+                ("feedback", 0),
+                ("deadline_losses", 0),
+            ] {
+                table.put(format_args!("fec.rolling.ch0.{name}"), field)?;
+            }
+        }
+        RecoveryMetrics::Other => {}
+    }
+    if let Some(research) = &snapshot.research_receiver {
+        for (name, field) in [
+            ("repairs_sent", 0),
+            ("repairs_used", research.covering_repairs),
+            ("decode_failures", research.abandon.dropped_repairs),
+            ("feedback", research.receipt_repeats),
+            ("deadline_losses", research.abandon.abandoned),
+        ] {
+            table.put(format_args!("fec.research.ch0.{name}"), field)?;
+        }
+    }
+    Ok(())
+}
+
+fn best_rtt_us(snapshot: &CommonSnapshot) -> Option<u64> {
+    if let Some(rtt) = snapshot
+        .credit
+        .as_ref()
+        .and_then(|c| c.sender)
+        .and_then(|s| s.min_rtt)
+    {
+        return Some(u64::try_from(rtt.as_micros()).unwrap_or(u64::MAX));
+    }
+    if let RecoveryMetrics::Swift { channels } = &snapshot.recovery_metrics
+        && let Some(rtt) = channels
+            .iter()
+            .filter_map(|ch| ch.send.map(|s| s.stats.smoothed_rtt_micros))
+            .find(|&rtt| rtt > 0)
+    {
+        return Some(rtt);
+    }
+    snapshot.liveness.last_rtt_micros
+}
+
 /// Write every register derived from the snapshot itself.
 fn snapshot_registers(table: &mut Table, snapshot: &CommonSnapshot) -> Result<(), TableError> {
     put(table, "meta.version", catalog::VERSION)?;
@@ -109,6 +289,9 @@ fn snapshot_registers(table: &mut Table, snapshot: &CommonSnapshot) -> Result<()
         "runtime.session.receive_channels",
         u64::from(snapshot.receive_channels),
     )?;
+    if let Some(rtt_us) = best_rtt_us(snapshot) {
+        put(table, "runtime.session.rtt_us", rtt_us)?;
+    }
     // The Common driver's counters aggregate every lane, so they are the
     // lane-shared instance rather than a claim about lane 0.
     let c = &snapshot.counters;
@@ -126,6 +309,15 @@ fn snapshot_registers(table: &mut Table, snapshot: &CommonSnapshot) -> Result<()
     ] {
         table.put(format_args!("{wire}.{name}"), field)?;
     }
+    put(table, "udp.socket.shared.socket_drops", c.socket_drops)?;
+    if let Some(value) = &snapshot.credit {
+        if let Some(requested) = value.requested_receive_buffer {
+            put(table, "udp.socket.shared.rcvbuf_requested", requested)?;
+        }
+        if let Some(granted) = value.receive_buffer_readback {
+            put(table, "udp.socket.shared.rcvbuf_granted", granted)?;
+        }
+    }
     for (name, field) in [
         ("read_packets", c.native_read),
         ("written_packets", c.native_written),
@@ -136,9 +328,50 @@ fn snapshot_registers(table: &mut Table, snapshot: &CommonSnapshot) -> Result<()
     ] {
         table.put(format_args!("runtime.device.{name}"), field)?;
     }
+    put(
+        table,
+        "runtime.native_output.would_block",
+        snapshot.performance.native_write_would_block,
+    )?;
+    let draining = usize::from(snapshot.native_delivery[1].is_some()) as u64;
+    put(table, "l2tunnel.record_bank.epoch_slots", 1 + draining)?;
+    put(table, "l2tunnel.record_bank.draining_generations", draining)?;
+    if let Some(frag_in) = &snapshot.fragment_ingress {
+        let groups: usize = frag_in.pending.iter().sum();
+        put(table, "runtime.common_fragments.groups", groups as u64)?;
+    }
+    if let Some(frag_st) = &snapshot.fragment_statistics {
+        put(
+            table,
+            "runtime.common_fragments.reassembled",
+            frag_st.groups_written,
+        )?;
+        put(
+            table,
+            "runtime.common_fragments.expired",
+            snapshot
+                .fragment_data_drops
+                .saturating_add(snapshot.fragment_feedback_drops),
+        )?;
+    }
+    if let Some(ack) = &snapshot.ack_ingress {
+        put(
+            table,
+            "pipeline.ack_coalescing.shared.held",
+            ack.statistics.flushed,
+        )?;
+        put(
+            table,
+            "pipeline.ack_coalescing.shared.replaced",
+            ack.statistics.superseded,
+        )?;
+    }
     if let Some(value) = &snapshot.credit {
         credit(table, value)?;
     }
+    mux_channels(table, &snapshot.channel_metrics)?;
+    mux_flows(table, &snapshot.flow_metrics)?;
+    recovery(table, snapshot)?;
     Ok(())
 }
 
@@ -149,7 +382,20 @@ fn build(
     path_scale: usize,
 ) -> Option<Table> {
     let (keys, reasons) = observer.map_or((0, 0), crate::buffer_metrics::Observer::csr_extent);
+    let recovery_channels = match &snapshot.recovery_metrics {
+        RecoveryMetrics::Swift { channels } => channels.len(),
+        RecoveryMetrics::Reliable { .. } | RecoveryMetrics::Rolling { .. } => 1,
+        RecoveryMetrics::Other => usize::from(snapshot.research_receiver.is_some()),
+    };
     let entries = FIXED_ENTRIES
+        .saturating_add(
+            snapshot
+                .channel_metrics
+                .len()
+                .saturating_mul(PER_CHANNEL_MUX),
+        )
+        .saturating_add(snapshot.flow_metrics.len().saturating_mul(PER_FLOW_MUX))
+        .saturating_add(recovery_channels.saturating_mul(PER_RECOVERY_CHANNEL))
         .saturating_add(keys.saturating_mul(PER_KEY))
         .saturating_add(reasons.saturating_mul(PER_REASON));
     let mut table = Table::new(Limits::for_entries(

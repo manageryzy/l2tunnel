@@ -678,6 +678,37 @@ impl Mux {
     pub fn queued_bytes(&self) -> usize {
         self.queued_bytes
     }
+
+    /// Payload bytes currently queued on one specific channel, without mutation or allocation.
+    pub fn channel_queued_bytes(&self, channel: u16) -> usize {
+        let index = usize::from(channel);
+        match &self.backing {
+            Backing::Legacy(lanes) => lanes
+                .get(index)
+                .map_or(0, |queue| queue.iter().map(|frame| frame.len()).sum()),
+            Backing::Reserved(reserved) => {
+                let Some(lane) = reserved.lanes.get(index) else {
+                    return 0;
+                };
+                let mut total = 0_usize;
+                let mut cursor = lane.head;
+                let mut steps = 0_usize;
+                while let Some(slot_index) = cursor {
+                    if steps >= reserved.slots.len() {
+                        break;
+                    }
+                    let Some(slot) = reserved.slots.get(slot_index) else {
+                        break;
+                    };
+                    total = total.saturating_add(slot.length);
+                    cursor = slot.next;
+                    steps += 1;
+                }
+                total
+            }
+            Backing::Handoff => 0,
+        }
+    }
 }
 
 #[cfg(test)]

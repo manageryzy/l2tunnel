@@ -122,9 +122,9 @@ pub use carrier_switch::{
     CarrierSwitchError, CarrierSwitchOutcome, CarrierSwitchSnapshot, CarrierTarget,
 };
 pub use common::{
-    CommonControlHandle, CommonControlRequests, CommonSnapshot, CommonStopped,
-    NativeDeliverySnapshot, SameFlowRecovery, common_channel, run_common, run_common_on_carrier,
-    run_common_on_maintained, run_common_on_raw,
+    ChannelMeterSnapshot, CommonControlHandle, CommonControlRequests, CommonSnapshot,
+    CommonStopped, FlowMeterSnapshot, NativeDeliverySnapshot, SameFlowRecovery, common_channel,
+    run_common, run_common_on_carrier, run_common_on_maintained, run_common_on_raw,
 };
 pub use common_connections::{ConnectionIngressLimits, ConnectionIngressSnapshot};
 pub use common_contract::CommonTransactionContract;
@@ -1597,6 +1597,8 @@ pub struct Liveness {
     pub last_verified_micros: Option<u64>,
     /// Last new correctly matching authenticated Pong.
     pub last_pong_micros: Option<u64>,
+    /// Measured round-trip time of the most recent completed Ping/Pong challenge.
+    pub last_rtt_micros: Option<u64>,
 }
 #[path = "transport_switch_error.rs"]
 mod switch_error;
@@ -1764,6 +1766,7 @@ struct Challenge {
     nonce: u64,
     deadline: u64,
     submitted: bool,
+    sent_at: u64,
 }
 struct Driver {
     config: Config,
@@ -2043,6 +2046,7 @@ impl Driver {
                 nonce,
                 deadline,
                 submitted: false,
+                sent_at: 0,
             });
             self.live.outstanding = Some(nonce);
             self.live.deadline_micros = Some(deadline);
@@ -2064,6 +2068,7 @@ impl Driver {
             && let Some(challenge) = &mut self.challenge
         {
             challenge.submitted = true;
+            challenge.sent_at = now;
             #[cfg(test)]
             self.trace_liveness("ping-submitted", nonce, now);
         }
@@ -2195,13 +2200,21 @@ impl Driver {
                 Command::Pong(nonce) => {
                     #[cfg(test)]
                     self.trace_liveness("pong-received", nonce, now);
-                    if self.challenge.as_ref().is_some_and(|challenge| {
-                        challenge.submitted && challenge.nonce == nonce && now < challenge.deadline
-                    }) {
+                    if let Some(sent_at) = self
+                        .challenge
+                        .as_ref()
+                        .filter(|challenge| {
+                            challenge.submitted
+                                && challenge.nonce == nonce
+                                && now < challenge.deadline
+                        })
+                        .map(|challenge| challenge.sent_at)
+                    {
                         self.challenge = None;
                         self.live.outstanding = None;
                         self.live.deadline_micros = None;
                         self.live.last_pong_micros = Some(now);
+                        self.live.last_rtt_micros = Some(now.saturating_sub(sent_at));
                         self.next_ping = add(now, self.config.lifetime.ping_interval)?;
                     }
                 }

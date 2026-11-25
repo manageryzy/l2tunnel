@@ -27,8 +27,8 @@ mod connection_ingress;
 pub mod connection_reuse;
 mod connections;
 pub use buffer_diagnostics::{
-    AdmissionBlock, AdmissionRefusal, CodecBufferSnapshot, RecoveryBufferSnapshot,
-    StagedAdmissionSnapshot,
+    AdmissionBlock, AdmissionRefusal, CodecBufferSnapshot, RecoveryBufferSnapshot, RecoveryMetrics,
+    StagedAdmissionSnapshot, SwiftChannelMetrics,
 };
 pub use connection_ingress::ConnectionSnapshot;
 mod ingress;

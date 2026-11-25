@@ -1476,6 +1476,124 @@ async fn live_carrier_switch_migrates_udp_socket_and_cover_without_dropping_sess
     Ok(())
 }
 
+#[tokio::test]
+async fn csr_meters_populate_recovery_carrier_mux_channels_flows_and_rtt() -> Result {
+    use crate::local::{MeterSide, OperationAction, OperationRequest};
+
+    let hosts = support::hosts();
+    let mut options = TransactionFixtureOptions::baseline();
+    options.report_interval = Some(Duration::from_millis(50));
+    let TransactionPlans { plans, .. } =
+        transaction_plans_with(l2tunnel_cover::Appearance::QuicLike, &hosts, options)?;
+    let [client_plan, server_plan] = plans;
+    let (client, client_run) = channel();
+    let (server, server_run) = channel();
+    let client_task = tokio::spawn(client_run);
+    let server_task = tokio::spawn(server_run);
+
+    let client_connect = client
+        .connect(client_plan, client.next_key().map_err(submit)?)
+        .map_err(submit)?;
+    let server_connect = server
+        .connect(server_plan, server.next_key().map_err(submit)?)
+        .map_err(submit)?;
+    tokio::try_join!(
+        connected(&client, client_connect),
+        connected(&server, server_connect)
+    )?;
+
+    // Send bidirectional packets so MUX channels, flows, Swift recovery, and RTT all populate.
+    let pkt_ab = packet(0x61, 512);
+    let pkt_ba = packet(0x62, 512);
+    hosts[0].send(&pkt_ab)?;
+    hosts[1].send(&pkt_ba)?;
+
+    // Wait for packets to cross and a CSR rebuild (>= 100 ms rebuild interval + liveness pong).
+    timeout(Duration::from_secs(3), async {
+        loop {
+            if let Some(m) = client.metrics()
+                && m.rtt_micros.is_some()
+                && !m.channels.is_empty()
+                && !m.flows.is_empty()
+                && m.channels.iter().any(|ch| ch.admitted > 0)
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await?;
+
+    let metrics = client.metrics().ok_or("missing live metrics")?;
+    assert!(metrics.rtt_micros.is_some(), "expected RTT: {metrics:?}");
+    assert!(
+        !metrics.channels.is_empty(),
+        "expected channels: {metrics:?}"
+    );
+    assert!(!metrics.flows.is_empty(), "expected flows: {metrics:?}");
+    assert!(
+        !metrics
+            .unreported
+            .iter()
+            .any(|item| item == "rtt" || item == "channel_counters" || item == "flow_counters"),
+        "expected rtt/channels/flows reported, got unreported={:?}",
+        metrics.unreported
+    );
+
+    // Page through the entire live CSR and verify every path is in the static catalog.
+    let mut all_entries = Vec::new();
+    let mut cursor: Option<String> = None;
+    loop {
+        let reply = client
+            .operations_request(OperationRequest::new(OperationAction::MetersRead {
+                side: MeterSide::Local,
+                prefix: String::new(),
+                cursor: cursor.clone(),
+                limit: 256,
+            }))
+            .await;
+        assert!(reply.ok, "meters_read failed: {reply:?}");
+        let page = reply.meters.ok_or("missing meters page")?;
+        all_entries.extend(page.entries);
+        match page.next {
+            Some(next) => cursor = Some(next),
+            None => break,
+        }
+    }
+    assert!(!all_entries.is_empty(), "expected non-empty CSR table");
+    for entry in &all_entries {
+        assert!(
+            l2tunnel_meters::catalog::lookup(&entry.path).is_some(),
+            "CSR emitted uncatalogued path: {}",
+            entry.path
+        );
+    }
+    let has_path = |prefix: &str| all_entries.iter().any(|e| e.path.starts_with(prefix));
+    assert!(has_path("runtime.session.rtt_us"), "missing session RTT");
+    assert!(has_path("udp.socket.shared."), "missing udp.socket family");
+    assert!(has_path("mux.channel.ch0."), "missing mux.channel family");
+    assert!(has_path("mux.flow"), "missing mux.flow family");
+    assert!(has_path("swift.sender.ch0."), "missing swift.sender family");
+    assert!(
+        has_path("swift.receiver.ch0."),
+        "missing swift.receiver family"
+    );
+    assert!(has_path("recovery.arq.ch0."), "missing recovery.arq family");
+    assert!(
+        has_path("l2tunnel.record_bank."),
+        "missing record_bank family"
+    );
+    assert!(
+        has_path("runtime.native_output.would_block"),
+        "missing native_output.would_block"
+    );
+
+    client_task.abort();
+    server_task.abort();
+    let _ = tokio::join!(client_task, server_task);
+    Ok(())
+}
+
 struct DirGuard(std::path::PathBuf);
 impl Drop for DirGuard {
     fn drop(&mut self) {

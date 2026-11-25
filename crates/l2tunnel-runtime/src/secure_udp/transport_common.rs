@@ -176,6 +176,199 @@ pub struct CommonSnapshot {
     pub meters: Option<std::sync::Arc<l2tunnel_meters::Table>>,
     /// Live in-session carrier / UDP cover switch state, when running on UDP.
     pub carrier_switch: Option<super::CarrierSwitchSnapshot>,
+    /// Per-channel MUX admission, refusal, byte and queue observations (`MCSR-07`).
+    pub channel_metrics: Vec<ChannelMeterSnapshot>,
+    /// Bounded top inner-flow byte/packet observations (`MCSR-07`).
+    pub flow_metrics: Vec<FlowMeterSnapshot>,
+    /// Protocol-specific recovery/coding counters (`MCSR-05`).
+    pub recovery_metrics: engine::RecoveryMetrics,
+}
+
+/// Per-channel MUX observation published in [`CommonSnapshot`] (`MCSR-07`).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ChannelMeterSnapshot {
+    /// Zero-based MUX channel index.
+    pub channel: u16,
+    /// Native packets admitted on this channel.
+    pub tx_packets: u64,
+    /// Native bytes admitted on this channel.
+    pub tx_bytes: u64,
+    /// Successful admissions into the sending codec on this channel.
+    pub tx_admitted: u64,
+    /// Downstream admission refusals on this channel.
+    pub tx_refused: u64,
+    /// Payload bytes currently queued on this channel in Pipeline/MUX.
+    pub tx_queued_bytes: u64,
+    /// Native packets committed on this channel in the receive direction.
+    pub rx_packets: u64,
+    /// Native bytes committed on this channel in the receive direction.
+    pub rx_bytes: u64,
+}
+
+/// Bounded inner-flow observation published in [`CommonSnapshot`] (`MCSR-07`).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct FlowMeterSnapshot {
+    /// Local monotonic flow identifier.
+    pub flow: u64,
+    /// Native packets admitted on this flow.
+    pub tx_packets: u64,
+    /// Native bytes admitted on this flow.
+    pub tx_bytes: u64,
+    /// Native packets committed on this flow.
+    pub rx_packets: u64,
+    /// Native bytes committed on this flow.
+    pub rx_bytes: u64,
+    /// Catalog flow-state code (`1` = active, `2` = idle).
+    pub state: u64,
+}
+
+const MAX_MUX_CHANNELS: usize = 64;
+const MAX_MUX_FLOWS: usize = 64;
+const FLOW_IDLE_US: u64 = 30_000_000;
+
+#[derive(Clone, Copy, Debug, Default)]
+struct ChannelCounter {
+    tx_packets: u64,
+    tx_bytes: u64,
+    tx_admitted: u64,
+    tx_refused: u64,
+    rx_packets: u64,
+    rx_bytes: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct FlowCounter {
+    flow: u64,
+    tx_packets: u64,
+    tx_bytes: u64,
+    rx_packets: u64,
+    rx_bytes: u64,
+    last_seen_us: u64,
+}
+
+/// Fixed-capacity, allocation-free MUX channel & flow counter bank (`MCSR-07`).
+pub(super) struct MuxCounters {
+    channels: [ChannelCounter; MAX_MUX_CHANNELS],
+    flows: [FlowCounter; MAX_MUX_FLOWS],
+}
+
+impl Default for MuxCounters {
+    fn default() -> Self {
+        Self {
+            channels: [ChannelCounter::default(); MAX_MUX_CHANNELS],
+            flows: [FlowCounter::default(); MAX_MUX_FLOWS],
+        }
+    }
+}
+
+impl MuxCounters {
+    pub(super) fn record_tx(&mut self, channel: u16, flow: u64, bytes: u64, now: u64) {
+        if let Some(slot) = self.channels.get_mut(usize::from(channel)) {
+            slot.tx_packets = slot.tx_packets.saturating_add(1);
+            slot.tx_bytes = slot.tx_bytes.saturating_add(bytes);
+            slot.tx_admitted = slot.tx_admitted.saturating_add(1);
+        }
+        if flow != 0 {
+            let entry = self.flow_slot(flow, now);
+            entry.tx_packets = entry.tx_packets.saturating_add(1);
+            entry.tx_bytes = entry.tx_bytes.saturating_add(bytes);
+            entry.last_seen_us = now;
+        }
+    }
+
+    pub(super) fn record_tx_refused(&mut self, channel: u16) {
+        if let Some(slot) = self.channels.get_mut(usize::from(channel)) {
+            slot.tx_refused = slot.tx_refused.saturating_add(1);
+        }
+    }
+
+    pub(super) fn record_rx(&mut self, channel: u16, flow: Option<u64>, bytes: u64, now: u64) {
+        if let Some(slot) = self.channels.get_mut(usize::from(channel)) {
+            slot.rx_packets = slot.rx_packets.saturating_add(1);
+            slot.rx_bytes = slot.rx_bytes.saturating_add(bytes);
+        }
+        if let Some(flow) = flow
+            && flow != 0
+        {
+            let entry = self.flow_slot(flow, now);
+            entry.rx_packets = entry.rx_packets.saturating_add(1);
+            entry.rx_bytes = entry.rx_bytes.saturating_add(bytes);
+            entry.last_seen_us = now;
+        }
+    }
+
+    fn flow_slot(&mut self, flow: u64, now: u64) -> &mut FlowCounter {
+        let mut empty_idx: Option<usize> = None;
+        let mut oldest_idx = 0_usize;
+        let mut oldest_time = u64::MAX;
+        for (idx, entry) in self.flows.iter().enumerate() {
+            if entry.flow == flow {
+                return &mut self.flows[idx];
+            }
+            if entry.flow == 0 && empty_idx.is_none() {
+                empty_idx = Some(idx);
+            }
+            if entry.last_seen_us < oldest_time {
+                oldest_time = entry.last_seen_us;
+                oldest_idx = idx;
+            }
+        }
+        let target = empty_idx.unwrap_or(oldest_idx);
+        self.flows[target] = FlowCounter {
+            flow,
+            tx_packets: 0,
+            tx_bytes: 0,
+            rx_packets: 0,
+            rx_bytes: 0,
+            last_seen_us: now,
+        };
+        &mut self.flows[target]
+    }
+
+    fn snapshot_channels(&self, count: u16, engine: &engine::Engine) -> Vec<ChannelMeterSnapshot> {
+        let width = usize::from(count).min(MAX_MUX_CHANNELS);
+        let mut out = Vec::with_capacity(width);
+        for index in 0..width {
+            let ch = index as u16;
+            let c = self.channels[index];
+            out.push(ChannelMeterSnapshot {
+                channel: ch,
+                tx_packets: c.tx_packets,
+                tx_bytes: c.tx_bytes,
+                tx_admitted: c.tx_admitted,
+                tx_refused: c.tx_refused,
+                tx_queued_bytes: engine.channel_queued_bytes(ch) as u64,
+                rx_packets: c.rx_packets,
+                rx_bytes: c.rx_bytes,
+            });
+        }
+        out
+    }
+
+    fn snapshot_flows(&self, now: u64) -> Vec<FlowMeterSnapshot> {
+        let mut out: Vec<FlowMeterSnapshot> = self
+            .flows
+            .iter()
+            .filter(|entry| entry.flow != 0)
+            .map(|entry| {
+                let state = if now.saturating_sub(entry.last_seen_us) <= FLOW_IDLE_US {
+                    1
+                } else {
+                    2
+                };
+                FlowMeterSnapshot {
+                    flow: entry.flow,
+                    tx_packets: entry.tx_packets,
+                    tx_bytes: entry.tx_bytes,
+                    rx_packets: entry.rx_packets,
+                    rx_bytes: entry.rx_bytes,
+                    state,
+                }
+            })
+            .collect();
+        out.sort_by_key(|f| std::cmp::Reverse(f.tx_bytes.saturating_add(f.rx_bytes)));
+        out
+    }
 }
 
 /// Actual native-byte window status, separate from recovery debt and TCP cwnd.
@@ -460,6 +653,8 @@ pub(super) struct Runtime {
     pub(super) path: SameFlowRecovery,
     /// Peer-confirmed live wire speed budget override `(send_rate, receive_rate)` in B/s.
     pub(super) rate_override: Option<(u64, u64)>,
+    /// Allocation-free per-channel and per-flow MUX counter bank (`MCSR-07`).
+    pub(super) mux_counters: MuxCounters,
 }
 
 /// Run actual common record generations on the original authenticated UDP socket.
@@ -1137,6 +1332,7 @@ impl Driver {
                 fragment_feedback_drops: 0,
                 path: SameFlowRecovery::default(),
                 rate_override: None,
+                mux_counters: MuxCounters::default(),
             })?;
             // Complete ownership here. The carrier moves this same Driver into its
             // existing cell without retaining additional inline Driver return slots
@@ -1350,6 +1546,12 @@ impl Driver {
             terminal: self.terminal,
             meters: None,
             carrier_switch: self.carrier_switch_snapshot(),
+            channel_metrics: runtime.mux_counters.snapshot_channels(
+                local.send().channels().max(local.receive().channels()),
+                state.engine(state.epoch())?,
+            ),
+            flow_metrics: runtime.mux_counters.snapshot_flows(now),
+            recovery_metrics: state.engine(state.epoch())?.recovery_metrics(),
         };
         snapshot.meters = super::meters::publish(&snapshot, runtime.buffer_metrics.as_ref(), now);
         Ok(snapshot)
