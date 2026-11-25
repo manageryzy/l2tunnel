@@ -14,6 +14,7 @@ mod operations;
 mod profile;
 mod schema;
 mod sessions;
+mod socks;
 mod tuning;
 mod worker;
 pub use describe::configuration_summary;
@@ -25,6 +26,7 @@ pub use operations::*;
 pub use profile::*;
 pub use schema::*;
 pub use sessions::*;
+pub use socks::*;
 pub use tuning::*;
 pub use worker::serve_private_common_stream;
 #[cfg(any(unix, windows))]

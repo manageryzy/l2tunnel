@@ -2,9 +2,6 @@
 use super::*;
 use crate::local::{Capability, Feature, OPERATIONS_VERSION, Role, ServiceInfo};
 
-/// Reason for a feature this service build does not serve yet.
-const NOT_IMPLEMENTED: &str = "not implemented by this service version";
-
 impl Handle {
     /// Current identity and per-feature capabilities. Reading never waits.
     pub fn service_info(&self) -> ServiceInfo {
@@ -69,7 +66,10 @@ impl Handle {
                 "key references are read from stored profiles; start the service as `daemon`",
             )
         });
-        capabilities.push(Capability::unavailable(Feature::Socks5, NOT_IMPLEMENTED));
+        capabilities.push(match self.socks_unavailable() {
+            None => Capability::available(Feature::Socks5),
+            Some(reason) => Capability::unavailable(Feature::Socks5, reason),
+        });
         capabilities.push(if self.0.stop.get().is_some() {
             Capability::available(Feature::Stop)
         } else {

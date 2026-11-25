@@ -297,6 +297,15 @@ pub enum OperationAction {
         /// Peer send (local download) wire budget in bytes/s (`125_000..=1_250_000_000`).
         receive_rate: u64,
     },
+    /// Read SOCKS5 entry settings, listener status and flow counters (`DGUI-08`).
+    SocksGet {},
+    /// Apply SOCKS5 entry settings, starting or stopping the local listener (`DGUI-08`).
+    SocksSet {
+        /// Complete validated settings (password is optional when already stored).
+        settings: super::SocksSettings,
+    },
+    /// Read active and recently ended SOCKS5 flows (`DGUI-08`).
+    SocksFlows {},
 }
 impl OperationAction {
     /// Whether the action submits a keyed service operation.
@@ -656,6 +665,12 @@ pub struct OperationReply {
     /// Live-tuning controls (`tuning_get`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tuning: Option<Box<super::TuningView>>,
+    /// SOCKS5 entry status and settings (`socks_get`, `socks_set`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub socks: Option<Box<super::SocksStatus>>,
+    /// Active and recent SOCKS5 flows (`socks_flows`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub socks_flows: Option<Box<super::SocksFlows>>,
 }
 impl OperationReply {
     /// Reply carrying only an outcome code.
@@ -682,6 +697,8 @@ impl OperationReply {
             sessions: None,
             test: None,
             tuning: None,
+            socks: None,
+            socks_flows: None,
         }
     }
 }

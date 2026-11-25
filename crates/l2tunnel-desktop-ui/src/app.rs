@@ -93,6 +93,7 @@ impl App {
         self.last_connected_ms = None;
         self.update_dismissed = false;
         self.ui.service_update = None;
+        self.ui.socks = crate::socks_panel::SocksForm::default();
         self.clear_confirmations();
         let commands = self.model.attach(&self.socket);
         self.dispatch(commands);

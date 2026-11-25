@@ -73,7 +73,8 @@ fn stopped(shared: &Shared, active: &mut Option<Active>, terminal: Terminal) {
     // without spawned children. Drop every original socket/device owner before
     // publishing release or reconnect.
     drop(active.take());
-    // Routes the service added belong to this session; the host releases them.
+    // Routes and SOCKS5 listeners belong to this session; release them on end.
+    shared.socks.stop_listener();
     if generation.is_some()
         && let Some(host) = shared.host.get()
     {

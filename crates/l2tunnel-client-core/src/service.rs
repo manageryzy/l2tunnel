@@ -36,6 +36,7 @@ pub mod profile_store;
 pub mod profiles;
 mod proxy_backend;
 mod sessions_local;
+mod socks_local;
 mod tuning_local;
 mod tunnel_tests_local;
 #[cfg(unix)]
@@ -510,6 +511,8 @@ struct Shared {
     started: Instant,
     host: std::sync::OnceLock<Arc<dyn host::Host>>,
     profiles: std::sync::OnceLock<Arc<dyn profiles::ProfileStore>>,
+    /// Service-owned SOCKS5 entry over client TCP-proxy sessions.
+    socks: socks_local::SocksService,
     /// Set by a host process that exits on `service_stop`.
     stop: std::sync::OnceLock<watch::Sender<bool>>,
 }
@@ -1381,6 +1384,7 @@ impl Drop for Completion {
         let queued = state.queued.take();
         drop(state);
         drop(queued);
+        self.0.socks.stop_listener();
         self.0.changed();
     }
 }
@@ -1425,6 +1429,7 @@ fn create_channel(plan: Option<Prepared>) -> (Handle, Run) {
         started: Instant::now(),
         host: std::sync::OnceLock::new(),
         profiles: std::sync::OnceLock::new(),
+        socks: socks_local::SocksService::new(),
         stop: std::sync::OnceLock::new(),
     });
     // Record the initial lifecycle as sequence 1, the baseline for subscribers.

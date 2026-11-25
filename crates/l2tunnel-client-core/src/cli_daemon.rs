@@ -27,12 +27,6 @@ pub(super) fn prepare_profile(document: &ProfileDocument) -> io::Result<service:
     let selected = secure_udp_frontend::selection(command, options, config)?.ok_or_else(|| {
         input("select --record-profile common and an explicit --carrier with --common-transaction-plan")
     })?;
-    if secure_udp_frontend::is_proxy(&selected) {
-        return Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "TCP-proxy profiles need the proxy frontend, which the profile service does not host yet",
-        ));
-    }
     secure_udp_frontend::prepare(command, options, config, &selected)
 }
 

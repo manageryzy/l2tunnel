@@ -69,6 +69,19 @@ class FakeService:
             {'destination': '0.0.0.0/0', 'gateway': '192.0.2.1', 'device': 'fake-eth0',
              'metric': 100, 'owned': False},
         ]
+        # SIMULATED SOCKS5 state (DGUI-08): no real socket is opened.
+        self.socks_settings: dict = {
+            'enabled': False,
+            'listen_host': '127.0.0.1',
+            'listen_port': 1080,
+            'auth_mode': 'none',
+            'username': None,
+            'password_set': False,
+            'allowed_clients': ['127.0.0.1/32'],
+            'max_flows': 128,
+        }
+        self.socks_password: str | None = None
+        self.socks_error: str | None = None
         with self.lock:
             self.publish()
 
@@ -238,6 +251,90 @@ class FakeService:
     def uptime_ms(self) -> int:
         return int((time.monotonic() - self.started) * 1000)
 
+    def socks_status_view(self) -> dict:
+        proxy_active = (not self.server) and self.phase == 'connected'
+        listening = None
+        if proxy_active and self.socks_settings['enabled']:
+            listening = f"{self.socks_settings['listen_host']}:{self.socks_settings['listen_port']}"
+        settings = {k: v for k, v in self.socks_settings.items() if v is not None}
+        settings['password_set'] = self.socks_password is not None
+        status = {
+            'proxy_active': proxy_active,
+            'settings': settings,
+            'active_flows': 1 if listening else 0,
+            'total_flows': 2 if listening else 0,
+            'rejected_clients': 0,
+            'failed_connects': 1 if listening else 0,
+        }
+        if listening:
+            status['listening'] = listening
+        if self.socks_error:
+            status['last_error'] = self.socks_error
+        return status
+
+    def socks_flows_view(self) -> dict:
+        proxy_active = (not self.server) and self.phase == 'connected'
+        if not (proxy_active and self.socks_settings['enabled']):
+            return {'flows': [], 'total_active': 0}
+        age = max(100, int((time.monotonic() - (self.connected_at or time.monotonic())) * 1000))
+        return {
+            'total_active': 1,
+            'flows': [
+                {
+                    'id': 1,
+                    'client': '127.0.0.1:53122',
+                    'target': 'example.org:443',
+                    'sent_bytes': 3_145_728,
+                    'received_bytes': 41_943_040,
+                    'state': 'open',
+                    'age_ms': age,
+                },
+                {
+                    'id': 2,
+                    'client': '127.0.0.1:53124',
+                    'target': '192.0.2.99:25',
+                    'sent_bytes': 0,
+                    'received_bytes': 0,
+                    'state': 'refused',
+                    'age_ms': max(50, age // 2),
+                    'error': 'connection refused by egress policy (simulated)',
+                },
+            ],
+        }
+
+    def socks_apply(self, settings: dict) -> dict:
+        if self.server:
+            return self.reply(False, 'unsupported', socks=self.socks_status_view())
+        proxy_active = self.phase == 'connected'
+        enabled = bool(settings.get('enabled', False))
+        if enabled and not proxy_active:
+            self.socks_error = 'SOCKS5 needs a connected TCP-proxy profile'
+            return self.reply(False, 'not_proxy_profile', socks=self.socks_status_view())
+        auth_mode = settings.get('auth_mode', 'none')
+        if auth_mode == 'user_pass':
+            if not settings.get('username'):
+                self.socks_error = 'username is required'
+                return self.reply(False, 'invalid_settings', socks=self.socks_status_view())
+            if settings.get('password'):
+                self.socks_password = settings['password']
+            elif self.socks_password is None:
+                self.socks_error = 'password is required'
+                return self.reply(False, 'invalid_settings', socks=self.socks_status_view())
+        else:
+            self.socks_password = None
+        self.socks_settings = {
+            'enabled': enabled,
+            'listen_host': settings.get('listen_host', '127.0.0.1'),
+            'listen_port': int(settings.get('listen_port', 1080)),
+            'auth_mode': auth_mode,
+            'username': settings.get('username') if auth_mode == 'user_pass' else None,
+            'password_set': self.socks_password is not None,
+            'allowed_clients': list(settings.get('allowed_clients', ['127.0.0.1/32'])),
+            'max_flows': int(settings.get('max_flows', 128)),
+        }
+        self.socks_error = None
+        return self.reply(True, 'ok', socks=self.socks_status_view())
+
     def info_view(self) -> dict:
         def capability(feature: str, reason: str | None) -> dict:
             if reason is None:
@@ -257,7 +354,12 @@ class FakeService:
                 capability('routes', None),
                 capability('profiles', None),
                 capability('keys', None),
-                capability('socks5', not_simulated),
+                capability(
+                    'socks5',
+                    'client role only' if self.server else (
+                        None if connected else 'SOCKS5 needs a connected TCP-proxy profile'
+                    ),
+                ),
                 capability('sessions', None if self.server else 'server role only'),
                 capability('stop', not_simulated),
                 capability('tests', None if connected else 'needs a connected session'),
@@ -658,6 +760,15 @@ class FakeService:
         if command == 'service_info':
             with self.lock:
                 return self.reply(True, 'ok', info=self.info_view())
+        if command == 'socks_get':
+            with self.lock:
+                return self.reply(True, 'ok', socks=self.socks_status_view())
+        if command == 'socks_set':
+            with self.lock:
+                return self.socks_apply(action['settings'])
+        if command == 'socks_flows':
+            with self.lock:
+                return self.reply(True, 'ok', socks_flows=self.socks_flows_view())
         if command == 'meters_read':
             with self.lock:
                 return self.meters_read(action)

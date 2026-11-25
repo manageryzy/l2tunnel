@@ -1262,11 +1262,6 @@ pub(super) fn prepare(
     Ok(plan)
 }
 
-/// Whether the selection runs the TCP-proxy profile (it needs the proxy frontend).
-pub(super) fn is_proxy(selected: &Selected) -> bool {
-    matches!(&selected.0, Choice::Proxy(..))
-}
-
 pub(super) async fn execute(
     command: &str,
     options: &BTreeMap<String, String>,

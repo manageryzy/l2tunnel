@@ -207,6 +207,32 @@ class ProfileDaemonTest(unittest.TestCase):
         self.assertEqual((self.daemon.returncode, stderr), (0, ''))
         self.daemon = None
 
+    def test_tcp_proxy_profile_reaches_proxy_plan_validation_in_daemon(self):
+        """DGUI-10: l2tunneld no longer refuses TCP-proxy profiles as unsupported."""
+        self.start()
+        policy_path = Path(self.directory.name) / 'proxy-policy.json'
+        policy_path.write_text(json.dumps({
+            'version': 1,
+            'channels': 4,
+            'time_wait_reset': 'maintained',
+            'routes': [{
+                'source': '10.231.255.0/30',
+                'destination': '10.231.255.0/30',
+                'ports': {'first': 80, 'last': 443},
+            }],
+        }))
+        doc = json.loads(self.documents['a'].read_text())
+        doc['options']['--duplex'] = 'full'
+        doc['options']['--traffic'] = 'proxy'
+        doc['options']['--proxy-policy'] = str(policy_path)
+        proxy_profile = Path(self.directory.name) / 'proxy-client.json'
+        proxy_profile.write_text(json.dumps(doc))
+        code, replies = self.ctl('profile', 'import', 'proxy-client', '--file', str(proxy_profile))
+        self.assertEqual(code, 1)
+        reason = replies[-1]['operation']['result']['reason']
+        self.assertNotIn('does not host yet', reason)
+        self.assertIn('Common proxy record capacity differs from actor frames', reason)
+
 
 if __name__ == '__main__':
     unittest.main()

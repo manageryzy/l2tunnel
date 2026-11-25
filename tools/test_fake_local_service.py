@@ -195,5 +195,26 @@ class FakeServiceTest(unittest.TestCase):
         [session] = self.ctl('session', 'list')[1][-1]['sessions']
         self.assertNotEqual(session['member'], old_member, 'only the new member key is trusted')
 
+    def test_simulated_socks5_settings_and_flows(self):
+        self.start()
+        code, replies = self.ctl('socks', 'show')
+        self.assertEqual((code, replies[-1]['socks']['proxy_active']), (0, False))
+        # Enabling while disconnected is refused.
+        code, replies = self.ctl('socks', 'set', '--enable')
+        self.assertEqual((code, replies[-1]['code']), (1, 'not_proxy_profile'))
+        self.assertEqual(self.ctl('service', 'reconnect', '--watch', '10')[0], 0)
+        # Non-loopback without explicit --allow fails validation.
+        self.assertEqual(self.ctl('socks', 'set', '--enable', '--listen', '0.0.0.0:1080', '--allow', '')[0], 2)
+        code, replies = self.ctl('socks', 'set', '--enable', '--listen', '127.0.0.1:1088',
+                                 '--allow', '127.0.0.1/32', '--max-flows', '64')
+        self.assertEqual((code, replies[-1]['socks']['listening']), (0, '127.0.0.1:1088'))
+        code, replies = self.ctl('socks', 'flows')
+        self.assertEqual((code, replies[-1]['socks_flows']['total_active']), (0, 1))
+        self.assertEqual(replies[-1]['socks_flows']['flows'][0]['target'], 'example.org:443')
+        self.assertEqual(replies[-1]['socks_flows']['flows'][1]['state'], 'refused')
+        code, replies = self.ctl('socks', 'set', '--disable')
+        self.assertEqual(code, 0)
+        self.assertNotIn('listening', replies[-1]['socks'])
+
 if __name__ == '__main__':
     unittest.main()

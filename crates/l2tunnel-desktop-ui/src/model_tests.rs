@@ -847,3 +847,99 @@ fn meters_paging_rates_and_action_results_work() {
     );
     assert!(model.take_action_result(Action::Profile).is_none());
 }
+
+#[test]
+fn socks5_settings_and_flows_flow() {
+    use l2tunnel_client_core::local::{Capability, Role, SocksFlow, SocksFlows, SocksStatus};
+
+    let mut model = Model::default();
+    let _ = model.attach("/run/x/api.sock");
+    let _ = model.handle(Message::Status {
+        attach: 1,
+        start_follower: true,
+        result: Ok(status_reply("connected", None, 1, 7)),
+    });
+    let mut info = reply("ok", 7);
+    info.info = Some(ServiceInfo {
+        version: "0.1.0".into(),
+        role: Role::Client,
+        api: OPERATIONS_VERSION,
+        uptime_ms: 1000,
+        capabilities: vec![Capability::available(Feature::Socks5)],
+    });
+    let _ = model.handle(Message::Query {
+        attach: 1,
+        query: Query::Info,
+        result: Ok(Box::new(info)),
+    });
+    assert!(model.capability(Feature::Socks5).is_ok());
+
+    let refresh = model.refresh_socks();
+    assert_eq!(refresh.len(), 2);
+
+    let settings = SocksSettings {
+        enabled: true,
+        listen_host: "127.0.0.1".into(),
+        listen_port: 1088,
+        ..SocksSettings::default()
+    };
+    let mut socks_reply = reply("ok", 7);
+    socks_reply.socks = Some(Box::new(SocksStatus {
+        proxy_active: true,
+        listening: Some("127.0.0.1:1088".into()),
+        settings: settings.clone(),
+        active_flows: 1,
+        total_flows: 1,
+        rejected_clients: 0,
+        failed_connects: 0,
+        last_error: None,
+    }));
+    let _ = model.handle(Message::Query {
+        attach: 1,
+        query: Query::SocksGet,
+        result: Ok(Box::new(socks_reply.clone())),
+    });
+    assert_eq!(
+        model.socks().and_then(|s| s.listening.as_deref()),
+        Some("127.0.0.1:1088")
+    );
+
+    let mut flows_reply = reply("ok", 7);
+    flows_reply.socks_flows = Some(Box::new(SocksFlows {
+        total_active: 1,
+        flows: vec![SocksFlow {
+            id: 41,
+            client: "127.0.0.1:53122".into(),
+            target: "example.org:443".into(),
+            sent_bytes: 1024,
+            received_bytes: 2048,
+            state: "open".into(),
+            age_ms: 500,
+            error: None,
+        }],
+    }));
+    let _ = model.handle(Message::Query {
+        attach: 1,
+        query: Query::SocksFlows,
+        result: Ok(Box::new(flows_reply)),
+    });
+    assert_eq!(model.socks_flows().map(|f| f.total_active), Some(1));
+
+    // Applying settings triggers a follow-up SocksFlows refresh on success.
+    let apply_cmds = model.apply_socks(settings.clone());
+    assert_eq!(apply_cmds.len(), 1);
+    assert!(model.socks_busy());
+    let next = model.handle(Message::Query {
+        attach: 1,
+        query: Query::SocksSet(Box::new(settings)),
+        result: Ok(Box::new(socks_reply)),
+    });
+    assert!(!model.socks_busy());
+    assert!(next.iter().any(|cmd| matches!(
+        cmd,
+        Command::Query {
+            query: Query::SocksFlows,
+            ..
+        }
+    )));
+}

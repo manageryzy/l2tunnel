@@ -8,8 +8,8 @@ use l2tunnel_client_core::local::tunnel_test::{TestRequest, TestState};
 use l2tunnel_client_core::local::{
     DeviceChange, DeviceState, EventBody, EventState, Feature, MeterPage, MeterSide, Metrics,
     OperationReply, OperationResult, OperationState, ProfileChange, ProfileEntry, ProfileSummary,
-    RouteChange, RouteState, ServiceId, ServiceInfo, ServiceStatus, SessionState, TerminalState,
-    TuningSetting, TuningView,
+    RouteChange, RouteState, ServiceId, ServiceInfo, ServiceStatus, SessionState, SocksFlows,
+    SocksSettings, SocksStatus, TerminalState, TuningSetting, TuningView,
 };
 use l2tunnel_client_core::secure_udp::common_status::CanonicalConfiguration;
 use std::collections::{BTreeMap, VecDeque};
@@ -150,6 +150,12 @@ pub enum Query {
         /// Peer send (local download) wire budget in bytes/s.
         receive_rate: u64,
     },
+    /// `socks_get`.
+    SocksGet,
+    /// `socks_flows`.
+    SocksFlows,
+    /// `socks_set`.
+    SocksSet(Box<SocksSettings>),
 }
 
 /// Catalogs up to this size are shown as one list.
@@ -419,6 +425,11 @@ pub struct Model {
     /// Live speed-budget update in flight and last error.
     rate_budget_busy: bool,
     rate_budget_error: Option<String>,
+    /// SOCKS5 entry status, active flows, and error state.
+    socks: Option<SocksStatus>,
+    socks_flows: Option<SocksFlows>,
+    socks_busy: bool,
+    socks_error: Option<String>,
     /// Latest CSR meter page, previous snapshot for rates, and error state.
     meters: Option<MeterPage>,
     meters_prev: Option<(MeterSide, u64, u64, BTreeMap<String, u64>)>,
@@ -608,6 +619,10 @@ impl Model {
         self.meters_prev = None;
         self.meters_request = None;
         self.meters_error = None;
+        self.socks = None;
+        self.socks_flows = None;
+        self.socks_busy = false;
+        self.socks_error = None;
         self.action_result = None;
         self.exported = None;
         self.backlog_end = None;
@@ -987,6 +1002,9 @@ impl Model {
         if self.sessions.is_some() && self.capability(Feature::Sessions).is_ok() {
             commands.extend(self.refresh_sessions());
         }
+        if self.socks.is_some() && self.capability(Feature::Socks5).is_ok() {
+            commands.extend(self.query(Query::SocksFlows));
+        }
         if self.capability(Feature::Metrics).is_err() {
             self.metrics = None;
             return commands;
@@ -1138,6 +1156,44 @@ impl Model {
     pub fn rate_budget_error(&self) -> Option<&str> {
         self.rate_budget_error.as_deref()
     }
+    /// Read SOCKS5 status and active flows.
+    pub fn refresh_socks(&mut self) -> Vec<Command> {
+        self.socks_error = None;
+        let mut commands = self.query(Query::SocksGet);
+        commands.extend(self.query(Query::SocksFlows));
+        commands
+    }
+    /// Apply updated SOCKS5 settings.
+    pub fn apply_socks(&mut self, settings: SocksSettings) -> Vec<Command> {
+        if self.socks_busy {
+            return Vec::new();
+        }
+        self.socks_busy = true;
+        self.socks_error = None;
+        self.query(Query::SocksSet(Box::new(settings)))
+    }
+    /// Latest SOCKS5 status.
+    pub fn socks(&self) -> Option<&SocksStatus> {
+        self.socks.as_ref()
+    }
+    /// Latest SOCKS5 flows.
+    pub fn socks_flows(&self) -> Option<&SocksFlows> {
+        self.socks_flows.as_ref()
+    }
+    /// Whether a SOCKS5 status or flows query is in flight.
+    pub fn socks_loading(&self) -> bool {
+        self.in_flight
+            .iter()
+            .any(|query| matches!(query, Query::SocksGet | Query::SocksFlows))
+    }
+    /// Whether a SOCKS5 settings apply is in flight.
+    pub fn socks_busy(&self) -> bool {
+        self.socks_busy
+    }
+    /// Last SOCKS5 error, if any.
+    pub fn socks_error(&self) -> Option<&str> {
+        self.socks_error.as_deref()
+    }
     /// Identity of the attached service instance.
     pub fn service(&self) -> Option<ServiceId> {
         self.service
@@ -1275,6 +1331,13 @@ impl Model {
                             Query::RateBudgetSet { .. } => {
                                 self.rate_budget_busy = false;
                                 self.rate_budget_error = Some(text);
+                            }
+                            Query::SocksGet | Query::SocksFlows => {
+                                self.socks_error = Some(text);
+                            }
+                            Query::SocksSet(_) => {
+                                self.socks_busy = false;
+                                self.socks_error = Some(text);
                             }
                             Query::Profiles if self.profiles.is_none() => {
                                 self.profiles = Some(Vec::new());
@@ -1487,6 +1550,66 @@ impl Model {
                                 _ => format!("refused ({})", bounded(&reply.code)),
                             };
                             self.rate_budget_error = Some(reason);
+                        }
+                    }
+                    Query::SocksGet => {
+                        if reply.ok {
+                            self.socks = reply.socks.map(|status| *status);
+                            self.socks_error = None;
+                        } else {
+                            self.socks_error =
+                                Some(format!("SOCKS5 status refused ({})", bounded(&reply.code)));
+                        }
+                    }
+                    Query::SocksFlows => {
+                        if reply.ok {
+                            self.socks_flows = reply.socks_flows.map(|flows| *flows);
+                        } else {
+                            self.socks_error =
+                                Some(format!("SOCKS5 flows refused ({})", bounded(&reply.code)));
+                        }
+                    }
+                    Query::SocksSet(_) => {
+                        self.socks_busy = false;
+                        if let Some(status) = reply.socks {
+                            self.socks = Some(*status);
+                        }
+                        if reply.ok {
+                            self.socks_error = None;
+                            let summary = self
+                                .socks
+                                .as_ref()
+                                .and_then(|status| status.listening.as_ref())
+                                .map_or_else(
+                                    || "SOCKS5 listener stopped".to_owned(),
+                                    |addr| format!("SOCKS5 listening on {addr}"),
+                                );
+                            self.notice = summary.clone();
+                            self.append(summary);
+                            let mut next = self.query(Query::SocksFlows);
+                            if let Some(q) = again {
+                                next.extend(self.query(q));
+                            }
+                            return next;
+                        } else {
+                            let reason = match reply.code.as_str() {
+                                "not_proxy_profile" => {
+                                    "SOCKS5 needs a connected TCP-proxy profile".into()
+                                }
+                                "invalid_settings" => "SOCKS5 settings failed validation".into(),
+                                "bind_failed" => self
+                                    .socks
+                                    .as_ref()
+                                    .and_then(|status| status.last_error.clone())
+                                    .unwrap_or_else(|| {
+                                        "could not bind SOCKS5 listen address".into()
+                                    }),
+                                "unsupported" => {
+                                    "SOCKS5 is only available on the client role".into()
+                                }
+                                _ => format!("SOCKS5 refused ({})", bounded(&reply.code)),
+                            };
+                            self.socks_error = Some(reason);
                         }
                     }
                     Query::Catalog {

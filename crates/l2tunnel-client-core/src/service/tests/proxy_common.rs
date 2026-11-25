@@ -545,6 +545,156 @@ async fn common_proxy_abnormal_disconnect_observes_release_without_clean_close()
     Ok(())
 }
 
+#[tokio::test]
+async fn common_proxy_client_enables_socks5_and_tears_down_on_disconnect() -> Result {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+
+    timeout(Duration::from_secs(35), async {
+        let hosts = support::hosts();
+        let ([a, b], _profile) = fixture(&hosts)?;
+        let (client, client_run) = channel();
+        let (server, server_run) = channel();
+        let tasks = [tokio::spawn(client_run), tokio::spawn(server_run)];
+        let accepted = [
+            client
+                .connect(a, client.next_key().map_err(submit)?)
+                .map_err(submit)?,
+            server
+                .connect(b, server.next_key().map_err(submit)?)
+                .map_err(submit)?,
+        ];
+        tokio::try_join!(
+            connected(&client, accepted[0]),
+            connected(&server, accepted[1])
+        )?;
+
+        // Client TCP-proxy advertises Feature::Socks5; server refuses it as client-only.
+        assert!(
+            client
+                .service_info()
+                .capability(local::Feature::Socks5)
+                .is_some_and(|cap| cap.available)
+        );
+        assert!(
+            server
+                .service_info()
+                .capability(local::Feature::Socks5)
+                .is_some_and(
+                    |cap| !cap.available && cap.reason.as_deref() == Some("client role only")
+                )
+        );
+
+        // Start a local echo server and enable SOCKS5 over the live proxy client service.
+        let echo = TcpListener::bind("127.0.0.1:0").await?;
+        let echo_addr = echo.local_addr()?;
+        let echo_task = tokio::spawn(async move {
+            if let Ok((mut stream, _)) = echo.accept().await {
+                let mut buf = [0_u8; 256];
+                if let Ok(n) = stream.read(&mut buf).await
+                    && n > 0
+                {
+                    let _ = stream.write_all(&buf[..n]).await;
+                }
+            }
+        });
+
+        let set_reply = client
+            .operations_request(local::OperationRequest::new(
+                local::OperationAction::SocksSet {
+                    settings: local::SocksSettings {
+                        enabled: true,
+                        listen_host: "127.0.0.1".into(),
+                        listen_port: 0,
+                        allowed_clients: vec!["127.0.0.1/32".into()],
+                        ..local::SocksSettings::default()
+                    },
+                },
+            ))
+            .await;
+        assert!(set_reply.ok, "socks_set failed: {set_reply:?}");
+        let listening = set_reply
+            .socks
+            .as_ref()
+            .and_then(|s| s.listening.as_deref())
+            .ok_or("missing socks listening address")?;
+        let proxy_addr: std::net::SocketAddr = listening.parse()?;
+
+        // Perform an RFC 1928 CONNECT through the service-owned SOCKS5 listener.
+        let mut sock = TcpStream::connect(proxy_addr).await?;
+        sock.write_all(&[0x05, 0x01, 0x00]).await?;
+        let mut greeting = [0_u8; 2];
+        sock.read_exact(&mut greeting).await?;
+        assert_eq!(greeting, [0x05, 0x00]);
+        let std::net::IpAddr::V4(v4) = echo_addr.ip() else {
+            return Err("expected ipv4 echo addr".into());
+        };
+        let mut req = vec![0x05, 0x01, 0x00, 0x01];
+        req.extend_from_slice(&v4.octets());
+        req.extend_from_slice(&echo_addr.port().to_be_bytes());
+        sock.write_all(&req).await?;
+        let mut rep = [0_u8; 10];
+        sock.read_exact(&mut rep).await?;
+        assert_eq!(rep[1], 0x00);
+
+        let payload = b"common-proxy-socks5";
+        sock.write_all(payload).await?;
+        let mut back = vec![0_u8; payload.len()];
+        sock.read_exact(&mut back).await?;
+        assert_eq!(back, payload);
+
+        let flows_reply = client
+            .operations_request(local::OperationRequest::new(
+                local::OperationAction::SocksFlows {},
+            ))
+            .await;
+        assert!(flows_reply.ok);
+        let flows = flows_reply.socks_flows.ok_or("missing socks_flows")?;
+        assert!(!flows.flows.is_empty());
+        assert_eq!(flows.flows[0].sent_bytes, payload.len() as u64);
+        assert_eq!(flows.flows[0].received_bytes, payload.len() as u64);
+        drop(sock);
+        echo_task.abort();
+
+        // Disconnecting tears down the SOCKS5 listener automatically.
+        let handles = [client, server];
+        for handle in &handles {
+            let key = handle.next_key().map_err(submit)?;
+            let accepted = handle.disconnect(key).map_err(submit)?;
+            assert_eq!(
+                handle.wait(accepted.operation).await.map_err(submit)?,
+                Completed::Aborted
+            );
+        }
+        let after = handles[0]
+            .operations_request(local::OperationRequest::new(
+                local::OperationAction::SocksGet {},
+            ))
+            .await;
+        assert!(after.ok);
+        assert!(
+            after
+                .socks
+                .is_some_and(|s| !s.proxy_active && s.listening.is_none())
+        );
+        assert!(
+            handles[0]
+                .service_info()
+                .capability(local::Feature::Socks5)
+                .is_some_and(|cap| !cap.available)
+        );
+
+        drop(handles);
+        for task in tasks {
+            task.abort();
+            assert!(task.await.is_err_and(|error| error.is_cancelled()));
+        }
+        Ok::<_, Error>(())
+    })
+    .await??;
+    Ok(())
+}
+
 #[path = "proxy_common_retirement.rs"]
 mod retirement;
 

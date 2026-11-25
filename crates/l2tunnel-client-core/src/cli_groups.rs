@@ -26,6 +26,7 @@ pub(super) const GROUPS: &[&str] = &[
     "diagnostics",
     "session",
     "member",
+    "socks",
     "test",
     "tune",
 ];
@@ -72,6 +73,12 @@ pub(super) const HELP: &str =
   route add DEST/LEN --device DEV [--gateway IP] [--metric N]
   route remove DEST/LEN --device DEV
   route default on|off --device DEV   (all traffic via DEV; peer keeps its path)
+  socks show
+  socks set [--enable | --disable] [--listen HOST:PORT] [--auth none|userpass]
+            [--username USER] [--password-file FILE] [--allow CIDR,...] [--max-flows N]
+  socks flows
+      (SOCKS5 entry over a connected client TCP-proxy profile; non-loopback listen
+       addresses require an explicit --allow CIDR list)
   test speed [--download] [--streams 1..8] [--seconds 1..30] [--detach]
   test ping [--count 1..100] [--interval-ms 100..1000] [--detach]
   test status [ID] | test cancel ID
@@ -204,6 +211,7 @@ enum Command {
         count: Option<u64>,
     },
     Test(test::Query),
+    Socks(socks::Query),
     Meters(meters::Query),
     TuneShow,
     TuneBudget(tune::Budget),
@@ -482,6 +490,12 @@ fn parse(args: &[String]) -> Result<Parsed, Usage> {
                 flags.extend(more_flags);
             }
         }
+        ("socks", _) if socks::accepted(verb).is_some() => {
+            if let Some((more_values, more_flags)) = socks::accepted(verb) {
+                values.extend(more_values);
+                flags.extend(more_flags);
+            }
+        }
         ("diagnostics", "export") => {
             values.push("--output");
             flags.push("--include-addresses");
@@ -557,6 +571,7 @@ fn parse(args: &[String]) -> Result<Parsed, Usage> {
             include_addresses: flag("--include-addresses"),
         },
         ("test", _) => Command::Test(test::parse(verb, &positional, &options, flag)?),
+        ("socks", _) => Command::Socks(socks::parse(verb, &options, flag)?),
         ("tune", "show") => Command::TuneShow,
         ("tune", "budget") => Command::TuneBudget(tune::budget(&options)?),
         ("tune", _) => {
@@ -1031,6 +1046,7 @@ async fn execute(parsed: Parsed) -> Exit {
             Err((exit, error)) => failed(exit, error),
         },
         Command::Start(request) => start::run(*request, output.json).await,
+        Command::Socks(query) => Box::pin(socks::run(&socket, &output, query)).await,
         Command::Diagnostics {
             output: file,
             include_addresses,
@@ -1538,6 +1554,8 @@ mod meters;
 mod profile;
 #[path = "cli_groups_sessions.rs"]
 mod sessions;
+#[path = "cli_groups_socks.rs"]
+mod socks;
 #[path = "cli_groups_start.rs"]
 mod start;
 #[path = "cli_groups_stats.rs"]

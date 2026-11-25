@@ -504,6 +504,24 @@ impl Handle {
                 info: Some(self.service_info()),
                 ..self.reply(true, "ok")
             },
+            OperationAction::SocksGet {} => OperationReply {
+                socks: Some(Box::new(self.socks_status())),
+                ..self.reply(true, "ok")
+            },
+            OperationAction::SocksSet { settings } => match self.socks_set(settings).await {
+                Ok(status) => OperationReply {
+                    socks: Some(Box::new(status)),
+                    ..self.reply(true, "ok")
+                },
+                Err((code, status)) => OperationReply {
+                    socks: Some(Box::new(status)),
+                    ..self.reply(false, code)
+                },
+            },
+            OperationAction::SocksFlows {} => OperationReply {
+                socks_flows: Some(Box::new(self.socks_flows())),
+                ..self.reply(true, "ok")
+            },
             OperationAction::Connect { request_key } => match key(request_key) {
                 Some(key) => self.accepted(self.connect_retained(key)),
                 None => self.reply(false, "invalid_request_key"),

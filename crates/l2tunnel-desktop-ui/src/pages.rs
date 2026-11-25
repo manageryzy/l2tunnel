@@ -80,8 +80,7 @@ impl Page {
         match self {
             Self::Devices => Some("l2tunnelctl device list"),
             Self::Routes => Some("l2tunnelctl route list"),
-            // No SOCKS5 command exists yet (DGUI-08).
-            Self::Socks5 => None,
+            Self::Socks5 => Some("l2tunnelctl socks show"),
             Self::Statistics => Some("l2tunnelctl stats watch"),
             _ => Some("l2tunnelctl service status"),
         }
@@ -117,6 +116,8 @@ pub struct UiState {
     pub include_addresses: bool,
     /// Tunnel test form.
     pub tests: crate::test_panel::TestForm,
+    /// SOCKS5 settings draft.
+    pub socks: crate::socks_panel::SocksForm,
     /// Live-tuning controls being edited.
     pub tune: crate::tuning_panel::TuneForm,
     /// Elapsed milliseconds since `ServiceInfo` was fetched (for live uptime).
@@ -151,6 +152,7 @@ impl Default for UiState {
             include_addresses: false,
             tune: crate::tuning_panel::TuneForm::default(),
             tests: crate::test_panel::TestForm::default(),
+            socks: crate::socks_panel::SocksForm::default(),
             info_elapsed_ms: 0,
             status_elapsed_ms: 0,
             meters_side: MeterSide::Local,
@@ -364,6 +366,11 @@ pub fn opened(model: &mut Model, page: Page) -> Vec<Command> {
                 commands.extend(model.refresh_profiles());
             }
         }
+        Page::Socks5 => {
+            if model.capability(Feature::Socks5).is_ok() {
+                commands.extend(model.refresh_socks());
+            }
+        }
         _ => {}
     }
     commands
@@ -403,7 +410,7 @@ pub fn show(ui: &mut egui::Ui, model: &mut Model, state: &mut UiState, page: Pag
             let commands = connect_card(ui, model, state);
             ui.add_space(10.0);
             overview(ui, model);
-            return commands;
+            commands
         }
         Page::Connection => {
             let mut commands = connect_card(ui, model, state);
@@ -411,18 +418,15 @@ pub fn show(ui: &mut egui::Ui, model: &mut Model, state: &mut UiState, page: Pag
             commands.extend(connection(ui, model, state));
             ui.add_space(10.0);
             commands.extend(crate::test_panel::panel(ui, model, &mut state.tests));
-            return commands;
+            commands
         }
-        Page::Statistics => return statistics(ui, model, state),
-        Page::Management => return management(ui, model, state),
-        Page::Events => return events(ui, model, state),
-        Page::Devices => return devices(ui, model, state),
-        Page::Routes => return routes(ui, model, state),
-        Page::Socks5 => {
-            unavailable_panel(ui, page, "not implemented by this GUI version");
-        }
+        Page::Statistics => statistics(ui, model, state),
+        Page::Management => management(ui, model, state),
+        Page::Events => events(ui, model, state),
+        Page::Devices => devices(ui, model, state),
+        Page::Routes => routes(ui, model, state),
+        Page::Socks5 => crate::socks_panel::panel(ui, model, &mut state.socks),
     }
-    Vec::new()
 }
 
 /// Profile choice for the connect card: the running profile, else the

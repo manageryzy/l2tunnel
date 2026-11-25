@@ -243,10 +243,18 @@ async fn serve(mut commands: async_mpsc::Receiver<Command>, post: Post) {
                             send_rate: *send_rate,
                             receive_rate: *receive_rate,
                         },
+                        Query::SocksGet => OperationAction::SocksGet {},
+                        Query::SocksFlows => OperationAction::SocksFlows {},
+                        Query::SocksSet(settings) => OperationAction::SocksSet {
+                            settings: (**settings).clone(),
+                        },
                     };
                     let result = if matches!(
                         query,
-                        Query::TestStart(_) | Query::TestCancel(_) | Query::RateBudgetSet { .. }
+                        Query::TestStart(_)
+                            | Query::TestCancel(_)
+                            | Query::RateBudgetSet { .. }
+                            | Query::SocksSet(_)
                     ) {
                         let _permit = permits.acquire().await;
                         exchange(&path, action).await

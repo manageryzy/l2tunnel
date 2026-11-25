@@ -21,6 +21,8 @@ pub mod profile_fields;
 #[cfg(any(unix, windows))]
 mod profiles;
 #[cfg(any(unix, windows))]
+mod socks_panel;
+#[cfg(any(unix, windows))]
 mod start;
 pub mod stats;
 pub mod test_panel;
