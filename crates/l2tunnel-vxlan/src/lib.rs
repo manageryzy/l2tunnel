@@ -1,6 +1,10 @@
-//! Bounded base VXLAN header codec and explicit VNI/domain admission table.
-//! Socket ownership, remote-peer authentication, FDB and BUM behavior are external.
+//! Bounded base VXLAN header codec, VNI/domain admission table, and pure VTEP
+//! switching/FDB/BUM/MTU policy (`docs/modules/vxlan.md`, `docs/overlay-and-carriers.md`).
+//! Socket ownership and OS device setup remain external.
 use std::collections::BTreeMap;
+
+/// Pure, clock-injected multi-peer VTEP policy, FDB, BUM accounting and MTU bounds.
+pub mod vtep;
 
 /// Base VXLAN header length in bytes.
 pub const HEADER_LEN: usize = 8;

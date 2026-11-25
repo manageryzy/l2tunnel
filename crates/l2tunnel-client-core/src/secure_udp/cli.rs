@@ -90,7 +90,19 @@ struct RawSelected {
     settings: crate::raw_packet::common::Settings,
     mark: Option<u32>,
 }
-pub(super) struct Selected(Choice, Carrier, Option<Box<RawSelected>>);
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct VxlanAttachment {
+    bind: SocketAddr,
+    peer: SocketAddr,
+    vni: l2tunnel_vxlan::Vni,
+    max_frame_bytes: usize,
+}
+pub(super) struct Selected(
+    Choice,
+    Carrier,
+    Option<Box<RawSelected>>,
+    Option<VxlanAttachment>,
+);
 enum Choice {
     Records(Common, Box<common_cli::Plan>),
     Proxy(
@@ -438,6 +450,7 @@ fn selection_for(
                         .contains(&key.as_str())
                 || proxy
                     && ["--traffic", "--proxy-policy", "--proxy-close"].contains(&key.as_str())
+                || !proxy && ["--vxlan-bind", "--vxlan-peer", "--vni"].contains(&key.as_str())
                 || inspection && key == "--role")
         })
     {
@@ -449,6 +462,9 @@ fn selection_for(
         if !(options.contains_key("--swift-transaction-plan") || records_plan)
             || [
                 "--device",
+                "--vxlan-bind",
+                "--vxlan-peer",
+                "--vni",
                 "--control-socket",
                 "--state-dir",
                 "--session-admission-key-file",
@@ -463,7 +479,19 @@ fn selection_for(
             ));
         }
     } else {
-        required(options, "--device")?;
+        let vxlan_count = ["--vxlan-bind", "--vxlan-peer", "--vni"]
+            .iter()
+            .filter(|key| options.contains_key(**key))
+            .count();
+        if vxlan_count == 0 {
+            required(options, "--device")?;
+        } else if options.contains_key("--device") {
+            return Err(input("--device and VXLAN options are mutually exclusive"));
+        } else if vxlan_count != 3 {
+            return Err(input(
+                "VXLAN VTEP mode requires all of --vxlan-bind, --vxlan-peer and --vni",
+            ));
+        }
         required(options, "--session-admission-key-file")?;
     }
     for key in ["--noise-private-key-file", "--noise-peer-key-file"] {
@@ -617,6 +645,11 @@ fn selection_for(
             "secure UDP requires a fixed distinct nonzero endpoint pair",
         ));
     }
+    let vxlan = if inspection {
+        None
+    } else {
+        parse_vxlan_attachment(options, config, local, peer)?
+    };
     let maximum_mtu = number(options, "--max-path-mtu", 9000)?;
     if let Some(path) = options.get("--common-transaction-plan") {
         if [
@@ -685,11 +718,85 @@ fn selection_for(
             },
             carrier,
             raw,
+            vxlan,
         )));
     }
     Err(input(
         "use --record-profile common --common-transaction-plan PATH; Swift is a catalog algorithm, not a connection mode",
     ))
+}
+
+fn parse_vxlan_attachment(
+    options: &BTreeMap<String, String>,
+    config: ConnectionConfig,
+    carrier_local: SocketAddr,
+    carrier_peer: SocketAddr,
+) -> io::Result<Option<VxlanAttachment>> {
+    let Some(bind_raw) = options.get("--vxlan-bind") else {
+        return Ok(None);
+    };
+    let peer_raw = required(options, "--vxlan-peer")?;
+    let vni_raw = required(options, "--vni")?;
+    let attachment_layer = match config.layer {
+        PacketLayer::Ip => l2tunnel_vxlan::vtep::AttachmentLayer::Ip,
+        PacketLayer::Ethernet => l2tunnel_vxlan::vtep::AttachmentLayer::Ethernet,
+    };
+    l2tunnel_vxlan::vtep::validate_mode(
+        l2tunnel_vxlan::vtep::VxlanMode::Vtep,
+        attachment_layer,
+        false,
+    )
+    .map_err(|_| input("VXLAN VTEP mode requires --layer tap (Ethernet)"))?;
+    let bind: SocketAddr = bind_raw
+        .parse()
+        .map_err(|_| input("--vxlan-bind requires IP:PORT"))?;
+    let peer: SocketAddr = peer_raw
+        .parse()
+        .map_err(|_| input("--vxlan-peer requires IP:PORT"))?;
+    let vni_value: u32 = vni_raw
+        .parse()
+        .map_err(|_| input("--vni must be a 24-bit unsigned integer"))?;
+    let vni = l2tunnel_vxlan::Vni::new(vni_value)
+        .map_err(|_| input("--vni exceeds 24-bit VXLAN range (0..=16777215)"))?;
+    if bind.is_ipv4() != peer.is_ipv4() {
+        return Err(input(
+            "--vxlan-bind and --vxlan-peer address families must match",
+        ));
+    }
+    if peer.port() == 0
+        || peer.ip().is_unspecified()
+        || peer.ip().is_multicast()
+        || matches!(peer.ip(), std::net::IpAddr::V4(addr) if addr.is_broadcast())
+    {
+        return Err(input(
+            "--vxlan-peer requires a unicast IP and nonzero destination port",
+        ));
+    }
+    if bind == peer {
+        return Err(input(
+            "--vxlan-bind and --vxlan-peer must be distinct endpoints",
+        ));
+    }
+    if bind == carrier_local
+        || bind == carrier_peer
+        || peer == carrier_local
+        || peer == carrier_peer
+    {
+        return Err(input(
+            "VXLAN endpoints must not collide with the outer tunnel carrier endpoints",
+        ));
+    }
+    if !(14..=l2tunnel_platform_vxlan::MAX_FRAME_BYTES).contains(&config.max_packet) {
+        return Err(input(
+            "VXLAN --max-packet must be within 14..=65499 Ethernet bytes",
+        ));
+    }
+    Ok(Some(VxlanAttachment {
+        bind,
+        peer,
+        vni,
+        max_frame_bytes: config.max_packet,
+    }))
 }
 
 #[cfg(test)]
@@ -927,14 +1034,29 @@ pub(super) fn prepare(
         options,
         "--session-admission-key-file",
     )?))?)?;
-    let name = required(options, "--device")?.to_owned();
-    let mtu_host = std::sync::Arc::new(service::device_mtu::LinuxDevice::new(name.clone()));
-    let attachment = service::Attachment::readable(config.layer, move || {
-        Ok(crate::native::Native::new(
-            l2tunnel_platform_linux::TunTap::attach(&name, config.layer)?,
-        ))
-    })
-    .with_device_mtu(mtu_host);
+    let attachment = if let Some(vxlan) = selected.3 {
+        service::Attachment::readable(PacketLayer::Ethernet, move || {
+            let device = l2tunnel_platform_vxlan::VxlanDevice::bind(
+                vxlan.bind,
+                l2tunnel_platform_vxlan::VxlanConfig {
+                    peer: vxlan.peer,
+                    vni: vxlan.vni,
+                    max_frame_bytes: vxlan.max_frame_bytes,
+                    receive_budget: 64,
+                },
+            )?;
+            Ok(crate::native::Native::new(device))
+        })
+    } else {
+        let name = required(options, "--device")?.to_owned();
+        let mtu_host = std::sync::Arc::new(service::device_mtu::LinuxDevice::new(name.clone()));
+        service::Attachment::readable(config.layer, move || {
+            Ok(crate::native::Native::new(
+                l2tunnel_platform_linux::TunTap::attach(&name, config.layer)?,
+            ))
+        })
+        .with_device_mtu(mtu_host)
+    };
     let plan = match command {
         "connect" => {
             let member_der =

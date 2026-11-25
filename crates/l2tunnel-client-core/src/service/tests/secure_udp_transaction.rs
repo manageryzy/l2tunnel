@@ -22,6 +22,8 @@ mod lifecycle_failures;
 mod setup_failures;
 #[path = "secure_udp_transaction_support.rs"]
 mod support;
+#[path = "secure_udp_vxlan.rs"]
+mod vxlan;
 
 #[derive(Clone, Copy)]
 struct TransactionFixtureOptions {

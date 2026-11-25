@@ -169,22 +169,14 @@ local L2 network needs a separate adapter and is not implied by VTEP support.
 
 ### VXLAN acceptance checklist
 
-- [ ] [VX-01] Freeze distinct configuration/capabilities for pass-through and VTEP mode;
-  reject ambiguous recursive or incompatible device-layer configurations.
-- [ ] [VX-02] Round-trip nested VXLAN bytes through TUN and TAP, including VLAN, IPv6,
-  oversized inputs and unsupported header-codec fallback.
-- [ ] [VX-03] Implement bounded VXLAN parsing and test truncated headers, flags/reserved
-  field behavior, VNI boundaries, invalid lengths and checksum handling.
-- [ ] [VX-04] Validate VNI/domain/VLAN/peer isolation, spoofed ingress, bounded FDB aging,
-  MAC moves, peer removal, static entries and unknown destination policy.
-- [ ] [VX-05] Measure charged BUM replication and per-domain limits; prove split-horizon
-  behavior and reject unsupported loop-forming configurations.
-- [ ] [VX-06] Test management-looking inner frames through VTEP and pass-through paths;
-  they must remain user data and never invoke session control.
-- [ ] [VX-07] Verify MTU, nested overhead, path-MTU changes and jumbo frames without
-  relying on fragmented VXLAN delivery.
-- [ ] [VX-08] Run Linux bridge/VXLAN/netem interoperability tests in owned namespaces,
-  including two isolated VNIs, loss/reorder and concurrent QoS classes.
+- [x] [VX-01] Freeze distinct configuration/capabilities for pass-through and VTEP mode; reject ambiguous recursive or incompatible device-layer configurations. Evidence: [mode validation](../crates/l2tunnel-vxlan/src/vtep.rs), [Common CLI validation](../crates/l2tunnel-client-core/src/secure_udp/cli.rs), [CLI refusal tests](../crates/l2tunnel-client-core/src/secure_udp/cli_tests.rs).
+- [x] [VX-02] Round-trip nested VXLAN bytes through TUN and TAP, including VLAN, IPv6, oversized inputs and unsupported header-codec fallback. Evidence: [authenticated Common TUN/TAP pass-through tests](../crates/l2tunnel-client-core/src/service/tests/secure_udp_vxlan.rs).
+- [x] [VX-03] Implement bounded VXLAN parsing and test truncated headers, flags/reserved field behavior, VNI boundaries, invalid lengths and checksum handling. Evidence: [VXLAN codec tests](../crates/l2tunnel-vxlan/src/lib.rs), [outer UDP checksum policy](../crates/l2tunnel-vxlan/src/vtep.rs), [IPv4/IPv6 loopback adapter tests](../crates/l2tunnel-platform-vxlan/src/tests.rs).
+- [x] [VX-04] Validate VNI/domain/VLAN/peer isolation, spoofed ingress, bounded FDB aging, MAC moves, peer removal, static entries and unknown destination policy. Evidence: [pure VTEP engine tests](../crates/l2tunnel-vxlan/src/vtep.rs), [multi-peer UDP VTEP loopback tests](../crates/l2tunnel-platform-vxlan/src/tests.rs), [Common VTEP integration tests](../crates/l2tunnel-client-core/src/service/tests/secure_udp_vxlan.rs).
+- [x] [VX-05] Measure charged BUM replication and per-domain limits; prove split-horizon behavior and reject unsupported loop-forming configurations. Evidence: [BUM/split-horizon/loop tests](../crates/l2tunnel-vxlan/src/vtep.rs), [live multi-peer BUM loopback tests](../crates/l2tunnel-platform-vxlan/src/tests.rs), [CLI loop/carrier-collision tests](../crates/l2tunnel-client-core/src/secure_udp/cli_tests.rs), [Common VTEP replication tests](../crates/l2tunnel-client-core/src/service/tests/secure_udp_vxlan.rs).
+- [x] [VX-06] Test management-looking inner frames through VTEP and pass-through paths; they must remain user data and never invoke session control. Evidence: [admission-gate pipeline test](../crates/l2tunnel/tests/pipeline.rs), [VTEP management-isolation tests](../crates/l2tunnel-vxlan/src/vtep.rs), [live Common TUN/TAP/VTEP tests](../crates/l2tunnel-client-core/src/service/tests/secure_udp_vxlan.rs).
+- [x] [VX-07] Verify MTU, nested overhead, path-MTU changes and jumbo frames without relying on fragmented VXLAN delivery. Evidence: [OverheadBudget & jumbo tests](../crates/l2tunnel-vxlan/src/vtep.rs), [dynamic MTU adapter tests](../crates/l2tunnel-platform-vxlan/src/tests.rs), [Common oversized rejection tests](../crates/l2tunnel-client-core/src/service/tests/secure_udp_vxlan.rs).
+- [x] [VX-08] Run Linux bridge/VXLAN/netem interoperability tests in owned namespaces, including two isolated VNIs, loss/reorder and concurrent QoS classes. Evidence: [Linux bridge/VLAN/VXLAN/netem receipt](../work/vxlan-live-20261125/receipt.json), [Swift TAP plan exporter](../crates/l2tunnel-client-core/examples/common_benchmark_plan.rs).
 - [ ] [VX-09] Record Windows/Android support separately from Linux interoperability;
   keep unqualified platform/device combinations unavailable.
 

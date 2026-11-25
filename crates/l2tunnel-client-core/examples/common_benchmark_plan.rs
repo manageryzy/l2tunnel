@@ -117,6 +117,9 @@ enum Algorithm {
     Swift {
         fec: bool,
     },
+    SwiftTap {
+        fec: bool,
+    },
     Aligned {
         packed: bool,
         fec: bool,
@@ -508,6 +511,8 @@ fn compact_packed(base: aligned::CompactConfig) -> aligned::packed::CompactConfi
 }
 
 const ETHERNET_FRAME: usize = MTU + 14;
+/// Maximum Ethernet frame carrying an 802.1Q/QinQ VLAN tag over a 1500-byte IP payload.
+const ETHERNET_VLAN_FRAME: usize = MTU + 22;
 
 fn kcp_like_rows() -> Vec<Row> {
     use aligned::NativeDelivery::{ChannelOrdered, ProfileDefault};
@@ -654,7 +659,9 @@ fn profile(algorithm: Algorithm, carrier: Carrier, peak_rate: u64) -> Result<c::
                 reverse: selected,
             }
         }
-        Algorithm::Swift { fec } => {
+        Algorithm::Swift { fec } | Algorithm::SwiftTap { fec } => {
+            let tap = matches!(algorithm, Algorithm::SwiftTap { .. });
+            let max_native = if tap { ETHERNET_VLAN_FRAME } else { MTU };
             let flow_sources = swift_flow_sources(peak_rate);
             let queue_bytes = if high_bdp {
                 usize::try_from(peak_rate / 64)
@@ -665,8 +672,12 @@ fn profile(algorithm: Algorithm, carrier: Carrier, peak_rate: u64) -> Result<c::
             };
             let selected = l2tunnel_swift::records::Config {
                 channels: usize::from(CHANNELS),
-                layer: l2tunnel_swift::records::Layer::Ip,
-                max_native: MTU,
+                layer: if tap {
+                    l2tunnel_swift::records::Layer::Ethernet
+                } else {
+                    l2tunnel_swift::records::Layer::Ip
+                },
+                max_native,
                 codec: l2tunnel_swift::Config {
                     datagram_bytes: MTU - carrier.overhead(),
                     window: if high_bdp { 64 } else { 128 },
@@ -674,7 +685,7 @@ fn profile(algorithm: Algorithm, carrier: Carrier, peak_rate: u64) -> Result<c::
                     repair_denominator: 4,
                     flow_sources,
                     queue_bytes,
-                    max_packet: MTU + l2tunnel_swift::header::MAX_EXPANSION,
+                    max_packet: max_native + l2tunnel_swift::header::MAX_EXPANSION,
                     flush_micros: if high_bdp { 250 } else { 500 },
                     feedback_micros: 1000,
                     tail_micros: 10_000,
@@ -944,12 +955,19 @@ fn mode_direction(
     peak_rate: u64,
 ) -> Result<c::CommonDirection> {
     let original = direction(rate, burst, peak_rate)?;
-    if !matches!(algorithm, Algorithm::KcpLikeL2(..)) {
-        return Ok(original);
-    }
+    let max_frame = match algorithm {
+        Algorithm::KcpLikeL2(..) => ETHERNET_FRAME,
+        Algorithm::SwiftTap { .. } => ETHERNET_VLAN_FRAME,
+        _ => return Ok(original),
+    };
     let mut pipeline = original.pipeline();
     pipeline.profile = pipeline::Profile::TapSystem;
-    pipeline.parse.max_packet_bytes = ETHERNET_FRAME;
+    pipeline.parse.max_packet_bytes = max_frame;
+    if matches!(algorithm, Algorithm::SwiftTap { .. }) {
+        // Real TAP/VXLAN networks generate many distinct outer UDP source ports
+        // and L2/ARP/ND flows; 64 entries would stall under multi-VNI/VLAN traffic.
+        pipeline.flows.capacity = 4096;
+    }
     Ok(c::CommonDirection::new(
         traffic::TrafficPolicy::tap(),
         pipeline,
@@ -1034,7 +1052,15 @@ fn policy(carrier: Carrier, client: bool) -> Option<Value> {
     }
 }
 fn cli(carrier: Carrier, client: bool, algorithm: Algorithm) -> Vec<String> {
-    let ethernet = matches!(algorithm, Algorithm::KcpLikeL2(..));
+    let ethernet = matches!(
+        algorithm,
+        Algorithm::KcpLikeL2(..) | Algorithm::SwiftTap { .. }
+    );
+    let max_packet = match algorithm {
+        Algorithm::KcpLikeL2(..) => "1514",
+        Algorithm::SwiftTap { .. } => "1522",
+        _ => "1500",
+    };
     let compression = match algorithm {
         Algorithm::KcpLikeL2(native, _) if native.uses_lz4() => "lz4",
         _ => "off",
@@ -1051,7 +1077,7 @@ fn cli(carrier: Carrier, client: bool, algorithm: Algorithm) -> Vec<String> {
         "--layer",
         if ethernet { "tap" } else { "tun" },
         "--max-packet",
-        if ethernet { "1514" } else { "1500" },
+        max_packet,
         "--max-path-mtu",
         "1500",
         "--noise-profile",
@@ -1220,7 +1246,7 @@ fn export_row(
         "descriptor_digest_definition":"SHA256 of exact unanchored descriptor bytes; not the session H0",
         "catalog_digest_hex":hex(catalog.root().as_bytes()),"record_profile_debug":format!("{selected:?}"),
         "validation":"both selected compact Engine storage plans accepted; daemon inspection and real carrier/native execution remain required",
-        "parameters":{"path_mtu":MTU,"maximum_native_bytes":MTU,"channels":CHANNELS,"symbol_capacity":carrier.symbol(),"max_packed_units":UNITS,"inner_payload_compression":"off","header_policy":"IpHeaders except Swift's own header codec","data_protection":"chacha20-poly1305","record_protection_overhead":21,"carrier_admission_allowance":carrier.physical_allowance(),"allowance_is_measured_wire_cost":false,"engine_capacity_bytes_by_role":plans,"runtime_retained_bytes":retained,"source_window":if ordinary {64} else if matches!(row.algorithm,Algorithm::Swift{..}) {swift_flow_sources(peak_rate)} else if matches!(row.algorithm,Algorithm::Connections{..}) {512} else {8192},"source_window_domain":if matches!(row.algorithm,Algorithm::Swift{..}) {"per Swift channel"} else if matches!(row.algorithm,Algorithm::Connections{..} | Algorithm::PythonCompact) {"per independent owner,16owners"} else {"shared recovery direction"}},
+        "parameters":{"path_mtu":MTU,"maximum_native_bytes":MTU,"channels":CHANNELS,"symbol_capacity":carrier.symbol(),"max_packed_units":UNITS,"inner_payload_compression":"off","header_policy":"IpHeaders except Swift's own header codec","data_protection":"chacha20-poly1305","record_protection_overhead":21,"carrier_admission_allowance":carrier.physical_allowance(),"allowance_is_measured_wire_cost":false,"engine_capacity_bytes_by_role":plans,"runtime_retained_bytes":retained,"source_window":if ordinary {64} else if matches!(row.algorithm,Algorithm::Swift{..}|Algorithm::SwiftTap{..}) {swift_flow_sources(peak_rate)} else if matches!(row.algorithm,Algorithm::Connections{..}) {512} else {8192},"source_window_domain":if matches!(row.algorithm,Algorithm::Swift{..}|Algorithm::SwiftTap{..}) {"per Swift channel"} else if matches!(row.algorithm,Algorithm::Connections{..} | Algorithm::PythonCompact) {"per independent owner,16owners"} else {"shared recovery direction"}},
         "limitations":if ordinary {json!(["Ordinary selective-repeat has a production hard64-source window shared across channels; it may be BDP-limited well below100Mbit/s."])} else {json!([])},
         "evidence_scope":"canonical plan preflight only; not throughput, loss-recovery or native qualification"
     });
@@ -1457,10 +1483,12 @@ fn run() -> Result<()> {
     let ack_lz4_pair =
         arguments.len() == 3 && arguments[2] == "--packed-c48-fixed-anchor-ack-lz4-pair";
     let raw_tls_like = arguments.len() == 3 && arguments[2] == "--raw-tls-like";
+    let swift_tap = arguments.len() == 3 && arguments[2] == "--swift-tap";
     let supported = match arguments.len() {
         2 | 4 => true,
         3 => {
             kcp_l2
+                || swift_tap
                 || c48_pair
                 || striped.is_some()
                 || headroom_pair
@@ -1497,6 +1525,21 @@ fn run() -> Result<()> {
             }]
         } else if kcp_l2 {
             kcp_like_rows()
+        } else if swift_tap {
+            vec![
+                Row {
+                    id: "swift-tap-arq",
+                    family: "swift",
+                    variant: "ethernet-vlan-repair-ratio-zero",
+                    algorithm: Algorithm::SwiftTap { fec: false },
+                },
+                Row {
+                    id: "swift-tap-fec",
+                    family: "swift",
+                    variant: "ethernet-vlan-repair-1-of-4",
+                    algorithm: Algorithm::SwiftTap { fec: true },
+                },
+            ]
         } else if c48_pair {
             vec![
                 Row {
@@ -1583,6 +1626,8 @@ fn run() -> Result<()> {
         };
     let carriers: &[Carrier] = if raw_tls_like {
         &[Carrier::RawTlsLike]
+    } else if swift_tap {
+        &[Carrier::Udp]
     } else {
         &[Carrier::Udp, Carrier::Raw, Carrier::Tls, Carrier::Quic]
     };

@@ -241,6 +241,73 @@ fn explicit_common_carrier_rejects_missing_cover_and_standalone_or_role_flags_be
     Ok(())
 }
 
+#[test]
+fn vxlan_cli_attachment_enforces_tap_layer_bounds_and_loop_rejection_before_io() -> io::Result<()> {
+    let file = transaction_integration_tests::PlanFile::new(
+        &transaction_integration_tests::common_value()?,
+    )?;
+    for command in ["connect", "serve"] {
+        let mut base = options_for(command, "quic-like");
+        base.insert(
+            "--common-transaction-plan".into(),
+            file.0.to_string_lossy().into_owned(),
+        );
+        base.remove("--device");
+        base.insert("--layer".into(), "tap".into());
+        base.insert("--vxlan-bind".into(), "127.0.0.1:47891".into());
+        base.insert("--vxlan-peer".into(), "127.0.0.1:47892".into());
+        base.insert("--vni".into(), "1001".into());
+
+        // Valid explicit TAP + VXLAN VTEP attachment passes selection before any I/O.
+        let cfg = configuration(&base)?;
+        assert_eq!(cfg.layer, PacketLayer::Ethernet);
+        assert!(selection(command, &base, cfg)?.is_some());
+
+        // Invalid combinations must fail with InvalidInput before opening sockets/files.
+        let bad_cases: Vec<(&str, Option<&str>)> = vec![
+            // VX-01: VTEP mode is incompatible with L3 TUN.
+            ("--layer", Some("tun")),
+            // VX-01: mutually exclusive with --device.
+            ("--device", Some("tap0")),
+            // Partial VXLAN flags rejected.
+            ("--vni", None),
+            ("--vxlan-peer", None),
+            ("--vxlan-bind", None),
+            // Out-of-range 24-bit VNI rejected.
+            ("--vni", Some("16777216")),
+            // Cross-family bind/peer rejected.
+            ("--vxlan-peer", Some("[::1]:47892")),
+            // Zero port / multicast / broadcast rejected.
+            ("--vxlan-peer", Some("127.0.0.1:0")),
+            ("--vxlan-peer", Some("224.0.0.1:4789")),
+            ("--vxlan-peer", Some("255.255.255.255:4789")),
+            // VX-05: self-loop bind == peer rejected.
+            ("--vxlan-peer", Some("127.0.0.1:47891")),
+            // VX-05: collision with outer tunnel carrier socket rejected.
+            ("--vxlan-bind", Some("127.0.0.1:42101")),
+            ("--vxlan-peer", Some("127.0.0.1:42102")),
+        ];
+        for (key, value) in bad_cases {
+            let mut mutated = base.clone();
+            if let Some(val) = value {
+                mutated.insert(key.into(), val.into());
+            } else {
+                mutated.remove(key);
+            }
+            let cfg = configuration(&mutated)?;
+            let err = selection(command, &mutated, cfg)
+                .err()
+                .ok_or_else(|| input(format!("accepted invalid VXLAN input {command} {key}")))?;
+            assert_eq!(
+                err.kind(),
+                io::ErrorKind::InvalidInput,
+                "{command} {key}: {err}"
+            );
+        }
+    }
+    Ok(())
+}
+
 #[path = "raw_cli_tests.rs"]
 mod raw_common;
 

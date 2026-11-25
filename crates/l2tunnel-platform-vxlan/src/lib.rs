@@ -1,12 +1,21 @@
-//! Safe nonblocking point-to-point UDP VXLAN Ethernet device adapter.
+//! Safe nonblocking UDP VXLAN Ethernet device adapters.
 //!
-//! The fixed remote-IP/VNI filter is not authentication. This native boundary
-//! performs explicit socket I/O; the public protocol/codec crates remain pure.
-//! FDB learning, BUM replication, PMTU/DF policy and congestion control are absent.
+//! Provides both the fixed point-to-point [`VxlanDevice`] and the multi-peer
+//! [`vtep::VxlanVtepDevice`] backed by the pure [`l2tunnel_vxlan::vtep`] policy
+//! engine (FDB learning/aging, BUM rate/byte accounting, VLAN isolation, and
+//! path-MTU bounds). Source-IP/VNI checks are not authentication; authentic
+//! transport remains the responsibility of the enclosing authenticated tunnel.
+//! This native boundary performs explicit socket I/O; public protocol/codec
+//! crates remain pure.
 use l2tunnel_device::{PacketDevice, PacketLayer};
 use l2tunnel_vxlan::{HEADER_LEN, Vni};
 use std::io;
 use std::net::{IpAddr, SocketAddr, UdpSocket};
+
+/// Multi-peer UDP VTEP adapter backed by the pure [`l2tunnel_vxlan::vtep`] engine.
+pub mod vtep;
+
+pub use vtep::{MAX_VTEP_PEERS, VtepDeviceConfig, VtepDeviceStats, VxlanVtepDevice};
 
 /// Portable non-jumbo IPv4 UDP payload ceiling, used for both address families.
 pub const MAX_UDP_PAYLOAD_BYTES: usize = 65_507;
@@ -124,6 +133,13 @@ impl VxlanDevice {
     /// Copy the current saturating traffic/drop/error counters.
     pub fn stats(&self) -> VxlanStats {
         self.stats
+    }
+}
+
+#[cfg(unix)]
+impl std::os::fd::AsRawFd for VxlanDevice {
+    fn as_raw_fd(&self) -> std::os::fd::RawFd {
+        self.socket.as_raw_fd()
     }
 }
 
@@ -260,6 +276,9 @@ fn validate_config(local: SocketAddr, config: VxlanConfig) -> io::Result<()> {
     }
     if local.is_ipv4() != config.peer.is_ipv4() {
         return Err(invalid("VXLAN bind and peer address families must match"));
+    }
+    if local == config.peer {
+        return Err(invalid("VXLAN bind and peer endpoints must be distinct"));
     }
     if config.peer.port() == 0
         || config.peer.ip().is_unspecified()
