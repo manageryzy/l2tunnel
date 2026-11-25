@@ -19,10 +19,12 @@ import time
 
 try:
     from . import common_native_c48 as c48, common_native_single_flow as single
+    from . import common_native_traffic as traffic
     from .throughput_probe import tcp_info
 except ImportError:
     import common_native_c48 as c48
     import common_native_single_flow as single
+    import common_native_traffic as traffic
     from throughput_probe import tcp_info
 
 FLOWS = 16
@@ -90,7 +92,24 @@ def identify_stream(stream, expected, seen, deadline_ns, flow_count=None):
 
 
 def transfer(streams, sending, clock, deadline_ns, result, *, paced=False, single_flow=False, flow_count=None, record_trace=None,
-             credit=single.CREDIT):
+             credit=single.CREDIT, workload='paced', traffic_seed=traffic.DEFAULT_TRAFFIC_SEED, sample_seconds=10, is_initiator=None):
+    maximum = max(single.TRANSFER_CAP, sample_seconds * 16 * 1024 * 1024) if (single_flow or flow_count is not None) else MAX_BYTES
+    max_samples = max(120, (sample_seconds + 30) * 2)
+    if workload == 'mixed-real':
+        traffic.run_mixed_real_transfer(
+            streams,
+            sending if is_initiator is None else is_initiator,
+            clock,
+            deadline_ns,
+            result,
+            traffic_seed=traffic_seed,
+            credit=credit,
+            single_module=single if (single_flow or flow_count is not None) else None,
+            tcp_info_fn=tcp_info,
+            max_samples=max_samples,
+            max_bytes_per_flow=maximum,
+        )
+        return
     states = [dict(flow_id=index, sent=0, received=0, warmup=0, measured=0, postwindow=0,
                    write_closed=False, eof=False, write_closed_ns=None, peer_eof_ns=None, bound_exhausted=False,
                    send_hash=hashlib.sha256(), receive_hash=hashlib.sha256()) for index, _ in enumerate(streams)]
@@ -99,10 +118,17 @@ def transfer(streams, sending, clock, deadline_ns, result, *, paced=False, singl
     if fixed_credit:
         result['tcp_memory_scope'] = single.tcp_memory_scope()
     start, measured, end = (clock[key] for key in ('start_ns', 'measure_start_ns', 'end_ns'))
-    maximum = single.TRANSFER_CAP if fixed_credit else MAX_BYTES
     windows = [single.Window(stream, clock, credit // len(streams)) for stream in streams] if fixed_credit else []
-    records = [c48.RecordFlow(i, len(streams), clock, single.RATE if fixed_credit else None)
-               for i in range(len(streams))] if paced else []
+    if paced and workload == 'bulk-random':
+        records = [traffic.BulkRandomFlow(i, len(streams), clock, single.RATE if fixed_credit else None, traffic_seed=traffic_seed)
+                   for i in range(len(streams))]
+        result['workload'] = 'bulk-random'
+        result['traffic_seed'] = traffic_seed
+    elif paced:
+        records = [c48.RecordFlow(i, len(streams), clock, single.RATE if fixed_credit else None)
+                   for i in range(len(streams))]
+    else:
+        records = []
     next_sample = start
     with selectors.DefaultSelector() as poll:
         for index, stream in enumerate(streams):
@@ -118,7 +144,7 @@ def transfer(streams, sending, clock, deadline_ns, result, *, paced=False, singl
                 if now < start:
                     time.sleep(min((start - now) / 1e9, .01))
                     continue
-                if now >= next_sample and len(result['samples']) < 120:
+                if now >= next_sample and len(result['samples']) < max_samples:
                     usage = resource.getrusage(resource.RUSAGE_SELF)
                     sample = {'at_ns': now, 'user_seconds': usage.ru_utime,
                         'system_seconds': usage.ru_stime, 'maxrss_kib': usage.ru_maxrss,
@@ -221,6 +247,8 @@ def transfer(streams, sending, clock, deadline_ns, result, *, paced=False, singl
                 result['paced_records']['per_flow'] = [c48.per_flow_measurement(
                     flow, clock, record_trace / f'flow-{flow.identity:02}-record-times.bin'
                     if record_trace is not None and not sending else None) for flow in records]
+                if workload == 'bulk-random':
+                    result['bulk_random_time_series'] = [flow.time_series.report() for flow in records]
             for window in windows:
                 window.sample_boundary(time.monotonic_ns())
             if windows:
@@ -234,11 +262,15 @@ def run(args):
     streams, listener = [], None
     single_flow = getattr(args, 'single_flow_4m', False)
     flow_count = getattr(args, 'flow_count', None)
+    sample_seconds = getattr(args, 'sample_seconds', 10)
+    workload = getattr(args, 'workload', 'paced')
+    traffic_seed = getattr(args, 'traffic_seed', traffic.DEFAULT_TRAFFIC_SEED)
     fixed_credit = single_flow or flow_count is not None
     flows = flow_count or (1 if single_flow else FLOWS)
     paced = fixed_credit or args.packed_c48_workload
+    max_per_flow = max(single.TRANSFER_CAP, sample_seconds * 16 * 1024 * 1024) if fixed_credit else MAX_BYTES
     result = {'status': 'running', 'role': args.role, 'phase': args.phase,
-              'original_deadline_ns': deadline, 'max_bytes_per_flow_direction': single.TRANSFER_CAP if fixed_credit else MAX_BYTES}
+              'original_deadline_ns': deadline, 'max_bytes_per_flow_direction': max_per_flow}
     credit = getattr(args, 'outstanding_credit_bytes', single.CREDIT)
     if fixed_credit:
         result['outstanding_application_credit_bytes'] = credit
@@ -303,12 +335,14 @@ def run(args):
         if set(clock) != {'start_ns', 'measure_start_ns', 'end_ns'} or any(type(value) is not int for value in clock.values()):
             raise ValueError('invalid shared clock')
         start, measured, end = (clock[key] for key in ('start_ns', 'measure_start_ns', 'end_ns'))
-        if not time.monotonic_ns() < start < measured < end < deadline or measured - start != 2_000_000_000 or end - measured != 10_000_000_000:
-            raise ValueError('late or changed 2s warmup/10s sample clock')
+        expected_sample_ns = sample_seconds * 1_000_000_000
+        if not time.monotonic_ns() < start < measured < end < deadline or measured - start != 2_000_000_000 or end - measured != expected_sample_ns:
+            raise ValueError(f'late or changed 2s warmup/{sample_seconds}s sample clock')
         sending = args.phase == 'simultaneous' or (args.phase == 'forward') == (args.role == 'connect')
         transfer(streams, sending, clock, deadline, result, paced=paced, single_flow=single_flow,
                  flow_count=flow_count, record_trace=args.result.parent if args.trace_records else None,
-                 credit=credit)
+                 credit=credit, workload=workload, traffic_seed=traffic_seed, sample_seconds=sample_seconds,
+                 is_initiator=(args.role == 'connect'))
         result['status'] = 'bound_exhausted' if any(row['bound_exhausted'] for row in result['flows']) else 'passed'
     except Exception as error:
         result.update(status='bound_exhausted' if isinstance(error, TimeoutError) else 'failed',
@@ -341,14 +375,25 @@ def main():
     parser.add_argument('--outstanding-credit-bytes', type=int, default=single.CREDIT,
                         help='Total unconfirmed application payload credit, divided equally over the '
                              'single-flow/flow-count sockets (default 4 MiB)')
+    parser.add_argument('--sample-seconds', type=int, default=10,
+                        help='Steady-state sample window in seconds (default 10)')
+    parser.add_argument('--workload', choices=('paced', 'bulk-random', 'mixed-real'), default='paced',
+                        help='Application traffic generator (default paced)')
+    parser.add_argument('--traffic-seed', type=int, default=traffic.DEFAULT_TRAFFIC_SEED,
+                        help='Deterministic seed for random traffic generation')
     args = parser.parse_args()
     problem = single.credit_error(args.outstanding_credit_bytes, args.flow_count or 1)
     if problem:
         parser.error(problem)
+    if not 1 <= args.sample_seconds <= 600:
+        parser.error('--sample-seconds must be within 1..600')
+    if args.workload == 'mixed-real' and args.flow_count != traffic.MIXED_FLOWS:
+        parser.error(f'mixed-real workload requires --flow-count {traffic.MIXED_FLOWS}')
     if (args.packed_c48_workload or args.single_flow_4m or args.flow_count) and args.phase != 'forward':
         parser.error('C48 workload requires the one-way forward phase')
-    if not 1024 <= args.port <= 65535 or not time.monotonic_ns() < args.deadline_ns <= time.monotonic_ns() + 60_000_000_000:
-        parser.error('port or original maximum60s workload deadline outside bound')
+    max_deadline_ns = max(60, args.sample_seconds + 120) * 1_000_000_000
+    if not 1024 <= args.port <= 65535 or not time.monotonic_ns() < args.deadline_ns <= time.monotonic_ns() + max_deadline_ns:
+        parser.error('port or original workload deadline outside bound')
     if args.result.exists() or args.result.is_symlink():
         parser.error('result already exists')
     def interrupted(signum, _frame):

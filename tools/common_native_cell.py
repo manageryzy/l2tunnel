@@ -34,6 +34,12 @@ def matrix_args(a: argparse.Namespace) -> list[str]:
         args.append("--switch-during-phase")
     if a.raw_rst_observation:
         args.append("--raw-rst-observation")
+    if a.sample_seconds != 10:
+        args += ["--sample-seconds", str(a.sample_seconds)]
+    if a.workload != "paced":
+        args += ["--workload", a.workload, "--traffic-seed", str(a.traffic_seed)]
+    if a.testcase_id:
+        args += ["--testcase-id", a.testcase_id]
     return args
 
 
@@ -54,6 +60,11 @@ def parse(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--capture", action="store_true", help="Keep tcpdump captures (default: counters only)")
     p.add_argument("--switch", action="store_true")
     p.add_argument("--raw-rst-observation", action="store_true")
+    p.add_argument("--sample-seconds", type=int, default=10, help="Steady-state measurement duration in seconds (default 10)")
+    p.add_argument("--workload", choices=("paced", "bulk-random", "mixed-real"), default="paced",
+                   help="Application workload generator (default: paced)")
+    p.add_argument("--traffic-seed", type=int, default=0x51A72026, help="Deterministic seed for random traffic generators")
+    p.add_argument("--testcase-id", help="Optional uniform testcase ID recorded in cell receipts")
     p.add_argument("--output", type=Path, required=True)
     p.add_argument("--apply", action="store_true")
     a = p.parse_args(argv)
@@ -91,12 +102,20 @@ def main(argv: list[str] | None = None) -> int:
         rc = subprocess.call([*args, "--apply"])
         survivors = subprocess.check_output(["ip", "netns", "list"], text=True).strip()
         if a.output.is_dir():
-            (a.output / "outer-isolation.json").write_text(json.dumps({
+            isolation = {
                 "initial_links": ["lo"], "outer_net_ns": os.readlink("/proc/self/ns/net"),
                 "outer_mount_ns": os.readlink("/proc/self/ns/mnt"),
                 "remaining_named_namespaces": survivors.splitlines(), "return_code": rc,
                 "netem_seed": a.seed, "loss_percent": a.loss_percent,
-                "outstanding_credit_bytes": a.outstanding_credit_bytes}) + "\n")
+                "outstanding_credit_bytes": a.outstanding_credit_bytes}
+            if a.sample_seconds != 10 or a.workload != "paced" or a.testcase_id:
+                isolation.update(
+                    sample_seconds=a.sample_seconds,
+                    workload=a.workload,
+                    traffic_seed=a.traffic_seed,
+                    testcase_id=a.testcase_id,
+                )
+            (a.output / "outer-isolation.json").write_text(json.dumps(isolation) + "\n")
         return rc if not survivors else 3
     finally:
         # Give the invoking user read access to the fresh cell output only.

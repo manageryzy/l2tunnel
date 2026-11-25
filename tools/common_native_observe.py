@@ -243,7 +243,7 @@ def validate_wire_metrics(value, carrier):
         raise ValueError('incomplete actual acceptance boundaries')
     if not all(unsigned(number) for number in [*classes.values(), *boundaries.values()]):
         raise ValueError('invalid accepted record count')
-    expected = {'udp': 'socket_accepted', 'raw': 'socket_accepted', 'tls': 'tls_stream_flushed', 'quic': 'quic_datagram_accepted'}[carrier]
+    expected = {'udp': 'socket_accepted', 'raw': 'socket_accepted', 'raw-tls-like': 'socket_accepted', 'tls': 'tls_stream_flushed', 'quic': 'quic_datagram_accepted'}[carrier]
     samples = sum(classes.values())
     if samples == 0 or sum(boundaries.values()) != samples or boundaries[expected] != samples:
         raise ValueError('actual record count or carrier boundary mismatch')
@@ -315,7 +315,7 @@ def validate_wire_metrics(value, carrier):
         result = {**result, 'extent_samples': populations, 'extent_totals': extent_totals,
                   'codec_coverage': coverage, 'extent_errors': 0}
         if value['schema'] == 3:
-            ip_samples = samples if carrier in ('udp', 'raw') else 0
+            ip_samples = samples if carrier in ('udp', 'raw', 'raw-tls-like') else 0
             joined_samples = dict(zip(JOINED_METRICS, (ip_samples, ip_samples, codec,
                                                        codec if ip_samples else 0)))
             joined_totals = {name: histogram(name, count) for name, count in joined_samples.items()}

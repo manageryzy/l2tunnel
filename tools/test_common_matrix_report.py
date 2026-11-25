@@ -136,9 +136,10 @@ class WireMetricsTests(unittest.TestCase):
 
     def test_schema3_joined_metrics_preserve_population_and_actual_ip_boundary(self):
         value = wire_fixture(3)
-        result = observe.validate_wire_metrics(value, 'raw')
-        self.assertEqual(result['joined_samples'], dict(zip(observe.JOINED_METRICS, (6, 6, 2, 2))))
-        self.assertEqual(result['joined_totals']['record_outside_codec_body_bytes'], 92)
+        for carrier in ('raw', 'raw-tls-like'):
+            result = observe.validate_wire_metrics(value, carrier)
+            self.assertEqual(result['joined_samples'], dict(zip(observe.JOINED_METRICS, (6, 6, 2, 2))))
+            self.assertEqual(result['joined_totals']['record_outside_codec_body_bytes'], 92)
         value['accepted_boundaries'] = dict(socket_accepted=0, tls_stream_flushed=6, quic_datagram_accepted=0)
         for name in ('socket_ip_bytes', 'socket_ip_over_record_bytes', 'socket_ip_outside_codec_body_bytes'):
             value[name] = histogram([])

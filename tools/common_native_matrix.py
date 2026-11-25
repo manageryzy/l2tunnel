@@ -32,6 +32,7 @@ try:
     from . import secure_udp_native as credentials_helper
     from . import common_native_observe as observe
     from . import common_native_single_flow as single
+    from . import common_native_traffic as traffic
     from . import common_python_reference as reference
     from . import common_native_switch as switch_hook
     from .native_throughput import parse_tc_class, parse_tc_qdisc
@@ -41,6 +42,7 @@ except ImportError:
     import secure_udp_native as credentials_helper
     import common_native_observe as observe
     import common_native_single_flow as single
+    import common_native_traffic as traffic
     import common_python_reference as reference
     import common_native_switch as switch_hook
     from native_throughput import parse_tc_class, parse_tc_qdisc
@@ -115,7 +117,7 @@ def manifest_rows(path, selected, *, require_python_comparable=False):
         if selected and row['id'] not in selected:
             continue
         if row['status'] == 'ready':
-            require(row.get('carrier') in ('udp', 'raw', 'tls', 'quic'), 'unknown carrier')
+            require(row.get('carrier') in ('udp', 'raw', 'raw-tls-like', 'tls', 'quic'), 'unknown carrier')
             plan = input_path(path.parent, row['common_plan'])
             plan_value = read_json(plan, 256 * 1024)
             require(plan_value.get('backend') == 'common_records_v2' and plan_value.get('version') == 1,
@@ -137,15 +139,16 @@ def manifest_rows(path, selected, *, require_python_comparable=False):
                             '--max-packet': '1514' if layer == 'tap' else '1500', '--max-path-mtu': '1500'}
                 require(all(options.get(key) == value for key, value in expected.items()),
                         'row differs from Full Common selection or native packet/MTU geometry')
-                require(options.get('--carrier') == {'udp': 'quic-like', 'raw': 'raw-packet', 'tls': 'tcp', 'quic': 'quic'}[row['carrier']], 'carrier selector mismatch')
+                require(options.get('--carrier') == {'udp': 'quic-like', 'raw': 'raw-packet', 'raw-tls-like': 'raw-packet', 'tls': 'tcp', 'quic': 'quic'}[row['carrier']], 'carrier selector mismatch')
             policy = row.get('carrier_policy')
+            is_raw = row['carrier'] in ('raw', 'raw-tls-like')
             if row['carrier'] == 'udp':
                 require(policy is None, 'original UDP must not carry an unrelated policy')
             else:
-                require(row.get('policy_flag') == ('--raw-policy' if row['carrier'] == 'raw' else '--maintained-policy'), 'wrong policy flag')
+                require(row.get('policy_flag') == ('--raw-policy' if is_raw else '--maintained-policy'), 'wrong policy flag')
                 for side, other in [('a', 'b'), ('b', 'a')]:
                     requested = read_json(input_path(path.parent, policy[side]), 64 * 1024)
-                    if row['carrier'] == 'raw':
+                    if is_raw:
                         require(requested.get('profile') == 'raw-common-carrier-v1'
                             and requested.get('forward') == {'local': WAN[side] + ':' + str(PORTS[side]), 'peer': WAN[other] + ':' + str(PORTS[other])}
                             and requested.get('reverse') is None, 'raw policy must match the exact owned Full tuple')
@@ -156,7 +159,7 @@ def manifest_rows(path, selected, *, require_python_comparable=False):
                     else:
                         require(requested.get('first') == {'client': WAN['a'] + ':' + str(PORTS['a']), 'server': WAN['b'] + ':' + str(PORTS['b'])}
                             and requested.get('second') is None, 'maintained policy must match exact owned Full tuple')
-                if row['carrier'] == 'raw':
+                if is_raw:
                     marks = [dict(zip(row['required_cli'][side][::2], row['required_cli'][side][1::2]))['--raw-mark'] for side in ('a', 'b')]
                     require(int(marks[0], 0) == int(marks[1], 0), 'raw endpoint socket marks must match isolation policy')
         else:
@@ -542,7 +545,8 @@ def readiness(case, binary, secrets, daemons):
         time.sleep(.1)
 
 
-def compare_probes(a, b, phase, *, paced=False, single_flow=False, flow_count=None, credit=single.CREDIT):
+def compare_probes(a, b, phase, *, paced=False, single_flow=False, flow_count=None, credit=single.CREDIT,
+                   workload='paced', sample_seconds=10):
     require(a.get('status') == b.get('status') == 'passed', 'TCP probe did not complete within original bounds')
     flows = flow_count or (1 if single_flow else 16)
     require(a['clock'] == b['clock'] and len(a['flows']) == len(b['flows']) == flows, 'shared clock or flow count differs')
@@ -552,6 +556,8 @@ def compare_probes(a, b, phase, *, paced=False, single_flow=False, flow_count=No
         require(identity.get('format') == 'u32be-id-echo-v1'
                 and [item.get('flow_id') for item in identity.get('connections', [])] == list(range(flows)),
                 'actual premeasurement flow identity exchange missing')
+    sample_den = sample_seconds * 1_000_000
+    expected_transfer_cap = max(single.TRANSFER_CAP, sample_seconds * 16 * 1024 * 1024)
     result = {}
     for direction, sender, receiver in [('a_to_b', a, b), ('b_to_a', b, a)]:
         for sent, received in zip(sender['flows'], receiver['flows']):
@@ -560,8 +566,13 @@ def compare_probes(a, b, phase, *, paced=False, single_flow=False, flow_count=No
                     and sent['write_closed'] and received['eof'], 'TCP stream bytes/hash/EOF mismatch')
         count = sum(flow['measured'] for flow in receiver['flows'])
         active = phase == 'simultaneous' or (phase == 'forward') == (direction == 'a_to_b')
-        require(count > 0 if active else count == 0, 'phase sent no measured bytes or inactive direction sent data')
-        result[direction] = {'receiver_unique_sample_bytes': count, 'sample_seconds': 10, 'goodput_mbit_s': count * 8 / 10_000_000}
+        if workload == 'mixed-real':
+            require(count > 0 if direction == 'a_to_b' else count >= 0, 'mixed-real phase sent no measured bytes')
+        else:
+            require(count > 0 if active else count == 0, 'phase sent no measured bytes or inactive direction sent data')
+        result[direction] = {'receiver_unique_sample_bytes': count, 'sample_seconds': sample_seconds, 'goodput_mbit_s': count * 8 / sample_den}
+        if workload == 'mixed-real':
+            continue
         if paced and active:
             submitted, delivered = sender['paced_records'], receiver['paced_records']
             expected = submitted['fully_written_records']
@@ -574,6 +585,8 @@ def compare_probes(a, b, phase, *, paced=False, single_flow=False, flow_count=No
                 'unsubmitted_at_offer_cutoff': submitted['scheduled_records'] - expected,
                 'first_write_to_complete_read': delivered['first_write_to_complete_read'],
                 'scheduled_offer_to_complete_read': delivered['scheduled_offer_to_complete_read']}
+            if workload == 'bulk-random' and receiver.get('bulk_random_time_series') is not None:
+                result[direction]['time_series'] = receiver['bulk_random_time_series']
             if flow_count:
                 rows = []
                 for i in range(flows):
@@ -605,7 +618,7 @@ def compare_probes(a, b, phase, *, paced=False, single_flow=False, flow_count=No
                             and edges[0]['total_retrans'] <= edges[1]['total_retrans'],
                             'per-flow TCP_INFO sample edges invalid')
                     rows.append({**timing, 'four_tuple': {'sender': client['local'], 'receiver': client['peer']},
-                                 'measured_bytes': received['measured'], 'goodput_mbit_s': received['measured'] * 8 / 10_000_000,
+                                 'measured_bytes': received['measured'], 'goodput_mbit_s': received['measured'] * 8 / sample_den,
                                  'full_hash_verified': True,
                                  'steady_retransmitted_segments': edges[1]['total_retrans'] - edges[0]['total_retrans'],
                                  'retrans_read_lag_ms': [(e['after_ns'] - e['target_ns']) / 1e6 for e in edges]})
@@ -620,7 +633,7 @@ def compare_probes(a, b, phase, *, paced=False, single_flow=False, flow_count=No
                     policy = endpoint['single_flow']
                     require(policy['outstanding_payload_cap'] == credit and
                             0 <= policy['max_outstanding_upper_bound'] <= credit and
-                            endpoint['max_bytes_per_flow_direction'] == single.TRANSFER_CAP and
+                            endpoint['max_bytes_per_flow_direction'] == expected_transfer_cap and
                             endpoint['paced_records']['aggregate_offered_mbit_s'] == single.RATE / 1e6,
                             'single-flow workload or application credit differs')
                 edges = sender['single_flow']['steady_tcp_info_edges']
@@ -633,6 +646,20 @@ def compare_probes(a, b, phase, *, paced=False, single_flow=False, flow_count=No
                 result[direction]['steady_tcp_retrans'] = {
                     'segments': edges[1]['total_retrans'] - edges[0]['total_retrans'],
                     'reads': edges, 'read_lag_ms': [(e['after_ns'] - e['target_ns']) / 1e6 for e in edges]}
+    if workload == 'mixed-real':
+        for endpoint in (a, b):
+            mr = endpoint.get('mixed_real') or {}
+            classes = mr.get('classes') or {}
+            require(set(classes) == set(traffic.CLASS_NAMES.values()), 'incomplete mixed-real traffic classes')
+            for cls in classes.values():
+                require(cls.get('remainder_bytes') == 0, 'truncated mixed-real application frame')
+        result['mixed_real'] = {'initiator': a['mixed_real'], 'responder': b['mixed_real']}
+        if a.get('flow_credit'):
+            result['steady_tcp_retrans_by_flow'] = [
+                edges[1]['total_retrans'] - edges[0]['total_retrans']
+                if len(edges := fc.get('steady_tcp_info_edges', [])) == 2 else None
+                for fc in a['flow_credit']
+            ]
     return result
 
 
@@ -841,11 +868,15 @@ def phase(case, name, binary, secrets, daemons):
     single_flow = getattr(case, 'single_flow_4m', False)
     flow_count = getattr(case, 'flow_count', None)
     credit = getattr(case, 'outstanding_credit_bytes', single.CREDIT)
+    sample_seconds = getattr(case, 'sample_seconds', 10)
+    workload = getattr(case, 'workload', 'paced')
+    traffic_seed = getattr(case, 'traffic_seed', traffic.DEFAULT_TRAFFIC_SEED)
     output = case.output / name
     output.mkdir()
     result = {'phase': name, 'status': 'running', 'cpu': [], 'status_samples': [], 'captures': {}}
     case.value['phases'].append(result)
-    deadline = min(case.deadline, time.monotonic() + BOUNDS['phase_seconds'])
+    phase_budget = max(BOUNDS['phase_seconds'], sample_seconds + 90)
+    deadline = min(case.deadline, time.monotonic() + phase_budget)
     captures, probes = {}, []
     sample_wall = None
     try:
@@ -880,6 +911,8 @@ def phase(case, name, binary, secrets, daemons):
                  '--deadline-ns', str(deadline_ns), '--clock', str(clock), '--result', str(output / (side + '.json')),
                  *(['--flow-count', str(flow_count)] if flow_count else ['--single-flow-4m'] if single_flow else ['--packed-c48-workload'] if paced else []),
                  *(['--outstanding-credit-bytes', str(credit)] if single_flow or flow_count else []),
+                 *(['--sample-seconds', str(sample_seconds)] if sample_seconds != 10 else []),
+                 *(['--workload', workload, '--traffic-seed', str(traffic_seed)] if workload != 'paced' else []),
                  *(['--trace-records'] if getattr(case, 'switch_during_phase', False) else [])])
             probes.append(child)
             if role == 'listen':
@@ -894,7 +927,7 @@ def phase(case, name, binary, secrets, daemons):
                     line for line in raw.splitlines() if WAN[side] + ':' in line or WAN['b' if side == 'a' else 'a'] + ':' in line]
         mono_before, wall, mono_after = time.monotonic_ns(), time.time_ns(), time.monotonic_ns()
         start = mono_after + 500_000_000
-        window = {'start_ns': start, 'measure_start_ns': start + 2_000_000_000, 'end_ns': start + 12_000_000_000}
+        window = {'start_ns': start, 'measure_start_ns': start + 2_000_000_000, 'end_ns': start + (2 + sample_seconds) * 1_000_000_000}
         result['clock_anchor'] = {'monotonic_before_ns': mono_before, 'wall_ns': wall, 'monotonic_after_ns': mono_after}
         offset = wall - (mono_before + mono_after) // 2
         sample_wall = (window['measure_start_ns'] + offset, window['end_ns'] + offset)
@@ -927,7 +960,7 @@ def phase(case, name, binary, secrets, daemons):
         for child in probes:
             require(child['process'].returncode == 0, 'native TCP probe exit disagrees with passing result')
         result['throughput'] = compare_probes(probe_results['a'], probe_results['b'], name, paced=paced, single_flow=single_flow,
-                                              flow_count=flow_count, credit=credit)
+                                              flow_count=flow_count, credit=credit, workload=workload, sample_seconds=sample_seconds)
         if getattr(case, 'switch_during_phase', False):
             validate_switch_flow_delivery(case, result['throughput']['a_to_b']['per_flow'], output, window)
         if paced:
@@ -962,9 +995,9 @@ def phase(case, name, binary, secrets, daemons):
                         sample['paced_records'] = observed.get('paced_records')
                     complete = sample['sample_window_completed']
                     result.setdefault('throughput_observed', {})['b_to_a' if side == 'a' else 'a_to_b'] = {
-                        'receiver_unique_sample_bytes': sample['receiver_unique_sample_bytes'], 'configured_sample_seconds': 10,
+                        'receiver_unique_sample_bytes': sample['receiver_unique_sample_bytes'], 'configured_sample_seconds': sample_seconds,
                         'sample_window_completed': complete,
-                        'observed_goodput_mbit_s': sample['receiver_unique_sample_bytes'] * 8 / 10_000_000 if complete else None,
+                        'observed_goodput_mbit_s': sample['receiver_unique_sample_bytes'] * 8 / (sample_seconds * 1_000_000) if complete else None,
                         'qualification': 'valid' if result['status'] == 'passed' else 'invalid_or_incomplete',
                         'reason': None if result['status'] == 'passed' else result.get('error', result['status'])}
 
@@ -1010,10 +1043,23 @@ def run_case(row, ordinal, args, binary, inputs, secrets, state_dir):
     case.single_flow_4m = getattr(args, 'single_flow_4m', False)
     case.flow_count = getattr(args, 'flow_count', None)
     case.outstanding_credit_bytes = getattr(args, 'outstanding_credit_bytes', single.CREDIT)
+    case.sample_seconds = getattr(args, 'sample_seconds', 10)
+    case.workload = getattr(args, 'workload', 'paced')
+    case.traffic_seed = getattr(args, 'traffic_seed', traffic.DEFAULT_TRAFFIC_SEED)
+    case.testcase_id = getattr(args, 'testcase_id', None)
+    if case.sample_seconds > 10:
+        case.deadline = max(case.deadline, time.monotonic() + case.sample_seconds + 180)
     case.no_capture = getattr(args, 'no_capture', False)
     case.switch_during_phase = getattr(args, 'switch_during_phase', False)
     case.paced_c48 = getattr(args, 'packed_c48_workload', False) or case.single_flow_4m or bool(case.flow_count)
     case.value['selected_phases'] = args.phases
+    if case.sample_seconds != 10 or case.workload != 'paced' or case.testcase_id:
+        case.value.update(
+            sample_seconds=case.sample_seconds,
+            workload=case.workload,
+            traffic_seed=case.traffic_seed,
+            testcase_id=case.testcase_id,
+        )
     created = False
     try:
         case.value['stage'] = 'offline_preflight'
@@ -1029,9 +1075,9 @@ def run_case(row, ordinal, args, binary, inputs, secrets, state_dir):
         case.value['stage'] = 'topology'
         topology(case, state_dir)
         created = True
-        if row['carrier'] == 'raw':
+        if row['carrier'] in ('raw', 'raw-tls-like'):
             raw_rules(case)
-        observe_rst = getattr(args, 'raw_rst_observation', False) and row['carrier'] == 'raw'
+        observe_rst = getattr(args, 'raw_rst_observation', False) and row['carrier'] in ('raw', 'raw-tls-like')
         if observe_rst:
             case.value['rst_rule_counters_before_transfer'] = {
                 side: case.command('endpoint_' + side, 'iptables', '-w', '1', '-nvxL', 'OUTPUT', '--line-numbers')
@@ -1052,7 +1098,7 @@ def run_case(row, ordinal, args, binary, inputs, secrets, state_dir):
                 daemon_command(row, side, binary, secrets, inputs), metrics=metrics / "wire")
         readiness(case, binary, secrets, daemons)
         case.value['both_forwarding_observed_wall_ns'] = time.time_ns()
-        if row['carrier'] in ('raw', 'udp'):
+        if row['carrier'] in ('raw', 'raw-tls-like', 'udp'):
             case.value['post_auth_socket_evidence'] = {}
             for side in ('a', 'b'):
                 role = 'endpoint_' + side
@@ -1172,6 +1218,14 @@ def main(argv=None):
                           help='Split 90 Mbit/s offer and 4 MiB (or --outstanding-credit-bytes) unconfirmed application credit equally across these CUBIC sockets')
     parser.add_argument('--outstanding-credit-bytes', type=int, default=single.CREDIT,
                         help='Total unconfirmed application payload credit for --single-flow-4m/--flow-count (default 4 MiB)')
+    parser.add_argument('--sample-seconds', type=int, default=10,
+                        help='Steady-state sample window in seconds (1..600, default 10)')
+    parser.add_argument('--workload', choices=('paced', 'bulk-random', 'mixed-real'), default='paced',
+                        help='Application workload generator (default paced)')
+    parser.add_argument('--traffic-seed', type=int, default=traffic.DEFAULT_TRAFFIC_SEED,
+                        help='Deterministic seed for random traffic generators')
+    parser.add_argument('--testcase-id',
+                        help='Optional uniform testcase ID (<carrier>__<protocol>__<workload>__l<loss>_r<rtt>_f<flows>_t<sec>s)')
     parser.add_argument('--require-python-comparable', action='store_true',
                         help='Reject unbound or non-equivalent Python comparisons before network I/O; current named diagnostic profiles retain explicit differences')
     args = parser.parse_args(argv)
@@ -1180,6 +1234,15 @@ def main(argv=None):
         parser.error('--netem-seed must be within 1..2**64-1')
     if not 0 <= args.loss_percent <= 100:
         parser.error('--loss-percent must be within 0..100')
+    if not 1 <= args.sample_seconds <= 600:
+        parser.error('--sample-seconds must be within 1..600')
+    if args.workload == 'mixed-real' and args.flow_count != traffic.MIXED_FLOWS:
+        parser.error(f'--workload mixed-real requires --flow-count {traffic.MIXED_FLOWS}')
+    if args.testcase_id is not None:
+        try:
+            traffic.parse_testcase_id(args.testcase_id)
+        except ValueError as error:
+            parser.error(str(error))
     NETEM_SEED, LOSS_PERCENT = args.netem_seed, args.loss_percent
     if args.native_tun_txqueuelen is not None and not 1 <= args.native_tun_txqueuelen <= MAX_TUN_TXQUEUELEN:
         parser.error(f'--native-tun-txqueuelen must be within 1..{MAX_TUN_TXQUEUELEN} packets')
@@ -1212,8 +1275,10 @@ def main(argv=None):
             'requested_native_forward_tun_maxrate_mbit': args.native_forward_tun_maxrate_mbit,
             'binary': str(args.binary), 'rows': rows, 'bounds': BOUNDS, 'phases': args.phases,
             'native_layers': {row['id']: native_layer(row) for row in rows if row['status'] == 'ready'},
-            'flows_per_phase': 16, 'warmup_seconds': 2, 'sample_seconds': 10,
-            'workload': 'paced 512-byte TCP application records, 76 Mbit/s aggregate' if args.packed_c48_workload else 'saturating native TCP',
+            'flows_per_phase': 16, 'warmup_seconds': 2, 'sample_seconds': args.sample_seconds,
+            'workload': ('mixed realistic 4-class bidirectional traffic (RPC + web + VBR video + bulk)' if args.workload == 'mixed-real'
+                         else 'non-repeating high-entropy 512-byte random records' if args.workload == 'bulk-random'
+                         else 'paced 512-byte TCP application records, 76 Mbit/s aggregate' if args.packed_c48_workload else 'saturating native TCP'),
             'network': {'forward_mbit_s': 100, 'reverse_mbit_s': 10, 'one_way_delay_ms': 35, 'loss_percent_each_direction': LOSS_PERCENT},
             'raw_rst_observation': args.raw_rst_observation,
             'captures': 'each endpoint WAN and native, both directions, full packets; native TAP also captures ARP separately from IPv4 byte totals',
@@ -1245,7 +1310,7 @@ def main(argv=None):
     signal.signal(signal.SIGTERM, interrupted)
     for name in ('ip', 'tc', 'sysctl', 'ethtool', 'tcpdump', 'openssl'):
         require(shutil.which(name) is not None, 'missing required tool: ' + name)
-    if any(row['carrier'] == 'raw' for row in rows if row['status'] == 'ready'):
+    if any(row['carrier'] in ('raw', 'raw-tls-like') for row in rows if row['status'] == 'ready'):
         require(shutil.which('iptables') is not None, 'raw carrier requires namespace-local iptables')
     require(args.binary.is_file() and not args.binary.is_symlink() and os.access(args.binary, os.X_OK), 'executable current binary required')
     require(not args.output.exists() and not args.output.is_symlink(), 'output already exists; failed receipts are never overwritten')

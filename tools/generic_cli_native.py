@@ -150,7 +150,10 @@ def transaction_plan(layer: str) -> dict:
             'native': {'pending_packets': 64, 'pending_bytes': maximum * 64,
                 'stall_timeout_micros': 10_000_000},
             'lifetime': {'lease_micros': 300_000_000, 'ping_interval_micros': 100_000,
-                'pong_timeout_micros': 5_000_000}, 'report_interval_micros': 100_000}}
+                'pong_timeout_micros': 5_000_000},
+            'credit': {'floor_datagrams': 64, 'ceiling_datagrams': 8192, 'floor_bytes': 102400,
+                'ceiling_bytes': 16777216, 'period_micros': 10000, 'idle_period_micros': 250000},
+            'report_interval_micros': 100_000}}
 
 
 def plan(lab_id: str, cover: str, layer: str) -> dict:
