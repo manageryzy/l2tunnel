@@ -37,7 +37,7 @@ async fn compact_wire_reuse_service_preserves_full_lifecycle_under_both_data_sui
         exercise(Some(l2tunnel::secure_record::compact::Selection {
             protection,
             limits: l2tunnel_security::compact::Selection {
-                max_forward_packets: 8192,
+                max_forward_packets: 32_768,
                 max_failed_checks: 64,
             },
         }))

@@ -13,7 +13,7 @@ async fn compact_wire_proxy_fixed_and_measured_keep_actual_tcp_and_retirement_fo
             let selection = l2tunnel::secure_record::compact::Selection {
                 protection,
                 limits: l2tunnel_security::compact::Selection {
-                    max_forward_packets: 8192,
+                    max_forward_packets: 32_768,
                     max_failed_checks: 64,
                 },
             };
@@ -29,7 +29,7 @@ async fn compact_hmac_proxy_preserves_four_channel_actor_and_actual_tcp_close() 
         l2tunnel::secure_record::compact::Selection {
             protection: l2tunnel_security::compact::Protection::HmacSha256,
             limits: l2tunnel_security::compact::Selection {
-                max_forward_packets: 8192,
+                max_forward_packets: 32_768,
                 max_failed_checks: 64,
             },
         },
@@ -206,7 +206,7 @@ fn compact_wire_proxy_observation_is_pending_until_actual_driver_report() -> Res
     let selection = l2tunnel::secure_record::compact::Selection {
         protection: l2tunnel_security::compact::Protection::Aes128Ccm4,
         limits: l2tunnel_security::compact::Selection {
-            max_forward_packets: 8192,
+            max_forward_packets: 32_768,
             max_failed_checks: 64,
         },
     };

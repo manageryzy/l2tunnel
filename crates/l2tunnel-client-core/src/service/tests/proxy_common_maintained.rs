@@ -28,7 +28,7 @@ fn exercise(
             let selection = l2tunnel::secure_record::compact::Selection {
                 protection: l2tunnel_security::compact::Protection::ChaCha20Crc32c,
                 limits: l2tunnel_security::compact::Selection {
-                    max_forward_packets: 8192,
+                    max_forward_packets: 32_768,
                     max_failed_checks: 64,
                 },
             };

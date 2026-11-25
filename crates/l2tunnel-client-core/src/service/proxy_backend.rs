@@ -129,8 +129,14 @@ impl ProxyFrame {
     pub fn common_status(&self) -> Option<local::ProxyCommonStatus> {
         let frame = self.common?;
         let cover = |appearance| match appearance {
-            l2tunnel_cover::Appearance::QuicLike => local::ProxyCommonCover::QuicLike,
-            l2tunnel_cover::Appearance::MediaLike => local::ProxyCommonCover::MediaLike,
+            l2tunnel_cover::Appearance::QuicLike => Some(local::ProxyCommonCover::QuicLike),
+            l2tunnel_cover::Appearance::MediaLike => Some(local::ProxyCommonCover::MediaLike),
+            l2tunnel_cover::Appearance::TlsLike => None,
+        };
+        let requested_cover = cover(frame.requested_cover)?;
+        let effective_cover = match frame.effective_cover {
+            Some(value) => Some(cover(value)?),
+            None => None,
         };
         Some(local::ProxyCommonStatus {
             requested_proxy_digest: self.requested_digest.0,
@@ -139,8 +145,8 @@ impl ProxyFrame {
             effective_configuration: frame.effective_configuration.0,
             requested_carrier: frame.requested_carrier,
             effective_carrier: frame.effective_carrier,
-            requested_cover: cover(frame.requested_cover),
-            effective_cover: frame.effective_cover.map(cover),
+            requested_cover,
+            effective_cover,
             compact_wire: frame.compact_wire,
             maintained_carrier: frame.maintained_request.and_then(|request| {
                 crate::secure_udp::common_status::MaintainedCarrier::from_observation(
@@ -191,6 +197,9 @@ pub(super) struct Backend {
     terminal: Mutex<Option<local::ProxyTerminal>>,
     #[cfg(unix)]
     common: Mutex<Option<ProxyCommonFrame>>,
+    /// Newest meter table of the Common runtime and its arrival time.
+    #[cfg(unix)]
+    meters: Mutex<Option<(Instant, Arc<l2tunnel_meters::Table>)>>,
 }
 impl Backend {
     pub(super) fn fixed(
@@ -243,11 +252,29 @@ impl Backend {
         backend.common = Mutex::new(Some(frame));
         backend
     }
+    /// Newest meter table and its arrival time.
+    #[cfg(unix)]
+    pub(super) fn meters(&self) -> Option<(Instant, Arc<l2tunnel_meters::Table>)> {
+        self.meters
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
     #[cfg(unix)]
     pub(super) fn observe_common(
         &self,
         snapshot: &l2tunnel_runtime::secure_udp::transport::CommonSnapshot,
     ) {
+        *self
+            .meters
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            snapshot.meters.clone().map(|table| {
+                (
+                    super::sampled_at(Instant::now(), snapshot.elapsed_micros, &table),
+                    table,
+                )
+            });
         if let Some(frame) = &mut *self
             .common
             .lock()
@@ -309,6 +336,8 @@ impl Backend {
             terminal: Mutex::new(None),
             #[cfg(unix)]
             common: Mutex::new(None),
+            #[cfg(unix)]
+            meters: Mutex::new(None),
         }
     }
     pub(super) fn observe(&self) -> ProxyFrame {

@@ -135,6 +135,7 @@ fn runtime_reason(reason: diagnostics::Reason) -> &'static str {
         Reason::Capacity => "capacity",
         Reason::CounterExhausted => "counter_exhausted",
         Reason::Clock => "clock",
+        Reason::LiveTuning(refusal) => refusal.name(),
         Reason::Unknown => "unknown",
     }
 }
@@ -302,6 +303,10 @@ mod tests {
             (Reason::Capacity, "capacity"),
             (Reason::CounterExhausted, "counter_exhausted"),
             (Reason::Clock, "clock"),
+            (
+                Reason::LiveTuning(l2tunnel::live_tuning::Refusal::RepairLimit),
+                "live_tuning_repair_limit",
+            ),
             (Reason::Unknown, "unknown"),
         ] {
             assert_eq!(runtime_reason(value), expected);

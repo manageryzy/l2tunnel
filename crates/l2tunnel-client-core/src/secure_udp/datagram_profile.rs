@@ -56,7 +56,8 @@ impl Common {
         settings.cover.max_packet_bytes = final_geometry.max_record_bytes;
         let overhead = final_geometry
             .ip_tcp_bytes
-            .checked_add(l2tunnel::secure_record::compact::AUTHENTICATED_OVERHEAD)
+            .checked_add(final_geometry.record_overhead_bytes)
+            .and_then(|n| n.checked_add(l2tunnel::secure_record::compact::AUTHENTICATED_OVERHEAD))
             .ok_or_else(|| input("raw final control overhead overflow"))?;
         let maximum_body = final_geometry
             .max_record_bytes
@@ -158,15 +159,15 @@ impl Common {
         member: l2tunnel_identity::MemberPublicKey,
     ) -> io::Result<secure_udp::Settings> {
         let ip = if self.local.is_ipv6() { 48 } else { 28 };
-        let header = if self.appearance == l2tunnel_cover::Appearance::QuicLike {
-            13
-        } else {
-            14
+        let header = match self.appearance {
+            l2tunnel_cover::Appearance::QuicLike => 13,
+            l2tunnel_cover::Appearance::MediaLike => 14,
+            l2tunnel_cover::Appearance::TlsLike => l2tunnel_cover::TLS_OVERHEAD,
         };
-        let handshake_header = if self.appearance == l2tunnel_cover::Appearance::QuicLike {
-            30
-        } else {
-            14
+        let handshake_header = match self.appearance {
+            l2tunnel_cover::Appearance::QuicLike => 30,
+            l2tunnel_cover::Appearance::MediaLike => 14,
+            l2tunnel_cover::Appearance::TlsLike => l2tunnel_cover::TLS_OVERHEAD,
         };
         let ids = |domain: &[u8]| -> io::Result<[u8; 8]> {
             public_digest(domain, peers)[..8]

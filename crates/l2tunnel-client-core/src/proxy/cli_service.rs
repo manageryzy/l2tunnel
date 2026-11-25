@@ -113,13 +113,8 @@ pub(crate) async fn serve(
     let local = handle.clone();
     let ipc = async {
         match &api {
-            Some(api) => {
-                api.serve(move |request| {
-                    let handle = local.clone();
-                    async move { handle.lifecycle_request(request).await }
-                })
-                .await
-            }
+            // Versions 1/4 keep lifecycle_request; version 5 adds operations.
+            Some(api) => api.serve_service(local.clone()).await,
             None => std::future::pending::<io::Result<()>>().await,
         }
     };
@@ -206,6 +201,8 @@ pub(crate) async fn serve(
                         Completed::Applied(_) | Completed::Rejected(_) | Completed::OutcomeUnknown => {},
                         #[cfg(unix)]
                         Completed::Common { .. } | Completed::ConnectionReuse { .. } => {},
+                        // Device/route changes leave the session lifecycle as it is.
+                        Completed::Host(_) | Completed::Profile(_) => {},
                     }
                 }
                 Err(error) => {

@@ -15,7 +15,7 @@ fn cancelled(shared: &Shared, id: OperationId) -> bool {
         .iter()
         .any(|e| e.accepted.operation == id && e.cancel)
 }
-fn finish(shared: &Shared, id: OperationId, result: Completed) {
+pub(super) fn finish(shared: &Shared, id: OperationId, result: Completed) {
     let mut state = shared.lock();
     let failed = matches!(result, Completed::Failed(_))
         || (state.backend.is_none()
@@ -24,7 +24,17 @@ fn finish(shared: &Shared, id: OperationId, result: Completed) {
     if state.backend.is_none() {
         state.snapshot.listening = None;
     }
-    state.snapshot.phase = if matches!(&state.backend, Some(ObservedBackend::Proxy(backend)) if backend.awaiting_release())
+    // A device or route change never changes the session phase.
+    let host_change = state.entries.iter().any(|entry| {
+        entry.accepted.operation == id
+            && matches!(
+                entry.fingerprint,
+                Fingerprint::Host(_) | Fingerprint::Profile(_)
+            )
+    });
+    state.snapshot.phase = if host_change {
+        state.snapshot.phase
+    } else if matches!(&state.backend, Some(ObservedBackend::Proxy(backend)) if backend.awaiting_release())
     {
         Phase::Failed
     } else if state.backend.is_some() {
@@ -63,6 +73,12 @@ fn stopped(shared: &Shared, active: &mut Option<Active>, terminal: Terminal) {
     // without spawned children. Drop every original socket/device owner before
     // publishing release or reconnect.
     drop(active.take());
+    // Routes the service added belong to this session; the host releases them.
+    if generation.is_some()
+        && let Some(host) = shared.host.get()
+    {
+        host.session_ended();
+    }
     let mut state = shared.lock();
     state.backend = None;
     state.snapshot.runtime = observation;
@@ -355,7 +371,7 @@ pub(super) fn publish_ready(
 }
 fn commit_ready(
     shared: &Shared,
-    mut state: std::sync::MutexGuard<'_, State>,
+    mut state: events::StateGuard<'_>,
     session: Active,
     accepted: Accepted,
 ) -> Active {
@@ -363,6 +379,7 @@ fn commit_ready(
     state.snapshot.runtime = session.backend.observe();
     state.backend = Some(session.backend.clone());
     state.snapshot.generation = Some(session.generation);
+    state.connected_at = Some(Instant::now());
     state.snapshot.terminal = None;
     state.snapshot.operation = None;
     state.snapshot.phase = Phase::Connected;
@@ -556,6 +573,45 @@ pub(super) async fn run(shared: Arc<Shared>) -> io::Result<()> {
                         }
                     };
                     finish(&shared, accepted.operation, result);
+                }
+                Command::Host(change) => {
+                    let handle = Handle(shared.clone());
+                    let result = match handle.host() {
+                        Some(host) => {
+                            let context = host::HostContext {
+                                peer: handle.peer_address(),
+                            };
+                            host.apply(change, context).await
+                        }
+                        None => Err("no device/route host is attached to this service".into()),
+                    };
+                    finish(&shared, accepted.operation, Completed::Host(result));
+                }
+                Command::Stop => {
+                    if let Some(session) = active.as_mut()
+                        && matches!(session.backend, ObservedBackend::Proxy(_))
+                        && let Err(error) = proxy::stop(session, accepted.deadline).await
+                    {
+                        proxy::retain_or_stop(&shared, &mut active, error.kind());
+                        finish(&shared, accepted.operation, failed(error));
+                        continue;
+                    }
+                    stopped(&shared, &mut active, Terminal::Aborted);
+                    // The process exits next: release session routes first.
+                    if let Some(host) = shared.host.get() {
+                        host.release().await;
+                    }
+                    finish(&shared, accepted.operation, Completed::Aborted);
+                    if let Some(stop) = shared.stop.get() {
+                        stop.send_replace(true);
+                    }
+                }
+                Command::Profile(change) => {
+                    let result = match shared.profiles.get() {
+                        Some(store) => store.apply(change),
+                        None => Err("no profile store is attached to this service".into()),
+                    };
+                    finish(&shared, accepted.operation, Completed::Profile(result));
                 }
                 Command::Apply(request) => {
                     let Some(session) = active.as_mut() else {

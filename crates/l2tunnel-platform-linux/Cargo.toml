@@ -19,3 +19,7 @@ panic = "deny"
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "=0.2.186"
 l2tunnel-device = { path = "../l2tunnel-device" }
+# Service-owned links, addresses and routes (docs/modules/linux-device.md).
+rtnetlink = { version = "=0.24.0", default-features = false, features = ["tokio_socket"] }
+futures-util = { version = "=0.3.34", default-features = false }
+tokio = { version = "=1.53.1", features = ["rt"] }

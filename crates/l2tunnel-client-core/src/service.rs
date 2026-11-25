@@ -18,15 +18,31 @@ use tokio::{
     time::Instant,
 };
 mod connection_reuse;
+pub mod device_mtu;
 mod prepared;
 pub use prepared::{Attachment, Client, Prepared, Server};
 mod common_local;
 mod common_reuse_local;
+pub mod host;
+#[cfg(target_os = "linux")]
+pub mod host_linux;
+mod info_local;
+mod meters_local;
+mod metrics_local;
+mod operations_local;
 mod owner;
+#[cfg(unix)]
+pub mod profile_store;
+pub mod profiles;
 mod proxy_backend;
+mod sessions_local;
+mod tuning_local;
+mod tunnel_tests_local;
 #[cfg(unix)]
 pub use proxy_backend::ProxyCommonFrame;
 pub use proxy_backend::{ProxyFrame, ProxyProfile};
+mod events;
+pub use events::{EVENT_PAGE_LIMIT, Event, EventKind, EventPage, OperationKind, OutcomeName};
 mod setup;
 pub use setup::{SetupFailure, SetupFailureReason, SetupObservation, SetupOutcome, SetupStage};
 #[cfg(all(test, unix))]
@@ -56,6 +72,10 @@ impl OperationId {
     /// Exact service-local ordinal, not a peer wire identifier.
     pub fn value(self) -> u64 {
         self.0
+    }
+    /// Identify a retained operation by its nonzero ordinal (its request key).
+    pub fn new(value: u64) -> Option<Self> {
+        (value != 0).then_some(Self(value))
     }
 }
 /// A reserved operation slot. It does not prove a peer or device changed.
@@ -134,6 +154,10 @@ pub enum Completed {
     OutcomeUnknown,
     /// Original deadline or actual factory/runtime failure.
     Failed(Failure),
+    /// Device or route change: applied summary, or a bounded refusal.
+    Host(Result<String, String>),
+    /// Profile store change: summary, or the refusal reason.
+    Profile(Result<String, String>),
 }
 /// Why a live generation stopped; only explicit Closed carries a clean proxy proof.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -226,9 +250,57 @@ struct SecureUdpCommonBackend {
     requested: Arc<crate::secure_udp::common_transaction_profile::Profile>,
     info: l2tunnel_runtime::secure_udp::member::Info,
     counters: Mutex<Option<l2tunnel_runtime::secure_udp::transport::CommonSnapshot>>,
+    /// When the latest snapshot arrived, for the meter table's age.
+    observed: Mutex<Option<Instant>>,
     switcher: l2tunnel_runtime::secure_udp::transport::CommonControlHandle,
     generation: u64,
 }
+impl SecureUdpCommonBackend {
+    /// Retain the newest runtime snapshot and its arrival time.
+    fn store(&self, snapshot: &l2tunnel_runtime::secure_udp::transport::CommonSnapshot) {
+        *self
+            .counters
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(snapshot.clone());
+        *self
+            .observed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Instant::now());
+    }
+    /// Newest meter table and the service instant it was sampled at.
+    fn meters(&self) -> Option<(Instant, Arc<l2tunnel_meters::Table>)> {
+        let (snapshot_us, table) = {
+            let counters = self
+                .counters
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let snapshot = counters.as_ref()?;
+            (snapshot.elapsed_micros, snapshot.meters.clone()?)
+        };
+        let arrived = (*self
+            .observed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner))?;
+        Some((sampled_at(arrived, snapshot_us, &table), table))
+    }
+}
+
+/// The table rides along with newer snapshots (meter-csr decision 17): its
+/// sample instant is the snapshot's arrival minus the runtime time between
+/// the table's `meta.sampled_us` and the snapshot.
+pub(crate) fn sampled_at(
+    arrived: Instant,
+    snapshot_us: u64,
+    table: &l2tunnel_meters::Table,
+) -> Instant {
+    let behind = table
+        .get("meta.sampled_us")
+        .map_or(0, |sampled| snapshot_us.saturating_sub(sampled));
+    arrived
+        .checked_sub(std::time::Duration::from_micros(behind))
+        .unwrap_or(arrived)
+}
+impl SecureUdpCommonBackend {}
 impl ObservedBackend {
     fn observe(&self) -> Option<Observation> {
         match self {
@@ -265,6 +337,20 @@ pub struct Snapshot {
     /// Latest actual generation termination.
     pub terminal: Option<Terminal>,
 }
+/// Non-blocking view of one retained operation; never waits or refreshes time.
+#[derive(Clone, Debug)]
+pub struct OperationView {
+    /// Original acceptance, including its absolute deadline.
+    pub accepted: Accepted,
+    /// Accepted operation kind.
+    pub kind: OperationKind,
+    /// A local cancellation was requested; not proof of cancellation.
+    pub cancel_requested: bool,
+    /// Latest setup evidence for connect/reconnect operations.
+    pub setup: Option<SetupObservation>,
+    /// Actual completion, absent while pending.
+    pub result: Option<Completed>,
+}
 /// Submission rejection before additional protocol/device work.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SubmitError {
@@ -296,6 +382,16 @@ enum Fingerprint {
     Apply(local::Request),
     Common(l2tunnel::record_configuration::Configuration),
     ConnectionReuse(local::ConnectionReuseRequest),
+    Host(host::HostChange),
+    Profile(crate::local::ProfileChange),
+    Stop,
+    Kick,
+    ProfileConnect {
+        name: String,
+        replace: bool,
+        /// Effective kind; not part of the request identity.
+        reconnect: bool,
+    },
 }
 impl Fingerprint {
     fn is_apply(&self) -> bool {
@@ -309,10 +405,26 @@ impl Fingerprint {
             (Self::Connect(a), Self::Connect(b)) | (Self::Reconnect(a), Self::Reconnect(b)) => {
                 Arc::ptr_eq(a, b)
             }
-            (Self::Disconnect, Self::Disconnect) => true,
+            (Self::Disconnect, Self::Disconnect)
+            | (Self::Stop, Self::Stop)
+            | (Self::Kick, Self::Kick) => true,
             (Self::Apply(a), Self::Apply(b)) => a == b,
             (Self::Common(a), Self::Common(b)) => a == b,
             (Self::ConnectionReuse(a), Self::ConnectionReuse(b)) => a == b,
+            (Self::Host(a), Self::Host(b)) => a == b,
+            (Self::Profile(a), Self::Profile(b)) => a == b,
+            (
+                Self::ProfileConnect {
+                    name: a,
+                    replace: x,
+                    ..
+                },
+                Self::ProfileConnect {
+                    name: b,
+                    replace: y,
+                    ..
+                },
+            ) => a == b && x == y,
             _ => false,
         }
     }
@@ -323,6 +435,7 @@ struct Entry {
     result: Option<Completed>,
     cancel: bool,
     setup: Option<setup::Record>,
+    reported: events::Reported,
 }
 // The sole queued command retains its complete value without another allocation.
 #[allow(clippy::large_enum_variant)]
@@ -333,6 +446,10 @@ enum Command {
     Apply(local::Request),
     Common(l2tunnel::record_configuration::Configuration),
     ConnectionReuse(local::ConnectionReuseRequest),
+    Host(host::HostChange),
+    Profile(crate::local::ProfileChange),
+    /// Disconnect, then end the hosting process (daemon only).
+    Stop,
 }
 struct Job {
     accepted: Accepted,
@@ -355,6 +472,11 @@ struct State {
     terminals: VecDeque<TerminalRecord>,
     last_key: u64,
     retired_through: u64,
+    events: events::EventLog,
+    /// When the live generation became ready.
+    connected_at: Option<Instant>,
+    /// Stored profile the retained plan was prepared from.
+    profile: Option<String>,
 }
 impl State {
     /// Arbitrate an idle runtime exit against disconnect admission under the same lock.
@@ -384,14 +506,24 @@ struct Shared {
     state: Mutex<State>,
     wake: Notify,
     changed: watch::Sender<()>,
+    instance: u64,
+    started: Instant,
+    host: std::sync::OnceLock<Arc<dyn host::Host>>,
+    profiles: std::sync::OnceLock<Arc<dyn profiles::ProfileStore>>,
+    /// Set by a host process that exits on `service_stop`.
+    stop: std::sync::OnceLock<watch::Sender<bool>>,
 }
 impl Shared {
-    fn lock(&self) -> std::sync::MutexGuard<'_, State> {
+    fn lock(&self) -> events::StateGuard<'_> {
         // No user/provider code runs under this mutex. Recovering a poisoned local
         // observation lock never authorizes a peer action or panics on a request.
-        self.state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        // Releasing the guard records the published transition in the event log.
+        events::StateGuard::new(
+            self.state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            &self.changed,
+        )
     }
     fn changed(&self) {
         self.changed.send_replace(());
@@ -417,6 +549,95 @@ impl Handle {
     /// Wake stream for lifecycle changes; use snapshot() for fresh runtime counters.
     pub fn subscribe(&self) -> watch::Receiver<()> {
         self.0.changed.subscribe()
+    }
+    /// Random identity of this service instance. Operation ordinals and event
+    /// sequences are only meaningful together with it. Not a secret.
+    pub fn instance(&self) -> u64 {
+        self.0.instance
+    }
+    /// Bounded page of recorded events after `after` (zero reads from the oldest).
+    pub fn events(&self, after: u64, limit: usize) -> EventPage {
+        self.0.lock().events.page(after, limit)
+    }
+    /// Latest recorded event sequence.
+    pub fn event_cursor(&self) -> u64 {
+        self.0.lock().events.last()
+    }
+    /// Wait until an event after `after` is recorded. A closed service with no
+    /// newer event returns Closed. Dropping this future has no effect.
+    pub async fn wait_event(&self, after: u64) -> Result<(), SubmitError> {
+        let mut changed = self.subscribe();
+        loop {
+            {
+                let state = self.0.lock();
+                if state.events.last() > after {
+                    return Ok(());
+                }
+                if state.snapshot.phase == Phase::Closed {
+                    return Err(SubmitError::Closed);
+                }
+            }
+            changed.changed().await.map_err(|_| SubmitError::Closed)?;
+        }
+    }
+    /// Read one retained operation without waiting.
+    pub fn operation(&self, id: OperationId) -> Result<OperationView, SubmitError> {
+        let state = self.0.lock();
+        if let Some(entry) = state.entries.iter().find(|e| e.accepted.operation == id) {
+            return Ok(OperationView {
+                accepted: entry.accepted,
+                kind: OperationKind::of(&entry.fingerprint),
+                cancel_requested: entry.cancel,
+                setup: entry.setup.as_ref().map(|record| record.observation),
+                result: entry.result.clone(),
+            });
+        }
+        Err(if id.0 <= state.retired_through {
+            SubmitError::Expired
+        } else if id.0 > state.last_key {
+            SubmitError::FutureKey
+        } else {
+            SubmitError::State
+        })
+    }
+    /// Connect from idle with the retained accepted plan under a caller key.
+    /// A live generation is refused with State; use reconnect.
+    pub fn connect_retained(&self, key: RequestKey) -> Result<Accepted, SubmitError> {
+        self.submit_retained(key, false)
+    }
+    /// Replace the live generation, or connect when idle, with the retained
+    /// plan (the local lifecycle `reconnect` meaning). An identical retry
+    /// replays its original acceptance whichever of the two it became.
+    pub fn reconnect_retained(&self, key: RequestKey) -> Result<Accepted, SubmitError> {
+        self.submit_retained(key, true)
+    }
+    fn submit_retained(&self, key: RequestKey, reconnect: bool) -> Result<Accepted, SubmitError> {
+        let state = self.0.lock();
+        let plan = state.plan.clone().ok_or(SubmitError::State)?;
+        if reconnect
+            && key.0 <= state.last_key
+            && let Some(entry) = state
+                .entries
+                .iter()
+                .find(|e| e.accepted.operation.0 == key.0)
+            && let Fingerprint::Connect(identity) | Fingerprint::Reconnect(identity) =
+                &entry.fingerprint
+            && Arc::ptr_eq(identity, &plan.identity)
+        {
+            return Ok(entry.accepted);
+        }
+        let (fingerprint, command) = if reconnect && state.backend.is_some() {
+            (
+                Fingerprint::Reconnect(plan.identity.clone()),
+                Command::Reconnect(plan),
+            )
+        } else {
+            (
+                Fingerprint::Connect(plan.identity.clone()),
+                Command::Connect(plan),
+            )
+        };
+        self.submit_locked(state, fingerprint, command, key)
     }
     /// Latest local lifecycle and the maintained runtime's current status.
     pub fn snapshot(&self) -> Snapshot {
@@ -518,7 +739,7 @@ impl Handle {
     }
     fn submit_locked(
         &self,
-        mut state: std::sync::MutexGuard<'_, State>,
+        mut state: events::StateGuard<'_>,
         fingerprint: Fingerprint,
         command: Command,
         key: RequestKey,
@@ -589,6 +810,21 @@ impl Handle {
                 return Err(SubmitError::Unsupported);
             }
         }
+        if matches!(command, Command::Stop) && self.0.stop.get().is_none() {
+            return Err(SubmitError::Unsupported);
+        }
+        if matches!(command, Command::Profile(_)) && self.0.profiles.get().is_none() {
+            return Err(SubmitError::Unsupported);
+        }
+        if let Command::Host(change) = &command {
+            if self.0.host.get().is_none() {
+                return Err(SubmitError::Unsupported);
+            }
+            // Routes belong to the running session and are removed when it ends.
+            if matches!(change, host::HostChange::Route(_)) && !connected {
+                return Err(SubmitError::State);
+            }
+        }
         match &command {
             Command::Connect(_) if connected => return Err(SubmitError::State),
             Command::Reconnect(_) if !connected && state.plan.is_none() => {
@@ -649,6 +885,7 @@ impl Handle {
             result: None,
             cancel: false,
             setup,
+            reported: events::Reported::default(),
         });
         state.snapshot.operation = Some(accepted.operation);
         state.snapshot.phase = match command {
@@ -656,6 +893,8 @@ impl Handle {
             Command::Apply(_) => Phase::Applying,
             Command::Common(_) => Phase::Applying,
             Command::ConnectionReuse(_) => Phase::Applying,
+            // A device or route change leaves the session phase as it is.
+            Command::Host(_) | Command::Profile(_) => state.snapshot.phase,
             _ => Phase::Stopping,
         };
         state.queued = Some(Job { accepted, command });
@@ -680,9 +919,13 @@ impl Handle {
         if entry.result.is_some() {
             return Err(SubmitError::State);
         }
+        // Profile connects and kicks run as Connect/Reconnect setups.
         if !matches!(
             entry.fingerprint,
-            Fingerprint::Connect(_) | Fingerprint::Reconnect(_)
+            Fingerprint::Connect(_)
+                | Fingerprint::Reconnect(_)
+                | Fingerprint::ProfileConnect { .. }
+                | Fingerprint::Kick
         ) {
             return Err(SubmitError::Unsupported);
         }
@@ -1172,10 +1415,20 @@ fn create_channel(plan: Option<Prepared>) -> (Handle, Run) {
             terminals: VecDeque::with_capacity(RETAINED),
             last_key: 0,
             retired_through: 0,
+            events: events::EventLog::new(),
+            connected_at: None,
+            profile: None,
         }),
         wake: Notify::new(),
         changed,
+        instance: events::instance(),
+        started: Instant::now(),
+        host: std::sync::OnceLock::new(),
+        profiles: std::sync::OnceLock::new(),
+        stop: std::sync::OnceLock::new(),
     });
+    // Record the initial lifecycle as sequence 1, the baseline for subscribers.
+    drop(shared.lock());
     (
         Handle(shared.clone()),
         Run {

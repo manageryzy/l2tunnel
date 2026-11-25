@@ -34,6 +34,11 @@ pub struct Profile {
     raw: Option<raw::RawSelection>,
     maintained: Option<Box<maintained::Selection>>,
     requested_catalog: Option<Catalog>,
+    // Live-tuning catalog generated after setup (docs/modules/live-tuning.md);
+    // the setup identity stays the base plan's.
+    live_catalog: Option<Catalog>,
+    // Client choices / server limits for live tuning at connect.
+    tuning: super::live_tuning::Policy,
     proxy: Option<l2tunnel_runtime::proxy::Config>,
     proxy_retirement: bool,
     // Keep an absent optional policy from enlarging every carrier setup future.
@@ -436,10 +441,15 @@ impl Profile {
                 let physical = if let Some(carrier) = maintained {
                     carrier.geometry.charged_overhead_bytes
                 } else if let Some(policy) = raw_policy {
-                    policy
-                        .record_geometry()
-                        .map_err(io::Error::other)?
+                    let final_geometry = policy
+                        .final_record_geometry_with_tls_cover(
+                            settings.cover.appearance == l2tunnel_cover::Appearance::TlsLike,
+                        )
+                        .map_err(io::Error::other)?;
+                    final_geometry
                         .ip_tcp_bytes
+                        .checked_add(final_geometry.record_overhead_bytes)
+                        .ok_or_else(|| invalid("raw physical overhead overflow"))?
                 } else if settings.gate.path.client.is_ipv6() {
                     48
                 } else {
@@ -458,10 +468,15 @@ impl Profile {
             let physical = if let Some(carrier) = maintained {
                 carrier.geometry.charged_overhead_bytes
             } else if let Some(policy) = raw_policy {
-                policy
-                    .record_geometry()
-                    .map_err(io::Error::other)?
+                let final_geometry = policy
+                    .final_record_geometry_with_tls_cover(
+                        settings.cover.appearance == l2tunnel_cover::Appearance::TlsLike,
+                    )
+                    .map_err(io::Error::other)?;
+                final_geometry
                     .ip_tcp_bytes
+                    .checked_add(final_geometry.record_overhead_bytes)
+                    .ok_or_else(|| invalid("raw physical overhead overflow"))?
             } else if settings.gate.path.client.is_ipv6() {
                 48
             } else {
@@ -543,12 +558,15 @@ impl Profile {
         if proxy.is_none() && connection.max_packet != native {
             return Err(invalid("common native maximum differs from attachment"));
         }
+        // The inner packet size may differ per entry (live-tuning decision
+        // 8); the attachment layer and duplex may not. Native resources must
+        // hold the largest entry.
+        let mut largest = native;
         for descriptor in catalog.descriptors() {
             for role in [Role::Client, Role::Server] {
                 let direction = descriptor.direction(role);
-                let original = initial.direction(role);
+                largest = largest.max(direction.max_native());
                 if direction.common().traffic().layer != layer
-                    || direction.max_native() != original.max_native()
                     || descriptor.duplex() != connection.duplex
                 {
                     return Err(invalid(
@@ -558,7 +576,7 @@ impl Profile {
             }
         }
         for resources in [initiator, responder] {
-            resources.validate_common_resources(native)?;
+            resources.validate_common_resources(largest)?;
             parameters.validate(resources)?;
             if resources.path_mtu != initial.path_mtu() {
                 return Err(invalid("common initial MTU differs from template"));
@@ -611,6 +629,8 @@ impl Profile {
             raw: None,
             maintained: None,
             requested_catalog: None,
+            live_catalog: None,
+            tuning: super::live_tuning::Policy::default(),
             proxy,
             proxy_retirement: false,
             proxy_measured: None,
@@ -767,8 +787,48 @@ impl Profile {
     pub fn parameters(&self) -> transport::TransactionSettings {
         self.parameters
     }
-    /// Whole supported catalog, without pruning to fit storage.
+    /// This profile switching within `catalog`, the live-tuning catalog both
+    /// ends generated from this plan and the authenticated proposal
+    /// (docs/modules/live-tuning.md). The setup identity, envelope and
+    /// initial entry stay this plan's; the runtime contract checks the rest.
+    pub fn with_live_catalog(&self, catalog: Catalog) -> io::Result<Self> {
+        if catalog.initial() != self.catalog.initial() {
+            return Err(invalid("live-tuning catalog changes the initial entry"));
+        }
+        let mut result = self.clone();
+        result.live_catalog = Some(catalog);
+        Ok(result)
+    }
+    /// This profile with a live-tuning policy (client choices or server
+    /// limits), read from the run options.
+    pub fn with_tuning(mut self, policy: super::live_tuning::Policy) -> Self {
+        self.tuning = policy;
+        self
+    }
+    /// The live-tuning policy.
+    pub fn tuning(&self) -> &super::live_tuning::Policy {
+        &self.tuning
+    }
+    /// The live-tuning catalog in use, when the session was tuned.
+    pub fn live_catalog(&self) -> Option<&Catalog> {
+        self.live_catalog.as_ref()
+    }
+    fn apply_live_catalog(
+        &self,
+        contract: transport::CommonTransactionContract,
+    ) -> io::Result<transport::CommonTransactionContract> {
+        match &self.live_catalog {
+            Some(catalog) => contract.with_live_catalog(catalog.clone()),
+            None => Ok(contract),
+        }
+    }
+    /// Whole supported catalog in effect, without pruning to fit storage:
+    /// the live-tuning catalog when the session was tuned, else the plan's.
     pub fn catalog(&self) -> &Catalog {
+        self.live_catalog.as_ref().unwrap_or(&self.catalog)
+    }
+    /// The plan's own catalog, which live tuning extends.
+    pub fn plan_catalog(&self) -> &Catalog {
         &self.catalog
     }
     /// Immutable common envelope E, distinct from H0 and D0.
@@ -849,6 +909,7 @@ impl Profile {
         &self,
         contract: transport::CommonTransactionContract,
     ) -> io::Result<transport::CommonTransactionContract> {
+        let contract = self.apply_live_catalog(contract)?;
         match &self.proxy {
             Some(proxy) => {
                 #[cfg(not(unix))]
@@ -899,7 +960,7 @@ impl Profile {
         binding: CarrierBinding,
         role: security::Role,
     ) -> io::Result<transport::CommonTransactionContract> {
-        transport::CommonTransactionContract::new_on_carrier_paired_compact(
+        let contract = transport::CommonTransactionContract::new_on_carrier_paired_compact(
             binding.requested_configuration,
             role,
             binding.resources,
@@ -910,7 +971,8 @@ impl Profile {
             self.parameters,
             binding.outer,
             self.compact_wire,
-        )
+        )?;
+        self.apply_live_catalog(contract)
     }
 }
 fn extra_byte(value: usize) -> io::Result<usize> {

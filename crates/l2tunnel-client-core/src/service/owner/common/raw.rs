@@ -27,10 +27,12 @@ pub(in crate::service::owner) async fn establish(
     })?;
     check(deadline)?;
     let (switcher, requests) = transport::common_channel();
+    let requests = crate::service::device_mtu::tune(&plan.data.attachment, &effective, requests);
     let backend = Arc::new(SecureUdpCommonBackend {
         requested: effective,
         info,
         counters: Mutex::new(None),
+        observed: Mutex::new(None),
         switcher,
         generation: accepted.operation.value(),
     });
@@ -130,6 +132,15 @@ pub(in crate::service::owner) fn authenticate<'a>(
         // remains immutable; all subsequent validation uses the effective profile.
         let effective = Arc::new(requested.bind_raw(outer.authenticated())?);
         let config = effective.establish_config(role)?;
+        // Live tuning (docs/modules/live-tuning.md): a client proposes its
+        // choices in Noise message 1; a server judges them against its limits.
+        let proposal = crate::secure_udp::live_tuning::proposal(&effective)?;
+        let mut live_catalog = proposal.as_ref().map(|proposal| proposal.catalog.clone());
+        let mut judge = |carried: &[u8]| {
+            let (catalog, root) = crate::secure_udp::live_tuning::judge(&effective, role, carried)?;
+            live_catalog = Some(catalog);
+            Ok(root)
+        };
         let mut entropy = authentication::RuntimeEntropy::new();
         let mut observe = |value| setup::runtime(shared, accepted.operation, value);
         let established = match &plan.data.endpoint {
@@ -141,6 +152,13 @@ pub(in crate::service::owner) fn authenticate<'a>(
                         inner.admission(),
                         &mut entropy,
                         &mut observe,
+                        match &proposal {
+                            Some(proposal) => authentication::Tuning::Propose {
+                                proposal: &proposal.bytes,
+                                context: proposal.root,
+                            },
+                            None => authentication::Tuning::Off,
+                        },
                     )
                     .await
             }
@@ -169,6 +187,7 @@ pub(in crate::service::owner) fn authenticate<'a>(
                         })?,
                         &mut entropy,
                         &mut observe,
+                        authentication::Tuning::Judge(&mut judge),
                     )
                     .await
             }
@@ -215,6 +234,11 @@ pub(in crate::service::owner) fn authenticate<'a>(
         check(deadline)?;
         let info = session.info();
         setup::stage(shared, accepted.operation, SetupStage::Configuration);
+        // A tuned session switches within the catalog both ends generated.
+        let effective = match live_catalog {
+            Some(catalog) => Arc::new(effective.with_live_catalog(catalog)?),
+            None => effective,
+        };
         let contract = effective.runtime_contract(role)?;
         if info.role != role
             || info.peers != effective.peers()
@@ -252,10 +276,7 @@ fn make_runtime_on_raw(
         Some(requests),
         std::future::pending::<()>(),
         move |snapshot| {
-            *sink
-                .counters
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(snapshot.clone());
+            sink.store(snapshot);
             changed.changed();
         },
     );

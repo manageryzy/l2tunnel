@@ -399,6 +399,14 @@ mod probe {
             connection_ingress: None,
             rolling_fragments: None,
             rolling_ingress: None,
+            credit: Some(l2tunnel_flow_control::session_credit::Config {
+                floor_datagrams: 64,
+                ceiling_datagrams: 8192,
+                floor_bytes: 102_400,
+                ceiling_bytes: 16 << 20,
+                period: Duration::from_millis(10),
+                idle_period: Duration::from_millis(250),
+            }),
             native: transport::NativeBudget {
                 pending_packets: 64,
                 pending_bytes: 102_400,
@@ -712,7 +720,8 @@ mod probe {
                     "send_batch":value.work.send_batch,"native_read_batch":value.work.native_read_batch,"native_write_batch":value.work.native_write_batch},
                 "native":{"pending_packets":value.native.pending_packets,"pending_bytes":value.native.pending_bytes,"stall_timeout_micros":value.native.stall_timeout.as_micros()},
                 "lifetime":{"lease_micros":value.lifetime.lease.as_micros(),"ping_interval_micros":value.lifetime.ping_interval.as_micros(),
-                    "pong_timeout_micros":value.lifetime.pong_timeout.as_micros()},"report_interval_micros":10000}}),
+                    "pong_timeout_micros":value.lifetime.pong_timeout.as_micros()},
+                "credit":{"floor_datagrams":64,"ceiling_datagrams":8192,"floor_bytes":102400,"ceiling_bytes":16777216,"period_micros":10000,"idle_period_micros":250000},"report_interval_micros":10000}}),
         )
     }
     fn inspection_args(

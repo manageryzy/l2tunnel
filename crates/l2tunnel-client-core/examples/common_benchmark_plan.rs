@@ -27,6 +27,7 @@ const REVERSE_PACED_ID: &str = "packed-c48-near8-reverse-paced";
 enum Carrier {
     Udp,
     Raw,
+    RawTlsLike,
     Tls,
     Quic,
 }
@@ -35,6 +36,7 @@ impl Carrier {
         match self {
             Self::Udp => "udp",
             Self::Raw => "raw",
+            Self::RawTlsLike => "raw-tls-like",
             Self::Tls => "tls",
             Self::Quic => "quic",
         }
@@ -42,7 +44,7 @@ impl Carrier {
     fn cli(self) -> &'static str {
         match self {
             Self::Udp => "quic-like",
-            Self::Raw => "raw-packet",
+            Self::Raw | Self::RawTlsLike => "raw-packet",
             Self::Tls => "tcp",
             Self::Quic => "quic",
         }
@@ -51,6 +53,7 @@ impl Carrier {
         match self {
             Self::Udp => 28,
             Self::Raw => 40,
+            Self::RawTlsLike => 45,
             Self::Tls => 70,
             Self::Quic => 156,
         }
@@ -315,20 +318,34 @@ fn source_max(symbol: usize, packed: bool) -> Result<usize> {
         codec::aligned_envelope::HEADER_BYTES + symbol
     })
 }
+/// Base-ARQ window from the lab's bandwidth-delay product: the forward rate
+/// times the nominal RTT in full sources, tripled so loss repair and RTO
+/// recovery do not stall the sender, rounded to a power of two and kept within
+/// the wide-ACK range (more than 64 selects the wide ACK).
+fn bdp_window(original: usize) -> usize {
+    const FORWARD_BYTES_PER_SECOND: usize = 12_500_000;
+    const NOMINAL_RTT_MS: usize = 70;
+    let bdp = FORWARD_BYTES_PER_SECOND * NOMINAL_RTT_MS / 1000;
+    (3 * bdp.div_ceil(original)).next_power_of_two().clamp(
+        l2tunnel_recovery::LEGACY_ACK_WINDOW,
+        l2tunnel_recovery::MAX_ARQ_WINDOW,
+    )
+}
 fn aligned_config(carrier: Carrier, packed: bool, with_fec: bool) -> Result<aligned::Config> {
     let symbol = carrier.symbol();
     let original = source_max(symbol, packed)?;
     let wrapped = original + l2tunnel_recovery::DATA_HEADER_BYTES;
+    let window = bdp_window(original);
     let count = if with_fec { 8 } else { 1 };
     let repairs = if with_fec { 2 } else { 0 };
     let fec_packet = fec::HEADER_BYTES + count + 2 + wrapped;
     let recovery = ReliableConfig {
         arq: ArqConfig {
             max_source_bytes: original,
-            send_bytes: 64 * original,
-            receive_bytes: 64 * original,
-            send_records: 64,
-            receive_records: 64,
+            send_bytes: window * original,
+            receive_bytes: window * original,
+            send_records: window,
+            receive_records: window,
             // Maintained ordinary ARQ defaults, not shortened fixture timers.
             initial_rto: Duration::from_millis(200),
             maximum_rto: Duration::from_secs(3),
@@ -350,13 +367,18 @@ fn aligned_config(carrier: Carrier, packed: bool, with_fec: bool) -> Result<alig
         },
         repair_symbols: repairs,
         flush_after: Duration::from_millis(1),
-        max_restored_packets: 64 + count,
-        max_restored_bytes: (64 + count) * wrapped,
+        max_restored_packets: window + count,
+        max_restored_bytes: (window + count) * wrapped,
         outer_overhead_bytes: carrier.overhead(),
     };
+    // The aligned receiver must hold the ARQ receive window plus every
+    // restored source, so its source window follows the ARQ window.
+    let source_window = (window + recovery.max_restored_packets)
+        .next_power_of_two()
+        .max(8192);
     Ok(aligned::Config {
         native_policy: aligned::NativePolicy::IpHeaders,
-        receiver: receiver(symbol, CHANNELS, 8192),
+        receiver: receiver(symbol, CHANNELS, source_window),
         max_recovery_packet_bytes: recovery.maximum_packet_bytes()?,
         recovery,
     })
@@ -766,7 +788,9 @@ fn profile(algorithm: Algorithm, carrier: Carrier) -> Result<c::Profile> {
             let selected = research_records::DirectionConfig {
                 native_release: Default::default(),
                 return_guard: Default::default(),
-                native_policy: rolling.native_policy,
+                // Hole abandonment loses records; anchored deltas keep later
+                // records decodable (owner decision 2026-11-24).
+                native_policy: aligned::NativePolicy::FixedAnchorIpHeaders,
                 receiver: rolling.receiver,
                 packing: rolling.packing,
                 codec_stage_micros: rolling.codec_stage_micros,
@@ -775,6 +799,7 @@ fn profile(algorithm: Algorithm, carrier: Carrier) -> Result<c::Profile> {
                     profile: policy,
                     feedback_ticks: 1000,
                     memory_bytes: ROW_MEMORY,
+                    abandon_ticks: 1_000_000,
                 },
             };
             c::Profile::Research {
@@ -865,7 +890,7 @@ fn write_json(path: &Path, value: &Value) -> Result<()> {
     Ok(())
 }
 
-fn runtime_document(retained_bytes: usize, descriptor: &c::Descriptor) -> Value {
+fn runtime_document(retained_bytes: usize, descriptor: &c::Descriptor, lease_micros: u64) -> Value {
     let message = json!({"max_message_bytes":4096,"max_outbound_messages":16,"max_outbound_bytes":131072,"max_fragments":32,"max_reassembly_bytes":65536,"max_incomplete_messages":8,"message_lifetime_micros":5_000_000,"work_per_call":32});
     json!({
         "version":1,"backend":"common_records_v2","initial_index":0,
@@ -874,12 +899,13 @@ fn runtime_document(retained_bytes: usize, descriptor: &c::Descriptor) -> Value 
         "runtime":{
             "control_epoch":1,"data_epoch":1,"legacy_policy":{"transaction_micros":10_000_000,"max_outbound":32},
             "security":{"packets_per_key":l2tunnel_security::MAX_PACKETS_PER_KEY,"max_body_bytes_per_key":l2tunnel_security::MAX_BODY_BYTES_PER_KEY},
-            "control":{"recovery":{"max_source_bytes":256,"send_bytes":16384,"receive_bytes":16384,"send_records":64,"receive_records":64,"initial_rto_micros":200000,"maximum_rto_micros":3000000,"ack_delay_micros":5000,"max_retries":8},"interval_micros":10000,"packets_per_interval":16,"bytes_per_interval":16384},
+            "control":{"recovery":{"max_source_bytes":256,"send_bytes":16384,"receive_bytes":16384,"send_records":64,"receive_records":64,"initial_rto_micros":120000,"maximum_rto_micros":500000,"ack_delay_micros":5000,"max_retries":8},"interval_micros":10000,"packets_per_interval":16,"bytes_per_interval":16384},
             "streams":{"transaction":message.clone(),"liveness":message.clone(),"data_feedback":message},
             "wire":{"initiator_burst_bytes":descriptor.local(Role::Client).send().common().burst_bytes(),"responder_burst_bytes":descriptor.local(Role::Server).send().common().burst_bytes()},
             "work":{"receive_interval_micros":1000,"receive_packets":256,"send_batch":64,"native_read_batch":64,"native_write_batch":64},
             "native":{"pending_packets":1024,"pending_bytes":1536000,"stall_timeout_micros":NATIVE_STALL_US},
-            "lifetime":{"lease_micros":120_000_000,"ping_interval_micros":1_000_000,"pong_timeout_micros":5_000_000},
+            "lifetime":{"lease_micros":lease_micros,"ping_interval_micros":1_000_000,"pong_timeout_micros":5_000_000},
+            "credit":{"floor_datagrams":64,"ceiling_datagrams":8192,"floor_bytes":102400,"ceiling_bytes":16777216,"period_micros":10000,"idle_period_micros":250000},
             "report_interval_micros":1_000_000
         },"rolling_work":null
     })
@@ -887,9 +913,11 @@ fn runtime_document(retained_bytes: usize, descriptor: &c::Descriptor) -> Value 
 fn policy(carrier: Carrier, client: bool) -> Option<Value> {
     match carrier {
         Carrier::Udp => None,
-        Carrier::Raw => Some(json!({"version":1,"profile":"raw-common-carrier-v1",
+        Carrier::Raw | Carrier::RawTlsLike => {
+            Some(json!({"version":1,"profile":"raw-common-carrier-v1",
             "forward":{"local":if client {"192.0.2.2:24440"} else {"192.0.2.6:24441"},"peer":if client {"192.0.2.6:24441"} else {"192.0.2.2:24440"}},"reverse":null,
-            "packet":{"mtu":1500,"protection":"aead","queue_packets":64,"horizon_bytes":1048576,"minimum_transfer_bytes":65536,"bytes_per_second":12500000,"packets_per_second":100000,"burst_bytes":65536,"burst_packets":256,"max_key_packets":1073741824u64,"max_key_bytes":68719476736u64}})),
+            "packet":{"mtu":1500,"protection":"aead","queue_packets":64,"horizon_bytes":1048576,"minimum_transfer_bytes":65536,"bytes_per_second":12500000,"packets_per_second":100000,"burst_bytes":65536,"burst_packets":256,"max_key_packets":1073741824u64,"max_key_bytes":68719476736u64}}))
+        }
         Carrier::Tls | Carrier::Quic => {
             let quic = matches!(carrier, Carrier::Quic);
             let physical = carrier.physical_allowance();
@@ -947,10 +975,12 @@ fn cli(carrier: Carrier, client: bool, algorithm: Algorithm) -> Vec<String> {
             .into_iter()
             .map(str::to_owned),
         );
+    } else if matches!(carrier, Carrier::RawTlsLike) {
+        result.extend(["--udp-cover", "tls-like"].into_iter().map(str::to_owned));
     } else {
         result.extend(["--udp-cover", "quic-like"].into_iter().map(str::to_owned));
     }
-    if matches!(carrier, Carrier::Raw) {
+    if matches!(carrier, Carrier::Raw | Carrier::RawTlsLike) {
         result.extend(["--raw-mark", "305790977"].into_iter().map(str::to_owned));
     }
     result
@@ -960,6 +990,7 @@ fn export_row(
     row: &Row,
     carrier: Carrier,
     reverse_burst: Option<usize>,
+    lease_micros: u64,
 ) -> Result<Value> {
     if matches!(row.algorithm, Algorithm::PackedC48 { source_wire, .. } if source_wire.is_near8())
         && !matches!(carrier, Carrier::Udp)
@@ -1027,7 +1058,7 @@ fn export_row(
         .checked_mul(2)
         .and_then(|bytes| bytes.checked_add(64 << 20))
         .ok_or("runtime reserve overflow")?;
-    let mut document = runtime_document(retained, &descriptor);
+    let mut document = runtime_document(retained, &descriptor, lease_micros);
     document["catalog"] = json!([encoded]);
     if let Some(ack) = ack {
         let role = json!({"selection":"benchmark","interval_micros":ack.interval.as_micros(),
@@ -1051,7 +1082,7 @@ fn export_row(
         if let Some(value) = policy(carrier, client) {
             let path = format!("{id}.{side}.carrier.json");
             #[cfg(unix)]
-            if matches!(carrier, Carrier::Raw) {
+            if matches!(carrier, Carrier::Raw | Carrier::RawTlsLike) {
                 l2tunnel_client_core::raw_packet::common::Settings::from_json(&serde_json::to_vec(
                     &value,
                 )?)
@@ -1069,7 +1100,7 @@ fn export_row(
     let mut result = json!({
         "id":id,"status":"ready","algorithm":row.family,"variant":row.variant,"carrier":carrier.id(),
         "layer":if ethernet {"tap"} else {"tun"},"duplex":"full","common_plan":plan_name,"carrier_policy":policies,
-        "policy_flag":match carrier {Carrier::Udp=>Value::Null,Carrier::Raw=>json!("--raw-policy"),Carrier::Tls|Carrier::Quic=>json!("--maintained-policy")},
+        "policy_flag":match carrier {Carrier::Udp=>Value::Null,Carrier::Raw|Carrier::RawTlsLike=>json!("--raw-policy"),Carrier::Tls|Carrier::Quic=>json!("--maintained-policy")},
         "required_cli":{"a":cli(carrier,true,row.algorithm),"b":cli(carrier,false,row.algorithm)},
         "expected_descriptor_hex":encoded,"descriptor_digest_hex":hex(digest::digest(&digest::SHA256,&bytes).as_ref()),
         "descriptor_digest_definition":"SHA256 of exact unanchored descriptor bytes; not the session H0",
@@ -1216,7 +1247,30 @@ fn striped_resources(direction: l2tunnel::striped_records::Direction) -> Result<
     }))
 }
 fn run() -> Result<()> {
-    let arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
+    let raw_arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
+    let mut arguments = Vec::with_capacity(raw_arguments.len());
+    let mut lease_seconds: u64 = 120;
+    let mut idx = 0;
+    while idx < raw_arguments.len() {
+        if raw_arguments[idx] == "--lease-seconds" {
+            let value = raw_arguments
+                .get(idx + 1)
+                .and_then(|arg| arg.to_str())
+                .ok_or("missing --lease-seconds value")?;
+            let parsed: u64 = value
+                .parse()
+                .map_err(|_| "invalid --lease-seconds integer")?;
+            if !(30..=3600).contains(&parsed) {
+                return Err("--lease-seconds must be within 30..=3600".into());
+            }
+            lease_seconds = parsed;
+            idx += 2;
+            continue;
+        }
+        arguments.push(raw_arguments[idx].clone());
+        idx += 1;
+    }
+    let lease_micros = lease_seconds * 1_000_000;
     let c48_pair = arguments.len() == 3 && arguments[2] == "--packed-c48-pair";
     let striped = match arguments.get(2).and_then(|arg| arg.to_str()) {
         Some("--striped-5-4") => Some((
@@ -1259,6 +1313,7 @@ fn run() -> Result<()> {
     let anchor_pair = arguments.len() == 3 && arguments[2] == "--packed-c48-fixed-anchor-pair";
     let ack_lz4_pair =
         arguments.len() == 3 && arguments[2] == "--packed-c48-fixed-anchor-ack-lz4-pair";
+    let raw_tls_like = arguments.len() == 3 && arguments[2] == "--raw-tls-like";
     let supported = match arguments.len() {
         2 | 4 => true,
         3 => {
@@ -1272,6 +1327,7 @@ fn run() -> Result<()> {
                 || reverse_pacing_pair
                 || anchor_pair
                 || ack_lz4_pair
+                || raw_tls_like
         }
         _ => false,
     };
@@ -1382,7 +1438,12 @@ fn run() -> Result<()> {
         } else {
             rows()
         };
-    let all_rows = selected_rows.len() * 4;
+    let carriers: &[Carrier] = if raw_tls_like {
+        &[Carrier::RawTlsLike]
+    } else {
+        &[Carrier::Udp, Carrier::Raw, Carrier::Tls, Carrier::Quic]
+    };
+    let all_rows = selected_rows.len() * carriers.len();
     let directory = Path::new(&arguments[1]);
     std::fs::create_dir(directory)?;
     let mut exported = Vec::new();
@@ -1392,8 +1453,8 @@ fn run() -> Result<()> {
         } else {
             DEFAULT_BURST_BYTES
         });
-        for carrier in [Carrier::Udp, Carrier::Raw, Carrier::Tls, Carrier::Quic] {
-            match export_row(directory, &row, carrier, reverse_burst) {
+        for &carrier in carriers {
+            match export_row(directory, &row, carrier, reverse_burst, lease_micros) {
                 Ok(value) => exported.push(value),
                 Err(error) if error.is::<std::io::Error>() || error.is::<serde_json::Error>() => {
                     return Err(error);
@@ -1819,7 +1880,14 @@ mod tests {
             let c::Profile::Aligned { forward, .. } = ordinary.profile() else {
                 return Err("ordinary Cauchy replaced".into());
             };
-            assert_eq!(forward.recovery.arq.send_records, 64);
+            // Wide-ACK window sized from bandwidth x RTT, not the old 64 cap.
+            let expected = if matches!(carrier, Carrier::Udp | Carrier::Raw) {
+                2048
+            } else {
+                4096
+            };
+            assert_eq!(forward.recovery.arq.send_records, expected);
+            assert!(forward.recovery.arq.wide_feedback());
             assert_eq!(forward.recovery.arq.initial_rto, Duration::from_millis(200));
             let old = descriptor(Algorithm::Connections { raw_ack: true }, carrier)?;
             assert_eq!(

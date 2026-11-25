@@ -352,7 +352,7 @@ async fn actual_compact_wire_paired_raw_service_preserves_switches_and_both_suit
         exercise_raw_wire(Some(Selection {
             protection,
             limits: l2tunnel_security::compact::Selection {
-                max_forward_packets: 8192,
+                max_forward_packets: 32_768,
                 max_failed_checks: 64,
             },
         }))

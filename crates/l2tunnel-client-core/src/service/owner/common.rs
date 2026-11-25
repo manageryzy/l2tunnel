@@ -29,6 +29,11 @@ pub(super) async fn establish(
     .await?;
     let info = session.info();
     setup::stage(shared, accepted.operation, SetupStage::Configuration);
+    // A tuned session switches within the catalog both ends generated.
+    let profile = match session.live_catalog() {
+        Some(catalog) => Arc::new(profile.with_live_catalog(catalog.clone())?),
+        None => profile,
+    };
     let contract = profile.runtime_contract(info.role)?;
     if info.peers != profile.peers()
         || info.authenticated.configuration != contract.expected_configuration().0
@@ -45,10 +50,12 @@ pub(super) async fn establish(
     })?;
     check(deadline)?;
     let (switcher, requests) = transport::common_channel();
+    let requests = crate::service::device_mtu::tune(&plan.data.attachment, &profile, requests);
     let backend = Arc::new(SecureUdpCommonBackend {
         requested: profile,
         info,
         counters: Mutex::new(None),
+        observed: Mutex::new(None),
         switcher,
         generation: accepted.operation.value(),
     });
@@ -133,10 +140,7 @@ fn make_runtime(
         Some(requests),
         std::future::pending::<()>(),
         move |snapshot| {
-            *sink
-                .counters
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(snapshot.clone());
+            sink.store(snapshot);
             changed.changed();
         },
     );

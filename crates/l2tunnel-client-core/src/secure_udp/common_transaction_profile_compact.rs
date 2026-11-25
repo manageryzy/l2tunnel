@@ -24,10 +24,15 @@ impl Profile {
         }
         let raw_policy = self.raw.map(|raw| raw.policy);
         let physical = if let Some(policy) = raw_policy {
-            policy
-                .record_geometry()
-                .map_err(io::Error::other)?
+            let final_geometry = policy
+                .final_record_geometry_with_tls_cover(
+                    self.settings.cover.appearance == l2tunnel_cover::Appearance::TlsLike,
+                )
+                .map_err(io::Error::other)?;
+            final_geometry
                 .ip_tcp_bytes
+                .checked_add(final_geometry.record_overhead_bytes)
+                .ok_or_else(|| invalid("raw physical overhead overflow"))?
         } else if self.settings.gate.path.client.is_ipv6() {
             48
         } else {

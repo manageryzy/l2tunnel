@@ -7,8 +7,8 @@ use std::{
 
 fn execute() -> io::Result<()> {
     let arguments: Vec<String> = std::env::args().skip(1).collect();
-    if arguments.first().is_some_and(|arg| arg == "common-worker") {
-        return l2tunnel_windows::worker::execute(&arguments[1..]);
+    if let Some(command) = l2tunnel_windows::service::parse(&arguments) {
+        return l2tunnel_windows::service::execute(command?);
     }
     match cli::parse(&arguments)? {
         Command::Help => writeln!(io::stdout().lock(), "{}", cli::HELP),
@@ -19,7 +19,7 @@ fn execute() -> io::Result<()> {
         ),
         Command::Plan => writeln!(
             io::stdout().lock(),
-            "Windows original UDP Common worker supports provisioned API4 lifecycle and a pinned Wintun L3 device. Start the packaged local host to use the GUI. Windows TAP, alternate carriers, credential vault, sleep/recovery and native hardware qualification remain open.\n{}",
+            "Windows service host (cross-compiled; not yet executed on native Windows) serves local API v1/v4/v5 on a named pipe with a proposed DACL and owns a provisioned original UDP Common tunnel with a pinned Wintun L3 device. Windows TAP, alternate carriers, credential vault, event logging, sleep/recovery and native hardware qualification remain open.\n{}",
             l2tunnel::IMPLEMENTATION_STATUS
         ),
         Command::Connect(plan) => {

@@ -102,6 +102,7 @@ pub(crate) struct RuntimeDto {
     work: WorkDto,
     native: NativeDto,
     lifetime: LifetimeDto,
+    credit: CreditDto,
     report_interval_micros: RequiredReport,
 }
 impl RuntimeDto {
@@ -173,6 +174,7 @@ impl RuntimeDto {
             connection_ingress: None,
             rolling_fragments: None,
             rolling_ingress: None,
+            credit: Some(self.credit.build()),
             report_interval: self.report_interval_micros.0.map(Duration::from_micros),
         };
         Ok([
@@ -334,6 +336,30 @@ struct LifetimeDto {
     lease_micros: u64,
     ping_interval_micros: u64,
     pong_timeout_micros: u64,
+}
+
+/// Session receiver credit (`docs/modules/receiver-credit.md`); required.
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CreditDto {
+    floor_datagrams: u64,
+    ceiling_datagrams: u64,
+    floor_bytes: u64,
+    ceiling_bytes: u64,
+    period_micros: u64,
+    idle_period_micros: u64,
+}
+impl CreditDto {
+    fn build(self) -> l2tunnel_flow_control::session_credit::Config {
+        l2tunnel_flow_control::session_credit::Config {
+            floor_datagrams: self.floor_datagrams,
+            ceiling_datagrams: self.ceiling_datagrams,
+            floor_bytes: self.floor_bytes,
+            ceiling_bytes: self.ceiling_bytes,
+            period: Duration::from_micros(self.period_micros),
+            idle_period: Duration::from_micros(self.idle_period_micros),
+        }
+    }
 }
 
 fn invalid(message: &'static str) -> io::Error {

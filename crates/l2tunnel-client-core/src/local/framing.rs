@@ -17,17 +17,47 @@ pub(super) fn response_limit(version: u16) -> usize {
 pub(super) fn invalid(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
 }
-pub(super) async fn read_json<R: AsyncRead + Unpin, T: for<'a> Deserialize<'a>>(
+pub(super) async fn read_frame<R: AsyncRead + Unpin>(
     stream: &mut R,
     maximum: usize,
-) -> io::Result<T> {
+) -> io::Result<Vec<u8>> {
     let count = stream.read_u32().await? as usize;
     if count == 0 || count > maximum {
         return Err(invalid("local API message exceeds bound"));
     }
     let mut bytes = vec![0; count];
     stream.read_exact(&mut bytes).await?;
+    Ok(bytes)
+}
+pub(super) async fn read_json<R: AsyncRead + Unpin, T: for<'a> Deserialize<'a>>(
+    stream: &mut R,
+    maximum: usize,
+) -> io::Result<T> {
+    let bytes = read_frame(stream, maximum).await?;
     serde_json::from_slice(&bytes).map_err(|_| invalid("invalid local API JSON"))
+}
+/// A decoded request of any version this transport understands.
+#[cfg_attr(not(any(unix, windows)), allow(dead_code))]
+pub(super) enum Incoming {
+    Legacy(super::Request),
+    Operations(super::OperationRequest),
+}
+/// Decode the version first, then the strict typed request for that version.
+/// Unknown versions and malformed bodies yield None (closed without reply).
+#[cfg_attr(not(any(unix, windows)), allow(dead_code))]
+pub(super) fn decode_request(bytes: &[u8]) -> Option<Incoming> {
+    #[derive(Deserialize)]
+    struct Probe {
+        version: u16,
+    }
+    let probe: Probe = serde_json::from_slice(bytes).ok()?;
+    if probe.version == super::OPERATIONS_VERSION {
+        serde_json::from_slice(bytes).ok().map(Incoming::Operations)
+    } else if super::supported_version(probe.version) {
+        serde_json::from_slice(bytes).ok().map(Incoming::Legacy)
+    } else {
+        None
+    }
 }
 pub(super) async fn write_json<W: AsyncWrite + Unpin, T: Serialize>(
     stream: &mut W,

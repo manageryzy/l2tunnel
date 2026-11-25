@@ -14,15 +14,24 @@ pub(crate) use proxy_frontend::{
     ServiceEvent as ProxyServiceEvent, ServicePresentation as ProxyServicePresentation,
     serve_shared_for_test as serve_shared_proxy_for_test,
 };
+#[cfg(target_os = "linux")]
+#[path = "cli_daemon.rs"]
+mod daemon;
+#[cfg(any(unix, windows))]
+#[path = "cli_groups.rs"]
+mod groups;
 #[path = "host_runtime_cli.rs"]
 mod host_runtime;
 #[cfg(unix)]
 #[path = "secure_udp/cli.rs"]
 pub(crate) mod secure_udp_frontend;
+#[cfg(target_os = "linux")]
+#[path = "cli_system_service.rs"]
+mod system_service;
 #[path = "cli_tls.rs"]
 mod tls_frontend;
 
-const HELP: &str = "l2tunnel connect|serve --record-profile common --common-transaction-plan PATH --carrier CARRIER. Use inspect-common-transaction-plan before startup. Select a native --device or Ethernet --vxlan-bind/--vxlan-peer/--vni attachment. keygen creates member keys. Current local commands: status, disconnect, reconnect, drain-proxy (API1), common-catalog and switch-common-configuration (API4). Interface setup/routes belong to the caller. Legacy standalone entries are retired; Common active TUN credit and Windows service migration remain unfinished.";
+const HELP: &str = "l2tunnel connect|serve --record-profile common --common-transaction-plan PATH --carrier CARRIER. Use inspect-common-transaction-plan before startup. Select a native --device or Ethernet --vxlan-bind/--vxlan-peer/--vni attachment. keygen creates member keys. Current local commands: status, disconnect, reconnect, drain-proxy (API1), common-catalog and switch-common-configuration (API4). Without --state-dir, interface setup/routes belong to the caller; with --state-dir DIR the service creates owned devices and session routes on request (l2tunnelctl device/route). daemon --control-socket PATH --state-dir DIR runs the long-lived Linux service with stored profiles (l2tunnelctl profile ...; service connect --profile NAME); it starts idle unless a default profile is set. Legacy standalone entries are retired; Common active TUN credit and Windows service migration remain unfinished.";
 fn input(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message.into())
 }
@@ -89,6 +98,7 @@ fn generate(options: &BTreeMap<String, String>) -> io::Result<()> {
     println!("Created member identity and raw public allowlist entry.");
     Ok(())
 }
+#[cfg(any(test, target_os = "linux"))]
 fn configuration(options: &BTreeMap<String, String>) -> io::Result<ConnectionConfig> {
     let layer = match required(options, "--layer")? {
         "tap" => PacketLayer::Ethernet,
@@ -128,6 +138,46 @@ fn configuration(options: &BTreeMap<String, String>) -> io::Result<ConnectionCon
     config.session()?;
     Ok(config)
 }
+/// Options `connect` or `serve` accept (stored profiles use the same set
+/// minus [`local::SERVICE_OPTIONS`]).
+fn run_options(command: &str) -> Vec<&'static str> {
+    let mut allowed = if command == "serve" {
+        vec!["--listen", "--cert", "--key", "--allow-key"]
+    } else {
+        vec!["--remote", "--ca", "--server-name", "--sni", "--identity"]
+    };
+    allowed.extend_from_slice(&[
+        "--control-socket",
+        "--state-dir",
+        "--device",
+        "--vxlan-bind",
+        "--vxlan-peer",
+        "--vni",
+        "--layer",
+        "--duplex",
+        "--max-packet",
+        "--compression",
+        "--runtime-model",
+        "--carrier",
+        "--record-profile",
+        "--traffic",
+        "--proxy-policy",
+        "--udp-bind",
+        "--udp-peer",
+        "--udp-cover",
+        "--raw-policy",
+        "--raw-mark",
+    ]);
+    #[cfg(unix)]
+    allowed.extend_from_slice(secure_udp_frontend::OPTIONS);
+    // Live tuning (docs/modules/live-tuning.md): choices on connect, limits on serve.
+    allowed.extend_from_slice(if command == "serve" {
+        &crate::secure_udp::live_tuning::SERVER_OPTIONS[..]
+    } else {
+        &crate::secure_udp::live_tuning::CLIENT_OPTIONS[..]
+    });
+    allowed
+}
 fn number<T: std::str::FromStr>(
     options: &BTreeMap<String, String>,
     key: &str,
@@ -142,6 +192,9 @@ fn number<T: std::str::FromStr>(
 
 #[cfg(target_os = "linux")]
 async fn execute(command: &str, options: &BTreeMap<String, String>) -> io::Result<()> {
+    if command == "daemon" {
+        return daemon::run(options).await;
+    }
     tls_frontend::preflight(command, options)?;
     let config = configuration(options)?;
     let selected = secure_udp_frontend::selection(command, options, config)?.ok_or_else(|| input(
@@ -157,7 +210,7 @@ async fn execute(_command: &str, _options: &BTreeMap<String, String>) -> io::Res
         "Common native CLI service is not yet implemented on this platform",
     ))
 }
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 async fn execute_api(command: &str, options: &BTreeMap<String, String>) -> io::Result<()> {
     use super::local::{self, Action, Request, VERSION};
     let action = match command {
@@ -248,7 +301,7 @@ async fn execute_api(command: &str, options: &BTreeMap<String, String>) -> io::R
     }
     Ok(())
 }
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 async fn execute_api(_command: &str, _options: &BTreeMap<String, String>) -> io::Result<()> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
@@ -262,7 +315,19 @@ pub fn main_entry(args: impl IntoIterator<Item = String>) -> ExitCode {
         println!("{HELP}");
         #[cfg(unix)]
         println!("\n{}", secure_udp_frontend::HELP);
+        #[cfg(any(unix, windows))]
+        println!("\n{}", groups::HELP);
+        #[cfg(target_os = "linux")]
+        println!("\n{}", system_service::HELP);
         return ExitCode::SUCCESS;
+    }
+    #[cfg(any(unix, windows))]
+    if groups::GROUPS.contains(&args[0].as_str()) {
+        return groups::main(&args);
+    }
+    #[cfg(target_os = "linux")]
+    if args[0] == "system-service" {
+        return system_service::main(&args[1..]);
     }
     if args.as_slice() == ["--version"] {
         println!("l2tunnel {}", env!("CARGO_PKG_VERSION"));
@@ -331,58 +396,14 @@ pub fn main_entry(args: impl IntoIterator<Item = String>) -> ExitCode {
             "--swift-repair-permille",
             "--path-mtu",
         ],
-        "connect" => vec![
-            "--remote",
-            "--control-socket",
-            "--device",
-            "--vxlan-bind",
-            "--vxlan-peer",
-            "--vni",
-            "--layer",
-            "--ca",
-            "--server-name",
-            "--sni",
-            "--identity",
-            "--duplex",
-            "--max-packet",
-            "--compression",
-        ],
-        "serve" => vec![
-            "--listen",
-            "--control-socket",
-            "--device",
-            "--vxlan-bind",
-            "--vxlan-peer",
-            "--vni",
-            "--layer",
-            "--cert",
-            "--key",
-            "--allow-key",
-            "--duplex",
-            "--max-packet",
-            "--compression",
-        ],
+        "connect" | "serve" => run_options(command),
+        #[cfg(target_os = "linux")]
+        "daemon" => vec!["--control-socket", "--state-dir", "--runtime-model"],
         _ => {
             eprintln!("Unknown command. Use --help.");
             return ExitCode::from(2);
         }
     };
-    if matches!(command.as_str(), "connect" | "serve") {
-        allowed.extend_from_slice(&[
-            "--runtime-model",
-            "--carrier",
-            "--record-profile",
-            "--traffic",
-            "--proxy-policy",
-            "--udp-bind",
-            "--udp-peer",
-            "--udp-cover",
-            "--raw-policy",
-            "--raw-mark",
-        ]);
-        #[cfg(unix)]
-        allowed.extend_from_slice(secure_udp_frontend::OPTIONS);
-    }
     let local_api = matches!(
         command.as_str(),
         "status"

@@ -31,6 +31,30 @@ struct TransactionFixtureOptions {
     admission: [[u8; 32]; 2],
     retained_bytes: usize,
     report_interval: Option<Duration>,
+    // Live tuning: both Swift directions on one repair rate, and a client
+    // that proposes a switchable choice (docs/modules/live-tuning.md).
+    live: Option<Live>,
+}
+/// One switchable choice the tuned client proposes.
+#[derive(Clone, Copy)]
+enum Live {
+    FecOff,
+    DeviceMtu(u16),
+}
+impl Live {
+    fn choices(self) -> l2tunnel::live_tuning::Choices {
+        use l2tunnel::live_tuning::{Choices, Repair};
+        match self {
+            Self::FecOff => Choices {
+                repair: vec![Repair::Off],
+                ..Choices::default()
+            },
+            Self::DeviceMtu(mtu) => Choices {
+                device_mtu: vec![mtu],
+                ..Choices::default()
+            },
+        }
+    }
 }
 impl TransactionFixtureOptions {
     fn baseline() -> Self {
@@ -41,6 +65,7 @@ impl TransactionFixtureOptions {
             admission: [[44; 32]; 2],
             retained_bytes: 16 * 1024 * 1024,
             report_interval: None,
+            live: None,
         }
     }
 }
@@ -130,6 +155,10 @@ fn transaction_plans_with(
     forward.records.codec.repair_denominator = 3;
     reverse.records.codec.repair_numerator = 2;
     reverse.records.codec.repair_denominator = 7;
+    if options.live.is_some() {
+        reverse.records.codec.repair_numerator = 1;
+        reverse.records.codec.repair_denominator = 3;
+    }
     let descriptor = |forward: l2tunnel_swift::policy::Direction,
                       reverse: l2tunnel_swift::policy::Direction|
      -> Result<Descriptor> {
@@ -203,8 +232,17 @@ fn transaction_plans_with(
         options.noise_profile,
         options.psk[1].map(Zeroizing::new),
     )?;
+    let client_profile = match options.live {
+        Some(live) => profile
+            .clone()
+            .with_tuning(crate::secure_udp::live_tuning::Policy {
+                choices: Some(live.choices()),
+                ..Default::default()
+            }),
+        None => profile.clone(),
+    };
     let client = Prepared::secure_udp_common_client(
-        profile.clone(),
+        client_profile,
         credentials::Client::new(
             client_noise,
             member,
@@ -568,6 +606,360 @@ pub(super) async fn transaction_service_lifecycle() -> Result {
             assert!(!value.running);
             assert_eq!(value.service_terminal.as_deref(), Some("Aborted"));
         }
+    }
+    Ok(())
+}
+
+/// TT-05 without privileges: two real services joined by real loopback UDP
+/// run built-in speed and ping tests through the local API. The test packets
+/// cross the real Common runtime and protocol, and never reach either device.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tunnel_tests_cross_the_real_session_and_never_reach_a_device() -> Result {
+    use crate::local::tunnel_test::{Direction, TestPhase, TestRequest};
+    use crate::local::{OperationAction, OperationRequest};
+    let hosts = [Arc::new(Host::default()), Arc::new(Host::default())];
+    let TransactionPlans {
+        plans: [client_plan, server_plan],
+        ..
+    } = transaction_plans(l2tunnel_cover::Appearance::QuicLike, &hosts)?;
+    let (client, client_run) = channel();
+    let (server, server_run) = channel();
+    let client_task = tokio::spawn(client_run);
+    let server_task = tokio::spawn(server_run);
+    let a = client
+        .connect(client_plan, client.next_key().map_err(submit)?)
+        .map_err(submit)?;
+    let b = server
+        .connect(server_plan, server.next_key().map_err(submit)?)
+        .map_err(submit)?;
+    tokio::try_join!(connected(&client, a), connected(&server, b))?;
+    let info = client
+        .operations_request(OperationRequest::new(OperationAction::ServiceInfo {}))
+        .await
+        .info
+        .ok_or("service info")?;
+    let tests = info
+        .capabilities
+        .iter()
+        .find(|capability| capability.feature == crate::local::Feature::Tests)
+        .ok_or("tests capability")?;
+    assert!(tests.available, "{tests:?}");
+    let run = |test: TestRequest| {
+        let client = client.clone();
+        async move {
+            let started = client
+                .operations_request(OperationRequest::new(OperationAction::TestStart { test }))
+                .await;
+            assert_eq!(started.code, "accepted", "{started:?}");
+            let id = started
+                .test
+                .and_then(|reply| reply.test)
+                .map(|state| state.id)
+                .ok_or("started test")?;
+            let finished = client
+                .operations_request(OperationRequest::new(OperationAction::TestGet {
+                    id: Some(id),
+                    timeout_ms: 30_000,
+                }))
+                .await;
+            finished.test.and_then(|reply| reply.test).ok_or_else(
+                || -> Box<dyn std::error::Error + Send + Sync> { "finished test".into() },
+            )
+        }
+    };
+    for direction in [Direction::Upload, Direction::Download] {
+        let speed = run(TestRequest::Speed {
+            direction,
+            streams: 2,
+            duration_ms: 2_000,
+        })
+        .await?;
+        assert_eq!(speed.state, TestPhase::Completed, "{speed:?}");
+        assert!(speed.bytes > 0 && speed.bits_per_second > 0, "{speed:?}");
+    }
+    let ping = run(TestRequest::Ping {
+        count: 5,
+        interval_ms: 100,
+    })
+    .await?;
+    assert_eq!(ping.state, TestPhase::Completed, "{ping:?}");
+    let result = ping.ping.ok_or("ping result")?;
+    assert_eq!((result.sent, result.received), (5, 5), "{result:?}");
+    for host in &hosts {
+        assert_no_native_replay(host)?;
+    }
+    client_task.abort();
+    server_task.abort();
+    let _ = tokio::join!(client_task, server_task);
+    Ok(())
+}
+
+#[tokio::test]
+async fn tuned_client_proposes_at_connect_and_switches_fec_off_live() -> Result {
+    use crate::local::{OperationAction, OperationRequest};
+    use l2tunnel::live_tuning::{self as tuning, Choices, Repair, Setting};
+    let hosts = [Arc::new(Host::default()), Arc::new(Host::default())];
+    let choices = Choices {
+        repair: vec![Repair::Off],
+        ..Choices::default()
+    };
+    let TransactionPlans {
+        plans: [client_plan, server_plan],
+        profile,
+        initial,
+        ..
+    } = transaction_plans_with(
+        l2tunnel_cover::Appearance::QuicLike,
+        &hosts,
+        TransactionFixtureOptions {
+            live: Some(Live::FecOff),
+            ..TransactionFixtureOptions::baseline()
+        },
+    )?;
+    let generated = tuning::extend(profile.plan_catalog(), &choices, &tuning::Limits::PROTOCOL)?;
+    assert_eq!(generated.descriptors().len(), 3);
+    let (client, client_run) = channel();
+    let (server, server_run) = channel();
+    let client_task = tokio::spawn(client_run);
+    let server_task = tokio::spawn(server_run);
+    let a = client
+        .connect(client_plan, client.next_key().map_err(submit)?)
+        .map_err(submit)?;
+    let b = server
+        .connect(server_plan, server.next_key().map_err(submit)?)
+        .map_err(submit)?;
+    tokio::try_join!(connected(&client, a), connected(&server, b))?;
+    // Both ends report the generated catalog, and the base setup identity.
+    for handle in [&client, &server] {
+        let observed = status(handle)?;
+        assert_eq!(observed.catalog, *generated.root().as_bytes());
+        assert_eq!(observed.catalog_members, 3);
+        assert_eq!(observed.configuration, profile.configuration()?.0);
+    }
+    let first_epoch = status(&client)?.epoch.ok_or("epoch")?;
+    every_channel(&hosts, [2, 3], 41).await?;
+    let off = Setting {
+        repair: Repair::Off,
+        ..tuning::setting(&initial.descriptor().clone())?
+    };
+    let descriptor = generated
+        .descriptors()
+        .iter()
+        .copied()
+        .find(|d| tuning::setting(d).is_ok_and(|s| s == off))
+        .ok_or("FEC-off entry")?;
+    let target = Configuration::new(profile.envelope(), descriptor)?;
+    let key = client.next_key().map_err(submit)?;
+    let accepted = client.apply_common(target, key).map_err(submit)?;
+    let completed = timeout(Duration::from_secs(3), client.wait(accepted.operation))
+        .await?
+        .map_err(submit)?;
+    let Completed::Common {
+        outcome: Ok(epoch), ..
+    } = completed
+    else {
+        return Err(format!("live FEC-off switch did not apply: {completed:?}").into());
+    };
+    assert_eq!(epoch.0, first_epoch + 1);
+    assert_current(&status(&client)?, target, first_epoch + 1)?;
+    expect_follower_current(&server, target, first_epoch + 1).await?;
+    every_channel(&hosts, [2, 3], 81).await?;
+
+    // The same switch by setting through the local API (decision 10).
+    let reply = client
+        .operations_request(OperationRequest::new(OperationAction::TuningGet {}))
+        .await;
+    assert!(reply.ok, "{reply:?}");
+    let view = reply.tuning.ok_or("tuning view")?;
+    assert!(view.live);
+    assert_eq!(view.repair, ["off", "1/3"]);
+    assert_eq!(view.entries.len(), 2, "plan target entry is not symmetric");
+    let current = view.current.clone().ok_or("current setting")?;
+    assert_eq!(current.repair, "off");
+    let fec = crate::local::TuningSetting {
+        repair: "1/3".into(),
+        ..current.clone()
+    };
+    let key = client.next_key().map_err(submit)?;
+    let reply = client
+        .operations_request(OperationRequest::new(OperationAction::TuningSwitch {
+            request_key: key.value(),
+            setting: fec.clone(),
+        }))
+        .await;
+    assert!(reply.ok, "{reply:?}");
+    let operation = reply.operation.ok_or("accepted operation")?.id;
+    let reply = client
+        .operations_request(OperationRequest::new(OperationAction::OperationWait {
+            operation,
+            timeout_ms: 3000,
+            service: None,
+        }))
+        .await;
+    assert_eq!(
+        reply.operation.as_ref().map(|state| state.state.as_str()),
+        Some("completed"),
+        "{reply:?}"
+    );
+    assert_current(&status(&client)?, initial, first_epoch + 2)?;
+    expect_follower_current(&server, initial, first_epoch + 2).await?;
+    every_channel(&hosts, [2, 3], 121).await?;
+    // A setting the catalog lacks is refused before any switch.
+    let key = client.next_key().map_err(submit)?;
+    let reply = client
+        .operations_request(OperationRequest::new(OperationAction::TuningSwitch {
+            request_key: key.value(),
+            setting: crate::local::TuningSetting {
+                device_mtu: fec.device_mtu - 1,
+                ..fec
+            },
+        }))
+        .await;
+    assert_eq!((reply.ok, reply.code.as_str()), (false, "not_in_catalog"));
+    client_task.abort();
+    server_task.abort();
+    let _ = tokio::join!(client_task, server_task);
+    Ok(())
+}
+
+#[tokio::test]
+async fn tuned_device_mtu_is_lowered_on_both_ends_before_the_switch_and_restored_after() -> Result {
+    use l2tunnel::live_tuning::{self as tuning, Setting};
+    let hosts = [Arc::new(Host::default()), Arc::new(Host::default())];
+    let probe = transaction_plans_with(
+        l2tunnel_cover::Appearance::QuicLike,
+        &hosts,
+        TransactionFixtureOptions {
+            live: Some(Live::FecOff),
+            ..TransactionFixtureOptions::baseline()
+        },
+    )?;
+    let base = tuning::setting(&probe.initial.descriptor().clone())?.device_mtu;
+    drop(probe);
+    let lower = base - 200;
+    let TransactionPlans {
+        plans: [client_plan, server_plan],
+        profile,
+        initial,
+        ..
+    } = transaction_plans_with(
+        l2tunnel_cover::Appearance::QuicLike,
+        &hosts,
+        TransactionFixtureOptions {
+            live: Some(Live::DeviceMtu(lower)),
+            ..TransactionFixtureOptions::baseline()
+        },
+    )?;
+    let generated = tuning::extend(
+        profile.plan_catalog(),
+        &Live::DeviceMtu(lower).choices(),
+        &tuning::Limits::PROTOCOL,
+    )?;
+    let (client, client_run) = channel();
+    let (server, server_run) = channel();
+    let client_task = tokio::spawn(client_run);
+    let server_task = tokio::spawn(server_run);
+    let a = client
+        .connect(client_plan, client.next_key().map_err(submit)?)
+        .map_err(submit)?;
+    let b = server
+        .connect(server_plan, server.next_key().map_err(submit)?)
+        .map_err(submit)?;
+    tokio::try_join!(connected(&client, a), connected(&server, b))?;
+    let base = u32::from(base);
+    let lower_mtu = u32::from(lower);
+    // Both services set the device to the initial entry's size.
+    let settled = |host: &Arc<Host>, mtu: u32| {
+        let host = host.clone();
+        async move {
+            for _ in 0..300 {
+                if host.mtu.current() == mtu {
+                    return true;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            false
+        }
+    };
+    for host in &hosts {
+        assert!(settled(host, base).await, "initial device MTU");
+    }
+    every_channel(&hosts, [2, 3], 51).await?;
+    let first_epoch = status(&client)?.epoch.ok_or("epoch")?;
+
+    // Switch down: each end lowers its device before its switch step.
+    let down = Setting {
+        device_mtu: lower,
+        ..tuning::setting(&initial.descriptor().clone())?
+    };
+    let descriptor = generated
+        .descriptors()
+        .iter()
+        .copied()
+        .find(|d| tuning::setting(d).is_ok_and(|s| s == down))
+        .ok_or("lower entry")?;
+    let target = Configuration::new(profile.envelope(), descriptor)?;
+    let key = client.next_key().map_err(submit)?;
+    let accepted = client.apply_common(target, key).map_err(submit)?;
+    let completed = timeout(Duration::from_secs(3), client.wait(accepted.operation))
+        .await?
+        .map_err(submit)?;
+    let switched_down = std::time::Instant::now();
+    let Completed::Common {
+        outcome: Ok(epoch), ..
+    } = completed
+    else {
+        return Err(format!("device MTU switch down did not apply: {completed:?}").into());
+    };
+    assert_eq!(epoch.0, first_epoch + 1);
+    expect_follower_current(&server, target, first_epoch + 1).await?;
+    let lowered = |host: &Arc<Host>| {
+        host.mtu
+            .changes()
+            .iter()
+            .find(|(mtu, _)| *mtu == lower_mtu)
+            .map(|(_, at)| *at)
+    };
+    let leader = lowered(&hosts[0]).ok_or("client device not lowered")?;
+    let follower = lowered(&hosts[1]).ok_or("server device not lowered")?;
+    // The leader lowers before it proposes, the follower before it
+    // acknowledges; the switch completes after both.
+    assert!(leader < follower);
+    assert!(follower < switched_down);
+    every_channel(&hosts, [2, 3], 91).await?;
+
+    // Switch up: both raise after the switch.
+    let key = client.next_key().map_err(submit)?;
+    let accepted = client.apply_common(initial, key).map_err(submit)?;
+    let completed = timeout(Duration::from_secs(3), client.wait(accepted.operation))
+        .await?
+        .map_err(submit)?;
+    let Completed::Common { outcome: Ok(_), .. } = completed else {
+        return Err(format!("device MTU switch up did not apply: {completed:?}").into());
+    };
+    for host in &hosts {
+        assert!(settled(host, base).await, "raised device MTU");
+        let values: Vec<u32> = host.mtu.changes().iter().map(|(mtu, _)| *mtu).collect();
+        assert_eq!(values, [base, lower_mtu, base]);
+    }
+    let snapshot = status(&client)?;
+    assert_eq!(
+        usize::from(snapshot.catalog_members),
+        generated.descriptors().len()
+    );
+    let reported = snapshot.device_mtu.ok_or("device MTU status")?;
+    assert_eq!(
+        (reported.applied, reported.wanted, reported.failures),
+        (Some(base), Some(base), 0)
+    );
+    every_channel(&hosts, [2, 3], 131).await?;
+
+    // Ending the session restores the MTU from before it.
+    client_task.abort();
+    server_task.abort();
+    let _ = tokio::join!(client_task, server_task);
+    for host in &hosts {
+        assert!(settled(host, 1500).await, "restored device MTU");
     }
     Ok(())
 }

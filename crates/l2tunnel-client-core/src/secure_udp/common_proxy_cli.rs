@@ -331,6 +331,7 @@ pub(super) async fn serve_prepared(
         .map(crate::local::Server::bind)
         .transpose()?;
     let (handle, run) = service::channel();
+    service::host::attach_state_dir(&handle, options.get("--state-dir")).await?;
     let submit = |error| io::Error::other(format!("Common proxy service: {error:?}"));
     let accepted = handle
         .connect(plan, handle.next_key().map_err(submit)?)

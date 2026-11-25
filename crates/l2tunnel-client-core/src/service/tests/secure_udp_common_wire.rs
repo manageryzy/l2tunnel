@@ -294,7 +294,7 @@ async fn actual_common_compact_wire_service_authenticates_selected_h0_status_and
                     let requested = CompactWireSelection {
                         version: 3,
                         data_protection,
-                        max_forward_packets: 8192,
+                        max_forward_packets: 32_768,
                         max_failed_checks: 64,
                     };
                     let selection = requested.build()?;

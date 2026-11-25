@@ -45,11 +45,62 @@ impl PacketDevice for Pipe {
         Ok(())
     }
 }
+/// A device whose MTU changes are recorded, in order, with when they
+/// finished (live tuning, decision 9).
+struct RecordedMtu {
+    mtu: Mutex<u32>,
+    changes: Mutex<Vec<(u32, std::time::Instant)>>,
+}
+impl Default for RecordedMtu {
+    fn default() -> Self {
+        Self {
+            mtu: Mutex::new(1500),
+            changes: Mutex::new(Vec::new()),
+        }
+    }
+}
+impl RecordedMtu {
+    fn changes(&self) -> Vec<(u32, std::time::Instant)> {
+        self.changes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+    fn current(&self) -> u32 {
+        *self
+            .mtu
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+impl crate::service::device_mtu::DeviceMtuHost for RecordedMtu {
+    fn get(&self) -> crate::service::device_mtu::MtuFuture<'_, u32> {
+        let mtu = self.current();
+        Box::pin(async move { Ok(mtu) })
+    }
+    fn set(&self, mtu: u32) -> crate::service::device_mtu::MtuFuture<'_, ()> {
+        Box::pin(async move {
+            // A visible delay: the switch must wait for it.
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            *self
+                .mtu
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = mtu;
+            self.changes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push((mtu, std::time::Instant::now()));
+            Ok(())
+        })
+    }
+}
+
 #[derive(Default)]
 struct Host {
     application: Mutex<Option<UnixDatagram>>,
     opened: AtomicUsize,
     live: AtomicUsize,
+    mtu: Arc<RecordedMtu>,
 }
 impl Host {
     fn attachment(self: &Arc<Self>) -> Attachment {
@@ -57,6 +108,7 @@ impl Host {
     }
     fn attachment_for(self: &Arc<Self>, layer: PacketLayer) -> Attachment {
         let host = self.clone();
+        let mtu = self.mtu.clone();
         Attachment::readable(layer, move || {
             let (socket, application) = UnixDatagram::pair()?;
             socket.set_nonblocking(true)?;
@@ -73,6 +125,7 @@ impl Host {
                 layer,
             }))
         })
+        .with_device_mtu(mtu)
     }
     fn send(&self, packet: &[u8]) -> io::Result<()> {
         let application = self

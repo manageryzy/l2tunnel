@@ -87,6 +87,12 @@ async fn generic_connect_key_identity_history_and_future_bounds_use_real_prepare
 #[tokio::test]
 async fn generic_apply_waiter_replay_catalog_and_replacement_preserve_one_actual_switch() -> Result
 {
+    // The body's future is about 400 KB in debug builds; keep it off the
+    // 2 MiB test-thread stack, which the service's setup path also needs.
+    Box::pin(apply_waiter_replay_catalog_and_replacement()).await
+}
+
+async fn apply_waiter_replay_catalog_and_replacement() -> Result {
     for appearance in appearances() {
         let hosts = hosts();
         let fixture = transaction_plans(appearance, &hosts)?;

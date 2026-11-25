@@ -34,20 +34,30 @@ l2tunnel-auth = { path = "../l2tunnel-auth" }
 l2tunnel-core = { path = "../l2tunnel-core" }
 l2tunnel-device = { path = "../l2tunnel-device" }
 l2tunnel-runtime = { path = "../l2tunnel-runtime" }
+l2tunnel-tunnel-test = { path = "../l2tunnel-tunnel-test" }
+l2tunnel-meters = { path = "../l2tunnel-meters" }
 l2tunnel-datagram = { path = "../l2tunnel-datagram" }
 l2tunnel-udp = { path = "../l2tunnel-udp" }
 l2tunnel-quic = { path = "../l2tunnel-quic" }
 ring = "=0.17.14"
-tokio = { version = "=1.53.1", features = ["net", "time", "rt-multi-thread"] }
+tokio = { version = "=1.53.1", features = ["net", "time", "rt-multi-thread", "io-util", "sync", "macros"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 l2tunnel-platform-linux = { path = "../l2tunnel-platform-linux" }
+
+[target.'cfg(windows)'.dependencies]
+l2tunnel-platform-windows = { path = "../l2tunnel-platform-windows" }
+# UAC prompt for the elevated service start (local::elevate); the crate owns
+# the ShellExecuteExW FFI, so this crate keeps no `unsafe`.
+runas = "=1.2.0"
 
 [target.'cfg(unix)'.dependencies]
 rustix = { version = "=1.1.4", features = ["process", "fs", "net"] }
 
 [dev-dependencies]
 tokio = { version = "=1.53.1", features = ["test-util"] }
+# Portable pipe-name constants only (help text test); no Windows I/O on Unix.
+l2tunnel-platform-windows = { path = "../l2tunnel-platform-windows" }
 l2tunnel-reliable = { path = "../l2tunnel-reliable" }
 l2tunnel-packet = { path = "../l2tunnel-packet" }
 rcgen = { version = "=0.14.10", default-features = false, features = ["ring"] }

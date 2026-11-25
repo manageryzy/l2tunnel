@@ -63,6 +63,7 @@ impl UdpClientProfile {
         let appearance = match manifest.cover.as_str() {
             "quic-like" => l2tunnel_cover::Appearance::QuicLike,
             "media-like" => l2tunnel_cover::Appearance::MediaLike,
+            "tls-like" => l2tunnel_cover::Appearance::TlsLike,
             _ => return Err(invalid("unsupported UDP cover")),
         };
         let pattern = match manifest.noise_profile.as_str() {

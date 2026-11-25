@@ -93,6 +93,23 @@ fn compact_plan_is_mandatory_with_strict_optional_protection_selection() -> io::
             "chacha20-poly1305"
         );
         assert_eq!(legacy.compact_wire().limits.max_failed_checks, u32::MAX);
+        // A forward limit below 4 x the credit ceiling (2,048) is clamped and
+        // reported, not refused.
+        for (forward, ceiling) in [(8192_u32, 2048_u64), (4096, 1024)] {
+            let mut value = base.clone();
+            value["compact_wire"] = selected.clone();
+            value["compact_wire"]["max_forward_packets"] = json!(forward);
+            let profile = decode(&value)?.build(connection, settings, peers, body, overhead)?;
+            let lines = crate::cli::secure_udp_frontend::common_cli_output::inspection(
+                &profile,
+                Role::Initiator,
+            )?;
+            let credit = &lines[0]["credit"];
+            assert_eq!(credit["record_receive_range"], forward, "{credit}");
+            assert_eq!(credit["requested_datagrams"][1], 2048, "{credit}");
+            assert_eq!(credit["effective_datagrams"][1], ceiling, "{credit}");
+            assert_eq!(credit["warning"].is_null(), forward == 8192, "{credit}");
+        }
         let mut h0 = Vec::new();
         for protection in ["aes-ccm-4", "chacha20-crc32c"] {
             let mut value = base.clone();

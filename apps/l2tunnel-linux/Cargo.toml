@@ -8,5 +8,20 @@ publish.workspace = true
 [lints]
 workspace = true
 
+[features]
+# Desktop GUI binary (docs/modules/desktop-gui.md). Off by default so the
+# headless tunnel build never compiles GUI dependencies.
+gui = ["dep:l2tunnel-desktop-ui"]
+
+[[bin]]
+name = "l2tunnel-linux"
+path = "src/main.rs"
+
+[[bin]]
+name = "l2tunnel-linux-gui"
+path = "src/gui/main.rs"
+required-features = ["gui"]
+
 [dependencies]
 l2tunnel-client-core = { path = "../../crates/l2tunnel-client-core" }
+l2tunnel-desktop-ui = { path = "../../crates/l2tunnel-desktop-ui", optional = true }

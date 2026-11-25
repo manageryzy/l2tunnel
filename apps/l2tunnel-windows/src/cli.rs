@@ -7,7 +7,9 @@ use l2tunnel_platform_windows::Config;
 use std::{collections::BTreeMap, io, net::SocketAddr, path::PathBuf, time::Duration};
 
 /// Accepted configuration syntax and explicit execution capability limits.
-pub const HELP: &str = "l2tunnel-windows common-worker --profile DIR --wintun-dll ABSOLUTE_DLL --wintun-sha256 HEX64 --address IPV4/PREFIX\nThe Windows GUI host runs this child using private framed API4 requests. Original UDP Common uses an authenticated peer and an explicitly pinned Wintun L3 adapter. The legacy tcp-tls connect command only validates its configuration. Other commands: plan, --help, --version.";
+pub const HELP: &str = r"l2tunnel-windows service install HOST_OPTIONS | service start | service install-start ENCODED | service uninstall | service run HOST_OPTIONS | foreground HOST_OPTIONS
+HOST_OPTIONS: --profile ABSOLUTE_DIR --wintun-dll ABSOLUTE_DLL --wintun-sha256 HEX64 --address IPV4/PREFIX [--pipe \\.\pipe\NAME]
+The installed service (LocalSystem, manual start) owns the original UDP Common tunnel with an explicitly pinned Wintun L3 adapter and serves local API v1/v4/v5 on the named pipe (default \\.\pipe\l2tunnel). Use the nonprivileged l2tunnelctl or l2tunnel-windows-gui with --control-socket/--socket set to that pipe. `service start` starts the installed service and waits until it runs; `service install-start` is the UAC entry of `l2tunnelctl service start --install` and the GUI (host options hex-encoded as one argument). `service run` is only for the service control manager; `foreground` serves in an elevated console until Ctrl+C. The tunnel stays disconnected until a client submits connect. The legacy tcp-tls connect command only validates its configuration. Other commands: plan, --help, --version.";
 
 /// One parsed command; parsing opens no sockets, credentials or devices.
 pub enum Command {
@@ -180,6 +182,13 @@ pub fn parse(args: &[String]) -> io::Result<Command> {
         server_name: server_name.to_owned(),
         sni,
     })))
+}
+
+/// Check device input shapes (absolute DLL, SHA-256 pin, address/prefix)
+/// before a profile supplies the MTU and peer for [`device_config`].
+pub(crate) fn device_shape(dll: &str, pin: &str, address: &str) -> io::Result<()> {
+    let unspecified = SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, 0));
+    device_config(dll, pin, address, 1280, unspecified).map(drop)
 }
 
 pub(crate) fn device_config(

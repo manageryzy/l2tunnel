@@ -211,14 +211,22 @@ impl RawCarrier {
         }
         let number = |n| u64::try_from(n).map_err(invalid);
         let geometry = outer.geometry();
+        let expected_record_overhead = if inner_cover == "tls-like" {
+            l2tunnel_raw_io::handoff::pairing::packet::compact::TLS_RECORD_HEADER_BYTES
+        } else {
+            0
+        };
         let final_framing = snapshot
             .and_then(|value| value.raw_final_geometry.map(|actual| (value, actual)))
             .map(|(value, actual)| {
+                let physical = actual
+                    .ip_tcp_bytes
+                    .checked_add(actual.record_overhead_bytes)
+                    .ok_or_else(|| invalid("actual raw physical overhead overflow"))?;
                 if actual.ip_tcp_bytes != 40
-                    || actual.record_overhead_bytes != 0
+                    || actual.record_overhead_bytes != expected_record_overhead
                     || actual.path_mtu != geometry.path_mtu
-                    || actual.max_record_bytes.checked_add(actual.ip_tcp_bytes)
-                        != Some(actual.path_mtu)
+                    || actual.max_record_bytes.checked_add(physical) != Some(actual.path_mtu)
                 {
                     return Err(invalid(
                         "actual raw final geometry differs from compact carrier",
@@ -230,14 +238,12 @@ impl RawCarrier {
                     record_overhead_bytes: number(actual.record_overhead_bytes)?,
                     max_record_bytes: number(actual.max_record_bytes)?,
                     data_overhead_bytes: number(
-                        actual
-                            .ip_tcp_bytes
+                        physical
                             .checked_add(value.effective_data_overhead_bytes)
                             .ok_or_else(|| invalid("actual raw data overhead overflow"))?,
                     )?,
                     control_feedback_overhead_bytes: number(
-                        actual
-                            .ip_tcp_bytes
+                        physical
                             .checked_add(l2tunnel::secure_record::compact::AUTHENTICATED_OVERHEAD)
                             .ok_or_else(|| invalid("actual raw control overhead overflow"))?,
                     )?,

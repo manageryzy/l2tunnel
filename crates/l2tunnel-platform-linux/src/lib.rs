@@ -1,6 +1,11 @@
 //! Linux-only nonblocking TAP/TUN adapter with one isolated ioctl boundary.
-//! No routes, bridges, sysctls or persistence flags are changed by this crate.
+//! `TunTap::attach` changes no routes, bridges, sysctls or persistence flags.
+//! The service-owned device and route operations (CL-22/CL-23) are separate:
+//! `TunTap::create_persistent` and the netlink [`netconf`] module.
 #![cfg(target_os = "linux")]
+
+/// Service-side netlink configuration of links, addresses and routes.
+pub mod netconf;
 
 use l2tunnel_device::{PacketDevice, PacketLayer};
 use std::fs::{File, OpenOptions};
@@ -102,6 +107,35 @@ impl TunTap {
     pub fn name(&self) -> &str {
         &self.name
     }
+    /// Create (or adopt) a persistent named device owned by `owner` (a uid),
+    /// as `ip tuntap add` does; it survives this process. Returns the
+    /// effective name. Requires CAP_NET_ADMIN.
+    pub fn create_persistent(
+        name: &str,
+        layer: PacketLayer,
+        owner: Option<u32>,
+    ) -> io::Result<String> {
+        let device = Self::attach(name, layer)?;
+        let fd = device.file.as_raw_fd();
+        if let Some(owner) = owner {
+            value_ioctl(fd, libc::TUNSETOWNER, libc::c_ulong::from(owner))?;
+        }
+        value_ioctl(fd, libc::TUNSETPERSIST, 1)?;
+        Ok(device.name)
+    }
+}
+
+// SAFETY REVIEW: TUNSETOWNER and TUNSETPERSIST take their argument by value;
+// no pointer crosses the boundary and the FD stays owned by the caller.
+#[allow(unsafe_code)]
+fn value_ioctl(fd: RawFd, request: libc::c_ulong, value: libc::c_ulong) -> io::Result<()> {
+    // SAFETY: fd is a live /dev/net/tun descriptor attached by TUNSETIFF; both
+    // requests read only the integer argument.
+    let result = unsafe { libc::ioctl(fd, request as _, value) };
+    if result < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 impl AsRawFd for TunTap {
     /// Borrowed descriptor for readiness registration; the device keeps ownership.

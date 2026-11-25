@@ -238,6 +238,7 @@ impl LocalSnapshot {
         let cover = |value| match value {
             l2tunnel_cover::Appearance::QuicLike => UdpCover::QuicLike,
             l2tunnel_cover::Appearance::MediaLike => UdpCover::MediaLike,
+            l2tunnel_cover::Appearance::TlsLike => UdpCover::NotApplicable,
         };
         let mut value = Self::observed(lanes, snapshot);
         let carrier = maintained.map_or(Carrier::CommonUdp, |request| match request.kind {

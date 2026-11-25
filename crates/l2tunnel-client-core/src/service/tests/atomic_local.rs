@@ -33,6 +33,8 @@ fn member() -> Result<l2tunnel_identity::IdentityKey> {
 struct Fixture {
     old: Prepared,
     generic: Prepared,
+    /// Server-role plan of the same profile (session list/kick admission).
+    server: Prepared,
     old_backend: ObservedBackend,
     generic_backend: ObservedBackend,
     initial: Configuration,
@@ -142,6 +144,20 @@ fn fixture() -> Result<Fixture> {
         Prepared::secure_udp_common_client((*old_profile).clone(), credentials()?, attachment())?;
     let generic =
         Prepared::secure_udp_common_client((*profile).clone(), credentials()?, attachment())?;
+    let server = Prepared::secure_udp_common_server(
+        (*profile).clone(),
+        credentials::Server::new(
+            credentials::NoiseIdentity::new(
+                Zeroizing::new([22; 32]),
+                peers.initiator,
+                hs::Profile::Ik,
+                None,
+            )?,
+            credentials::Secret32::new(Zeroizing::new([44; 32]))?,
+            credentials::Secret32::new(Zeroizing::new([55; 32]))?,
+        )?,
+        attachment(),
+    )?;
     let backend =
         |requested: Arc<transaction_profile::Profile>, generation| -> Result<ObservedBackend> {
             let settings = requested.settings();
@@ -168,6 +184,7 @@ fn fixture() -> Result<Fixture> {
                     requested,
                     info,
                     counters: Mutex::new(None),
+                    observed: Mutex::new(None),
                     switcher,
                     generation,
                 },
@@ -178,6 +195,7 @@ fn fixture() -> Result<Fixture> {
     Ok(Fixture {
         old,
         generic,
+        server,
         old_backend,
         generic_backend,
         initial,
@@ -443,5 +461,49 @@ async fn pending_complete_configuration_is_unknown_when_service_owner_drops() ->
         .ok_or("retained generic frame")?;
     assert_eq!(frame.service_terminal, Some(Terminal::Aborted));
     assert!(frame.runtime.is_none());
+    Ok(())
+}
+
+#[test]
+fn server_session_list_and_kick_admission_relisten_with_the_retained_plan() -> Result {
+    let fixture = fixture()?;
+    let (handle, _run) = channel();
+    let error = |error: SubmitError| format!("unexpected service result: {error:?}");
+    // No plan, then a client plan: sessions are server-only.
+    assert_eq!(handle.sessions(), Err(SubmitError::Unsupported));
+    assert_eq!(handle.kick(RequestKey(1)), Err(SubmitError::State));
+    install(&handle, &fixture.generic, &fixture.generic_backend, 22);
+    assert_eq!(handle.sessions(), Err(SubmitError::Unsupported));
+    assert_eq!(handle.kick(RequestKey(1)), Err(SubmitError::Unsupported));
+    // A server plan that is not connected lists nothing and cannot be kicked.
+    {
+        let mut state = handle.0.lock();
+        state.plan = Some(fixture.server.clone());
+        state.backend = None;
+        state.snapshot.phase = Phase::Disconnected;
+        state.snapshot.generation = None;
+    }
+    assert_eq!(handle.sessions().map_err(error)?, Vec::new());
+    assert_eq!(handle.kick(RequestKey(1)), Err(SubmitError::State));
+    // Live server generation: one session; a kick reconnects with the same plan.
+    install(&handle, &fixture.server, &fixture.generic_backend, 22);
+    handle.0.lock().connected_at = Some(Instant::now());
+    let sessions = handle.sessions().map_err(error)?;
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(sessions[0].generation, 22);
+    assert!(sessions[0].connected_ms.is_some());
+    assert_eq!((&sessions[0].profile, &sessions[0].member), (&None, &None));
+    let accepted = handle.kick(RequestKey(1)).map_err(error)?;
+    assert!(matches!(
+        handle.0.lock().queued.as_ref().map(|job| &job.command),
+        Some(Command::Reconnect(plan)) if Arc::ptr_eq(&plan.identity, &fixture.server.identity)
+    ));
+    // Exact replay returns the same operation; another action on the key conflicts.
+    assert_eq!(handle.kick(RequestKey(1)), Ok(accepted));
+    assert_eq!(handle.disconnect(RequestKey(1)), Err(SubmitError::Conflict));
+    assert_eq!(handle.kick(RequestKey(2)), Err(SubmitError::Busy));
+    // The relisten is a reconnect setup, so it can be cancelled.
+    assert_eq!(handle.cancel(accepted.operation), Ok(()));
+    assert_eq!(fixture.opened.load(Ordering::SeqCst), 0);
     Ok(())
 }

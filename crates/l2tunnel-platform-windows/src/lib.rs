@@ -1,8 +1,12 @@
-//! Safe Windows Wintun L3 boundary; no protocol, authentication or service engine.
+//! Safe Windows Wintun L3 boundary and local API pipe security; no protocol,
+//! authentication or service engine.
 //!
 //! Construction is privileged, blocking platform work. Packet operations are
-//! nonblocking. The maintained `tun-rs` dependency owns its reviewed native FFI;
-//! this crate inherits the workspace's `unsafe_code = "forbid"` policy.
+//! nonblocking. The maintained `tun-rs` dependency owns its reviewed native FFI
+//! for the device. The crate denies `unsafe` everywhere except the single
+//! documented named-pipe security module `local_pipe::ffi`
+//! (docs/modules/windows-local-service.md, WLS-03), which is the narrow
+//! exception this crate's `[lints]` table exists for.
 
 #[cfg(any(windows, test))]
 use l2tunnel_device::MAX_PACKET_BYTES;
@@ -14,6 +18,8 @@ use std::io::Read;
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 
+/// Local API named-pipe names, proposed access policy and security boundary.
+pub mod local_pipe;
 #[cfg(windows)]
 mod native;
 #[cfg(windows)]

@@ -104,6 +104,16 @@ enum Built {
     Records(Box<secure_udp::common_transaction_profile::Profile>),
     Proxy(Box<secure_udp::common_transaction_profile::Profile>),
 }
+impl Built {
+    /// Apply the live-tuning run options of `command` (docs/modules/live-tuning.md).
+    fn tuned(self, command: &str, options: &BTreeMap<String, String>) -> io::Result<Self> {
+        let policy = secure_udp::live_tuning::policy(command, options)?;
+        Ok(match self {
+            Self::Records(profile) => Self::Records(Box::new(profile.with_tuning(policy))),
+            Self::Proxy(profile) => Self::Proxy(Box::new(profile.with_tuning(policy))),
+        })
+    }
+}
 impl Selected {
     fn common(&self) -> Common {
         match &self.0 {
@@ -148,18 +158,14 @@ impl Selected {
                 }
                 if let Some(selected) = &self.2 {
                     let policy = selected.settings.packet_policy();
+                    let tls_cover = common.appearance == l2tunnel_cover::Appearance::TlsLike;
                     let geometry = policy.record_geometry().map_err(io::Error::other)?;
-                    let (overhead, _) = common.raw_geometry(
-                        &mut raw,
-                        geometry,
-                        policy.final_record_geometry().map_err(io::Error::other)?,
-                    )?;
-                    let maximum_body = plan.protected_body_capacity(
-                        policy
-                            .final_record_geometry()
-                            .map_err(io::Error::other)?
-                            .max_record_bytes,
-                    )?;
+                    let final_geometry = policy
+                        .final_record_geometry_with_tls_cover(tls_cover)
+                        .map_err(io::Error::other)?;
+                    let (overhead, _) = common.raw_geometry(&mut raw, geometry, final_geometry)?;
+                    let maximum_body =
+                        plan.protected_body_capacity(final_geometry.max_record_bytes)?;
                     return plan
                         .build_raw(connection, raw, peers, maximum_body, overhead, policy)
                         .map(Box::new)
@@ -198,7 +204,11 @@ impl Selected {
                     )
                 } else if let Some(value) = packet {
                     let geometry = value.record_geometry().map_err(io::Error::other)?;
-                    let final_geometry = value.final_record_geometry().map_err(io::Error::other)?;
+                    let final_geometry = value
+                        .final_record_geometry_with_tls_cover(
+                            common.appearance == l2tunnel_cover::Appearance::TlsLike,
+                        )
+                        .map_err(io::Error::other)?;
                     let (overhead, _) = common.raw_geometry(&mut raw, geometry, final_geometry)?;
                     (
                         overhead,
@@ -335,18 +345,21 @@ fn selection_for(
     let appearance = match options.get("--carrier").map(String::as_str) {
         Some("quic-like") => l2tunnel_cover::Appearance::QuicLike,
         Some("media-like") => l2tunnel_cover::Appearance::MediaLike,
+        Some("tls-like") => l2tunnel_cover::Appearance::TlsLike,
         Some("tcp" | "quic") if maintained_selected => match required(options, "--udp-cover")? {
             "quic-like" => l2tunnel_cover::Appearance::QuicLike,
             "media-like" => l2tunnel_cover::Appearance::MediaLike,
+            "tls-like" => l2tunnel_cover::Appearance::TlsLike,
             _ => return Err(input("maintained Common requires explicit bootstrap cover")),
         },
         Some("raw-packet") if carrier == Carrier::RawPacket => {
             match required(options, "--udp-cover")? {
                 "quic-like" => l2tunnel_cover::Appearance::QuicLike,
                 "media-like" => l2tunnel_cover::Appearance::MediaLike,
+                "tls-like" => l2tunnel_cover::Appearance::TlsLike,
                 _ => {
                     return Err(input(
-                        "raw Common requires explicit inner quic-like or media-like cover",
+                        "raw Common requires explicit inner quic-like, media-like or tls-like cover",
                     ));
                 }
             }
@@ -355,9 +368,10 @@ fn selection_for(
             match required(options, "--udp-cover")? {
                 "quic-like" => l2tunnel_cover::Appearance::QuicLike,
                 "media-like" => l2tunnel_cover::Appearance::MediaLike,
+                "tls-like" => l2tunnel_cover::Appearance::TlsLike,
                 _ => {
                     return Err(input(
-                        "OpenVPN Common requires explicit inner cover quic-like or media-like",
+                        "OpenVPN Common requires explicit inner cover quic-like, media-like or tls-like",
                     ));
                 }
             }
@@ -384,6 +398,7 @@ fn selection_for(
         "--udp-peer",
         "--path-mtu",
         "--control-socket",
+        "--state-dir",
         "--identity",
         "--allow-key",
         "--swift-forward-kbit",
@@ -412,6 +427,9 @@ fn selection_for(
         || options.keys().any(|key| {
             !(allowed.contains(&key.as_str())
                 || OPTIONS.contains(&key.as_str())
+                || records_plan
+                    && (secure_udp::live_tuning::CLIENT_OPTIONS.contains(&key.as_str())
+                        || secure_udp::live_tuning::SERVER_OPTIONS.contains(&key.as_str()))
                 || carrier != Carrier::OriginalUdp && carrier_options.contains(&key.as_str())
                 || matches!(carrier, Carrier::Maintained(_))
                     && ["--remote", "--listen"].contains(&key.as_str())
@@ -432,6 +450,7 @@ fn selection_for(
             || [
                 "--device",
                 "--control-socket",
+                "--state-dir",
                 "--session-admission-key-file",
                 "--session-cookie-key-file",
                 "--runtime-model",
@@ -732,6 +751,8 @@ impl Selection {
             receive_records: 32,
             send_bytes: 8192,
             receive_bytes: 8192,
+            initial_rto: Duration::from_millis(120),
+            maximum_rto: Duration::from_millis(500),
             ..l2tunnel_recovery::ArqConfig::default()
         };
         let pair_cost = recovery.max_source_bytes
@@ -798,6 +819,14 @@ impl Selection {
             connection_ingress: None,
             rolling_fragments: None,
             rolling_ingress: None,
+            credit: Some(l2tunnel_flow_control::session_credit::Config {
+                floor_datagrams: 64,
+                ceiling_datagrams: 8192,
+                floor_bytes: 102_400,
+                ceiling_bytes: 16 << 20,
+                period: Duration::from_millis(10),
+                idle_period: Duration::from_millis(250),
+            }),
             report_interval: Some(self.report.unwrap_or(Duration::from_secs(1))),
         };
         let responder = transport::Config {
@@ -868,15 +897,18 @@ pub(super) fn inspect(options: &BTreeMap<String, String>) -> io::Result<()> {
 }
 
 #[cfg(target_os = "linux")]
-pub(super) async fn execute(
+/// Build the service plan for `connect` or `serve` options: read and check
+/// credentials, trust and the transaction plan. Opens no socket or device
+/// (the device opens when the service accepts a connect); shared by the
+/// foreground run and by stored profiles.
+pub(super) fn prepare(
     command: &str,
     options: &BTreeMap<String, String>,
     config: ConnectionConfig,
-    selected: Selected,
-) -> io::Result<()> {
-    use crate::service::{self, Completed, Terminal};
+    selected: &Selected,
+) -> io::Result<crate::service::Prepared> {
+    use crate::service;
     use std::path::Path;
-    let report_interval = selected.report_interval();
     let common = selected.common();
     let noise = credentials::NoiseIdentity::new(
         credentials::read_secret(Path::new(required(options, "--noise-private-key-file")?))?,
@@ -896,18 +928,22 @@ pub(super) async fn execute(
         "--session-admission-key-file",
     )?))?)?;
     let name = required(options, "--device")?.to_owned();
+    let mtu_host = std::sync::Arc::new(service::device_mtu::LinuxDevice::new(name.clone()));
     let attachment = service::Attachment::readable(config.layer, move || {
         Ok(crate::native::Native::new(
             l2tunnel_platform_linux::TunTap::attach(&name, config.layer)?,
         ))
-    });
+    })
+    .with_device_mtu(mtu_host);
     let plan = match command {
         "connect" => {
             let member_der =
                 credentials::read_member_der(Path::new(required(options, "--identity")?))?;
             let member = l2tunnel_identity::IdentityKey::from_pkcs8(&member_der)
                 .map_err(io::Error::other)?;
-            let profile = selected.build(config, peers, member.public_key())?;
+            let profile = selected
+                .build(config, peers, member.public_key())?
+                .tuned(command, options)?;
             let credentials = credentials::Client::new(noise, member, admission)?;
             match profile {
                 Built::Proxy(profile) | Built::Records(profile) => {
@@ -1002,7 +1038,9 @@ pub(super) async fn execute(
             let cookie = credentials::Secret32::new(credentials::read_secret(Path::new(
                 required(options, "--session-cookie-key-file")?,
             ))?)?;
-            let profile = selected.build(config, peers, member)?;
+            let profile = selected
+                .build(config, peers, member)?
+                .tuned(command, options)?;
             let credentials = credentials::Server::new(noise, admission, cookie)?;
             match profile {
                 Built::Proxy(profile) | Built::Records(profile) => {
@@ -1099,6 +1137,23 @@ pub(super) async fn execute(
         }
         _ => return Err(input("unsupported secure UDP command")),
     };
+    Ok(plan)
+}
+
+/// Whether the selection runs the TCP-proxy profile (it needs the proxy frontend).
+pub(super) fn is_proxy(selected: &Selected) -> bool {
+    matches!(&selected.0, Choice::Proxy(..))
+}
+
+pub(super) async fn execute(
+    command: &str,
+    options: &BTreeMap<String, String>,
+    config: ConnectionConfig,
+    selected: Selected,
+) -> io::Result<()> {
+    use crate::service::{self, Completed, Terminal};
+    let report_interval = selected.report_interval();
+    let plan = prepare(command, options, config, &selected)?;
     if matches!(&selected.0, Choice::Proxy(..)) {
         return common_proxy_cli::serve_prepared(plan, options, config).await;
     }
@@ -1110,6 +1165,8 @@ pub(super) async fn execute(
     // generation fails. This neither retries automatically nor resets Records.
     let local_control = api.is_some();
     let (handle, run) = service::channel();
+    // Service-owned devices and routes (CL-22/CL-23) need an ownership record.
+    service::host::attach_state_dir(&handle, options.get("--state-dir")).await?;
     let submit = |error| io::Error::other(format!("service request: {error:?}"));
     // Prepare persistent output owners before any protocol operation starts.
     // Regular descriptions retain their original shared offset and flags.
@@ -1182,7 +1239,7 @@ pub(super) async fn execute(
                             }
                             live = None;
                         }
-                        Completed::Applied(_) | Completed::Rejected(_) | Completed::Common { .. } | Completed::ConnectionReuse { .. } | Completed::OutcomeUnknown => {}
+                        Completed::Applied(_) | Completed::Rejected(_) | Completed::Common { .. } | Completed::ConnectionReuse { .. } | Completed::OutcomeUnknown | Completed::Host(_) | Completed::Profile(_) => {}
                     }
                 }
                 _ = report_tick.tick(), if report_interval.is_some() => {
@@ -1201,13 +1258,8 @@ pub(super) async fn execute(
     };
     let local = async {
         match api {
-            Some(api) => {
-                api.serve(move |request| {
-                    let handle = handle.clone();
-                    async move { handle.lifecycle_request(request).await }
-                })
-                .await
-            }
+            // Versions 1/4 keep lifecycle_request; version 5 adds operations.
+            Some(api) => api.serve_service(handle.clone()).await,
             None => std::future::pending::<io::Result<()>>().await,
         }
     };

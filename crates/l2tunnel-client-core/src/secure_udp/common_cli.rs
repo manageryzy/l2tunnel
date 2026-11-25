@@ -290,10 +290,15 @@ impl Plan {
             let physical: usize = if let Some(selected) = maintained {
                 selected.geometry.charged_overhead_bytes
             } else if let Some(policy) = raw {
-                policy
-                    .record_geometry()
-                    .map_err(io::Error::other)?
+                let final_geometry = policy
+                    .final_record_geometry_with_tls_cover(
+                        settings.cover.appearance == l2tunnel_cover::Appearance::TlsLike,
+                    )
+                    .map_err(io::Error::other)?;
+                final_geometry
                     .ip_tcp_bytes
+                    .checked_add(final_geometry.record_overhead_bytes)
+                    .ok_or_else(|| invalid("raw physical overhead overflow"))?
             } else if settings.gate.path.client.is_ipv6() {
                 48
             } else {

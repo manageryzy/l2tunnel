@@ -394,3 +394,6 @@ async fn genuine_outer_refuses_member_endpoint_and_tight_capacity_without_mutati
     assert!(too_large.carrier_binding().is_none());
     Ok(())
 }
+
+#[path = "live_tuning_profile_tests.rs"]
+mod live_tuning;

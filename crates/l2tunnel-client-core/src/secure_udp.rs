@@ -18,6 +18,7 @@ pub mod common_transaction_profile;
 /// Explicit runtime credential owners and bounded manual key-file readers.
 pub mod credentials;
 pub(crate) mod datagram_profile;
+pub mod live_tuning;
 /// Explicit maintained TCP/TLS and genuine QUIC Common transport policies.
 pub mod maintained;
 /// Load a provisioned native Common UDP client.
@@ -111,6 +112,7 @@ impl Cover {
         hash.update(&[match self.appearance {
             cover::Appearance::QuicLike => 1,
             cover::Appearance::MediaLike => 2,
+            cover::Appearance::TlsLike => 3,
         }]);
         hash.update(&self.initiator_connection.0);
         hash.update(&self.responder_connection.0);
@@ -296,9 +298,14 @@ pub struct Session {
     requested: Settings,
     effective: establish::Config,
     authenticated: member::Authenticated,
+    live_catalog: Option<l2tunnel::record_configuration::Catalog>,
 }
 
 impl Session {
+    /// The live-tuning catalog both ends generated at connect, if tuned.
+    pub fn live_catalog(&self) -> Option<&l2tunnel::record_configuration::Catalog> {
+        self.live_catalog.as_ref()
+    }
     /// Exact requested settings, with no secret material or silent fallback.
     pub fn requested(&self) -> Settings {
         self.requested
@@ -371,7 +378,7 @@ pub async fn connect_observed(
         .runtime(security::Role::Initiator, peers)
         .inspect_err(|_| configuration_failure(observe))?;
     connect_effective_observed(
-        socket, settings, effective, identity, member, admission, deadline, entropy, observe,
+        socket, settings, effective, identity, member, admission, deadline, entropy, observe, None,
     )
     .await
 }
@@ -403,8 +410,11 @@ pub(crate) async fn connect_common_observed(
     let effective = profile
         .establish_config(security::Role::Initiator)
         .inspect_err(|_| configuration_failure(observe))?;
+    let proposal =
+        live_tuning::proposal(profile).inspect_err(|_| configuration_failure(observe))?;
     connect_effective_observed(
         socket, settings, effective, identity, member, admission, deadline, entropy, observe,
+        proposal,
     )
     .await
 }
@@ -422,9 +432,17 @@ async fn connect_effective_observed(
     deadline: Instant,
     entropy: &mut (impl hs::Entropy + Send),
     observe: &mut diagnostics::Observer<'_>,
+    proposal: Option<live_tuning::Proposal>,
 ) -> io::Result<Session> {
-    let established = establish::connect_observed(
-        socket, effective, identity, admission, deadline, entropy, observe,
+    let tuning = match &proposal {
+        Some(proposal) => establish::Tuning::Propose {
+            proposal: &proposal.bytes,
+            context: proposal.root,
+        },
+        None => establish::Tuning::Off,
+    };
+    let established = establish::connect_tuned(
+        socket, effective, identity, admission, deadline, entropy, observe, tuning,
     )
     .await
     .map_err(runtime_error)?;
@@ -440,6 +458,7 @@ async fn connect_effective_observed(
         requested: settings,
         effective,
         authenticated,
+        live_catalog: proposal.map(|proposal| proposal.catalog),
     })
 }
 
@@ -449,6 +468,8 @@ pub struct Server {
     peers: establish::Peers,
     effective: establish::Config,
     admission: establish::ServerAdmission,
+    // Common plan judging live-tuning proposals; absent for legacy settings.
+    common: Option<Box<common_transaction_profile::Profile>>,
 }
 
 impl Server {
@@ -475,14 +496,16 @@ impl Server {
                 "Common server credentials differ from configured pins",
             ));
         }
-        Self::from_effective(
+        let mut server = Self::from_effective(
             profile.settings(),
             peers,
             profile.establish_config(security::Role::Responder)?,
             admission,
             cookie,
             origin,
-        )
+        )?;
+        server.common = Some(Box::new(profile.clone()));
+        Ok(server)
     }
     fn from_effective(
         settings: Settings,
@@ -500,6 +523,7 @@ impl Server {
             peers,
             effective,
             admission,
+            common: None,
         })
     }
 
@@ -544,13 +568,24 @@ impl Server {
             }
             observe(observation);
         };
-        let established = establish::accept_observed(
+        let mut live_catalog = None;
+        let mut judge = |proposal: &[u8]| {
+            let profile = self
+                .common
+                .as_deref()
+                .ok_or(l2tunnel::live_tuning::Refusal::NotOffered)?;
+            let (catalog, root) = live_tuning::judge(profile, security::Role::Responder, proposal)?;
+            live_catalog = Some(catalog);
+            Ok(root)
+        };
+        let established = establish::accept_tuned(
             socket,
             identity,
             &mut self.admission,
             deadline,
             entropy,
             &mut forward,
+            establish::Tuning::Judge(&mut judge),
         )
         .await
         .map_err(runtime_error)?;
@@ -572,6 +607,7 @@ impl Server {
             requested: self.settings,
             effective: self.effective,
             authenticated,
+            live_catalog,
         })
     }
 }

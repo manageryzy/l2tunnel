@@ -352,6 +352,57 @@ impl From<l2tunnel::rolling_records::NativeReorderStatus> for RollingNativeReord
     }
 }
 
+/// Research receiver recovery and hole abandonment (RRP-07). An abandoned
+/// source was passed over without recovery; inner TCP retransmits it end to end.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ResearchRecovery {
+    /// Contiguous recovered-or-abandoned prefix.
+    pub decoded_prefix: u32,
+    /// Contiguous upper handoff prefix.
+    pub handoff_prefix: u32,
+    /// Unresolved independent equations.
+    pub rank: u64,
+    /// Sources passed over without recovery.
+    pub abandoned: u64,
+    /// Abandoned because no future repair could include them.
+    pub abandoned_definite: u64,
+    /// Abandoned because the deficit could not close in time.
+    pub abandoned_projected: u64,
+    /// Abandoned at `abandon_ticks`.
+    pub abandoned_cap: u64,
+    /// Repairs dropped because they included an abandoned source.
+    pub dropped_repairs: u64,
+    /// Equations removed with an abandoned pivot.
+    pub dropped_rows: u64,
+    /// Originals that arrived after being abandoned.
+    pub late_originals: u64,
+    /// Oldest current hole, if any.
+    pub hole_source: Option<u32>,
+    /// How long the oldest hole has been missing, in microseconds.
+    pub hole_age_micros: Option<u64>,
+    /// Repairs covering the oldest hole since it became the oldest.
+    pub covering_repairs: u64,
+}
+impl From<l2tunnel_fec::research::ReceiverStatus> for ResearchRecovery {
+    fn from(value: l2tunnel_fec::research::ReceiverStatus) -> Self {
+        Self {
+            decoded_prefix: value.decoder.decoded_prefix,
+            handoff_prefix: value.decoder.handoff_prefix,
+            rank: value.decoder.rank as u64,
+            abandoned: value.abandon.abandoned,
+            abandoned_definite: value.abandoned_by.definite,
+            abandoned_projected: value.abandoned_by.projected,
+            abandoned_cap: value.abandoned_by.cap,
+            dropped_repairs: value.abandon.dropped_repairs,
+            dropped_rows: value.abandon.dropped_rows,
+            late_originals: value.abandon.late_originals,
+            hole_source: value.hole.map(|(id, _)| id.0),
+            hole_age_micros: value.hole.map(|(_, age)| age),
+            covering_repairs: value.covering_repairs,
+        }
+    }
+}
+
 /// Requested or effective native release order at the local receiver.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -401,6 +452,105 @@ pub enum RollingGuardMode {
     Off,
     /// Shed above the requested ratio.
     On,
+}
+/// Requested and effective session receiver credit (`docs/modules/receiver-credit.md`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CreditStatus {
+    /// Configured floor and ceiling in datagrams.
+    pub configured_datagrams: [u64; 2],
+    /// Effective floor and ceiling in datagrams: the configured values, with
+    /// the ceiling lowered to a quarter of a small record-receive range.
+    #[serde(default)]
+    pub effective_datagrams: [u64; 2],
+    /// Receive buffer requested from the UDP data socket (the byte ceiling).
+    #[serde(default)]
+    pub requested_receive_buffer: Option<u64>,
+    /// The kernel's raw read-back after that request (Linux reports twice the
+    /// granted value); the grant's allowance is half of it, at most 106,496.
+    #[serde(default)]
+    pub receive_buffer_readback: Option<u64>,
+    /// Configured floor and ceiling in bytes.
+    pub configured_bytes: [u64; 2],
+    /// Configured Credit period and idle heartbeat, microseconds.
+    pub configured_period_micros: [u64; 2],
+    /// Receive direction: highest processed peer data packet number plus one.
+    pub processed: u64,
+    /// Receive direction: last granted limit and byte allowance.
+    pub granted_limit: u64,
+    /// Receive direction: last granted bytes above `processed`.
+    pub granted_bytes: u64,
+    /// Receive direction: measured drain, bytes and datagrams per second.
+    pub drain: [u64; 2],
+    /// Receive direction: socket allowance in the grant.
+    pub allowance_bytes: u64,
+    /// Whether the allowance was read back from the real socket buffer.
+    pub allowance_readback: bool,
+    /// Receive direction: Credits issued.
+    pub issued: u64,
+    /// Receive direction: growth frozen for native backpressure.
+    pub frozen: bool,
+    /// Send direction: effective limit, absent before the first data.
+    pub effective_limit: Option<u64>,
+    /// Send direction: effective bytes above the peer's processed packet.
+    pub effective_bytes: Option<u64>,
+    /// Send direction: data bytes and datagrams sent above the peer's processed packet.
+    pub inflight: Option<[u64; 2]>,
+    /// Send direction: peer drain and effective data pacing rate, bytes per second.
+    pub peer_drain_and_pacing: Option<[u64; 2]>,
+    /// Send direction: Credits accepted and ignored as stale.
+    pub accepted_and_stale: Option<[u64; 2]>,
+    /// Send direction: gate refusals for credit and for pacing.
+    pub blocked_credit_and_pacing: Option<[u64; 2]>,
+    /// Send direction: minimum RTT sample, microseconds.
+    pub min_rtt_micros: Option<u64>,
+    /// Send direction: in-flight datagrams declared lost after an idle peer
+    /// reported no progress.
+    pub declared_lost: Option<u64>,
+    /// Send direction: the peer's record-receive range data stays within
+    /// (half of it above the peer's processed number).
+    pub range: Option<u64>,
+    /// Send direction: gate checks refused at that half-range bound.
+    pub range_blocked: Option<u64>,
+    /// Malformed Credits, sender restarts and unrecorded sends.
+    pub anomalies: [u64; 3],
+}
+impl From<l2tunnel_runtime::secure_udp::transport::CreditSnapshot> for CreditStatus {
+    fn from(value: l2tunnel_runtime::secure_udp::transport::CreditSnapshot) -> Self {
+        let micros = |d: std::time::Duration| u64::try_from(d.as_micros()).unwrap_or(u64::MAX);
+        let c = value.configured;
+        let r = value.receiver;
+        let s = value.sender;
+        Self {
+            configured_datagrams: [c.floor_datagrams, c.ceiling_datagrams],
+            effective_datagrams: [
+                value.effective.floor_datagrams,
+                value.effective.ceiling_datagrams,
+            ],
+            requested_receive_buffer: value.requested_receive_buffer,
+            receive_buffer_readback: value.receive_buffer_readback,
+            configured_bytes: [c.floor_bytes, c.ceiling_bytes],
+            configured_period_micros: [micros(c.period), micros(c.idle_period)],
+            processed: r.processed,
+            granted_limit: r.limit,
+            granted_bytes: r.bytes_above,
+            drain: [r.drain_bytes, r.drain_datagrams],
+            allowance_bytes: r.allowance_bytes,
+            allowance_readback: value.allowance_readback,
+            issued: r.issued,
+            frozen: r.frozen,
+            effective_limit: s.map(|s| s.limit),
+            effective_bytes: s.map(|s| s.bytes_above),
+            inflight: s.map(|s| [s.inflight_bytes, s.inflight_datagrams]),
+            peer_drain_and_pacing: s.map(|s| [s.peer_drain_bytes, s.pacing_rate]),
+            accepted_and_stale: s.map(|s| [s.accepted, s.stale]),
+            blocked_credit_and_pacing: s.map(|s| [s.credit_blocked, s.pacing_blocked]),
+            min_rtt_micros: s.and_then(|s| s.min_rtt).map(micros),
+            declared_lost: s.map(|s| s.declared_lost),
+            range: s.map(|s| s.range),
+            range_blocked: s.map(|s| s.range_blocked),
+            anomalies: [value.rejected, value.sender_restarts, value.unrecorded],
+        }
+    }
 }
 /// Requested/effective release order and local return guard in the active generation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -834,6 +984,32 @@ impl From<l2tunnel_runtime::secure_udp::transport::NativeDeliverySnapshot> for N
         }
     }
 }
+/// Device MTU state of a live-tuned session (docs/modules/live-tuning.md,
+/// decision 9).
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeviceMtuStatus {
+    /// MTU this session last set on the device.
+    pub applied: Option<u32>,
+    /// MTU the current protocol entry needs.
+    pub wanted: Option<u32>,
+    /// Changes that failed or timed out.
+    pub failures: u64,
+    /// Kind of the last failure.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+}
+impl From<l2tunnel_runtime::secure_udp::transport::DeviceMtuSnapshot> for DeviceMtuStatus {
+    fn from(value: l2tunnel_runtime::secure_udp::transport::DeviceMtuSnapshot) -> Self {
+        Self {
+            applied: value.applied,
+            wanted: value.wanted,
+            failures: value.failures,
+            last_error: value.last_error.map(|kind| format!("{kind:?}")),
+        }
+    }
+}
+
 /// Separate truthful portable status for explicit finite-catalog generic selection.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -893,6 +1069,10 @@ pub struct Status {
     pub catalog: [u8; 32],
     /// Full catalog member count; no truncation of the supported set.
     pub catalog_members: u16,
+    /// Device MTU the service keeps in step with live inner-size switches;
+    /// absent unless the session is live-tuned on a configurable device.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_mtu: Option<DeviceMtuStatus>,
     /// Exact requested startup complete configuration.
     pub initial: CanonicalConfiguration,
     /// Exact requested startup KCP-like policy, absent for other algorithms.
@@ -980,6 +1160,13 @@ pub struct Status {
     /// Requested/effective release order and return guard of the active rolling generation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rolling_delivery: Option<RollingDelivery>,
+    /// Research receiver recovery and hole abandonment, research rows only.
+    /// Boxed: this status is held inline in large service futures.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub research_recovery: Option<Box<ResearchRecovery>>,
+    /// Requested and effective session receiver credit for data datagrams.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credit: Option<CreditStatus>,
     /// Explicit immutable Benchmark policy and actual Engine ingress observations.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ack_coalescing: Option<AckStatus>,
@@ -1169,6 +1356,7 @@ mod observe {
             let udp_cover = match settings.cover.appearance {
                 l2tunnel_cover::Appearance::QuicLike => "quic-like",
                 l2tunnel_cover::Appearance::MediaLike => "media-like",
+                l2tunnel_cover::Appearance::TlsLike => "tls-like",
             };
             let original_carrier = profile
                 .carrier_binding()
@@ -1242,6 +1430,9 @@ mod observe {
                 catalog: *profile.catalog().root().as_bytes(),
                 catalog_members: u16::try_from(profile.catalog().descriptors().len())
                     .map_err(invalid)?,
+                device_mtu: snapshot
+                    .and_then(|value| value.device_mtu)
+                    .map(DeviceMtuStatus::from),
                 initial: CanonicalConfiguration::from_configuration(profile.initial())?,
                 kcp_like_initial: crate::kcp_like_l2::selected(
                     &profile.requested_catalog().initial(),
@@ -1394,6 +1585,10 @@ mod observe {
                     .and_then(|s| s.rolling_native_reorder)
                     .map(Into::into),
                 rolling_delivery: snapshot.and_then(|s| s.rolling_delivery).map(Into::into),
+                research_recovery: snapshot
+                    .and_then(|s| s.research_receiver.as_deref())
+                    .map(|status| Box::new((*status).into())),
+                credit: snapshot.and_then(|s| s.credit).map(Into::into),
                 rolling_repair_budget: snapshot
                     .and_then(|s| s.rolling_repair_budget)
                     .map(Into::into),

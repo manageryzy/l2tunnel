@@ -11,6 +11,8 @@ pub(super) type Device = Box<dyn PacketDevice<Error = io::Error> + Send>;
 pub struct Attachment {
     layer: PacketLayer,
     open: Open,
+    // Sets the device MTU around live inner-size switches.
+    device_mtu: Option<Arc<dyn super::device_mtu::DeviceMtuHost>>,
 }
 #[cfg(windows)]
 type Opening = Pin<Box<dyn Future<Output = io::Result<crate::native::Native>> + Send>>;
@@ -78,6 +80,7 @@ impl Attachment {
         Self {
             layer,
             open: Open::Readable(Arc::new(open)),
+            device_mtu: None,
         }
     }
     /// Bind a cancellable Windows native setup future. Its owner must join
@@ -93,6 +96,7 @@ impl Attachment {
         Self {
             layer,
             open: Open::Deferred(Arc::new(move || Box::pin(open()))),
+            device_mtu: None,
         }
     }
 
@@ -104,7 +108,18 @@ impl Attachment {
         Self {
             layer,
             open: Open::Packet(Arc::new(open)),
+            device_mtu: None,
         }
+    }
+    /// Let live-tuned sessions on this device set its MTU around inner-size
+    /// switches (docs/modules/live-tuning.md, decisions 2 and 9).
+    #[must_use]
+    pub fn with_device_mtu(mut self, host: Arc<dyn super::device_mtu::DeviceMtuHost>) -> Self {
+        self.device_mtu = Some(host);
+        self
+    }
+    pub(super) fn device_mtu(&self) -> Option<&Arc<dyn super::device_mtu::DeviceMtuHost>> {
+        self.device_mtu.as_ref()
     }
 }
 /// Already parsed client credentials and fixed original endpoint.
@@ -228,6 +243,17 @@ pub struct Prepared {
 type Protection = std::pin::Pin<Box<dyn std::future::Future<Output = io::Result<()>> + Send>>;
 type UdpSocketProtector = Arc<dyn Fn(&tokio::net::UdpSocket) -> Protection + Send + Sync>;
 impl Prepared {
+    /// Whether this plan connects to a peer or accepts members.
+    pub fn role(&self) -> local::Role {
+        match &self.data.endpoint {
+            Endpoint::SecureServer(_) => local::Role::Server,
+            #[cfg(unix)]
+            Endpoint::CommonCarrierServer(_)
+            | Endpoint::CommonRawServer(_)
+            | Endpoint::CommonMaintainedServer(_) => local::Role::Server,
+            _ => local::Role::Client,
+        }
+    }
     /// Require platform protection of each freshly bound client UDP socket before
     /// connecting it or starting authentication. A failed protection stops setup.
     pub fn with_udp_socket_protector<F, Fut>(mut self, protect: F) -> io::Result<Self>

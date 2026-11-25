@@ -82,7 +82,7 @@ pub(super) fn inspection(profile: &Profile, role: Role) -> io::Result<Vec<Value>
     output.push(bounded(json!({"event":"secure_udp_common_plan","schema":1,"api_version":4,
         "backend":"common_records_v2","requested":true,"validated":true,"authenticated":false,
         "role":match role{Role::Initiator=>"initiator",Role::Responder=>"responder"},
-        "carrier":match profile.settings().cover.appearance{l2tunnel_cover::Appearance::QuicLike=>"quic-like",l2tunnel_cover::Appearance::MediaLike=>"media-like"},
+        "carrier":match profile.settings().cover.appearance{l2tunnel_cover::Appearance::QuicLike=>"quic-like",l2tunnel_cover::Appearance::MediaLike=>"media-like",l2tunnel_cover::Appearance::TlsLike=>"tls-like"},
         "configuration":profile.configuration()?.0,"envelope":profile.envelope().as_bytes(),
         "catalog":profile.catalog().root().as_bytes(),"catalog_members":profile.catalog().descriptors().len(),
         "initial":CanonicalConfiguration::from_configuration(profile.initial())?,
@@ -118,6 +118,35 @@ pub(super) fn inspection(profile: &Profile, role: Role) -> io::Result<Vec<Value>
             "effective":null,"checks":null,"feedback_packet_number":null,
             "appearance":"initial-only","established_mimic":false,
             "control_protection":"chacha20-poly1305","retiring_feedback_protection":"chacha20-poly1305"
+        });
+        output[0] = bounded(std::mem::take(&mut output[0]))?;
+    }
+    if let Some(credit) = resources.credit {
+        // The runtime lowers the credit ceiling to a quarter of a small
+        // record-receive range (docs/modules/receiver-credit.md).
+        let range = resources
+            .security
+            .packets_per_key
+            .min(u64::from(profile.compact_wire().limits.max_forward_packets));
+        let effective = credit.fit_range(range).ok();
+        let warning = effective
+            .filter(|effective| *effective != credit)
+            .map(|effective| {
+                format!(
+                    "record-receive range {range} (min of packets_per_key and max_forward_packets) \
+                     is below 4 x ceiling_datagrams {}; the tunnel runs with ceiling_datagrams {}. \
+                     Raise both to at least {} to keep the configured ceiling.",
+                    credit.ceiling_datagrams,
+                    effective.ceiling_datagrams,
+                    credit.ceiling_datagrams.saturating_mul(4)
+                )
+            });
+        output[0]["credit"] = json!({
+            "record_receive_range":range,
+            "requested_datagrams":[credit.floor_datagrams,credit.ceiling_datagrams],
+            "effective_datagrams":effective.map(|c|[c.floor_datagrams,c.ceiling_datagrams]),
+            "requested_receive_buffer_bytes":credit.ceiling_bytes,
+            "warning":warning,
         });
         output[0] = bounded(std::mem::take(&mut output[0]))?;
     }
@@ -245,25 +274,32 @@ pub(super) fn raw_inspection(
         "burst_bytes":policy.burst_bytes,"burst_packets":policy.burst_packets,"max_key_packets":policy.max_key_packets,"max_key_bytes":policy.max_key_bytes,
         "kernel_firewall_ready":false,"native_qualified":false,"congestion_control":false,"clean_close":false}));
     {
+        let tls_cover = profile.settings().cover.appearance == l2tunnel_cover::Appearance::TlsLike;
+        let final_geometry = policy
+            .final_record_geometry_with_tls_cover(tls_cover)
+            .map_err(io::Error::other)?;
+        let physical = final_geometry
+            .ip_tcp_bytes
+            .checked_add(final_geometry.record_overhead_bytes)
+            .ok_or_else(|| output_invalid("requested raw physical overhead overflow"))?;
         let data = profile.compact_wire().data_overhead();
         let data = if profile.proxy_config().is_some() {
             data.max(l2tunnel::secure_record::compact::AUTHENTICATED_OVERHEAD)
         } else {
             data
         };
-        let data = geometry
-            .ip_tcp_bytes
+        let data = physical
             .checked_add(data)
             .ok_or_else(|| output_invalid("requested raw data overhead overflow"))?;
-        let control = geometry
-            .ip_tcp_bytes
+        let control = physical
             .checked_add(l2tunnel::secure_record::compact::AUTHENTICATED_OVERHEAD)
             .ok_or_else(|| output_invalid("requested raw control overhead overflow"))?;
         header.insert("outer_policy_scope".into(), json!("bootstrap"));
         header.insert(
             "requested_final_framing".into(),
             json!({
-                "ip_tcp_bytes":geometry.ip_tcp_bytes,
+                "ip_tcp_bytes":final_geometry.ip_tcp_bytes,
+                "record_overhead_bytes":final_geometry.record_overhead_bytes,
                 "data_overhead_bytes":data,
                 "control_feedback_overhead_bytes":control,
                 "protection_layers":1,"phase_envelope":false,"raw_datagram_envelope":false

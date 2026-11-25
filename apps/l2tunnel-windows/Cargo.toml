@@ -8,6 +8,20 @@ publish.workspace = true
 [lints]
 workspace = true
 
+[features]
+# Windows desktop GUI binary (docs/modules/desktop-gui.md). Off by default so
+# the headless service build never compiles GUI dependencies.
+gui = ["dep:l2tunnel-desktop-ui"]
+
+[[bin]]
+name = "l2tunnel-windows"
+path = "src/main.rs"
+
+[[bin]]
+name = "l2tunnel-windows-gui"
+path = "src/gui/main.rs"
+required-features = ["gui"]
+
 [dependencies]
 l2tunnel = { path = "../../crates/l2tunnel" }
 l2tunnel-auth = { path = "../../crates/l2tunnel-auth" }
@@ -15,8 +29,12 @@ l2tunnel-client-core = { path = "../../crates/l2tunnel-client-core" }
 l2tunnel-core = { path = "../../crates/l2tunnel-core" }
 l2tunnel-device = { path = "../../crates/l2tunnel-device" }
 l2tunnel-platform-windows = { path = "../../crates/l2tunnel-platform-windows" }
-tokio = { version = "=1.53.1", features = ["rt-multi-thread", "io-std", "macros", "signal", "time", "sync"] }
+l2tunnel-desktop-ui = { path = "../../crates/l2tunnel-desktop-ui", optional = true }
+tokio = { version = "=1.53.1", features = ["rt-multi-thread", "macros", "signal", "time", "sync"] }
 zeroize = "=1.9.0"
+
+[target.'cfg(windows)'.dependencies]
+windows-service = "=0.8.1"
 
 [dev-dependencies]
 rcgen = { version = "=0.14.10", default-features = false, features = ["ring"] }

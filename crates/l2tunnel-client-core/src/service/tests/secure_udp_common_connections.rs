@@ -474,7 +474,7 @@ fn maintained_requested_reuse_is_explicit_and_commits_before_outer_authenticatio
     let wire = l2tunnel::secure_record::compact::Selection {
         protection: l2tunnel_security::compact::Protection::Aes128Ccm4,
         limits: l2tunnel_security::compact::Selection {
-            max_forward_packets: 8192,
+            max_forward_packets: 32_768,
             max_failed_checks: 64,
         },
     };

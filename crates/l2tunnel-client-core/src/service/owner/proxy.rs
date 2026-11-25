@@ -310,7 +310,13 @@ fn authenticate_common<'a>(
         .await?;
         let info = session.info();
         setup::stage(shared, accepted.operation, SetupStage::Configuration);
-        let contract = profile.runtime_contract(info.role)?;
+        // A tuned session switches within the catalog both ends generated.
+        let contract = match session.live_catalog() {
+            Some(catalog) => profile
+                .with_live_catalog(catalog.clone())?
+                .runtime_contract(info.role)?,
+            None => profile.runtime_contract(info.role)?,
+        };
         let requested = profile.configuration()?;
         let carrier = profile.establish_config(info.role)?.binding.carrier;
         if info.peers != profile.peers()

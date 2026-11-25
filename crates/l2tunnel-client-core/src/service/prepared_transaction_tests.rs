@@ -327,6 +327,48 @@ async fn native_provisioning_preserves_disconnected_api4_without_device_io() -> 
     Ok(())
 }
 
+/// Version-5 keyed submission with the retained plan: acceptance without
+/// waiting, exact replay of an identical retry and conflict for another
+/// action under the same key. The owner is never polled, so no I/O occurs.
+#[tokio::test]
+async fn version5_retained_submission_replays_identical_retry_only() -> Result {
+    use crate::local::{OperationAction, OperationRequest};
+    let plans = plans(Appearance::QuicLike)?;
+    let opens = Arc::new(AtomicUsize::new(0));
+    let plan = Prepared::secure_udp_common_client(
+        plans.generic,
+        client(false, 11, 22, hs::Profile::Ik)?,
+        attachment(&opens, PacketLayer::Ip, true),
+    )?;
+    let (handle, _owner) = crate::service::channel_with_plan(plan);
+    let submit = |action| handle.operations_request(OperationRequest::new(action));
+    let first = submit(OperationAction::Reconnect { request_key: 1 }).await;
+    assert_eq!((first.ok, first.code.as_str()), (true, "accepted"));
+    let accepted = first.operation.ok_or("missing accepted operation")?;
+    assert_eq!((accepted.id, accepted.kind.as_str()), (1, "connect"));
+    assert_eq!(accepted.state, "pending");
+    assert!(accepted.deadline_ms.is_some());
+    let cursor = handle.event_cursor();
+    let retry = submit(OperationAction::Reconnect { request_key: 1 }).await;
+    assert_eq!(retry.code, "accepted");
+    assert_eq!(retry.operation.map(|state| state.id), Some(1));
+    assert_eq!(handle.event_cursor(), cursor, "a replay records no event");
+    let other = submit(OperationAction::Disconnect { request_key: 1 }).await;
+    assert_eq!((other.ok, other.code.as_str()), (false, "conflict"));
+    let busy = submit(OperationAction::Connect { request_key: 2 }).await;
+    assert_eq!(busy.code, "busy");
+    let skipped = submit(OperationAction::Connect { request_key: 9 }).await;
+    assert_eq!(skipped.code, "future_key");
+    let status = submit(OperationAction::Status {}).await;
+    let status = status.status.ok_or("missing status")?;
+    assert_eq!(
+        (status.phase.as_str(), status.operation),
+        ("preparing", Some(1))
+    );
+    assert_eq!(opens.load(Ordering::SeqCst), 0);
+    Ok(())
+}
+
 #[test]
 fn current_common_plans_keep_explicit_carrier_appearance() -> Result {
     let quic = plans(Appearance::QuicLike)?;
