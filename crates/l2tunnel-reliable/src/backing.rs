@@ -163,10 +163,21 @@ impl Queue {
 pub(crate) struct RestoredSlot {
     id: Option<u64>,
     value: Restored,
+    /// Next slot in the live or free list; `NONE` ends a list.
+    next: usize,
 }
+const NONE: usize = usize::MAX;
+/// Reserved staging threads every slot on exactly one of two intrusive lists
+/// (live or free), so operations cost O(live entries) rather than O(capacity).
+/// Slot indices are stable while live; diagnostics key waits by them.
 pub(crate) enum RestoredMap {
     Legacy(BTreeMap<u64, Restored>),
-    Reserved(Vec<RestoredSlot>),
+    Reserved {
+        slots: Vec<RestoredSlot>,
+        live: usize,
+        free: usize,
+        occupied: usize,
+    },
 }
 impl RestoredMap {
     pub fn legacy() -> Self {
@@ -174,30 +185,50 @@ impl RestoredMap {
     }
     pub fn reserved(n: usize, bytes: usize, a: &mut Allocation) -> Result<Self, storage::Error> {
         let mut slots = a.vec(n)?;
-        for _ in 0..n {
+        for index in 0..n {
             slots.push(RestoredSlot {
                 id: None,
                 value: Restored {
                     bytes: a.vec(bytes)?,
                     recovered: false,
                 },
+                next: if index + 1 < n { index + 1 } else { NONE },
             });
         }
-        Ok(Self::Reserved(slots))
+        Ok(Self::Reserved {
+            slots,
+            live: NONE,
+            free: if n == 0 { NONE } else { 0 },
+            occupied: 0,
+        })
     }
     pub fn len(&self) -> usize {
         match self {
             Self::Legacy(m) => m.len(),
-            Self::Reserved(v) => v.iter().filter(|s| s.id.is_some()).count(),
+            Self::Reserved { occupied, .. } => *occupied,
         }
     }
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
+    /// Live slot holding `id`, with its live-list predecessor.
+    fn find(slots: &[RestoredSlot], live: usize, id: u64) -> Option<(usize, usize)> {
+        let (mut previous, mut index) = (NONE, live);
+        while index != NONE {
+            if slots[index].id == Some(id) {
+                return Some((previous, index));
+            }
+            previous = index;
+            index = slots[index].next;
+        }
+        None
+    }
     pub fn get(&self, id: &u64) -> Option<&Restored> {
         match self {
             Self::Legacy(m) => m.get(id),
-            Self::Reserved(v) => v.iter().find(|s| s.id == Some(*id)).map(|s| &s.value),
+            Self::Reserved { slots, live, .. } => {
+                Self::find(slots, *live, *id).map(|(_, index)| &slots[index].value)
+            }
         }
     }
     pub fn contains_key(&self, id: &u64) -> bool {
@@ -206,11 +237,19 @@ impl RestoredMap {
     pub fn first_key_value(&self) -> Option<(Option<usize>, &u64, &Restored)> {
         match self {
             Self::Legacy(m) => m.first_key_value().map(|(id, value)| (None, id, value)),
-            Self::Reserved(v) => v
-                .iter()
-                .enumerate()
-                .filter_map(|(index, s)| s.id.as_ref().map(|id| (Some(index), id, &s.value)))
-                .min_by_key(|(_, id, _)| **id),
+            Self::Reserved { slots, live, .. } => {
+                let mut best: Option<(usize, &u64)> = None;
+                let mut index = *live;
+                while index != NONE {
+                    if let Some(id) = slots[index].id.as_ref()
+                        && best.is_none_or(|(_, current)| id < current)
+                    {
+                        best = Some((index, id));
+                    }
+                    index = slots[index].next;
+                }
+                best.map(|(index, id)| (Some(index), id, &slots[index].value))
+            }
         }
     }
     pub fn insert(&mut self, id: u64, bytes: &[u8], recovered: bool) -> Result<(), Error> {
@@ -224,15 +263,25 @@ impl RestoredMap {
                     },
                 );
             }
-            Self::Reserved(v) => {
-                let slot = v
-                    .iter_mut()
-                    .find(|s| s.id.is_none() && s.value.bytes.capacity() >= bytes.len())
+            Self::Reserved {
+                slots,
+                live,
+                free,
+                occupied,
+            } => {
+                let index = *free;
+                let slot = slots
+                    .get_mut(index)
+                    .filter(|slot| slot.value.bytes.capacity() >= bytes.len())
                     .ok_or(Error::RestoredCapacity)?;
+                *free = slot.next;
                 slot.value.bytes.clear();
                 slot.value.bytes.extend_from_slice(bytes);
                 slot.value.recovered = recovered;
                 slot.id = Some(id);
+                slot.next = *live;
+                *live = index;
+                *occupied += 1;
             }
         }
         Ok(())
@@ -242,10 +291,25 @@ impl RestoredMap {
             Self::Legacy(m) => {
                 m.remove(id);
             }
-            Self::Reserved(v) => {
-                if let Some(s) = v.iter_mut().find(|s| s.id == Some(*id)) {
-                    s.id = None;
-                    s.value.bytes.clear();
+            Self::Reserved {
+                slots,
+                live,
+                free,
+                occupied,
+            } => {
+                if let Some((previous, index)) = Self::find(slots, *live, *id) {
+                    let next = slots[index].next;
+                    if previous == NONE {
+                        *live = next;
+                    } else {
+                        slots[previous].next = next;
+                    }
+                    let slot = &mut slots[index];
+                    slot.id = None;
+                    slot.value.bytes.clear();
+                    slot.next = *free;
+                    *free = index;
+                    *occupied -= 1;
                 }
             }
         }
@@ -408,4 +472,62 @@ pub(crate) fn expired(
         },
     );
     Ok(values)
+}
+
+#[cfg(test)]
+mod restored_tests {
+    use super::*;
+
+    /// Reserved staging behaves exactly like the dynamic map under random use,
+    /// including refusal when full and duplicate-free reinsertion.
+    #[test]
+    fn reserved_restored_map_matches_the_dynamic_map() -> Result<(), Box<dyn std::error::Error>> {
+        let capacity = 37;
+        let mut allocation = Allocation::new(usize::MAX);
+        let mut reserved = RestoredMap::reserved(capacity, 8, &mut allocation)?;
+        let mut reference = RestoredMap::legacy();
+        let mut state = 0x9e37_79b9_u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for _ in 0..200_000 {
+            let id = next() % 64;
+            match next() % 4 {
+                0 | 1 => {
+                    if reference.contains_key(&id) {
+                        continue;
+                    }
+                    let bytes = id.to_be_bytes();
+                    let full = reference.len() == capacity;
+                    let result = reserved.insert(id, &bytes, id % 3 == 0);
+                    assert_eq!(result.is_err(), full);
+                    if !full {
+                        reference.insert(id, &bytes, id % 3 == 0)?;
+                    }
+                }
+                2 => {
+                    reserved.remove(&id);
+                    reference.remove(&id);
+                }
+                _ => {
+                    let first = reserved
+                        .first_key_value()
+                        .map(|(_, id, v)| (*id, v.bytes.clone()));
+                    let expected = reference
+                        .first_key_value()
+                        .map(|(_, id, v)| (*id, v.bytes.clone()));
+                    assert_eq!(first, expected);
+                }
+            }
+            assert_eq!(reserved.len(), reference.len());
+            assert_eq!(
+                reserved.get(&id).map(|v| (v.bytes.clone(), v.recovered)),
+                reference.get(&id).map(|v| (v.bytes.clone(), v.recovered))
+            );
+        }
+        Ok(())
+    }
 }

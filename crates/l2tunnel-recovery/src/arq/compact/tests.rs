@@ -1087,3 +1087,121 @@ fn admitted_body_feedback_matches_existing_peek_and_emit() -> Result {
     assert_eq!(left.feedback_deadline(), right.feedback_deadline());
     Ok(())
 }
+
+#[test]
+fn wide_receive_reserves_and_serves_receipt_journal() -> Result {
+    let small = config(CompactRecovery::Guarded, 64, 16, 128)?;
+    let small_owner = CompactRepeat::new(small, context(EndpointRole::Responder))?;
+    assert_eq!(small_owner.receipt_serial(), None);
+    assert!(small_owner.received_after(0)?.is_none());
+
+    let wide = config(CompactRecovery::Guarded, 128, 16, 128)?;
+    let plan = crate::storage::CompactPlan::for_compact(wide, wide)?;
+    let mut receiver = CompactRepeat::new_duplex_reserved(
+        wide,
+        wide,
+        context(EndpointRole::Responder),
+        crate::storage::Limits {
+            capacity_bytes: plan.capacity_bytes(),
+        },
+    )?;
+    let usage = receiver.storage_usage().ok_or("wide usage")?;
+    assert_eq!(usage.capacity_bytes, plan.capacity_bytes());
+    assert_eq!(
+        usage.allocations,
+        6 + wide.bounds().send_records + wide.bounds().receive_records
+    );
+    assert_eq!(receiver.receipt_serial(), Some(0));
+    assert_eq!(
+        receiver.received_after(0)?.ok_or("empty journal")?.count(),
+        0
+    );
+
+    receiver.receive(&incoming(wide, 2, 1, b"two")?, ms(10))?;
+    receiver.receive(&incoming(wide, 0, 2, b"zero")?, ms(11))?;
+    // Duplicate must not advance the receipt journal.
+    receiver.receive(&incoming(wide, 2, 3, b"two")?, ms(12))?;
+    assert_eq!(receiver.receipt_serial(), Some(2));
+    let seen: Vec<_> = receiver
+        .received_after(0)?
+        .ok_or("after 0")?
+        .map(|entry| (entry.serial, entry.source, entry.bytes.to_vec()))
+        .collect();
+    assert_eq!(
+        seen,
+        vec![
+            (1, SourceId(2), b"two".to_vec()),
+            (2, SourceId(0), b"zero".to_vec()),
+        ]
+    );
+    let tail: Vec<_> = receiver
+        .received_after(1)?
+        .ok_or("after 1")?
+        .map(|entry| (entry.serial, entry.source))
+        .collect();
+    assert_eq!(tail, vec![(2, SourceId(0))]);
+    assert_eq!(receiver.received_after(2)?.ok_or("after 2")?.count(), 0);
+    // Delivering source 0 drops it from retained payloads while keeping journal order.
+    let mut out = [0; 64];
+    assert_eq!(receiver.poll_delivered(&mut out)?, Some((0, 4)));
+    let remaining: Vec<_> = receiver
+        .received_after(0)?
+        .ok_or("after deliver")?
+        .map(|entry| (entry.serial, entry.source))
+        .collect();
+    assert_eq!(remaining, vec![(1, SourceId(2))]);
+    Ok(())
+}
+
+#[test]
+fn compact_feedback_handles_held_acknowledged_flight_below_base() -> Result {
+    let (mut sender, mut receiver) = pair(CompactRecovery::Guarded)?;
+    let mut pkt0 = [0; 128];
+    let mut pkt1 = [0; 128];
+    let mut pkt2 = [0; 128];
+    // Send and physically confirm 0, 1, 2.
+    sender.submit(b"zero", Duration::ZERO)?;
+    sender.submit(b"one", Duration::ZERO)?;
+    sender.submit(b"two", Duration::ZERO)?;
+    let l0 = sender
+        .poll_source(Duration::ZERO, &mut pkt0)?
+        .ok_or("pkt0")?;
+    let t0 = sender.pending_transmission(SourceId(0)).ok_or("t0")?;
+    sender.confirm_transmission_at(ms(1), ms(1), t0)?;
+    let l1 = sender.poll_source(ms(1), &mut pkt1)?.ok_or("pkt1")?;
+    let t1 = sender.pending_transmission(SourceId(1)).ok_or("t1")?;
+    sender.confirm_transmission_at(ms(2), ms(2), t1)?;
+    let l2 = sender.poll_source(ms(2), &mut pkt2)?.ok_or("pkt2")?;
+    let t2 = sender.pending_transmission(SourceId(2)).ok_or("t2")?;
+    sender.confirm_transmission_at(ms(3), ms(3), t2)?;
+
+    // Retry source 0 so it has attempts == 2 and transmission != 0 (held physically).
+    let retry_at = sender.source_deadline().ok_or("retry deadline")?;
+    let mut retry0 = [0; 128];
+    sender.poll_source(retry_at, &mut retry0)?.ok_or("retry0")?;
+    let held0 = sender.pending_transmission(SourceId(0)).ok_or("held0")?;
+
+    // Peer acknowledges source 0 (from original copy) and source 2; source 1 is unacked.
+    receiver.receive(&pkt0[..l0], ms(20))?;
+    receiver.receive(&pkt2[..l2], ms(21))?;
+    let fb1 = feedback(&mut receiver, ms(30))?;
+    sender.receive(&fb1, retry_at)?;
+    assert!(sender.source_confirmed(SourceId(0))?);
+    assert!(!sender.source_confirmed(SourceId(1))?);
+    assert!(sender.source_confirmed(SourceId(2))?);
+    // Source 0 stays retained below base until physical confirmation, while source 2 was freed.
+    assert_eq!(sender.retained().send_records, 2);
+
+    // Second feedback acknowledges source 1 while source 0 is still held below base.
+    receiver.receive(&pkt1[..l1], ms(35))?;
+    let fb2 = feedback(&mut receiver, ms(45))?;
+    sender.receive(&fb2, retry_at + ms(1))?;
+    assert!(sender.source_confirmed(SourceId(1))?);
+    assert_eq!(sender.retained().send_records, 1);
+
+    // Confirming the held retry of source 0 frees it cleanly and drains sender.
+    sender.confirm_transmission_at(retry_at + ms(2), retry_at + ms(2), held0)?;
+    assert_eq!(sender.retained().send_records, 0);
+    assert_eq!(sender.retained().send_bytes, 0);
+    Ok(())
+}

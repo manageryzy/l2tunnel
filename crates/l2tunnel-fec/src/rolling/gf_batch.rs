@@ -33,6 +33,44 @@ pub(super) fn nonzero_bytes(word: u64) -> usize {
     high.count_ones() as usize
 }
 
+fn count_nonzero_slice(bytes: &[u8]) -> usize {
+    let mut total = 0;
+    let mut chunks = bytes.chunks_exact(8);
+    for chunk in chunks.by_ref() {
+        let mut word = [0; 8];
+        word.copy_from_slice(chunk);
+        total += nonzero_bytes(u64::from_ne_bytes(word));
+    }
+    for &byte in chunks.remainder() {
+        total += usize::from(byte != 0);
+    }
+    total
+}
+
+/// Multiply `slice` in place by `factor` over GF(256), using SIMD chunks when wide.
+pub(super) fn scale_in_place(slice: &mut [u8], factor: u8) {
+    if factor == 1 || slice.is_empty() {
+        return;
+    }
+    if factor == 0 {
+        slice.fill(0);
+        return;
+    }
+    if slice.len() >= 32 {
+        let mut scratch = [0_u8; 512];
+        for chunk in slice.chunks_mut(scratch.len()) {
+            let len = chunk.len();
+            scratch[..len].copy_from_slice(chunk);
+            tape_reed_solomon::gf::mul_slice(chunk, &scratch[..len], factor);
+        }
+        return;
+    }
+    let products = &MULTIPLICATION_ROWS[usize::from(factor)];
+    for value in slice {
+        *value = products[usize::from(*value)];
+    }
+}
+
 // The caller has already bounded and validated both slices and charges every
 // logical GF byte, including zeros. Skip only physically redundant zero-word
 // loads/stores. COUNT tracks exact before/after coefficient counts; payload
@@ -46,9 +84,19 @@ pub(super) fn xor_scaled<const COUNT: bool>(
         return (0, 0);
     }
     let count = destination.len().min(input.len());
-    if !COUNT && count >= 32 {
+    if count >= 32 {
         // The backend dispatches at runtime with a scalar fallback. Both
         // operands have exactly the length already granted by the caller.
+        if COUNT {
+            let removed = count_nonzero_slice(&destination[..count]);
+            tape_reed_solomon::gf::mul_slice_xor(
+                &mut destination[..count],
+                &input[..count],
+                factor,
+            );
+            let added = count_nonzero_slice(&destination[..count]);
+            return (removed, added);
+        }
         tape_reed_solomon::gf::mul_slice_xor(&mut destination[..count], &input[..count], factor);
         return (0, 0);
     }

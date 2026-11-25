@@ -1,6 +1,7 @@
 use super::*;
 use l2tunnel_codec::{packed as packer, packed_envelope as envelope};
 use l2tunnel_datagram as datagram;
+use std::collections::VecDeque;
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 fn ms(value: u64) -> Duration {
     Duration::from_millis(value)
@@ -710,4 +711,376 @@ fn one_packed_source_exposes_both_sender_native_identities_without_context_credi
     assert_eq!(large.bytes, &[0x7a; 80]);
     receiver.commit_delivery(ms(6))?;
     Ok(())
+}
+
+/// Packed over a wide base-ARQ window (above 64 records), with the selected
+/// compact wire, physical send confirmation as the runtime uses it, data in
+/// both directions, drops and many sources in flight.
+#[test]
+fn packed_wide_arq_window_transfers_with_compact_wire_and_loss() -> TestResult {
+    let mut config = config(128);
+    let window = 512;
+    let original = config.base.recovery.arq.max_source_bytes;
+    let wrapped = config.base.recovery.fec.block.max_source_bytes;
+    config.base.recovery.arq.send_records = window;
+    config.base.recovery.arq.receive_records = window;
+    config.base.recovery.arq.send_bytes = window * original;
+    config.base.recovery.arq.receive_bytes = window * original;
+    config.base.recovery.arq.max_retries = 8;
+    config.base.recovery.repair_symbols = 0;
+    config.base.recovery.max_restored_packets = window + 3;
+    config.base.recovery.max_restored_bytes = (window + 3) * wrapped;
+    config.base.receiver.source_window = 2048;
+    config.base.receiver.record_window = 8192;
+    config.validate()?;
+    assert!(config.base.recovery.arq.wide_feedback());
+    for physical in [false, true] {
+        let (mut left, mut right) = peers(config)?;
+        if physical {
+            left.enable_physical_send_confirmation()?;
+            right.enable_physical_send_confirmation()?;
+        }
+        left.enable_compact_wire(53)?;
+        right.enable_compact_wire(53)?;
+        let total = 3000_usize;
+        let mut queued = [0_usize; 2];
+        let mut delivered = [Vec::new(), Vec::new()];
+        let mut dropped = 0;
+        let mut emitted = 0_u64;
+        let mut wire: Vec<(u64, bool, Vec<u8>)> = Vec::new();
+        for now in 0..20_000_u64 {
+            for (side, endpoint) in [(0, &mut left), (1, &mut right)] {
+                // The reverse direction carries a lighter stream, like inner ACKs.
+                let target = if side == 0 { total } else { total / 4 };
+                while queued[side] < target {
+                    let n = queued[side];
+                    let frame = vec![(n % 251) as u8, (n / 251) as u8, side as u8, 0];
+                    if endpoint
+                        .enqueue_admitted(ChannelId((n % 2) as u8), &frame, ms(now))
+                        .is_err()
+                    {
+                        break;
+                    }
+                    queued[side] += 1;
+                }
+            }
+            for (to_right, endpoint) in [(true, &mut left), (false, &mut right)] {
+                let mut allowance = budget(endpoint);
+                for feedback in [true, false] {
+                    for _ in 0..64 {
+                        let Some(packet) = emit(endpoint, now, feedback, &mut allowance)? else {
+                            break;
+                        };
+                        if physical && let Some(output) = endpoint.pending_output() {
+                            endpoint.confirm_output(ms(now), output)?;
+                        }
+                        emitted += 1;
+                        if now < 400 && emitted.is_multiple_of(7) {
+                            dropped += 1;
+                            continue;
+                        }
+                        wire.push((now + 10 + emitted % 5, to_right, packet));
+                    }
+                }
+            }
+            for index in (0..wire.len()).rev() {
+                if wire[index].0 <= now {
+                    let (_, to_right, packet) = wire.swap_remove(index);
+                    if to_right {
+                        right.receive_authenticated(&packet, ms(now))?;
+                    } else {
+                        left.receive_authenticated(&packet, ms(now))?;
+                    }
+                }
+            }
+            delivered[0].extend(deliveries(&mut right, now)?);
+            delivered[1].extend(deliveries(&mut left, now)?);
+            if delivered[0].len() == total
+                && delivered[1].len() == total / 4
+                && wire.is_empty()
+                && left.drained()
+                && right.drained()
+            {
+                break;
+            }
+        }
+        assert!(dropped > 0);
+        assert_eq!(delivered[0].len(), total, "physical={physical}");
+        assert_eq!(delivered[1].len(), total / 4, "physical={physical}");
+    }
+    Ok(())
+}
+
+/// Wide-window Packed through a rate-limited bottleneck with deep queues and a
+/// few early drops (native 100/10 Mbit/s shape). Queueing inflates the RTT far
+/// above its smoothed value; fast resend must not re-send copies still queued
+/// (which once exhausted retries within about two seconds).
+#[test]
+fn packed_wide_window_survives_queue_inflated_rtt_with_drops() -> TestResult {
+    let mut config = config(128);
+    let window = 2048;
+    let original = config.base.recovery.arq.max_source_bytes;
+    let wrapped = config.base.recovery.fec.block.max_source_bytes;
+    config.base.recovery.arq.send_records = window;
+    config.base.recovery.arq.receive_records = window;
+    config.base.recovery.arq.send_bytes = window * original;
+    config.base.recovery.arq.receive_bytes = window * original;
+    config.base.recovery.arq.max_retries = 8;
+    config.base.recovery.arq.initial_rto = ms(200);
+    config.base.recovery.arq.maximum_rto = ms(3000);
+    config.base.recovery.repair_symbols = 0;
+    config.base.recovery.max_restored_packets = window + 3;
+    config.base.recovery.max_restored_bytes = (window + 3) * wrapped;
+    config.base.receiver.source_window = 8192;
+    config.base.receiver.record_window = 8192;
+    config.base.receiver.lookahead_records = 1024;
+    config.base.receiver.lookahead_bytes = 4 << 20;
+    config.base.receiver.lookahead_fragments = 4096;
+    config.base.receiver.lifetime_ticks = 30_000;
+    config.base.receiver.max_fragments_per_record = 4;
+    config.base.receiver.body.max_frame_bytes = 440;
+    config.base.max_recovery_packet_bytes = 2048;
+    config.validate()?;
+    assert!(config.base.recovery.arq.wide_feedback());
+    // Reserved endpoints, as the daemon builds them: indexed ARQ storage, the
+    // deadline heap, the send-order queue and the receipt journal.
+    let plan = storage::Plan::for_packed_duplex(config, config)?;
+    let limits = storage::Limits {
+        capacity_bytes: plan.capacity_bytes(),
+    };
+    let mut left =
+        packed::Endpoint::new_reserved(config, tests::context(EndpointRole::Initiator), limits)?;
+    let mut right =
+        packed::Endpoint::new_reserved(config, tests::context(EndpointRole::Responder), limits)?;
+    left.enable_physical_send_confirmation()?;
+    right.enable_physical_send_confirmation()?;
+    left.enable_compact_wire(53)?;
+    right.enable_compact_wire(53)?;
+    // Fragmented forward frames; short reverse frames like inner TCP ACKs.
+    let totals = [6_000_usize, 8_000];
+    let sizes = [300_usize, 40];
+    // Senders may emit 4x faster than their link drains its 1000-packet queue.
+    let rates = [40_usize, 8];
+    let link = [10_usize, 2];
+    let mut queues: [VecDeque<Vec<u8>>; 2] = Default::default();
+    let mut flights: [VecDeque<(u64, Vec<u8>)>; 2] = Default::default();
+    let mut queued = [0_usize; 2];
+    let mut delivered = [0_usize; 2];
+    let mut drops = 0;
+    for now in 0..60_000_u64 {
+        for (side, endpoint) in [(0, &mut left), (1, &mut right)] {
+            let mut allowance = budget(endpoint);
+            let mut sent = 0;
+            let mut feedback = true;
+            for _ in 0..4 * rates[side] + 8 {
+                while queued[side] < totals[side] {
+                    let n = queued[side];
+                    let mut frame = vec![(n % 251) as u8; sizes[side]];
+                    frame[1] = side as u8;
+                    if endpoint
+                        .enqueue_admitted(ChannelId((n % 2) as u8), &frame, ms(now))
+                        .is_err()
+                    {
+                        break;
+                    }
+                    queued[side] += 1;
+                }
+                if sent == rates[side] {
+                    break;
+                }
+                let packet = match emit(endpoint, now, feedback, &mut allowance) {
+                    Ok(Some(packet)) => packet,
+                    Ok(None) if feedback => {
+                        feedback = false;
+                        continue;
+                    }
+                    Ok(None) => break,
+                    Err(error) => {
+                        return Err(format!(
+                            "side {side} failed at {now} ms after {delivered:?}: {error:?}"
+                        )
+                        .into());
+                    }
+                };
+                feedback = false;
+                if let Some(output) = endpoint.pending_output() {
+                    endpoint.confirm_output(ms(now), output)?;
+                }
+                sent += 1;
+                if side == 0 && (300..2000).contains(&now) && now % 97 == 0 && drops < 12 {
+                    drops += 1;
+                } else if queues[side].len() < 1000 {
+                    queues[side].push_back(packet);
+                }
+            }
+        }
+        for side in 0..2 {
+            for _ in 0..link[side] {
+                let Some(packet) = queues[side].pop_front() else {
+                    break;
+                };
+                flights[side].push_back((now + 35, packet));
+            }
+            while flights[side].front().is_some_and(|(at, _)| *at <= now) {
+                let Some((_, packet)) = flights[side].pop_front() else {
+                    break;
+                };
+                if side == 0 {
+                    right.receive_authenticated(&packet, ms(now))?;
+                } else {
+                    left.receive_authenticated(&packet, ms(now))?;
+                }
+            }
+        }
+        delivered[0] += deliveries(&mut right, now)?.len();
+        delivered[1] += deliveries(&mut left, now)?.len();
+        if delivered == totals {
+            assert!(drops > 0);
+            return Ok(());
+        }
+    }
+    Err(format!("incomplete after 60 s: {delivered:?} of {totals:?}").into())
+}
+
+/// Wide-window Packed through a rate-limited bottleneck with deep queues and a
+/// few early drops (native 100/10 Mbit/s shape). Queueing inflates the RTT far
+/// above its smoothed value; fast resend must not re-send copies still queued
+/// (which once exhausted retries within about two seconds).
+#[test]
+#[ignore = "diagnostic"]
+fn diag_wide_cauchy_random_loss() -> TestResult {
+    let mut config = config(128);
+    let window = 2048;
+    let original = config.base.recovery.arq.max_source_bytes;
+    let wrapped = config.base.recovery.fec.block.max_source_bytes;
+    config.base.recovery.arq.send_records = window;
+    config.base.recovery.arq.receive_records = window;
+    config.base.recovery.arq.send_bytes = window * original;
+    config.base.recovery.arq.receive_bytes = window * original;
+    config.base.recovery.arq.max_retries = 8;
+    config.base.recovery.arq.initial_rto = ms(200);
+    config.base.recovery.arq.maximum_rto = ms(3000);
+    config.base.recovery.repair_symbols = 2;
+    config.base.recovery.fec.block.max_sources = 8;
+    config.base.recovery.fec.block.max_packet_bytes = l2tunnel_fec::HEADER_BYTES + 8 + 2 + wrapped;
+    config.base.recovery.fec.max_generations = 16;
+    config.base.recovery.fec.max_symbols_per_generation = 10;
+    config.base.recovery.fec.max_reserved_bytes = 16 << 20;
+    config.base.recovery.fec.max_lifetime_ticks = 10_000;
+    config.base.recovery.fec.generation_window = 256;
+    config.base.recovery.max_restored_packets = window + 8;
+    config.base.recovery.max_restored_bytes = (window + 8) * wrapped;
+    config.base.receiver.source_window = 8192;
+    config.base.receiver.record_window = 8192;
+    config.base.receiver.lookahead_records = 1024;
+    config.base.receiver.lookahead_bytes = 4 << 20;
+    config.base.receiver.lookahead_fragments = 4096;
+    config.base.receiver.lifetime_ticks = 30_000;
+    config.base.receiver.max_fragments_per_record = 4;
+    config.base.receiver.body.max_frame_bytes = 440;
+    config.base.max_recovery_packet_bytes = 2048;
+    config.validate()?;
+    assert!(config.base.recovery.arq.wide_feedback());
+    // Reserved endpoints, as the daemon builds them: indexed ARQ storage, the
+    // deadline heap, the send-order queue and the receipt journal.
+    let plan = storage::Plan::for_packed_duplex(config, config)?;
+    let limits = storage::Limits {
+        capacity_bytes: plan.capacity_bytes(),
+    };
+    let mut left =
+        packed::Endpoint::new_reserved(config, tests::context(EndpointRole::Initiator), limits)?;
+    let mut right =
+        packed::Endpoint::new_reserved(config, tests::context(EndpointRole::Responder), limits)?;
+    left.enable_physical_send_confirmation()?;
+    right.enable_physical_send_confirmation()?;
+    left.enable_compact_wire(53)?;
+    right.enable_compact_wire(53)?;
+    // Fragmented forward frames; short reverse frames like inner TCP ACKs.
+    let totals = [6_000_usize, 8_000];
+    let sizes = [300_usize, 40];
+    // Senders may emit 4x faster than their link drains its 1000-packet queue.
+    let rates = [40_usize, 8];
+    let link = [10_usize, 2];
+    let mut queues: [VecDeque<Vec<u8>>; 2] = Default::default();
+    let mut flights: [VecDeque<(u64, Vec<u8>)>; 2] = Default::default();
+    let mut queued = [0_usize; 2];
+    let mut delivered = [0_usize; 2];
+    let mut drops = 0;
+    let mut rng = 0x9e37_79b9_7f4a_7c15_u64;
+    for now in 0..60_000_u64 {
+        for (side, endpoint) in [(0, &mut left), (1, &mut right)] {
+            let mut allowance = budget(endpoint);
+            let mut sent = 0;
+            let mut feedback = true;
+            for _ in 0..4 * rates[side] + 8 {
+                while queued[side] < totals[side] {
+                    let n = queued[side];
+                    let mut frame = vec![(n % 251) as u8; sizes[side]];
+                    frame[1] = side as u8;
+                    if endpoint
+                        .enqueue_admitted(ChannelId((n % 2) as u8), &frame, ms(now))
+                        .is_err()
+                    {
+                        break;
+                    }
+                    queued[side] += 1;
+                }
+                if sent == rates[side] {
+                    break;
+                }
+                let packet = match emit(endpoint, now, feedback, &mut allowance) {
+                    Ok(Some(packet)) => packet,
+                    Ok(None) if feedback => {
+                        feedback = false;
+                        continue;
+                    }
+                    Ok(None) => break,
+                    Err(error) => {
+                        return Err(format!(
+                            "side {side} failed at {now} ms after {delivered:?}: {error:?}"
+                        )
+                        .into());
+                    }
+                };
+                feedback = false;
+                if let Some(output) = endpoint.pending_output() {
+                    endpoint.confirm_output(ms(now), output)?;
+                }
+                sent += 1;
+                rng ^= rng << 13;
+                rng ^= rng >> 7;
+                rng ^= rng << 17;
+                if rng % 100 < 15 {
+                    drops += 1;
+                } else if queues[side].len() < 1000 {
+                    queues[side].push_back(packet);
+                }
+            }
+        }
+        for side in 0..2 {
+            for _ in 0..link[side] {
+                let Some(packet) = queues[side].pop_front() else {
+                    break;
+                };
+                flights[side].push_back((now + 35, packet));
+            }
+            while flights[side].front().is_some_and(|(at, _)| *at <= now) {
+                let Some((_, packet)) = flights[side].pop_front() else {
+                    break;
+                };
+                if side == 0 {
+                    right.receive_authenticated(&packet, ms(now))?;
+                } else {
+                    left.receive_authenticated(&packet, ms(now))?;
+                }
+            }
+        }
+        delivered[0] += deliveries(&mut right, now)?.len();
+        delivered[1] += deliveries(&mut left, now)?.len();
+        if delivered == totals {
+            assert!(drops > 0);
+            return Ok(());
+        }
+    }
+    Err(format!("incomplete after 60 s: {delivered:?} of {totals:?}").into())
 }

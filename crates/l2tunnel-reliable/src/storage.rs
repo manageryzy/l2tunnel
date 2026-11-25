@@ -60,8 +60,8 @@ pub struct Plan {
 impl Plan {
     /// Validate both complete directions before computing nested and wrapper layouts.
     pub fn for_duplex(send: ReliableConfig, receive: ReliableConfig) -> Result<Self, Error> {
-        let maximum = send.maximum_packet().map_err(Error::Reliable)?;
         receive.validate().map_err(Error::Reliable)?;
+        let (maximum, _) = crate::duplex_maxima(send, receive).map_err(Error::Reliable)?;
         let arq = l2tunnel_recovery::storage::DuplexPlan::for_arq(send.arq, receive.arq)
             .map_err(Error::Recovery)?;
         let encoder = (send.repair_symbols != 0)
@@ -85,7 +85,8 @@ impl Plan {
             receive.arq.max_source_bytes,
         )?;
         let scratch = bs
-            .max(l2tunnel_recovery::ACK_PACKET_BYTES)
+            // Local feedback acknowledges the receive direction (wide above 64).
+            .max(receive.arq.ack_packet_bytes())
             .max(if decoder.is_some() {
                 add(receive.fec.block.max_source_bytes, 2)?
             } else {

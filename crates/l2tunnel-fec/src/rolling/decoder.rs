@@ -1625,12 +1625,7 @@ impl Decoder {
                     let count = field_chunk(remaining, budget)?;
                     let end = add(index, count)?;
                     let candidate = self.candidate.get_mut(index..end).ok_or(Error::Identity)?;
-                    if factor != 1 {
-                        let products = &gf_batch::MULTIPLICATION_ROWS[usize::from(factor)];
-                        for value in candidate {
-                            *value = products[usize::from(*value)];
-                        }
-                    }
+                    gf_batch::scale_in_place(candidate, factor);
                     charge_field_chunk(count, budget);
                     job.phase = Phase::Normalize {
                         pivot,

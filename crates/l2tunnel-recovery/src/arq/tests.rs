@@ -481,7 +481,12 @@ fn time_regression_overflow_and_invalid_configuration_are_explicit() -> Result<(
         Err(RecoveryError::TimeOverflow)
     );
     assert_eq!(sender.statistics().transmissions, 0);
-    settings.send_records = 65;
+    for valid in [65, crate::MAX_ARQ_WINDOW] {
+        settings.send_records = valid;
+        settings.send_bytes = settings.send_bytes.max(valid);
+        assert!(SelectiveRepeat::new(settings, context(EndpointRole::Initiator)).is_ok());
+    }
+    settings.send_records = crate::MAX_ARQ_WINDOW + 1;
     assert!(matches!(
         SelectiveRepeat::new(settings, context(EndpointRole::Initiator)),
         Err(RecoveryError::InvalidConfig)

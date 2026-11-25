@@ -152,6 +152,9 @@ impl CompactArqConfig {
             .ok_or(RecoveryError::TimeOverflow)?;
         Ok(())
     }
+    pub(crate) fn wide_receive(self) -> bool {
+        self.base().wide_feedback()
+    }
     fn base(self) -> ArqConfig {
         ArqConfig {
             max_source_bytes: self.bounds.max_source_bytes,
@@ -466,6 +469,8 @@ impl CompactRepeat {
                     attempts: 0,
                     retry_at: None,
                     rto: Duration::ZERO,
+                    fast_resend: false,
+                    serial: 0,
                 },
             });
         }
@@ -505,9 +510,17 @@ impl CompactRepeat {
             last_feedback: None,
             notified_gap: None,
         });
+        let journal = if receive.wide_receive() {
+            Some(allocation.vec::<ReceiptEntry>(receive.bounds.receive_records)?)
+        } else {
+            None
+        };
         let usage = allocation.usage();
         if usage.capacity_bytes != plan.capacity_bytes()
-            || usage.allocations != 5 + send.bounds.send_records + receive.bounds.receive_records
+            || usage.allocations
+                != 5 + usize::from(journal.is_some())
+                    + send.bounds.send_records
+                    + receive.bounds.receive_records
         {
             return Err(crate::storage::Error::Invariant);
         }
@@ -519,6 +532,7 @@ impl CompactRepeat {
             Received::Indexed(received, 0),
             Some(usage),
         );
+        engine.receipts = journal.map(|storage| receipts::Journal::new(receive.base(), storage));
         engine.compact = Cell(selected);
         engine
             .enable_physical_send_confirmation()
@@ -806,6 +820,27 @@ impl CompactRepeat {
             .iter()
             .map(|(source, bytes)| (*source, bytes.as_slice())))
     }
+    /// Latest receipt serial when this receive direction keeps a journal
+    /// (more than 64 records); `None` otherwise.
+    pub fn receipt_serial(&self) -> Option<u64> {
+        self.engine.receipt_serial()
+    }
+    /// Retained sources received after receipt serial `cursor`, in arrival
+    /// order with their serials, starting in O(1). `None` means no journal or a
+    /// cursor older than the journal: use [`Self::received_sources`] instead.
+    pub fn received_after(
+        &self,
+        cursor: u64,
+    ) -> Result<Option<impl Iterator<Item = Receipt<'_>>>, RecoveryError> {
+        self.engine.running()?;
+        Ok(self.engine.receipts_after(cursor).map(|entries| {
+            entries.map(|(serial, source, bytes)| Receipt {
+                serial,
+                source,
+                bytes: bytes.as_slice(),
+            })
+        }))
+    }
     /// Actual estimator snapshot with explicit nearest-nanosecond scheduling.
     pub fn timing(&self) -> Result<CompactTimingSnapshot, RecoveryError> {
         let state = self
@@ -1019,12 +1054,17 @@ impl Engine {
                     self.ack_at.map_or(due, |old| old.min(due))
                 });
                 if let CompactRecovery::BoundedGap { min_interval } = state.receive.recovery {
-                    let later = self
-                        .received
-                        .keys()
-                        .filter(|source| source.0 >= self.receive_prefix)
-                        .take(3)
-                        .count();
+                    let mut later = 0usize;
+                    if let Some(highest) = state.highest_received {
+                        for number in self.receive_prefix..=highest {
+                            if self.received.contains_key(&SourceId(number)) {
+                                later += 1;
+                                if later >= 3 {
+                                    break;
+                                }
+                            }
+                        }
+                    }
                     let allowed = state
                         .last_feedback
                         .and_then(|at| at.checked_add(min_interval));
@@ -1065,13 +1105,28 @@ impl Engine {
                 return Err(RecoveryError::UnsentAcknowledgement);
             }
         }
-        for (source, flight) in self.sent.iter() {
-            if feedback.acknowledges(*source) {
+        // Every retained entry below `state.base` is already acknowledged (with
+        // attempts >= 2), so only covered sources in [state.base, next_source)
+        // can violate transmission/physical-custody checks.
+        let check_ack = |source: SourceId| -> Result<(), RecoveryError> {
+            if let Some(flight) = self.sent.get(&source) {
                 if flight.attempts == 0 {
                     return Err(RecoveryError::UnsentAcknowledgement);
                 }
                 if flight.attempts == 1 && flight.transmission != 0 {
                     return Err(RecoveryError::FeedbackAwaitingPhysical);
+                }
+            }
+            Ok(())
+        };
+        for number in state.base..feedback.prefix {
+            check_ack(SourceId(number))?;
+        }
+        for offset in 0..usize::from(feedback.count) {
+            if feedback.bit(offset) {
+                let number = feedback.start + offset as u64;
+                if number >= state.base.max(feedback.prefix) {
+                    check_ack(SourceId(number))?;
                 }
             }
         }
@@ -1126,14 +1181,19 @@ impl Engine {
             )?
         };
         // Preflight every potentially failing guard addition before ACK/RTT mutation.
-        for (source, flight) in self.sent.iter() {
-            if flight.transmission == 0
-                && !feedback.acknowledges(*source)
-                && let Some(at) = state.meta(*source).accepted
-            {
-                at.checked_add(guard).ok_or(RecoveryError::TimeOverflow)?;
+        // Entries below `state.base` are physically held acknowledged flights
+        // (`transmission != 0`), and `guard == 0` (KcpLike) cannot overflow.
+        if !guard.is_zero() {
+            for (source, flight) in self.compact_candidates(state.base) {
+                if flight.transmission == 0
+                    && !feedback.acknowledges(source)
+                    && let Some(at) = state.meta(source).accepted
+                {
+                    at.checked_add(guard).ok_or(RecoveryError::TimeOverflow)?;
+                }
             }
         }
+        let sent = &mut self.sent;
         let state = self.compact.as_mut().ok_or(RecoveryError::InvalidConfig)?;
         if let Some((srtt, variance)) = sample {
             let retired = state.history_prefix_ranges(feedback.echo);
@@ -1150,26 +1210,38 @@ impl Engine {
             }
         }
         let mut released = 0;
-        self.sent.retain(|source, flight| {
-            if !feedback.acknowledges(*source) {
-                return true;
-            }
-            state.meta_mut(*source).fast = false;
+        let old_base = state.base;
+        let mut acknowledge = |source: SourceId| {
+            let Some(flight) = sent.get_mut(&source) else {
+                return;
+            };
+            state.meta_mut(source).fast = false;
             if flight.transmission != 0 {
                 flight.acknowledged = true;
-                return true;
+                return;
             }
             released += flight.payload.len();
-            false
-        });
+            sent.remove(&source);
+        };
+        for number in old_base..feedback.prefix {
+            acknowledge(SourceId(number));
+        }
+        for offset in 0..usize::from(feedback.count) {
+            if feedback.bit(offset) {
+                let number = feedback.start + offset as u64;
+                if number >= old_base.max(feedback.prefix) {
+                    acknowledge(SourceId(number));
+                }
+            }
+        }
         self.send_bytes -= released;
-        state.base = self
-            .sent
-            .iter()
-            .filter(|(_, flight)| !flight.acknowledged)
-            .map(|(source, _)| source.0)
-            .min()
-            .unwrap_or(self.next_source);
+        while state.base < self.next_source
+            && sent
+                .get(&SourceId(state.base))
+                .is_none_or(|flight| flight.acknowledged)
+        {
+            state.base += 1;
+        }
         if feedback.serial > state.received_feedback_serial {
             state.received_feedback_serial = feedback.serial;
             if let CompactRecovery::KcpLike(config) = state.send.recovery {
@@ -1179,13 +1251,14 @@ impl Engine {
                     .filter(|p| p.serial > state.fast_ack_echo && feedback.acknowledges(p.source))
                 {
                     state.fast_ack_echo = payment.serial;
-                    for (source, flight) in self.sent.iter() {
-                        if *source < payment.source
+                    for number in state.base..payment.source.0.min(self.next_source) {
+                        let source = SourceId(number);
+                        if let Some(flight) = sent.get(&source)
                             && !flight.acknowledged
                             && flight.transmission == 0
                         {
                             state
-                                .meta_mut(*source)
+                                .meta_mut(source)
                                 .observe_fast_ack(config, payment, arrival);
                         }
                     }

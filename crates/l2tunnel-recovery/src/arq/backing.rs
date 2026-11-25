@@ -50,6 +50,9 @@ impl Sent {
         self.iter().min_by_key(|(source, _)| **source)
     }
     pub(super) fn get(&self, source: &SourceId) -> Option<&Flight> {
+        if let Self::Legacy(map) = self {
+            return map.get(source);
+        }
         if let Self::Indexed(slots, _) = self {
             let slot = slots.get((source.0 % slots.len() as u64) as usize)?;
             return (slot.source.as_ref() == Some(source)).then_some(&slot.flight);
@@ -90,6 +93,8 @@ impl Sent {
                         attempts: 0,
                         retry_at: None,
                         rto,
+                        fast_resend: false,
+                        serial: 0,
                     },
                 );
             }
@@ -113,6 +118,8 @@ impl Sent {
                 slot.flight.attempts = 0;
                 slot.flight.retry_at = None;
                 slot.flight.rto = rto;
+                slot.flight.fast_resend = false;
+                slot.flight.serial = 0;
                 slot.source = Some(source);
                 // A vacant slot was admitted; occupied never exceeds slots.len().
                 *occupied += 1;
@@ -204,6 +211,9 @@ impl Received {
         self.get(source).is_some()
     }
     pub(super) fn get(&self, source: &SourceId) -> Option<&Vec<u8>> {
+        if let Self::Legacy(map) = self {
+            return map.get(source);
+        }
         if let Self::Indexed(slots, _) = self {
             let slot = slots.get((source.0 % slots.len() as u64) as usize)?;
             return (slot.source.as_ref() == Some(source)).then_some(&slot.payload);

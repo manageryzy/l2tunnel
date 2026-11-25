@@ -6,8 +6,13 @@ use std::time::Duration;
 
 mod backing;
 mod body;
-pub use body::{ARQ_BODY_DATA_MAX_HEADER_BYTES, ARQ_BODY_FEEDBACK_MAX_HEADER_BYTES, inspect_body};
+pub use body::{
+    ARQ_BODY_DATA_MAX_HEADER_BYTES, ARQ_BODY_FEEDBACK_MAX_HEADER_BYTES, inspect_body,
+    inspect_body_for,
+};
+use body::{varint_len, write_varint};
 mod compact;
+mod wide_timing;
 pub(crate) use backing::{ReceiveSlot, SendSlot};
 use backing::{Received, Sent};
 pub use compact::{
@@ -18,13 +23,22 @@ pub use compact::{
     CompactTimingSnapshot, KcpLikeConfig, inspect_compact_body, inspect_compact_packet,
 };
 pub(crate) use compact::{History as CompactHistory, Meta as CompactMeta, State as CompactState};
+pub use wide_timing::{ADAPTIVE_RTO_FLOOR, FAST_RESEND_THRESHOLD};
+pub(crate) use wide_timing::{DeadlineEntry, SentEntry};
+mod receipts;
+pub(crate) use receipts::ReceiptEntry;
 
 /// Bytes preceding one source payload in the draft authenticated inner encoding.
 pub const DATA_HEADER_BYTES: usize = 44;
 /// Exact byte size of the bounded cumulative/bitmap ACK packet.
 pub const ACK_PACKET_BYTES: usize = 48;
 const COMMON_HEADER_BYTES: usize = 32;
-const WINDOW_LIMIT: usize = 64;
+/// Largest window whose direction keeps the original fixed 64-bit ACK.
+pub const LEGACY_ACK_WINDOW: usize = 64;
+/// Largest base-ARQ send/receive window; larger than 64 selects the wide ACK.
+pub const MAX_ARQ_WINDOW: usize = 8192;
+/// Fixed bytes of a wide ACK packet before its bitmap (common header + prefix).
+pub const WIDE_ACK_HEADER_BYTES: usize = 40;
 
 // Local custody only; never serialized, authenticated or used as a nonce.
 static NEXT_PHYSICAL_OWNER: AtomicU64 = AtomicU64::new(1);
@@ -71,9 +85,10 @@ pub struct ArqConfig {
     pub send_bytes: usize,
     /// Maximum retained receive-payload bytes, including pending application delivery.
     pub receive_bytes: usize,
-    /// Maximum unconfirmed source count and source-ID span, in 1..=64.
+    /// Maximum unconfirmed source count and source-ID span, in 1..=8192.
+    /// Above 64 (here or in `receive_records`) the direction uses the wide ACK.
     pub send_records: usize,
-    /// Maximum retained source count and receive-ID window, in 1..=64.
+    /// Maximum retained source count and receive-ID window, in 1..=8192.
     pub receive_records: usize,
     /// Timeout from the first transmission to its first retry.
     pub initial_rto: Duration,
@@ -102,14 +117,43 @@ impl Default for ArqConfig {
 }
 
 impl ArqConfig {
+    /// Whether this direction's feedback uses the wide ACK. Both peers derive it
+    /// from the same authenticated direction configuration; nothing is negotiated.
+    pub const fn wide_feedback(self) -> bool {
+        self.send_records > LEGACY_ACK_WINDOW || self.receive_records > LEGACY_ACK_WINDOW
+    }
+    /// Largest wide-ACK bitmap for this direction, in bytes; zero when legacy.
+    pub const fn wide_bitmap_max_bytes(self) -> usize {
+        if self.wide_feedback() {
+            self.receive_records.div_ceil(8)
+        } else {
+            0
+        }
+    }
+    /// Largest complete ACK packet (legacy encoding) for this direction.
+    pub const fn ack_packet_bytes(self) -> usize {
+        if self.wide_feedback() {
+            WIDE_ACK_HEADER_BYTES + self.wide_bitmap_max_bytes()
+        } else {
+            ACK_PACKET_BYTES
+        }
+    }
+    /// Largest context-free feedback body for this direction.
+    pub const fn feedback_body_max_bytes(self) -> usize {
+        if self.wide_feedback() {
+            ARQ_BODY_DATA_MAX_HEADER_BYTES + self.wide_bitmap_max_bytes()
+        } else {
+            ARQ_BODY_FEEDBACK_MAX_HEADER_BYTES
+        }
+    }
     /// Validate existing payload, retention, sequence-window and timing bounds.
     /// This pure check reserves no backing and grants no authentication authority.
     pub fn validate(self) -> Result<(), RecoveryError> {
         if !(1..=65_535).contains(&self.max_source_bytes)
             || self.send_bytes < self.max_source_bytes
             || self.receive_bytes < self.max_source_bytes
-            || !(1..=WINDOW_LIMIT).contains(&self.send_records)
-            || !(1..=WINDOW_LIMIT).contains(&self.receive_records)
+            || !(1..=MAX_ARQ_WINDOW).contains(&self.send_records)
+            || !(1..=MAX_ARQ_WINDOW).contains(&self.receive_records)
             || self.initial_rto.is_zero()
             || self.maximum_rto < self.initial_rto
             || self.ack_delay > self.initial_rto
@@ -207,6 +251,8 @@ pub struct Statistics {
     pub delivered: u64,
     /// Full source and feedback packet bytes emitted, before outer protection.
     pub wire_bytes_emitted: u64,
+    /// Wide-direction sources made due early by ACK gaps (fast resend).
+    pub fast_retransmissions: u64,
 }
 
 /// Current owned payload retention, excluding fixed-size metadata.
@@ -336,6 +382,10 @@ struct Flight {
     attempts: u32,
     retry_at: Option<Duration>,
     rto: Duration,
+    /// Made due by ACK gaps; its next timer uses the adaptive RTO undoubled.
+    fast_resend: bool,
+    /// Transmission serial of the latest copy (wide directions only).
+    serial: u64,
 }
 
 #[derive(Debug)]
@@ -364,11 +414,30 @@ struct Engine {
     last_now: Duration,
     failure: Option<RecoveryError>,
     statistics: Statistics,
+    /// Adaptive timing and O(1) scheduling; present only for a wide send direction.
+    wide: Option<wide_timing::WideTiming>,
+    /// Highest source ever stored for receipt; sizes wide ACKs in O(1).
+    highest_received: u64,
+    /// Arrival-order receipt journal; present only for a wide receive direction.
+    receipts: Option<receipts::Journal>,
+}
+
+/// One retained received source from a wide direction's receipt journal.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Receipt<'a> {
+    /// Arrival serial; the first receipt is 1.
+    pub serial: u64,
+    /// Received source identity.
+    pub source: SourceId,
+    /// Retained authenticated source bytes.
+    pub bytes: &'a [u8],
 }
 
 /// Actual-payload selective-repeat ARQ for an authenticated datagram carrier.
 /// This baseline has bounded selective ACKs and timeout recovery, not Python
-/// wire parity, FEC, fast retransmit, a clock or a congestion controller.
+/// wire parity, FEC, a clock or a congestion controller. A send direction above
+/// 64 records adds an adaptive RTO and once-per-RTT fast resend from ACK gaps;
+/// windows of at most 64 keep the classic fixed, doubling timer.
 ///
 /// ```
 /// use l2tunnel_recovery::{
@@ -423,6 +492,79 @@ pub enum PacketView<'a> {
         /// Selective receipt bits relative to prefix; bit zero is clear.
         bitmap: u64,
     },
+    /// Wide receipt feedback for a direction whose window exceeds 64.
+    WideAck {
+        /// First missing contiguous received source ID.
+        prefix: u64,
+        /// Canonical bitmap: bit `i % 8` of byte `i / 8` acknowledges
+        /// `prefix + i`; bit zero is clear and the last byte is nonzero.
+        bitmap: &'a [u8],
+    },
+}
+
+/// Receipt bits of either ACK form, relative to the cumulative prefix.
+#[derive(Clone, Copy, Debug)]
+enum AckBits<'a> {
+    Legacy(u64),
+    Wide(&'a [u8]),
+}
+impl AckBits<'_> {
+    fn contains(self, offset: u64) -> bool {
+        match self {
+            Self::Legacy(bitmap) => offset < 64 && bitmap & (1_u64 << offset) != 0,
+            Self::Wide(bytes) => usize::try_from(offset / 8)
+                .ok()
+                .and_then(|index| bytes.get(index))
+                .is_some_and(|byte| byte & (1 << (offset % 8)) != 0),
+        }
+    }
+    /// Every acknowledged offset above the prefix, in increasing order.
+    fn offsets(self) -> impl Iterator<Item = u64> {
+        let (legacy, wide) = match self {
+            Self::Legacy(bitmap) => (Some(bitmap), None),
+            Self::Wide(bytes) => (None, Some(bytes)),
+        };
+        let legacy = legacy
+            .into_iter()
+            .flat_map(|bitmap| (0..64).filter(move |offset| bitmap & (1_u64 << offset) != 0));
+        let wide = wide.into_iter().flat_map(|bytes| {
+            bytes
+                .iter()
+                .enumerate()
+                .filter(|(_, byte)| **byte != 0)
+                .flat_map(|(index, byte)| {
+                    (0..8)
+                        .filter(move |bit| byte & (1 << bit) != 0)
+                        .map(move |bit| index as u64 * 8 + bit)
+                })
+        });
+        legacy.chain(wide)
+    }
+    /// Highest acknowledged offset, if any bit is set.
+    fn highest(self) -> Option<u64> {
+        match self {
+            Self::Legacy(0) => None,
+            Self::Legacy(bitmap) => Some(63 - u64::from(bitmap.leading_zeros())),
+            Self::Wide(bytes) => {
+                let last = *bytes.last()?;
+                Some((bytes.len() as u64 - 1) * 8 + 7 - u64::from(last.leading_zeros()))
+            }
+        }
+    }
+    /// Canonical form: bit zero clear, no trailing zero byte, no prefix overflow.
+    fn canonical(self, prefix: u64) -> bool {
+        let first_clear = match self {
+            Self::Legacy(bitmap) => bitmap & 1 == 0,
+            Self::Wide(bytes) => {
+                bytes.first().is_none_or(|byte| byte & 1 == 0)
+                    && bytes.last().is_none_or(|byte| *byte != 0)
+            }
+        };
+        first_clear
+            && self
+                .highest()
+                .is_none_or(|top| prefix.checked_add(top).is_some())
+    }
 }
 
 /// Inspect a selective-repeat peer packet using the engine's authoritative parser.
@@ -437,7 +579,37 @@ pub fn inspect_packet(
     if !(1..=65_535).contains(&max_source_bytes) {
         return Err(RecoveryError::InvalidConfig);
     }
-    parse(packet, context, Profile::Selective, max_source_bytes)
+    parse(
+        packet,
+        context,
+        Profile::Selective,
+        max_source_bytes,
+        ArqConfig::default(),
+    )
+}
+
+/// Inspect a selective-repeat peer packet for one direction configuration.
+///
+/// `direction` is the configuration of the sources an ACK would acknowledge:
+/// a data sender passes its send configuration. Its window selects the legacy
+/// or wide ACK form. Data is bounded by `max_source_bytes` as in `inspect_packet`.
+pub fn inspect_packet_for(
+    packet: &[u8],
+    context: RecoveryContext,
+    max_source_bytes: usize,
+    direction: ArqConfig,
+) -> Result<PacketView<'_>, RecoveryError> {
+    if !(1..=65_535).contains(&max_source_bytes) {
+        return Err(RecoveryError::InvalidConfig);
+    }
+    direction.validate()?;
+    parse(
+        packet,
+        context,
+        Profile::Selective,
+        max_source_bytes,
+        direction,
+    )
 }
 
 /// Local observation of one prepared source attempt; never peer authentication.
@@ -565,6 +737,29 @@ impl SelectiveRepeat {
             .map(|(source, bytes)| (*source, bytes.as_slice())))
     }
 
+    /// Latest receipt serial when this receive direction keeps a journal
+    /// (more than 64 records); `None` otherwise.
+    pub fn receipt_serial(&self) -> Option<u64> {
+        self.0.receipt_serial()
+    }
+
+    /// Retained sources received after receipt serial `cursor`, in arrival
+    /// order with their serials, starting in O(1). `None` means no journal or a
+    /// cursor older than the journal: use [`Self::received_sources`] instead.
+    pub fn received_after(
+        &self,
+        cursor: u64,
+    ) -> Result<Option<impl Iterator<Item = Receipt<'_>>>, RecoveryError> {
+        self.0.running()?;
+        Ok(self.0.receipts_after(cursor).map(|entries| {
+            entries.map(|(serial, source, bytes)| Receipt {
+                serial,
+                source,
+                bytes: bytes.as_slice(),
+            })
+        }))
+    }
+
     /// Emit due feedback only, without advancing source attempts or source timers.
     /// Caller must charge this output to the same wire budget as data/repair copies.
     pub fn poll_feedback(
@@ -622,12 +817,16 @@ macro_rules! engine_api {
 
             /// Exact local output buffer ceiling, including fixed feedback.
             pub fn send_max_packet_bytes(&self) -> usize {
-                (DATA_HEADER_BYTES + self.0.config.max_source_bytes).max(ACK_PACKET_BYTES)
+                // Local feedback acknowledges the receive direction.
+                (DATA_HEADER_BYTES + self.0.config.max_source_bytes)
+                    .max(self.0.receive_config.ack_packet_bytes())
             }
 
             /// Exact peer packet ceiling; never replaced by the send maximum.
             pub fn receive_max_packet_bytes(&self) -> usize {
-                (DATA_HEADER_BYTES + self.0.receive_config.max_source_bytes).max(ACK_PACKET_BYTES)
+                // Peer feedback acknowledges the local send direction.
+                (DATA_HEADER_BYTES + self.0.receive_config.max_source_bytes)
+                    .max(self.0.config.ack_packet_bytes())
             }
 
             /// Saturating diagnostic counters for emitted/received/delivered work.
@@ -700,9 +899,9 @@ struct Construction {
     #[cfg(test)]
     metadata: [Option<usize>; 2],
     #[cfg(test)]
-    send_payloads: [Option<usize>; WINDOW_LIMIT],
+    send_payloads: Vec<Option<usize>>,
     #[cfg(test)]
-    receive_payloads: [Option<usize>; WINDOW_LIMIT],
+    receive_payloads: Vec<Option<usize>>,
 }
 
 impl Construction {
@@ -715,21 +914,26 @@ impl Construction {
             #[cfg(test)]
             metadata: [None; 2],
             #[cfg(test)]
-            send_payloads: [None; WINDOW_LIMIT],
+            send_payloads: Vec::new(),
             #[cfg(test)]
-            receive_payloads: [None; WINDOW_LIMIT],
+            receive_payloads: Vec::new(),
         }
     }
 
-    fn publish(mut self) -> (Sent, Received) {
+    /// `indexed` stores by `source % window`; the engine's send and receive
+    /// span limits keep every live source in a distinct slot.
+    fn publish(mut self, indexed: bool) -> (Sent, Received) {
         #[cfg(test)]
         {
             self.record_inventory(crate::storage::ConstructionEventKind::Published);
         }
-        (
-            Sent::Reserved(std::mem::take(&mut self.sent), 0),
-            Received::Reserved(std::mem::take(&mut self.received), 0),
-        )
+        let sent = std::mem::take(&mut self.sent);
+        let received = std::mem::take(&mut self.received);
+        if indexed {
+            (Sent::Indexed(sent, 0), Received::Indexed(received, 0))
+        } else {
+            (Sent::Reserved(sent, 0), Received::Reserved(received, 0))
+        }
     }
 
     #[cfg(test)]
@@ -748,10 +952,14 @@ impl Construction {
     fn record_inventory(&self, kind: crate::storage::ConstructionEventKind) {
         self.record(kind, self.metadata[0], &self.sent);
         self.record(kind, self.metadata[1], &self.received);
-        for (slot, reservation) in self.sent.iter().zip(self.send_payloads) {
+        for (slot, reservation) in self.sent.iter().zip(self.send_payloads.iter().copied()) {
             self.record(kind, reservation, &slot.flight.payload);
         }
-        for (slot, reservation) in self.received.iter().zip(self.receive_payloads) {
+        for (slot, reservation) in self
+            .received
+            .iter()
+            .zip(self.receive_payloads.iter().copied())
+        {
             self.record(kind, reservation, &slot.payload);
         }
     }
@@ -788,7 +996,7 @@ impl Drop for Construction {
         }
         let sent = self.sent.iter_mut();
         #[cfg(test)]
-        let sent = sent.zip(self.send_payloads);
+        let sent = sent.zip(self.send_payloads.iter().copied());
         for slot in sent {
             #[cfg(test)]
             let (slot, reservation) = slot;
@@ -802,7 +1010,7 @@ impl Drop for Construction {
         }
         let received = self.received.iter_mut();
         #[cfg(test)]
-        let received = received.zip(self.receive_payloads);
+        let received = received.zip(self.receive_payloads.iter().copied());
         for slot in received {
             #[cfg(test)]
             let (slot, reservation) = slot;
@@ -881,12 +1089,16 @@ impl Engine {
                     attempts: 0,
                     retry_at: None,
                     rto: config.initial_rto,
+                    fast_resend: false,
+                    serial: 0,
                 },
             });
             #[cfg(test)]
             {
                 let index = construction.sent.len() - 1;
-                construction.send_payloads[index] = Some(allocation.usage().allocations);
+                construction
+                    .send_payloads
+                    .push(Some(allocation.usage().allocations));
                 construction.record(
                     crate::storage::ConstructionEventKind::Owned,
                     construction.send_payloads[index],
@@ -902,7 +1114,9 @@ impl Engine {
             #[cfg(test)]
             {
                 let index = construction.received.len() - 1;
-                construction.receive_payloads[index] = Some(allocation.usage().allocations);
+                construction
+                    .receive_payloads
+                    .push(Some(allocation.usage().allocations));
                 construction.record(
                     crate::storage::ConstructionEventKind::Owned,
                     construction.receive_payloads[index],
@@ -910,21 +1124,47 @@ impl Engine {
                 );
             }
         }
+        // A wide send direction also reserves its deadline queue.
+        let deadlines = if config.wide_feedback() {
+            Some((
+                allocation.vec::<DeadlineEntry>(2 * config.send_records)?,
+                allocation.vec::<SentEntry>(2 * config.send_records)?,
+            ))
+        } else {
+            None
+        };
+        // A wide receive direction also reserves its receipt journal.
+        let journal = if receive.wide_feedback() {
+            Some(allocation.vec::<ReceiptEntry>(receive.receive_records)?)
+        } else {
+            None
+        };
         let usage = allocation.usage();
         if usage.capacity_bytes != plan.capacity_bytes()
-            || usage.allocations != 2 + config.send_records + receive.receive_records
+            || usage.allocations
+                != 2 + config.send_records
+                    + receive.receive_records
+                    + 2 * usize::from(deadlines.is_some())
+                    + usize::from(journal.is_some())
         {
             return Err(crate::storage::Error::Invariant);
         }
-        let (sent, received) = construction.publish();
-        Ok(Self::from_backing(
+        // Large windows need O(1) lookups; windows of at most 64 keep their
+        // original first-fit storage unchanged.
+        let (sent, received) =
+            construction.publish(config.wide_feedback() || receive.wide_feedback());
+        let mut engine = Self::from_backing(
             (config, receive),
             context,
             Profile::Selective,
             sent,
             received,
             Some(usage),
-        ))
+        );
+        engine.wide =
+            deadlines.map(|(storage, order)| wide_timing::WideTiming::new(config, storage, order));
+        engine.receipts = journal.map(|storage| receipts::Journal::new(receive, storage));
+        Ok(engine)
     }
 
     fn new_duplex(
@@ -935,14 +1175,22 @@ impl Engine {
     ) -> Result<Self, RecoveryError> {
         config.validate()?;
         receive.validate()?;
-        Ok(Self::from_backing(
+        let mut engine = Self::from_backing(
             (config, receive),
             context,
             profile,
             Sent::Legacy(BTreeMap::new()),
             Received::Legacy(BTreeMap::new()),
             None,
-        ))
+        );
+        engine.wide = config
+            .wide_feedback()
+            .then(|| wide_timing::WideTiming::dynamic(config));
+        engine.receipts = engine
+            .receive_config
+            .wide_feedback()
+            .then(|| receipts::Journal::dynamic(engine.receive_config));
+        Ok(engine)
     }
 
     fn from_backing(
@@ -978,6 +1226,9 @@ impl Engine {
             last_now: Duration::ZERO,
             failure: None,
             statistics: Statistics::default(),
+            wide: None,
+            highest_received: 0,
+            receipts: None,
         }
     }
 
@@ -1005,7 +1256,13 @@ impl Engine {
         self.compact
             .as_ref()
             .map(|state| SourceId(state.base))
-            .or_else(|| self.sent.first_key_value().map(|(source, _)| *source))
+            .or_else(|| {
+                if self.wide_active() {
+                    self.wide_oldest()
+                } else {
+                    self.sent.first_key_value().map(|(source, _)| *source)
+                }
+            })
     }
     fn admission_span_full(&self, base: Option<SourceId>) -> bool {
         base.is_some_and(|first| self.next_source - first.0 >= self.config.send_records as u64)
@@ -1015,16 +1272,21 @@ impl Engine {
         proposed_bytes: usize,
     ) -> Result<AdmissionSnapshot, RecoveryError> {
         let resulting_bytes = self.admission_bytes(proposed_bytes)?;
-        let oldest = self
-            .sent
-            .first_key_value()
-            .map(|(source, flight)| AdmissionFlight {
-                source: *source,
-                attempts: flight.attempts,
-                transmission: flight.transmission,
-                acknowledged: flight.acknowledged,
-                retry_at: flight.retry_at,
-            });
+        let oldest = if self.wide_active() {
+            self.wide_oldest()
+                .and_then(|source| self.sent.get(&source).map(|flight| (source, flight)))
+        } else {
+            self.sent
+                .first_key_value()
+                .map(|(source, flight)| (*source, flight))
+        }
+        .map(|(source, flight)| AdmissionFlight {
+            source,
+            attempts: flight.attempts,
+            transmission: flight.transmission,
+            acknowledged: flight.acknowledged,
+            retry_at: flight.retry_at,
+        });
         let span_base = self
             .compact
             .as_ref()
@@ -1082,6 +1344,7 @@ impl Engine {
             self.context,
             self.profile,
             self.receive_config.max_source_bytes,
+            self.config,
         )?;
         self.receive_view(parsed, now)
     }
@@ -1105,7 +1368,20 @@ impl Engine {
                 }
                 self.receive_source(source, payload, now)?;
             }
-            PacketView::Ack { prefix, bitmap } => self.receive_ack(prefix, bitmap, observation)?,
+            PacketView::Ack { prefix, bitmap } => {
+                if self.config.wide_feedback() {
+                    return Err(RecoveryError::MalformedPacket);
+                }
+                self.receive_ack(prefix, AckBits::Legacy(bitmap), observation, now)?
+            }
+            PacketView::WideAck { prefix, bitmap } => {
+                if !self.config.wide_feedback()
+                    || bitmap.len() > self.config.wide_bitmap_max_bytes()
+                {
+                    return Err(RecoveryError::MalformedPacket);
+                }
+                self.receive_ack(prefix, AckBits::Wide(bitmap), observation, now)?
+            }
         }
         self.last_now = now;
         Ok(())
@@ -1154,6 +1430,10 @@ impl Engine {
             return Err(RecoveryError::Capacity(BufferSide::Receive));
         }
         self.received.insert_payload(source, payload)?;
+        self.highest_received = self.highest_received.max(source.0);
+        if let Some(journal) = self.receipts.as_mut() {
+            journal.record(source);
+        }
         self.receive_bytes = bytes;
         while self.received.contains_key(&SourceId(self.receive_prefix)) {
             // Source u64::MAX is rejected by the codec, so advancing is safe.
@@ -1176,20 +1456,23 @@ impl Engine {
     fn receive_ack(
         &mut self,
         prefix: u64,
-        bitmap: u64,
+        bitmap: AckBits<'_>,
         observation: Option<&mut Option<AckObservation>>,
+        now: Duration,
     ) -> Result<(), RecoveryError> {
         if prefix > self.next_source {
             return Err(RecoveryError::UnsentAcknowledgement);
         }
-        if bitmap != 0 {
-            let highest = 63 - u64::from(bitmap.leading_zeros());
+        if let Some(highest) = bitmap.highest() {
             let last = prefix
                 .checked_add(highest)
                 .ok_or(RecoveryError::UnsentAcknowledgement)?;
             if last >= self.next_source {
                 return Err(RecoveryError::UnsentAcknowledgement);
             }
+        }
+        if observation.is_none() && self.wide_active() {
+            return self.receive_ack_wide(prefix, bitmap, now);
         }
         let mut before = observation
             .as_ref()
@@ -1200,7 +1483,7 @@ impl Engine {
             if let Some(before) = before.as_mut() {
                 before.visit(*source, flight, self.physical_confirmation);
             }
-            acknowledged(*source, prefix, bitmap)
+            acknowledged_bits(*source, prefix, bitmap)
                 && (flight.attempts == 0
                     || (self.physical_confirmation
                         && flight.attempts == 1
@@ -1210,12 +1493,28 @@ impl Engine {
         }
         let mut released_bytes = 0;
         let mut after = observation.as_ref().map(|_| AckRetained::new(0, 0));
+        let mut acknowledged_serial = 0;
+        let sampling = self.wide_active();
+        let mut latest_armed: Option<Duration> = None;
         self.sent.retain(|source, flight| {
-            let keep = if acknowledged(*source, prefix, bitmap) {
+            let keep = if acknowledged_bits(*source, prefix, bitmap) {
+                // Karn: a re-sent source does not say which copy arrived, so
+                // only single-copy sources are send-order evidence.
+                if flight.attempts == 1 {
+                    acknowledged_serial = acknowledged_serial.max(flight.serial);
+                }
                 if self.physical_confirmation && flight.retry_at.is_none() {
                     flight.acknowledged = true;
                     true
                 } else {
+                    // Karn: only a flight released after exactly one attempt.
+                    if sampling
+                        && flight.attempts == 1
+                        && !flight.fast_resend
+                        && let Some(armed) = wide_timing::armed_at(flight)
+                    {
+                        latest_armed = latest_armed.max(Some(armed));
+                    }
                     released_bytes += flight.payload.len();
                     false
                 }
@@ -1229,6 +1528,13 @@ impl Engine {
         });
         // The removed payload subset cannot exceed the previously accounted sum.
         self.send_bytes -= released_bytes;
+        if sampling {
+            self.wide_sample(now, latest_armed);
+            self.wide_acknowledged(acknowledged_serial);
+            self.wide_tidy();
+            self.wide_fast_resend(now)?;
+            self.wide_tidy();
+        }
         self.statistics.feedback_received = self.statistics.feedback_received.saturating_add(1);
         if let (Some(output), Some(before), Some(mut after)) = (observation, before, after) {
             after.records = self.sent.len();
@@ -1238,7 +1544,139 @@ impl Engine {
         Ok(())
     }
 
+    /// Wide send direction without diagnostics: visit only the sources this
+    /// ACK covers (retained ones below the prefix plus set bitmap bits), not the
+    /// whole window. Validation completes before any state changes.
+    fn receive_ack_wide(
+        &mut self,
+        prefix: u64,
+        bitmap: AckBits<'_>,
+        now: Duration,
+    ) -> Result<(), RecoveryError> {
+        // No retained source lies below `oldest`; the caller bounded `prefix`
+        // and the highest bit by `next_source`, so no ID overflows.
+        let low = self
+            .wide_oldest()
+            .map_or(prefix, |source| source.0.min(prefix));
+        let covered = || (low..prefix).chain(bitmap.offsets().map(move |offset| prefix + offset));
+        for id in covered() {
+            if let Some(flight) = self.sent.get(&SourceId(id))
+                && (flight.attempts == 0
+                    || (self.physical_confirmation
+                        && flight.attempts == 1
+                        && flight.retry_at.is_none()))
+            {
+                return Err(RecoveryError::UnsentAcknowledgement);
+            }
+        }
+        let mut released_bytes = 0;
+        let mut acknowledged_serial = 0;
+        let mut latest_armed: Option<Duration> = None;
+        for id in covered() {
+            let source = SourceId(id);
+            let Some(flight) = self.sent.get_mut(&source) else {
+                continue;
+            };
+            // Karn: only single-copy sources are send-order and RTT evidence.
+            if flight.attempts == 1 {
+                acknowledged_serial = acknowledged_serial.max(flight.serial);
+            }
+            if self.physical_confirmation && flight.retry_at.is_none() {
+                flight.acknowledged = true;
+                continue;
+            }
+            if flight.attempts == 1
+                && !flight.fast_resend
+                && let Some(armed) = wide_timing::armed_at(flight)
+            {
+                latest_armed = latest_armed.max(Some(armed));
+            }
+            released_bytes += flight.payload.len();
+            self.sent.remove(&source);
+        }
+        // The removed payload subset cannot exceed the previously accounted sum.
+        self.send_bytes -= released_bytes;
+        self.wide_sample(now, latest_armed);
+        self.wide_acknowledged(acknowledged_serial);
+        self.wide_tidy();
+        self.wide_fast_resend(now)?;
+        self.wide_tidy();
+        self.statistics.feedback_received = self.statistics.feedback_received.saturating_add(1);
+        Ok(())
+    }
+
+    fn legacy_bitmap(&self) -> u64 {
+        let mut bitmap = 0;
+        for source in self.received.keys() {
+            if source.0 >= self.receive_prefix {
+                let offset = source.0 - self.receive_prefix;
+                if offset < 64 {
+                    bitmap |= 1_u64 << offset;
+                }
+            }
+        }
+        bitmap
+    }
+
+    /// Exact wide bitmap length: through the highest received offset, or zero.
+    fn wide_bitmap_len(&self) -> usize {
+        // Sources below the prefix were all received; a source above it is
+        // only removed by in-order delivery, which cannot pass the prefix. So
+        // the highest stored source, when above the prefix, is still retained.
+        // Received sources lie within the receive window, so this fits usize.
+        self.highest_received
+            .checked_sub(self.receive_prefix)
+            .filter(|offset| *offset > 0)
+            .map_or(0, |highest| (highest / 8) as usize + 1)
+    }
+
+    /// Exact due wide-ACK size in the selected representation.
+    fn wide_ack_bytes(&self, body: bool) -> usize {
+        let header = if body {
+            varint_len(self.receive_prefix)
+        } else {
+            WIDE_ACK_HEADER_BYTES
+        };
+        header + self.wide_bitmap_len()
+    }
+
+    /// Write the due wide ACK directly into caller output; no allocation.
+    fn write_wide_ack(&self, output: &mut [u8], body: bool) -> Result<usize, RecoveryError> {
+        let length = self.wide_bitmap_len();
+        let required = self.wide_ack_bytes(body);
+        ensure_output(output, required)?;
+        let start = if body {
+            let mut position = 0;
+            write_varint(self.receive_prefix, output, &mut position);
+            position
+        } else {
+            write_common(output, self.context, self.profile, 3);
+            output[32..40].copy_from_slice(&self.receive_prefix.to_be_bytes());
+            WIDE_ACK_HEADER_BYTES
+        };
+        let bitmap = &mut output[start..start + length];
+        bitmap.fill(0);
+        // Walk the gap span with O(1) lookups rather than the whole window.
+        let span = (length as u64) * 8;
+        for offset in 1..span {
+            let Some(source) = self.receive_prefix.checked_add(offset) else {
+                break;
+            };
+            if self.received.contains_key(&SourceId(source)) {
+                bitmap[(offset / 8) as usize] |= 1 << (offset % 8);
+            }
+        }
+        Ok(required)
+    }
+
     fn ready_source(&self, now: Duration) -> Option<SourceId> {
+        if self.wide_active() {
+            let (retry, unsent) = self.wide_ready(now);
+            return match (retry, unsent) {
+                (Some(retry), Some(unsent)) => Some(if self.prefer_retry { retry } else { unsent }),
+                (retry, unsent) => retry.or(unsent),
+            };
+        }
         let retry = self
             .sent
             .iter()
@@ -1291,6 +1729,7 @@ impl Engine {
             return self.compact_poll(now, output, allow_feedback, allow_sources);
         }
         self.check_time(now)?;
+        self.wide_tidy();
         let ack_ready = allow_feedback && self.ack_at.is_some_and(|deadline| deadline <= now);
         let data = if allow_sources
             && (!self.physical_confirmation
@@ -1301,23 +1740,17 @@ impl Engine {
             None
         };
         if ack_ready && (!self.prefer_data || data.is_none()) {
-            let mut bitmap = 0;
-            for source in self.received.keys() {
-                if source.0 >= self.receive_prefix {
-                    let offset = source.0 - self.receive_prefix;
-                    if offset < 64 {
-                        bitmap |= 1_u64 << offset;
-                    }
-                }
-            }
-            let bytes = if body {
+            let bytes = if self.receive_config.wide_feedback() {
+                self.write_wide_ack(output, body)?
+            } else if body {
                 PacketView::Ack {
                     prefix: self.receive_prefix,
-                    bitmap,
+                    bitmap: self.legacy_bitmap(),
                 }
                 .encode_body_into(output)?
             } else {
                 ensure_output(output, ACK_PACKET_BYTES)?;
+                let bitmap = self.legacy_bitmap();
                 write_common(output, self.context, self.profile, 2);
                 output[32..40].copy_from_slice(&self.receive_prefix.to_be_bytes());
                 output[40..48].copy_from_slice(&bitmap.to_be_bytes());
@@ -1358,7 +1791,9 @@ impl Engine {
         };
         ensure_output(output, required)?;
         let is_retry = flight.attempts > 0;
-        let rto = if is_retry {
+        let rto = if let Some(rto) = self.wide_attempt_rto(flight) {
+            rto
+        } else if is_retry {
             flight
                 .rto
                 .checked_mul(2)
@@ -1400,6 +1835,12 @@ impl Engine {
             flight.transmission = transmission;
             flight.rto = rto;
             flight.retry_at = retry_at;
+            flight.fast_resend = false;
+            self.wide_transmit(source);
+            if retry_at.is_some() {
+                self.wide_arm(source);
+            }
+            self.wide_tidy();
         }
         self.next_transmission = transmission;
         if self.physical_confirmation {
@@ -1453,6 +1894,9 @@ impl Engine {
         if self.compact.is_some() {
             return self.compact_source_deadline();
         }
+        if self.wide_active() {
+            return self.wide_source_deadline();
+        }
         self.sent
             .values()
             .filter_map(|flight| {
@@ -1472,11 +1916,11 @@ impl Engine {
 }
 
 fn acknowledged(source: SourceId, prefix: u64, bitmap: u64) -> bool {
-    if source.0 < prefix {
-        return true;
-    }
-    let offset = source.0 - prefix;
-    offset < 64 && bitmap & (1_u64 << offset) != 0
+    acknowledged_bits(source, prefix, AckBits::Legacy(bitmap))
+}
+
+fn acknowledged_bits(source: SourceId, prefix: u64, bits: AckBits<'_>) -> bool {
+    source.0 < prefix || bits.contains(source.0 - prefix)
 }
 
 fn ensure_output(output: &[u8], required: usize) -> Result<(), RecoveryError> {
@@ -1509,6 +1953,7 @@ fn parse(
     context: RecoveryContext,
     profile: Profile,
     max_source: usize,
+    ack: ArqConfig,
 ) -> Result<PacketView<'_>, RecoveryError> {
     if packet.len() < COMMON_HEADER_BYTES || packet.get(..4) != Some(b"L2AR") || packet[4] != 1 {
         return Err(RecoveryError::MalformedPacket);
@@ -1541,7 +1986,19 @@ fn parse(
                 payload: &packet[DATA_HEADER_BYTES..],
             })
         }
-        2 if profile == Profile::Selective => {
+        3 if profile == Profile::Selective && ack.wide_feedback() => {
+            let bitmap = packet
+                .get(WIDE_ACK_HEADER_BYTES..)
+                .ok_or(RecoveryError::MalformedPacket)?;
+            let prefix = u64::from_be_bytes(field(packet, 32)?);
+            if bitmap.len() > ack.wide_bitmap_max_bytes()
+                || !AckBits::Wide(bitmap).canonical(prefix)
+            {
+                return Err(RecoveryError::MalformedPacket);
+            }
+            Ok(PacketView::WideAck { prefix, bitmap })
+        }
+        2 if profile == Profile::Selective && !ack.wide_feedback() => {
             if packet.len() != ACK_PACKET_BYTES {
                 return Err(RecoveryError::MalformedPacket);
             }
@@ -1565,6 +2022,8 @@ mod tests;
 
 #[cfg(test)]
 mod physical_tests;
+#[cfg(test)]
+mod wide_tests;
 
 impl Engine {
     /// Select whole-send timer custody before any source or peer input is used.
@@ -1656,6 +2115,8 @@ impl Engine {
                 if let Some(flight) = self.sent.get_mut(&token.source) {
                     flight.retry_at = deadline;
                 }
+                self.wide_arm(token.source);
+                self.wide_tidy();
                 if let Some(state) = self.compact.as_mut() {
                     state.confirm(token.source, token.serial, accepted)?;
                 }

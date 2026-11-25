@@ -48,25 +48,57 @@ pub fn inv(a: u8) -> Option<u8> {
 
 /// `destination[i] ^= factor * source[i]` over the common prefix.
 pub fn mul_add(destination: &mut [u8], source: &[u8], factor: u8) {
-    match factor {
-        0 => (),
-        1 => {
-            for (d, s) in destination.iter_mut().zip(source) {
-                *d ^= *s;
-            }
+    let count = destination.len().min(source.len());
+    if count == 0 || factor == 0 {
+        return;
+    }
+    let destination = &mut destination[..count];
+    let source = &source[..count];
+    if factor == 1 {
+        let mut dst_chunks = destination.chunks_exact_mut(8);
+        let mut src_chunks = source.chunks_exact(8);
+        for (dst, src) in dst_chunks.by_ref().zip(src_chunks.by_ref()) {
+            let mut d = [0u8; 8];
+            let mut s = [0u8; 8];
+            d.copy_from_slice(dst);
+            s.copy_from_slice(src);
+            dst.copy_from_slice(&(u64::from_ne_bytes(d) ^ u64::from_ne_bytes(s)).to_ne_bytes());
         }
-        _ => {
-            let row = &MUL[usize::from(factor)];
-            for (d, s) in destination.iter_mut().zip(source) {
-                *d ^= row[usize::from(*s)];
-            }
+        for (d, s) in dst_chunks
+            .into_remainder()
+            .iter_mut()
+            .zip(src_chunks.remainder())
+        {
+            *d ^= *s;
         }
+        return;
+    }
+    if count >= 32 {
+        tape_reed_solomon::gf::mul_slice_xor(destination, source, factor);
+        return;
+    }
+    let row = &MUL[usize::from(factor)];
+    for (d, s) in destination.iter_mut().zip(source) {
+        *d ^= row[usize::from(*s)];
     }
 }
 
 /// `values[i] = factor * values[i]`.
 pub fn scale(values: &mut [u8], factor: u8) {
-    if factor == 1 {
+    if factor == 1 || values.is_empty() {
+        return;
+    }
+    if factor == 0 {
+        values.fill(0);
+        return;
+    }
+    if values.len() >= 32 {
+        let mut scratch = [0u8; 512];
+        for chunk in values.chunks_mut(scratch.len()) {
+            let len = chunk.len();
+            scratch[..len].copy_from_slice(chunk);
+            tape_reed_solomon::gf::mul_slice(chunk, &scratch[..len], factor);
+        }
         return;
     }
     let row = &MUL[usize::from(factor)];
@@ -127,5 +159,28 @@ mod tests {
         }
         assert!((0..10_000u32).all(|s| coefficient(42, s) != 0));
         assert_ne!(coefficient(1, 5), coefficient(2, 5));
+    }
+    #[test]
+    fn simd_and_tail_lengths_match_scalar_table_for_all_factors() {
+        for len in [0usize, 1, 7, 15, 31, 32, 33, 64, 511, 512, 513, 1400] {
+            let source: Vec<u8> = (0..len).map(|i| ((i * 73 + 19) & 0xff) as u8).collect();
+            for factor in [0u8, 1, 2, 3, 17, 127, 128, 254, 255] {
+                let mut dst: Vec<u8> = (0..len).map(|i| ((i * 37 + 5) & 0xff) as u8).collect();
+                let mut expected = dst.clone();
+                for (d, s) in expected.iter_mut().zip(&source) {
+                    *d ^= mul(factor, *s);
+                }
+                mul_add(&mut dst, &source, factor);
+                assert_eq!(dst, expected, "mul_add mismatch len={len} factor={factor}");
+
+                let mut scaled = source.clone();
+                let expected_scaled: Vec<u8> = source.iter().map(|&b| mul(factor, b)).collect();
+                scale(&mut scaled, factor);
+                assert_eq!(
+                    scaled, expected_scaled,
+                    "scale mismatch len={len} factor={factor}"
+                );
+            }
+        }
     }
 }

@@ -1,4 +1,5 @@
 use super::*;
+use l2tunnel_recovery::ACK_PACKET_BYTES;
 #[path = "feedback_custody_tests.rs"]
 mod feedback_custody;
 #[path = "physical_tests.rs"]
@@ -793,3 +794,96 @@ fn generation_exhaustion_is_explicit_and_never_reuses_a_context_identity() -> Te
 
 #[path = "diagnostics_tests.rs"]
 mod block_diagnostics;
+
+/// A legacy direction with small sources against a wide (above 64 records)
+/// direction: local output must fit the wide ACK for the receive direction,
+/// and the peer must parse it with its own wide send configuration.
+#[test]
+fn asymmetric_wide_receive_direction_fits_and_parses_wide_acks() -> TestResult {
+    let legacy = ReliableConfig {
+        repair_symbols: 0,
+        ..config()
+    };
+    let base = config();
+    let wide = ReliableConfig {
+        arq: ArqConfig {
+            send_records: 1024,
+            receive_records: 1024,
+            send_bytes: 1024 * 64,
+            receive_bytes: 1024 * 64,
+            ..base.arq
+        },
+        repair_symbols: 0,
+        max_restored_packets: 1040,
+        max_restored_bytes: 1040 * 108,
+        ..base
+    };
+    assert!(!legacy.arq.wide_feedback() && wide.arq.wide_feedback());
+    let legacy_source = DATA_HEADER_BYTES + legacy.arq.max_source_bytes;
+    assert!(wide.arq.ack_packet_bytes() > legacy_source);
+    for reserved in [false, true] {
+        let make = |send, receive, role| -> Result<Reliable, Box<dyn std::error::Error>> {
+            Ok(if reserved {
+                let plan = storage::Plan::for_duplex(send, receive)?;
+                Reliable::new_duplex_reserved(
+                    send,
+                    receive,
+                    context(role),
+                    storage::Limits {
+                        capacity_bytes: plan.capacity_bytes(),
+                    },
+                )?
+            } else {
+                Reliable::new_duplex(send, receive, context(role))?
+            })
+        };
+        // The initiator receives the wide direction and sends the legacy one.
+        let mut initiator = make(legacy, wide, EndpointRole::Initiator)?;
+        let mut responder = make(wide, legacy, EndpointRole::Responder)?;
+        assert!(initiator.send_max_packet_bytes() >= ENVELOPE_BYTES + wide.arq.ack_packet_bytes());
+        let total = 600_u64;
+        let mut submitted = 0;
+        let mut delivered = 0_u64;
+        let mut largest_feedback = 0;
+        let mut emitted = 0_u64;
+        for tick in 0..4_000 {
+            while submitted < total
+                && responder
+                    .submit(&[(submitted % 251) as u8; 8], time(tick))
+                    .is_ok()
+            {
+                submitted += 1;
+            }
+            while let Some(packet) = emit(&mut responder, tick)? {
+                emitted += 1;
+                // Drop some early sources so feedback carries a real bitmap.
+                if tick < 50 && emitted.is_multiple_of(9) {
+                    continue;
+                }
+                initiator.receive(&packet, time(tick))?;
+            }
+            while let Some(packet) = emit(&mut initiator, tick)? {
+                if initiator.inspect_output(&packet)? == RecordKind::Feedback {
+                    largest_feedback = largest_feedback.max(packet.len());
+                }
+                responder.receive(&packet, time(tick))?;
+            }
+            for (identity, payload) in deliveries(&mut initiator)? {
+                assert_eq!(identity, delivered);
+                assert_eq!(payload, vec![(delivered % 251) as u8; 8]);
+                delivered += 1;
+            }
+            if delivered == total && responder.drained() {
+                break;
+            }
+        }
+        assert_eq!(delivered, total, "reserved={reserved}");
+        assert!(responder.drained());
+        // At least one wide ACK was larger than the 48-byte legacy form.
+        assert!(
+            largest_feedback > ENVELOPE_BYTES + ACK_PACKET_BYTES,
+            "{largest_feedback}"
+        );
+    }
+    Ok(())
+}

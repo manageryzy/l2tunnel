@@ -13,6 +13,9 @@ impl PacketView<'_> {
     pub fn acknowledges(self, source: SourceId) -> Option<bool> {
         match self {
             Self::Ack { prefix, bitmap } => Some(acknowledged(source, prefix, bitmap)),
+            Self::WideAck { prefix, bitmap } => {
+                Some(acknowledged_bits(source, prefix, AckBits::Wide(bitmap)))
+            }
             Self::Data { .. } => None,
         }
     }
@@ -40,6 +43,12 @@ impl PacketView<'_> {
                 }
                 Ok(varint_len(prefix) + varint_len(bitmap))
             }
+            Self::WideAck { prefix, bitmap } => {
+                if !AckBits::Wide(bitmap).canonical(prefix) {
+                    return Err(RecoveryError::MalformedPacket);
+                }
+                Ok(varint_len(prefix) + bitmap.len())
+            }
         }
     }
     /// Serialize the chosen arm without session, epoch, profile or length duplicates.
@@ -55,6 +64,10 @@ impl PacketView<'_> {
             Self::Ack { prefix, bitmap } => {
                 write_varint(prefix, output, &mut position);
                 write_varint(bitmap, output, &mut position);
+            }
+            Self::WideAck { prefix, bitmap } => {
+                write_varint(prefix, output, &mut position);
+                output[position..required].copy_from_slice(bitmap);
             }
         }
         Ok(required)
@@ -96,7 +109,56 @@ pub fn inspect_body(
     Ok(view)
 }
 
+/// Parse a canonical body for one direction configuration (see
+/// `inspect_packet_for`): a wide direction's feedback is the varint prefix
+/// followed by the bitmap; a legacy direction's is unchanged.
+pub fn inspect_body_for(
+    feedback: bool,
+    bytes: &[u8],
+    maximum: usize,
+    direction: ArqConfig,
+) -> Result<PacketView<'_>, RecoveryError> {
+    direction.validate()?;
+    if !(feedback && direction.wide_feedback()) {
+        return inspect_body(feedback, bytes, maximum);
+    }
+    if !(1..=65_535).contains(&maximum) {
+        return Err(RecoveryError::InvalidConfig);
+    }
+    let mut position = 0;
+    let prefix = read_varint(bytes, &mut position)?;
+    let bitmap = &bytes[position..];
+    if bitmap.len() > direction.wide_bitmap_max_bytes() {
+        return Err(RecoveryError::MalformedPacket);
+    }
+    let view = PacketView::WideAck { prefix, bitmap };
+    view.body_encoded_len()?;
+    Ok(view)
+}
+
 impl SelectiveRepeat {
+    /// Parse one peer body with this owner's direction configurations: data is
+    /// bounded by the receive direction, feedback uses the send direction's ACK form.
+    pub fn inspect_peer_body<'a>(
+        &self,
+        feedback: bool,
+        bytes: &'a [u8],
+    ) -> Result<PacketView<'a>, RecoveryError> {
+        inspect_body_for(
+            feedback,
+            bytes,
+            self.0.receive_config.max_source_bytes,
+            self.0.config,
+        )
+    }
+    /// Local send-direction configuration (the direction peer feedback acknowledges).
+    pub fn send_config(&self) -> ArqConfig {
+        self.0.config
+    }
+    /// Local receive-direction configuration (the direction local feedback acknowledges).
+    pub fn receive_config(&self) -> ArqConfig {
+        self.0.receive_config
+    }
     /// Emit the actual source owner using the selected context-free representation.
     pub fn poll_source_body(
         &mut self,
@@ -144,6 +206,9 @@ impl SelectiveRepeat {
             if self.0.ack_at.is_none_or(|deadline| deadline > now) {
                 return Ok(None);
             }
+            if self.0.receive_config.wide_feedback() {
+                return Ok(Some(self.0.wide_ack_bytes(true)));
+            }
             let mut bitmap = 0;
             for source in self.0.received.keys() {
                 if source.0 >= self.0.receive_prefix {
@@ -182,10 +247,10 @@ impl SelectiveRepeat {
     }
 }
 
-fn varint_len(value: u64) -> usize {
+pub(super) fn varint_len(value: u64) -> usize {
     ((64 - value.leading_zeros()).max(1) as usize).div_ceil(7)
 }
-fn write_varint(mut value: u64, output: &mut [u8], position: &mut usize) {
+pub(super) fn write_varint(mut value: u64, output: &mut [u8], position: &mut usize) {
     loop {
         let low = (value & 0x7f) as u8;
         value >>= 7;

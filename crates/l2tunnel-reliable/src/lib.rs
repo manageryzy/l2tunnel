@@ -4,9 +4,9 @@
 //! belong to the caller. Every emitted copy consumes an explicit wire allowance.
 use l2tunnel_fec as fec;
 use l2tunnel_recovery::{
-    ACK_PACKET_BYTES, ArqConfig, BufferSide, DATA_HEADER_BYTES, EndpointRole, PacketView,
-    PhysicalTransmission, RecoveryContext, RecoveryEngine, RecoveryError, Retained,
-    SelectiveRepeat, Statistics as ArqStatistics, inspect_packet,
+    ArqConfig, BufferSide, DATA_HEADER_BYTES, EndpointRole, PacketView, PhysicalTransmission,
+    RecoveryContext, RecoveryEngine, RecoveryError, Retained, SelectiveRepeat,
+    Statistics as ArqStatistics, inspect_packet, inspect_packet_for,
 };
 mod backing;
 mod compact;
@@ -31,9 +31,11 @@ static NEXT_PHYSICAL_OWNER: AtomicU64 = AtomicU64::new(1);
 /// Reliable envelope bytes preceding a strict ARQ or FEC packet.
 pub const ENVELOPE_BYTES: usize = 8;
 /// Hard restored-source staging count, independent of payload-byte capacity.
-pub const MAX_RESTORED_PACKETS: usize = 256;
+/// It must hold one ARQ send window plus one FEC block, so it follows the
+/// largest base-ARQ window (wide ACK) plus the largest block.
+pub const MAX_RESTORED_PACKETS: usize = l2tunnel_recovery::MAX_ARQ_WINDOW + 256;
 /// Hard restored-source payload storage, including complete ARQ record headers.
-pub const MAX_RESTORED_BYTES: usize = 4 * 1024 * 1024;
+pub const MAX_RESTORED_BYTES: usize = 16 * 1024 * 1024;
 
 /// Previously negotiated limits for one bidirectional reliable coding domain.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -145,6 +147,7 @@ pub fn inspect_structural(
         block,
         opposite_context(context),
         fec_context(context, false),
+        ArqConfig::default(),
     )
 }
 
@@ -155,6 +158,7 @@ fn inspect_record_view(
     block: fec::BlockConfig,
     arq_context: RecoveryContext,
     fec_context: fec::FecContext,
+    acknowledged: ArqConfig,
 ) -> Result<StructuralRecord<'_>, Error> {
     let (kind, inner) = envelope(packet, maximum_packet)?;
     let mut value = StructuralRecord {
@@ -164,12 +168,12 @@ fn inspect_record_view(
         fec: None,
     };
     match kind {
-        1 | 2 => match inspect_packet(inner, arq_context, max_source_bytes)? {
+        1 | 2 => match inspect_packet_for(inner, arq_context, max_source_bytes, acknowledged)? {
             PacketView::Data { source, payload } if kind == 1 => {
                 value.kind = RecordKind::Source;
                 value.source = Some((source, payload));
             }
-            PacketView::Ack { .. } if kind == 2 => {}
+            PacketView::Ack { .. } | PacketView::WideAck { .. } if kind == 2 => {}
             _ => return Err(Error::Malformed),
         },
         3 => {
@@ -436,7 +440,7 @@ impl ReliableConfig {
         config.fec.validate()?;
         if config.repair_symbols == 0 {
             ENVELOPE_BYTES
-                .checked_add(source_bytes.max(ACK_PACKET_BYTES))
+                .checked_add(source_bytes.max(config.arq.ack_packet_bytes()))
                 .ok_or(Error::InvalidConfig)
         } else {
             Ok(maximum_packet)
@@ -463,8 +467,7 @@ impl Reliable {
         receive_config: ReliableConfig,
         context: RecoveryContext,
     ) -> Result<Self, Error> {
-        let maximum_packet = config.maximum_packet()?;
-        let receive_maximum_packet = receive_config.maximum_packet()?;
+        let (maximum_packet, receive_maximum_packet) = duplex_maxima(config, receive_config)?;
         let count = if config.repair_symbols == 0 {
             0
         } else {
@@ -625,10 +628,8 @@ impl Reliable {
         {
             return Err(storage::Error::Invariant);
         }
-        let maximum_packet = config.maximum_packet().map_err(storage::Error::Reliable)?;
-        let receive_maximum_packet = receive_config
-            .maximum_packet()
-            .map_err(storage::Error::Reliable)?;
+        let (maximum_packet, receive_maximum_packet) =
+            duplex_maxima(config, receive_config).map_err(storage::Error::Reliable)?;
         let sources = plan.encoder.map_or(0, |_| config.fec.block.max_sources);
         let generations = plan
             .decoder
@@ -899,12 +900,13 @@ impl Reliable {
                 self.enrich_retry(inner, now)?;
             }
             2 => {
-                match inspect_packet(
+                match inspect_packet_for(
                     inner,
                     self.context,
                     self.legacy_send()?.arq.max_source_bytes,
+                    self.legacy_send()?.arq,
                 ) {
-                    Ok(PacketView::Ack { .. }) => {}
+                    Ok(PacketView::Ack { .. } | PacketView::WideAck { .. }) => {}
                     Ok(_) => return self.fail(Error::Malformed),
                     Err(error) => return self.fail(error.into()),
                 }
@@ -1013,6 +1015,7 @@ impl Reliable {
                 self.legacy_send()?.fec.block,
                 opposite_context(self.context),
                 self.send_fec,
+                self.legacy_receive()?.arq,
             )?
         };
         Ok(view.source.map(|(source, _)| source))
@@ -1034,6 +1037,7 @@ impl Reliable {
             self.send_fec,
             *self.legacy_send()?,
             self.maximum_packet,
+            self.legacy_receive()?.arq,
         )
     }
 
@@ -1054,6 +1058,7 @@ impl Reliable {
             self.receive_fec,
             *self.legacy_receive()?,
             self.receive_maximum_packet,
+            self.legacy_send()?.arq,
         )
     }
 
@@ -1064,6 +1069,7 @@ impl Reliable {
         fec_context: fec::FecContext,
         config: ReliableConfig,
         maximum_packet: usize,
+        acknowledged: ArqConfig,
     ) -> Result<RecordKind, Error> {
         let view = inspect_record_view(
             packet,
@@ -1072,6 +1078,7 @@ impl Reliable {
             config.fec.block,
             arq_context,
             fec_context,
+            acknowledged,
         )?;
         if config.repair_symbols == 0 && view.fec.is_some() {
             return Err(Error::Malformed);
@@ -1143,6 +1150,7 @@ impl Reliable {
                 self.legacy_send()?.fec.block,
                 opposite_context(self.context),
                 self.send_fec,
+                self.legacy_receive()?.arq,
             )
         }
         .or_else(|error| self.fail(error))?;
@@ -1225,7 +1233,22 @@ impl Reliable {
             self.allowed(self.maximum_packet, budget)?
         };
         if allow_data && self.outgoing.is_empty() && source_allowed {
-            for _ in 0..self.legacy_send()?.fec.block.max_sources {
+            for index in 0..self.legacy_send()?.fec.block.max_sources {
+                // Fresh sources only enter the block, but ARQ may answer a
+                // later poll with a retry that is emitted at once. Its compact
+                // size can exceed the first prediction, so recheck the budget
+                // before every poll; a polled retry cannot be returned.
+                if index > 0
+                    && self.compact_wire.is_some()
+                    && !self
+                        .arq
+                        .body_packet_bytes(now, false)?
+                        .map(|bytes| self.allowed(1 + bytes, budget))
+                        .transpose()?
+                        .unwrap_or(false)
+                {
+                    break;
+                }
                 let emitted = if self.compact_wire.is_some() {
                     self.arq.poll_source_body(now, &mut self.scratch)?
                 } else {
@@ -1316,6 +1339,22 @@ impl Reliable {
             .map(|(source, bytes)| (source.0, bytes)))
     }
 
+    /// Latest receipt serial when the receive direction keeps a journal.
+    pub fn receipt_serial(&self) -> Option<u64> {
+        self.arq.receipt_serial()
+    }
+
+    /// Retained sources received after receipt serial `cursor`, in arrival
+    /// order, starting in O(1). `None`
+    /// means no journal or a stale cursor: use [`Self::received_sources`].
+    pub fn received_after(
+        &self,
+        cursor: u64,
+    ) -> Result<Option<impl Iterator<Item = l2tunnel_recovery::Receipt<'_>>>, Error> {
+        self.running()?;
+        Ok(self.arq.received_after(cursor)?)
+    }
+
     /// Actual next ARQ feedback deadline, independently of data/coding work.
     pub fn feedback_deadline(&self) -> Option<Duration> {
         if self.failure().is_some() || self.pending_output().is_some() {
@@ -1343,7 +1382,8 @@ impl Reliable {
             };
             bytes
         } else {
-            l2tunnel_recovery::ACK_PACKET_BYTES
+            // Upper bound: local feedback acknowledges the receive direction.
+            self.legacy_receive()?.arq.ack_packet_bytes()
         };
         let bytes = body.checked_add(ENVELOPE_BYTES).ok_or(Error::Exhausted)?;
         Ok(Some((at, bytes)))
@@ -1925,7 +1965,10 @@ impl Reliable {
                 .emit_scratch(2, length, Emission::Feedback, output, budget)
                 .map(Some);
         }
-        if !self.allowed(ENVELOPE_BYTES + ACK_PACKET_BYTES, budget)? {
+        if !self.allowed(
+            ENVELOPE_BYTES + self.legacy_receive()?.arq.ack_packet_bytes(),
+            budget,
+        )? {
             return Ok(None);
         }
         let Some(length) = self.arq.poll_feedback(self.now, &mut self.scratch)? else {
@@ -2275,6 +2318,26 @@ fn fec_context(context: RecoveryContext, peer: bool) -> fec::FecContext {
             EndpointRole::Responder => fec::Direction::ServerToClient,
         },
     }
+}
+/// Exact (send, receive) record ceilings for one legacy duplex pair. Feedback
+/// travels against its data: local output carries ACKs sized by the receive
+/// direction and peer input carries ACKs sized by the send direction, so each
+/// ceiling also covers the opposite direction's ACK (wide above 64 records).
+pub(crate) fn duplex_maxima(
+    config: ReliableConfig,
+    receive: ReliableConfig,
+) -> Result<(usize, usize), Error> {
+    let ack = |direction: ReliableConfig| {
+        ENVELOPE_BYTES
+            .checked_add(direction.arq.ack_packet_bytes())
+            .ok_or(Error::InvalidConfig)
+    };
+    let send = config.maximum_packet()?.max(ack(receive)?);
+    let peer = receive.maximum_packet()?.max(ack(config)?);
+    if send > 65_507 || peer > 65_507 {
+        return Err(Error::InvalidConfig);
+    }
+    Ok((send, peer))
 }
 fn write_header(kind: u8, output: &mut [u8]) {
     output[..ENVELOPE_BYTES].copy_from_slice(&[b'L', b'2', b'R', b'F', 1, kind, 0, 0]);

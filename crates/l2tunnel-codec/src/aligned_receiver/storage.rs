@@ -16,6 +16,7 @@ struct ChannelCheckpoint {
     expected: Option<RecordId>,
     header: DecoderState,
     preview: Option<Preview>,
+    validated: Option<ValidatedFrontier>,
 }
 struct Globals {
     floor: Option<SourceId>,
@@ -74,7 +75,7 @@ pub(super) struct Reserved {
     compacted: Vec<RecordBuffer>,
     proofs: Vec<Vec<u8>>,
     journals: [Journal; 2],
-    active: Option<usize>,
+    pub(super) active: Option<usize>,
     complete: Vec<u8>,
     native: Vec<u8>,
     usage: Option<heap::Usage>,
@@ -231,6 +232,8 @@ impl Receiver {
             channels.push(Channel {
                 expected: Some(l.first_record),
                 preview: None,
+                validated: None,
+                scan_cache: ScanPrefixCache::None,
                 decoder: Decoder::new_in_mode(l.body, a, ip)?,
             });
         }
@@ -465,6 +468,7 @@ impl Receiver {
                 independent_short: old.independent_short,
                 defer_early: old.defer_early,
                 defer_head: old.defer_head,
+                validated: old.validated,
             })
         } else {
             None
@@ -528,6 +532,7 @@ impl Receiver {
             expected: self.channels[channel].expected,
             header: self.channels[channel].decoder.checkpoint(),
             preview: self.channels[channel].preview.clone(),
+            validated: self.channels[channel].validated.clone(),
         });
         j.channel_order.push(channel);
         Ok(())
@@ -653,6 +658,8 @@ impl Receiver {
                 self.channels[channel].expected = old.expected;
                 self.channels[channel].decoder.restore(old.header);
                 self.channels[channel].preview = old.preview;
+                self.channels[channel].validated = old.validated;
+                self.channels[channel].scan_cache = ScanPrefixCache::None;
                 if self.mode == ReceiverMode::FixedIpAnchors {
                     let backup = (index + 1) * self.channels.len() + channel;
                     self.anchors[channel] = self.anchors[backup].clone();
@@ -781,9 +788,16 @@ impl Receiver {
             return Err(error);
         }
         if let Some(policy) = policy {
-            self.begin_journal(1)?;
-            let validation = self.validate_pending_batch(now, policy);
-            self.end_journal(1, false)?;
+            let validation = match self.try_validate_incremental(policy) {
+                Ok(true) => Ok(()),
+                Ok(false) => {
+                    self.begin_journal(1)?;
+                    let validation = self.validate_pending_batch(now, policy);
+                    self.end_journal(1, false)?;
+                    validation
+                }
+                Err(error) => Err(error),
+            };
             if let Err(error) = validation {
                 self.end_journal(0, false)?;
                 return Err(error);
@@ -792,6 +806,139 @@ impl Receiver {
         self.end_journal(0, true)?;
         output[..symbols.len()].copy_from_slice(&outcomes[..symbols.len()]);
         Ok(symbols.len())
+    }
+    // Validate newly completed contiguous head runs in O(new records) without
+    // journal-1 record cloning or ordered_slots churn. Complete independent
+    // frames ahead of a gap are validated statelessly once and memoized; any
+    // context-dependent record behind a gap falls back to the full journaled
+    // replay so UnresolvedContext and reset-chain rules stay identical.
+    fn try_validate_incremental(&mut self, policy: BatchValidation) -> Result<bool, Error> {
+        if self.mode == ReceiverMode::FixedIpAnchors || self.loss_mode {
+            return Ok(false);
+        }
+        let saved_staged = self.staged.checkpoint();
+        let outcome = self.try_validate_incremental_inner(policy);
+        self.staged.restore(saved_staged);
+        outcome
+    }
+    fn try_validate_incremental_inner(&mut self, policy: BatchValidation) -> Result<bool, Error> {
+        let mut cursor = 0usize;
+        while cursor < self.ordered_slots.len() {
+            let first_slot = usize::from(self.ordered_slots[cursor]);
+            let channel = self.records[first_slot]
+                .as_ref()
+                .ok_or(Error::Malformed)?
+                .channel;
+            let index = usize::from(channel.0);
+            let expected = self.channels[index].expected;
+            let (mut next_id, loaded_from_validated) =
+                match (expected, &self.channels[index].validated) {
+                    (Some(exp), Some(v)) if v.next.is_none_or(|n| n > exp) => (v.next, true),
+                    _ => (expected, false),
+                };
+            let mut pos = match next_id {
+                Some(id) => {
+                    let rel = self.ordered_slots[cursor..].binary_search_by_key(
+                        &Some((channel.0, id)),
+                        |slot| {
+                            self.records[usize::from(*slot)]
+                                .as_ref()
+                                .map(|r| (r.channel.0, r.id))
+                        },
+                    );
+                    cursor
+                        + match rel {
+                            Ok(i) | Err(i) => i,
+                        }
+                }
+                None => {
+                    let rel = self.ordered_slots[cursor..].partition_point(|slot| {
+                        self.records[usize::from(*slot)]
+                            .as_ref()
+                            .is_some_and(|r| r.channel == channel)
+                    });
+                    cursor + rel
+                }
+            };
+            let mut staged_ready = false;
+            let mut advanced = false;
+            while pos < self.ordered_slots.len() {
+                let slot = usize::from(self.ordered_slots[pos]);
+                let entry = self.records[slot].as_ref().ok_or(Error::Malformed)?;
+                if entry.channel != channel || Some(entry.id) != next_id || !entry.complete() {
+                    break;
+                }
+                let skip_decode =
+                    entry.early_delivered && independent_length(&entry.bytes).is_some();
+                if !skip_decode {
+                    if !staged_ready {
+                        if loaded_from_validated {
+                            if let Some(v) = &self.channels[index].validated {
+                                self.staged.restore(v.header.clone());
+                            }
+                        } else {
+                            self.staged.copy_context_from(&self.channels[index].decoder);
+                        }
+                        staged_ready = true;
+                    }
+                    let output = &mut self.reserved.as_mut().ok_or(Error::Storage)?.native;
+                    self.staged
+                        .decode_body(&entry.bytes, entry.padding, output)
+                        .map_err(Error::Body)?;
+                }
+                next_id = entry.id.0.checked_add(1).map(RecordId);
+                advanced = true;
+                pos += 1;
+            }
+            if advanced {
+                let header = if staged_ready {
+                    self.staged.checkpoint()
+                } else if loaded_from_validated {
+                    self.channels[index]
+                        .validated
+                        .as_ref()
+                        .ok_or(Error::Storage)?
+                        .header
+                        .clone()
+                } else {
+                    self.channels[index].decoder.checkpoint()
+                };
+                self.touch_channel(index)?;
+                self.channels[index].validated = Some(ValidatedFrontier {
+                    next: next_id,
+                    header,
+                });
+            }
+            while pos < self.ordered_slots.len() {
+                let slot = usize::from(self.ordered_slots[pos]);
+                let entry = self.records[slot].as_ref().ok_or(Error::Malformed)?;
+                if entry.channel != channel {
+                    break;
+                }
+                if entry.complete() && !entry.early_delivered {
+                    let independent = entry.independent_short
+                        || (matches!(policy, BatchValidation::IndependentPackets)
+                            && independent_length(&entry.bytes).is_some());
+                    if independent {
+                        if !entry.validated {
+                            let output = &mut self.reserved.as_mut().ok_or(Error::Storage)?.native;
+                            self.staged
+                                .decode_body(&entry.bytes, entry.padding, output)
+                                .map_err(Error::Body)?;
+                            if let Some(rec) = self.records[slot].as_mut() {
+                                rec.validated = true;
+                            }
+                        }
+                        pos += 1;
+                        continue;
+                    }
+                    return Ok(false);
+                }
+                pos += 1;
+            }
+            cursor = pos;
+        }
+        Ok(true)
     }
     pub(super) fn validate_pending_batch(
         &mut self,

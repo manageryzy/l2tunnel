@@ -1,5 +1,5 @@
 use super::*;
-use crate::rolling::gf_batch::{MULTIPLICATION_ROWS, nonzero_bytes};
+use crate::rolling::gf_batch::{MULTIPLICATION_ROWS, nonzero_bytes, scale_in_place};
 
 fn config() -> Config {
     Config {
@@ -78,6 +78,22 @@ fn measured_gf_rows_match_all_factors_and_byte_products() {
             .map(|(index, value)| if index % 32 < 16 { 0 } else { *value })
             .collect();
         check_scaled(factor, &mixed, &before);
+    }
+}
+
+#[test]
+fn scale_in_place_matches_scalar_across_chunk_and_simd_boundaries() {
+    for length in [0, 1, 7, 15, 31, 32, 33, 255, 511, 512, 513, 1290] {
+        let input: Vec<u8> = (0..length).map(|i| ((i * 37 + 11) & 0xff) as u8).collect();
+        for factor in [0_u8, 1, 2, 17, 129, 255] {
+            let expected: Vec<u8> = input
+                .iter()
+                .map(|&value| field::multiply(factor, value))
+                .collect();
+            let mut actual = input.clone();
+            scale_in_place(&mut actual, factor);
+            assert_eq!(actual, expected, "length={length} factor={factor}");
+        }
     }
 }
 

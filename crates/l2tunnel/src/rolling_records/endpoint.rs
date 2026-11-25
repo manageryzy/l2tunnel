@@ -2549,6 +2549,10 @@ impl<P: RecoveryPolicy> Endpoint<P> {
     pub fn record_status(&self) -> receiver::Status {
         self.records.status()
     }
+    /// Exact count of distinct channels retaining at least one record.
+    pub fn retained_channel_count(&self) -> usize {
+        self.records.retained_channel_count()
+    }
     /// Read actual codec retention without stepping the independent FEC owners.
     pub fn codec_buffer_snapshot(&self) -> l2tunnel_codec::diagnostics::DuplexBuffers {
         l2tunnel_codec::diagnostics::DuplexBuffers {

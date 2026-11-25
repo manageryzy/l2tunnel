@@ -37,6 +37,9 @@ pub mod swift_configuration;
 /// Complete versioned common record values and exact transaction catalogs.
 pub mod record_configuration;
 
+/// Switchable catalog generation from a client's live-tuning proposal.
+pub mod live_tuning;
+
 /// Actual shared-queue composition of existing Swift, Aligned and Packed owners.
 pub mod record_engine;
 

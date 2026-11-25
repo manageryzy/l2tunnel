@@ -14,6 +14,8 @@ fn send_slots() -> Vec<SendSlot> {
                 attempts: 0,
                 retry_at: None,
                 rto: Duration::ZERO,
+                fast_resend: false,
+                serial: 0,
             },
         })
         .collect()

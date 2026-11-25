@@ -333,6 +333,8 @@ struct Record {
     defer_early: u64,
     // Only a time-bounded native byte-order policy may defer the channel head.
     defer_head: bool,
+    // Memoized stateless validation for complete independent records ahead of a gap.
+    validated: bool,
 }
 impl Record {
     fn complete(&self) -> bool {
@@ -349,10 +351,28 @@ struct LegacyChannel {
     expected: Option<RecordId>,
     decoder: [u8; Decoder::legacy_inline_bytes()],
 }
+#[derive(Clone, Copy)]
+pub(super) enum ScanPrefixCache {
+    None,
+    Reevaluated {
+        complete_packets: bool,
+        check_head: bool,
+        skip_to: Option<RecordId>,
+        count: u8,
+        tokens: [u64; 8],
+    },
+}
+#[derive(Clone)]
+struct ValidatedFrontier {
+    next: Option<RecordId>,
+    header: aligned_body::DecoderState,
+}
 struct Channel {
     expected: Option<RecordId>,
     decoder: Decoder,
     preview: Option<Preview>,
+    validated: Option<ValidatedFrontier>,
+    scan_cache: ScanPrefixCache,
 }
 #[derive(Clone, Copy)]
 struct Pending {
@@ -522,6 +542,8 @@ impl Receiver {
             channels.push(Channel {
                 expected: Some(limits.first_record),
                 preview: None,
+                validated: None,
+                scan_cache: ScanPrefixCache::None,
                 decoder: if ip {
                     Decoder::new_ip(limits.body)
                 } else {
@@ -721,6 +743,7 @@ impl Receiver {
         for (target, source) in shadow.channels.iter_mut().zip(&self.channels) {
             target.expected = source.expected;
             target.preview.clone_from(&source.preview);
+            target.validated.clone_from(&source.validated);
             target.decoder.copy_context_from(&source.decoder);
         }
         shadow.records.clone_from(&self.records);
@@ -939,6 +962,7 @@ impl Receiver {
                             .independent_short(self.limits.body.independent_short_frame_bytes),
                         defer_early: 0,
                         defer_head: false,
+                        validated: false,
                     };
                     self.retention.add_record(&record);
                     self.deadlines.insert(record.deadline);
@@ -948,6 +972,23 @@ impl Receiver {
                 }
             }
         };
+        if outcome == Admission::Accepted {
+            let index = usize::from(parsed.channel.0);
+            let is_fixed_anchor_context = self.mode == ReceiverMode::FixedIpAnchors
+                && parsed.offset == 0
+                && parsed.body.first() == Some(&8);
+            let keep = !is_fixed_anchor_context
+                && matches!(
+                    self.channels[index].scan_cache,
+                    ScanPrefixCache::Reevaluated {
+                        skip_to: Some(limit),
+                        ..
+                    } if identity.record >= limit
+                );
+            if !keep {
+                self.channels[index].scan_cache = ScanPrefixCache::None;
+            }
+        }
         self.touch_proof(proof_slot)?;
         let bytes = self.proof_buffer(symbol)?;
         let proof = Proof {
@@ -1100,12 +1141,26 @@ impl Receiver {
                 Some(id) => id,
                 None => return Ok(Prepared::Idle),
             };
-            let Some((position, anchor)) = self.select_record(channel, expected, &selection)?
-            else {
-                return Ok(Prepared::Idle);
+            let index = usize::from(channel.0);
+            let (position, anchor) = match self.select_record(channel, expected, &selection)? {
+                preview::RecordSelection::Selected {
+                    position,
+                    anchor,
+                    cache,
+                } => {
+                    if self.reserved.as_ref().is_none_or(|r| r.active.is_none()) {
+                        self.channels[index].scan_cache = cache.unwrap_or(ScanPrefixCache::None);
+                    }
+                    (position, anchor)
+                }
+                preview::RecordSelection::Idle(cache) => {
+                    if self.reserved.as_ref().is_none_or(|r| r.active.is_none()) {
+                        self.channels[index].scan_cache = cache;
+                    }
+                    return Ok(Prepared::Idle);
+                }
             };
             let slot = usize::from(self.ordered_slots[position]);
-            let index = usize::from(channel.0);
             if self.mode == ReceiverMode::FixedIpAnchors {
                 match self.stage_fixed_anchor(slot, &mut remaining)? {
                     Some(true) => {}
@@ -1243,6 +1298,22 @@ impl Receiver {
         self.check_time(now)?;
         let pending = self.pending.ok_or(Error::NoPending)?;
         if pending.early {
+            let (channel, id) = {
+                let record = self.records[pending.slot]
+                    .as_ref()
+                    .ok_or(Error::Malformed)?;
+                (usize::from(record.channel.0), record.id)
+            };
+            let keep = matches!(
+                self.channels[channel].scan_cache,
+                ScanPrefixCache::Reevaluated {
+                    skip_to: Some(limit),
+                    ..
+                } if id >= limit
+            );
+            if !keep {
+                self.channels[channel].scan_cache = ScanPrefixCache::None;
+            }
             self.touch_record(pending.slot, true)?;
             let record = self.records[pending.slot]
                 .as_mut()
@@ -1376,6 +1447,28 @@ impl Receiver {
         self.records[usize::from(*slot)].as_ref().map(|r| r.channel)
     }
 
+    /// Exact count of distinct channels currently retaining at least one record.
+    pub fn retained_channel_count(&self) -> usize {
+        let mut count = 0usize;
+        let mut cursor = 0usize;
+        while cursor < self.ordered_slots.len() {
+            let Some(channel) = self.records[usize::from(self.ordered_slots[cursor])]
+                .as_ref()
+                .map(|r| r.channel)
+            else {
+                break;
+            };
+            count += 1;
+            let next = self.ordered_slots[cursor..].partition_point(|slot| {
+                self.records[usize::from(*slot)]
+                    .as_ref()
+                    .is_some_and(|r| r.channel == channel)
+            });
+            cursor += next.max(1);
+        }
+        count
+    }
+
     fn record_position(&self, channel: ChannelId, record: RecordId) -> Result<usize, usize> {
         self.ordered_slots
             .binary_search_by_key(&Some((channel.0, record)), |slot| {
@@ -1464,6 +1557,13 @@ impl Receiver {
         self.check_time(now)?;
         let floor = self.floor.ok_or(Error::Exhausted)?;
         self.loss_mode = true;
+        for index in 0..self.channels.len() {
+            self.channels[index].scan_cache = ScanPrefixCache::None;
+            if self.channels[index].validated.is_some() {
+                self.touch_channel(index)?;
+                self.channels[index].validated = None;
+            }
+        }
         self.last_time = Some(now);
         if end.0 <= floor.0 {
             return Ok(());
@@ -1519,14 +1619,22 @@ impl Receiver {
         self.touch_channel(index)?;
         self.loss.skipped_records += next.0 - expected.0;
         self.channels[index].expected = Some(next);
+        self.channels[index].validated = None;
+        self.channels[index].scan_cache = ScanPrefixCache::None;
         Ok(())
     }
     /// Release one retained record without delivery or head movement.
     pub(super) fn discard(&mut self, slot: usize) -> Result<(), Error> {
         let entry = self.records[slot].as_ref().ok_or(Error::Malformed)?;
+        let index = usize::from(entry.channel.0);
         let position = self
             .record_position(entry.channel, entry.id)
             .map_err(|_| Error::Malformed)?;
+        self.channels[index].scan_cache = ScanPrefixCache::None;
+        if self.channels[index].validated.is_some() {
+            self.touch_channel(index)?;
+            self.channels[index].validated = None;
+        }
         self.touch_record(slot, false)?;
         self.ordered_slots.remove(position);
         if let Some(record) = self.records[slot].take() {
@@ -1550,7 +1658,16 @@ impl Receiver {
         self.touch_channel(index)?;
         self.touch_record(slot, false)?;
         self.ordered_slots.remove(position);
-        self.channels[index].expected = id.0.checked_add(1).map(RecordId);
+        let next = id.0.checked_add(1).map(RecordId);
+        self.channels[index].expected = next;
+        self.channels[index].scan_cache = ScanPrefixCache::None;
+        if self.channels[index]
+            .validated
+            .as_ref()
+            .is_some_and(|v| v.next == next)
+        {
+            self.channels[index].validated = None;
+        }
         if let Some(record) = self.records[slot].take() {
             self.retention.remove_record(&record);
             self.deadlines

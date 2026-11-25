@@ -119,6 +119,38 @@ impl Owner {
             .flatten()
             .chain(compact.into_iter().flatten()))
     }
+    /// Latest receipt serial of a journaled (wide) receive direction.
+    pub fn receipt_serial(&self) -> Option<u64> {
+        dispatch!(self, owner => owner.receipt_serial())
+    }
+    /// Journaled receipts after `cursor`; `None` asks for a full scan.
+    pub fn received_after(
+        &self,
+        cursor: u64,
+    ) -> Result<Option<impl Iterator<Item = l2tunnel_recovery::Receipt<'_>>>, RecoveryError> {
+        let legacy = if let Self::Legacy(owner) = self {
+            match owner.received_after(cursor)? {
+                Some(entries) => Some(entries),
+                None => return Ok(None),
+            }
+        } else {
+            None
+        };
+        let compact = if let Self::Compact(owner) = self {
+            match owner.received_after(cursor)? {
+                Some(entries) => Some(entries),
+                None => return Ok(None),
+            }
+        } else {
+            None
+        };
+        Ok(Some(
+            legacy
+                .into_iter()
+                .flatten()
+                .chain(compact.into_iter().flatten()),
+        ))
+    }
     pub fn source_deadline(&self) -> Option<Duration> {
         dispatch!(self, owner => owner.source_deadline())
     }
@@ -202,11 +234,7 @@ impl Owner {
     ) -> Result<(), RecoveryError> {
         match self {
             Self::Legacy(owner) => {
-                let view = l2tunnel_recovery::inspect_body(
-                    feedback,
-                    bytes,
-                    owner.receive_max_packet_bytes() - DATA_HEADER_BYTES,
-                )?;
+                let view = owner.inspect_peer_body(feedback, bytes)?;
                 // Reuse the existing canonical view. Only a successfully applied
                 // ACK can reach the optional observer; malformed/unsent ACKs keep
                 // their original error and cannot replace a prior valid event.

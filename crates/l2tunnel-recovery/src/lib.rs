@@ -13,9 +13,13 @@ pub use arq::{
     CompactBounds, CompactFeedback, CompactPacketKind, CompactPacketView,
     CompactPeerFeedbackSnapshot, CompactPollError, CompactRecovery, CompactRepeat,
     CompactRetryFailureSnapshot, CompactTiming, CompactTimingSnapshot, DATA_HEADER_BYTES,
-    EndpointRole, KcpLikeConfig, PacketView, PhysicalTransmission, RecoveryContext, RecoveryError,
-    Retained, SelectiveRepeat, SourceId, Statistics, inspect_body, inspect_compact_body,
-    inspect_compact_packet, inspect_packet,
+    EndpointRole, KcpLikeConfig, PacketView, PhysicalTransmission, Receipt, RecoveryContext,
+    RecoveryError, Retained, SelectiveRepeat, SourceId, Statistics, inspect_body, inspect_body_for,
+    inspect_compact_body, inspect_compact_packet, inspect_packet, inspect_packet_for,
+};
+pub use arq::{
+    ADAPTIVE_RTO_FLOOR, FAST_RESEND_THRESHOLD, LEGACY_ACK_WINDOW, MAX_ARQ_WINDOW,
+    WIDE_ACK_HEADER_BYTES,
 };
 
 /// Incremental recovery uses injected monotonic time and bounded caller buffers.

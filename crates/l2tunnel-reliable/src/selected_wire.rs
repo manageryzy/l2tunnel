@@ -1,6 +1,8 @@
 //! Explicit context-free final union over the existing Reliable owners.
 use super::*;
-use l2tunnel_recovery::{CompactPacketKind, CompactPacketView, inspect_body, inspect_compact_body};
+use l2tunnel_recovery::{
+    CompactPacketKind, CompactPacketView, inspect_body, inspect_body_for, inspect_compact_body,
+};
 
 impl ReliableConfig {
     /// Selected data union ceiling, excluding final protection and carrier bytes.
@@ -19,7 +21,8 @@ impl ReliableConfig {
     /// Selected strong-feedback union ceiling, with both complete u64 values.
     pub fn compact_wire_maximum_feedback_bytes(self) -> Result<usize, Error> {
         self.validate()?;
-        Ok(1 + l2tunnel_recovery::ARQ_BODY_FEEDBACK_MAX_HEADER_BYTES)
+        // Feedback for this direction is sized by its own window (wide above 64).
+        Ok(1 + self.arq.feedback_body_max_bytes())
     }
     /// Largest selected packet body across data and strong feedback.
     pub fn compact_wire_maximum_packet_bytes(self) -> Result<usize, Error> {
@@ -194,7 +197,15 @@ impl Reliable {
                         _ => return Err(Error::Malformed),
                     },
                     2 => {
-                        inspect_body(true, body, policy.arq.max_source_bytes)?;
+                        // Feedback acknowledges the opposite direction: outgoing
+                        // feedback covers the receive policy, incoming the send policy.
+                        let acknowledged = if outgoing { receive } else { send };
+                        inspect_body_for(
+                            true,
+                            body,
+                            policy.arq.max_source_bytes,
+                            acknowledged.arq,
+                        )?;
                     }
                     3 | 4 if policy.repair_symbols != 0 => {
                         let view = inspect_symbol(kind, body, policy.fec.block)?;

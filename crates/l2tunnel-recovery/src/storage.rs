@@ -70,6 +70,33 @@ impl DuplexPlan {
                     .and_then(|payload| metadata.checked_add(payload))
             })
             .ok_or(Error::Layout)?;
+        // A wide send direction reserves its deadline queue (twice the window).
+        let deadlines = if send.wide_feedback() {
+            array_bytes::<crate::arq::DeadlineEntry>(
+                send.send_records.checked_mul(2).ok_or(Error::Layout)?,
+            )?
+        } else {
+            0
+        };
+        // ... and its transmission-order queue for fast resend (same length).
+        let order = if send.wide_feedback() {
+            array_bytes::<crate::arq::SentEntry>(
+                send.send_records.checked_mul(2).ok_or(Error::Layout)?,
+            )?
+        } else {
+            0
+        };
+        // A wide receive direction reserves its receipt journal.
+        let journal = if receive.wide_feedback() {
+            array_bytes::<crate::arq::ReceiptEntry>(receive.receive_records)?
+        } else {
+            0
+        };
+        let capacity_bytes = capacity_bytes
+            .checked_add(deadlines)
+            .and_then(|bytes| bytes.checked_add(order))
+            .and_then(|bytes| bytes.checked_add(journal))
+            .ok_or(Error::Layout)?;
         Ok(Self {
             send,
             receive,
@@ -110,6 +137,12 @@ impl CompactPlan {
         receive.validate().map_err(Error::Recovery)?;
         let sb = send.bounds();
         let rb = receive.bounds();
+        // A wide receive direction reserves its receipt journal, matching DuplexPlan.
+        let journal = if receive.wide_receive() {
+            array_bytes::<crate::arq::ReceiptEntry>(rb.receive_records)?
+        } else {
+            0
+        };
         let values = [
             array_bytes::<crate::arq::SendSlot>(sb.send_records)?,
             array_bytes::<crate::arq::ReceiveSlot>(rb.receive_records)?,
@@ -122,6 +155,7 @@ impl CompactPlan {
             array_bytes::<crate::arq::CompactMeta>(sb.send_records)?,
             array_bytes::<Option<crate::arq::CompactHistory>>(send.history_entries())?,
             array_bytes::<crate::arq::CompactState>(1)?,
+            journal,
         ];
         let capacity_bytes = values.into_iter().try_fold(0usize, |sum, value| {
             sum.checked_add(value).ok_or(Error::Layout)

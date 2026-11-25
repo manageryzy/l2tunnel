@@ -17,6 +17,15 @@ impl Preview {
     }
 }
 
+pub(super) enum RecordSelection {
+    Selected {
+        position: usize,
+        anchor: Option<usize>,
+        cache: Option<ScanPrefixCache>,
+    },
+    Idle(ScanPrefixCache),
+}
+
 impl Receiver {
     // Find the first eligible body and, for a delta, the complete reset chain
     // that gives it an unambiguous header. A missing record or fragment cuts
@@ -26,25 +35,27 @@ impl Receiver {
         channel: ChannelId,
         expected: RecordId,
         selection: &EarlySelection<'_>,
-    ) -> Result<Option<(usize, Option<usize>)>, Error> {
+    ) -> Result<RecordSelection, Error> {
         let start = self
             .record_position(channel, expected)
             .unwrap_or_else(|i| i);
-        let packets = matches!(
-            selection,
+        let (packets, check_head, reevaluated) = match selection {
             EarlySelection::Reevaluated {
-                complete_packets: true,
+                complete_packets,
+                check_head,
                 ..
-            }
-        );
-        let mut anchor = None;
-        let mut next = None;
-        for position in start..self.ordered_slots.len() {
-            let entry = self.indexed_record(position)?;
-            if entry.channel != channel {
-                break;
-            }
-            if entry.id == expected && entry.complete() {
+            } => (*complete_packets, *check_head, true),
+            _ => (false, false, false),
+        };
+        // Step 1: always inspect the channel head at `start` first.
+        let mut scan_pos = start;
+        if let Some(entry) = (start < self.ordered_slots.len())
+            .then(|| self.indexed_record(start))
+            .transpose()?
+            && entry.channel == channel
+            && entry.id == expected
+        {
+            if entry.complete() {
                 if entry.defer_head
                     && let EarlySelection::Reevaluated {
                         changed,
@@ -53,33 +64,105 @@ impl Receiver {
                     } = selection
                     && !changed(entry.defer_early)
                 {
-                    continue;
+                } else {
+                    return Ok(RecordSelection::Selected {
+                        position: start,
+                        anchor: None,
+                        cache: None,
+                    });
                 }
-                return Ok(Some((position, None)));
             }
-            if matches!(selection, EarlySelection::Ordered)
-                || (!packets && self.limits.body.independent_short_frame_bytes == 0)
-            {
+            scan_pos = start + 1;
+        }
+        if matches!(selection, EarlySelection::Ordered)
+            || (!packets && self.limits.body.independent_short_frame_bytes == 0)
+        {
+            return Ok(RecordSelection::Idle(ScanPrefixCache::None));
+        }
+
+        let mut tokens = [0u64; 8];
+        let mut token_count = 0usize;
+        let mut cacheable = reevaluated;
+        let mut skip_floor = expected.0.checked_add(1).map(RecordId);
+
+        // Step 2: if a cached ineligible prefix strictly past `expected` still
+        // has all wait tokens unchanged, binary-search jump past it in O(log N).
+        let index = usize::from(channel.0);
+        if let (
+            EarlySelection::Reevaluated { changed, .. },
+            ScanPrefixCache::Reevaluated {
+                complete_packets: cached_packets,
+                check_head: cached_head,
+                skip_to,
+                count,
+                tokens: cached_tokens,
+            },
+        ) = (selection, self.channels[index].scan_cache)
+            && packets == cached_packets
+            && check_head == cached_head
+            && cached_tokens[..usize::from(count)]
+                .iter()
+                .all(|&t| !changed(t))
+        {
+            tokens = cached_tokens;
+            token_count = usize::from(count);
+            skip_floor = skip_to;
+            match skip_to {
+                None => {
+                    return Ok(RecordSelection::Idle(self.channels[index].scan_cache));
+                }
+                Some(resume_id) => {
+                    if scan_pos < self.ordered_slots.len() {
+                        let rel = self.ordered_slots[scan_pos..].binary_search_by_key(
+                            &Some((channel.0, resume_id)),
+                            |slot| {
+                                self.records[usize::from(*slot)]
+                                    .as_ref()
+                                    .map(|r| (r.channel.0, r.id))
+                            },
+                        );
+                        scan_pos += match rel {
+                            Ok(i) | Err(i) => i,
+                        };
+                    }
+                }
+            }
+        }
+
+        let mut anchor = None;
+        let mut next = None;
+        let mut last_ineligible: Option<RecordId> = None;
+        for position in scan_pos..self.ordered_slots.len() {
+            let entry = self.indexed_record(position)?;
+            if entry.channel != channel {
                 break;
             }
             // A fixed-anchor delta names its own context. A prior native commit
             // leaves only ordered retirement work for this row at the head.
             if self.mode == ReceiverMode::FixedIpAnchors && entry.early_delivered {
+                last_ineligible = Some(entry.id);
                 continue;
             }
             if !entry.complete() {
                 anchor = None;
+                last_ineligible = Some(entry.id);
                 continue;
             }
             if Some(entry.id.0) != next {
                 anchor = None;
             }
             next = entry.id.0.checked_add(1);
-            if packets && entry.bytes.first() == Some(&8) {
+            if self.mode != ReceiverMode::FixedIpAnchors
+                && packets
+                && entry.bytes.first() == Some(&8)
+            {
                 anchor = Some(position);
                 continue;
             }
             if entry.early_delivered {
+                if anchor.is_none() {
+                    last_ineligible = Some(entry.id);
+                }
                 continue;
             }
             if entry.defer_early != 0
@@ -93,23 +176,75 @@ impl Receiver {
                     _ => false,
                 }
             {
+                if cacheable
+                    && entry.defer_early != u64::MAX
+                    && !tokens[..token_count].contains(&entry.defer_early)
+                {
+                    if token_count < tokens.len() {
+                        tokens[token_count] = entry.defer_early;
+                        token_count += 1;
+                    } else {
+                        cacheable = false;
+                    }
+                }
+                if anchor.is_none() {
+                    last_ineligible = Some(entry.id);
+                }
                 continue;
             }
+            let prefix_cache =
+                (cacheable && anchor.is_none()).then_some(ScanPrefixCache::Reevaluated {
+                    complete_packets: packets,
+                    check_head,
+                    skip_to: Some(entry.id),
+                    count: token_count as u8,
+                    tokens,
+                });
             if entry.independent_short || (packets && independent_length(&entry.bytes).is_some()) {
-                return Ok(Some((position, None)));
+                return Ok(RecordSelection::Selected {
+                    position,
+                    anchor: None,
+                    cache: prefix_cache,
+                });
             }
             if self.mode == ReceiverMode::FixedIpAnchors {
                 if packets
                     && entry.bytes.first() == Some(&aligned_body::FIXED_ANCHOR_TAG)
                     && self.fixed_anchor_available(entry)?
                 {
-                    return Ok(Some((position, None)));
+                    return Ok(RecordSelection::Selected {
+                        position,
+                        anchor: None,
+                        cache: prefix_cache,
+                    });
                 }
+                last_ineligible = Some(entry.id);
             } else if anchor.is_some() {
-                return Ok(Some((position, anchor)));
+                return Ok(RecordSelection::Selected {
+                    position,
+                    anchor,
+                    cache: None,
+                });
+            } else {
+                last_ineligible = Some(entry.id);
             }
         }
-        Ok(None)
+        let cache = if cacheable && anchor.is_none() {
+            let skip_to = match last_ineligible {
+                Some(id) => id.0.checked_add(1).map(RecordId),
+                None => skip_floor,
+            };
+            ScanPrefixCache::Reevaluated {
+                complete_packets: packets,
+                check_head,
+                skip_to,
+                count: token_count as u8,
+                tokens,
+            }
+        } else {
+            ScanPrefixCache::None
+        };
+        Ok(RecordSelection::Idle(cache))
     }
 
     fn indexed_record(&self, position: usize) -> Result<&Record, Error> {

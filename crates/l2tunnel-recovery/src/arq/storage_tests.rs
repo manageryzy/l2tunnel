@@ -102,7 +102,7 @@ fn exact_plan_one_short_invalid_layout_and_legacy_observation() -> Result {
             ..config
         },
         ArqConfig {
-            send_records: 65,
+            send_records: crate::MAX_ARQ_WINDOW + 1,
             ..config
         },
         ArqConfig {

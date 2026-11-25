@@ -306,6 +306,8 @@ pub struct Endpoint {
     compact_wire: bool,
     compact_data_overhead: usize,
     staged_wait: staged_wait::State,
+    /// Receipt serial up to which early preview has handled every source.
+    preview_cursor: u64,
     receiver_handoff: Vec<receiver_handoff::State>,
 }
 impl Endpoint {
@@ -526,6 +528,7 @@ impl Endpoint {
             compact_wire: false,
             compact_data_overhead: 0,
             staged_wait: staged_wait::State::default(),
+            preview_cursor: 0,
             receiver_handoff,
             usage: Some(storage::Usage {
                 limit_bytes: limits.capacity_bytes,
@@ -635,6 +638,7 @@ impl Endpoint {
             compact_wire: false,
             compact_data_overhead: 0,
             staged_wait: staged_wait::State::default(),
+            preview_cursor: 0,
             receiver_handoff: Vec::new(),
             usage: None,
         })
@@ -1522,8 +1526,42 @@ impl Endpoint {
             return self.preview_packed(options);
         }
         let now = ticks(self.now)?;
+        // Visit only receipts after the cursor when the journal covers it;
+        // otherwise (no journal or stale cursor) rescan every retained source.
+        let cursor = self.preview_cursor;
+        let latest = self.recovery.receipt_serial();
+        if latest == Some(cursor) && self.recovery.failure().is_none() {
+            return Ok(());
+        }
         let result = (|| {
-            for (id, payload) in self.recovery.received_sources().map_err(Error::Recovery)? {
+            let journaled = self
+                .recovery
+                .received_after(cursor)
+                .map_err(Error::Recovery)?;
+            let journal_used = journaled.is_some();
+            let full = if journal_used {
+                None
+            } else {
+                Some(self.recovery.received_sources().map_err(Error::Recovery)?)
+            };
+            let entries = journaled
+                .into_iter()
+                .flatten()
+                .map(|receipt| (Some(receipt.serial), receipt.source.0, receipt.bytes))
+                .chain(
+                    full.into_iter()
+                        .flatten()
+                        .map(|(id, payload)| (None, id, payload)),
+                );
+            // Receipts strictly before the current one are fully handled.
+            let mut processed = cursor;
+            let mut previous = None;
+            let mut stopped = false;
+            for (serial, id, payload) in entries {
+                if let Some(serial) = previous {
+                    processed = serial;
+                }
+                previous = serial;
                 // Reliable retains immutable source bytes and rejects conflicting
                 // duplicates before this point. A previous successful preview is
                 // therefore not another admission. `advance` still checks every
@@ -1560,14 +1598,24 @@ impl Endpoint {
                     ) => {}
                     // Actual ARQ ownership is retained for ordered retry. No
                     // source or native completion is fabricated on pressure.
-                    Err(receiver::Error::Capacity | receiver::Error::RecordWindow) => break,
+                    Err(receiver::Error::Capacity | receiver::Error::RecordWindow) => {
+                        stopped = true;
+                        break;
+                    }
                     Ok(_) => return Err(Error::Identity),
                     Err(error) => return Err(Error::Receiver(error)),
                 }
             }
-            Ok(())
+            // A pressure stop retries the refused receipt (or, without a usable
+            // journal, the whole scan) on the next pump.
+            Ok(match (stopped, journal_used) {
+                (true, true) => processed,
+                (true, false) => cursor,
+                (false, _) => latest.unwrap_or(cursor),
+            })
         })();
-        self.terminal_result(result)
+        self.preview_cursor = self.terminal_result(result)?;
+        Ok(())
     }
     fn admit_packed(
         &mut self,
@@ -1661,11 +1709,45 @@ impl Endpoint {
     }
     fn preview_packed(&mut self, options: packed::Options) -> Result<(), Error> {
         let now = ticks(self.now)?;
+        // Visit only receipts after the cursor when the journal covers it;
+        // otherwise (no journal or stale cursor) rescan every retained source.
+        let cursor = self.preview_cursor;
+        let latest = self.recovery.receipt_serial();
+        if latest == Some(cursor) && self.recovery.failure().is_none() {
+            return Ok(());
+        }
         let (seen, symbols) = self
             .packed_symbols
             .split_at_mut(self.receive_config.packed_preview_bytes());
         let result = (|| {
-            for (id, payload) in self.recovery.received_sources().map_err(Error::Recovery)? {
+            let journaled = self
+                .recovery
+                .received_after(cursor)
+                .map_err(Error::Recovery)?;
+            let journal_used = journaled.is_some();
+            let full = if journal_used {
+                None
+            } else {
+                Some(self.recovery.received_sources().map_err(Error::Recovery)?)
+            };
+            let entries = journaled
+                .into_iter()
+                .flatten()
+                .map(|receipt| (Some(receipt.serial), receipt.source.0, receipt.bytes))
+                .chain(
+                    full.into_iter()
+                        .flatten()
+                        .map(|(id, payload)| (None, id, payload)),
+                );
+            // Receipts strictly before the current one are fully handled.
+            let mut processed = cursor;
+            let mut previous = None;
+            let mut stopped = false;
+            for (serial, id, payload) in entries {
+                if let Some(serial) = previous {
+                    processed = serial;
+                }
+                previous = serial;
                 let completion = if seen.is_empty() {
                     None
                 } else {
@@ -1724,6 +1806,44 @@ impl Endpoint {
                     }
                 }
                 if selected != 0 {
+                    // Keep enough lookahead headroom for ordered `admit_packed` to admit
+                    // a full multi-unit head source (and any fragmented head span) even
+                    // after opportunistic early previews fill the rest of lookahead with
+                    // tombstones. Otherwise an arriving head source rolls back on Capacity
+                    // and cannot unlock tombstone retirement.
+                    let max_units = usize::from(options.max_units);
+                    let reserve_items =
+                        max_units.min(self.receive_config.receiver.lookahead_records / 2);
+                    let reserve_bytes = reserve_items
+                        .saturating_mul(self.receive_config.receiver.body.symbol_bytes)
+                        .min(self.receive_config.receiver.lookahead_bytes / 2);
+                    let reserve_fragments =
+                        max_units.min(self.receive_config.receiver.lookahead_fragments / 2);
+                    let snap = self.receiver.buffer_snapshot();
+                    let incoming_bytes = inputs[..selected]
+                        .iter()
+                        .fold(0usize, |acc, sym| acc.saturating_add(sym.bytes.len()));
+                    let needed_items = snap
+                        .lookahead
+                        .items
+                        .saturating_add(selected)
+                        .saturating_add(reserve_items);
+                    let needed_bytes = snap
+                        .lookahead
+                        .bytes
+                        .saturating_add(incoming_bytes)
+                        .saturating_add(reserve_bytes);
+                    let needed_fragments = snap
+                        .lookahead_fragments
+                        .saturating_add(selected)
+                        .saturating_add(reserve_fragments);
+                    if needed_items > snap.lookahead.item_capacity
+                        || needed_bytes > snap.lookahead.byte_capacity
+                        || needed_fragments > snap.lookahead_fragment_capacity
+                    {
+                        stopped = true;
+                        break;
+                    }
                     let mut outcomes = [receiver::Admission::Accepted; 255];
                     match self.receiver.admit_batch_authenticated_into(
                         &inputs[..selected],
@@ -1740,7 +1860,10 @@ impl Endpoint {
                                             | receiver::Admission::StaleSource
                                     )
                                 }) => {}
-                        Err(receiver::Error::Capacity | receiver::Error::RecordWindow) => break,
+                        Err(receiver::Error::Capacity | receiver::Error::RecordWindow) => {
+                            stopped = true;
+                            break;
+                        }
                         Err(receiver::Error::SourceWindow)
                             if self.receive_config.independent_packets =>
                         {
@@ -1758,9 +1881,16 @@ impl Endpoint {
                     *byte |= mask;
                 }
             }
-            Ok(())
+            // A pressure stop retries the refused receipt (or, without a usable
+            // journal, the whole scan) on the next pump.
+            Ok(match (stopped, journal_used) {
+                (true, true) => processed,
+                (true, false) => cursor,
+                (false, _) => latest.unwrap_or(cursor),
+            })
         })();
-        self.terminal_result(result)
+        self.preview_cursor = self.terminal_result(result)?;
+        Ok(())
     }
     fn recovery_result<T>(&mut self, result: Result<T, Error>) -> Result<T, Error> {
         match result {

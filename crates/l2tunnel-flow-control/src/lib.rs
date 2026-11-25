@@ -42,6 +42,8 @@ use std::ops::Bound::{Excluded, Unbounded};
 
 /// Bounded bandwidth-delay delivery admission, independent of local queues.
 pub mod delivery_window;
+/// Session receiver credit: processed window and drain-rate pacing.
+pub mod session_credit;
 /// Injected-time adaptive transparent-TUN credit targets, separate from grants.
 pub mod target;
 /// Fixed-size credit tokens for an independently authenticated record layer.

@@ -78,6 +78,7 @@ impl Reliable {
             config.fec.block,
             opposite_context(self.context),
             self.send_fec,
+            self.legacy_receive()?.arq,
         )
     }
 

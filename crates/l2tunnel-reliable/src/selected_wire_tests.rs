@@ -190,3 +190,50 @@ fn selected_parser_rejects_noncanonical_union_and_legacy_fallback() -> TestResul
     assert_eq!(a.enable_compact_wire(49), Err(Error::InvalidConfig));
     Ok(())
 }
+
+/// A fresh source enters the FEC block without spending budget, after which the
+/// ARQ alternates to a larger due retry. That retry must wait for budget rather
+/// than fail the owner (native Aligned Cauchy once died with `Exhausted` here).
+#[test]
+fn selected_fec_defers_a_larger_retry_after_a_fresh_block_source() -> TestResult {
+    for reserved in [false, true] {
+        let (mut a, _) = selected_pair(2, reserved)?;
+        let mut output = vec![0; a.max_packet_bytes()];
+        let drain = |a: &mut Reliable, at: u64| -> Result<usize, Error> {
+            let mut output = vec![0; a.max_packet_bytes()];
+            let mut count = 0;
+            while let Some(_length) = a.poll_data(time(at), &mut output, &mut allowance())? {
+                let token = a.pending_output().ok_or(Error::OutputToken)?;
+                a.confirm_output_at(time(at), time(at), token)?;
+                count += 1;
+            }
+            Ok(count)
+        };
+        a.submit(&[7; 60], time(0))?;
+        a.submit(&[8; 60], time(0))?;
+        assert_eq!(drain(&mut a, 0)?, 0);
+        // Flush: both sources and two repairs; each source's retry is due at 105.
+        assert_eq!(drain(&mut a, 5)?, 4);
+        a.submit(&[9], time(150))?;
+        // The first source's retry goes first and flips the preference to fresh.
+        let mut one = OutboundBudget {
+            packets: 1,
+            wire_bytes: 100_000,
+        };
+        a.poll_data(time(150), &mut output, &mut one)?
+            .ok_or("first retry")?;
+        let token = a.pending_output().ok_or("token")?;
+        a.confirm_output_at(time(150), time(150), token)?;
+        // Budget for exactly the small fresh source; the second retry is larger.
+        let fresh = a.arq.body_packet_bytes(time(150), false)?.ok_or("fresh")?;
+        let mut exact = OutboundBudget {
+            packets: 1,
+            wire_bytes: 1 + fresh + a.outer_overhead(),
+        };
+        assert_eq!(a.poll_data(time(150), &mut output, &mut exact)?, None);
+        assert!(a.running().is_ok());
+        assert!(drain(&mut a, 151)? >= 1);
+        assert!(a.running().is_ok());
+    }
+    Ok(())
+}

@@ -647,3 +647,249 @@ fn empty_reserved_payloads_initialize_dirty_recycled_storage_before_fragment_rea
     }
     Ok(())
 }
+
+#[test]
+fn incremental_batch_validation_matches_replay_across_large_backlog_and_pending_frame() -> Result {
+    let mut l = limits();
+    l.channels = 4;
+    l.lookahead_records = 600;
+    l.lookahead_bytes = 600 * 64;
+    l.source_window = 1024;
+    l.record_window = 1024;
+    let mut receiver = reserved(l)?;
+    let pointers = payloads(&receiver)?;
+    assert_eq!(receiver.retained_channel_count(), 0);
+    // Admit and stage record 0 as pending native on channel 0 before building a 512-record backlog.
+    let first = raw(l, 0, 0, 1);
+    let mut outcomes = [Admission::Duplicate; 2];
+    receiver.admit_validated_batch_authenticated_into(
+        &[unit(0, 0, &first)],
+        Tick(1),
+        &mut outcomes[..1],
+    )?;
+    assert_eq!(receiver.prepare(ChannelId(0), Tick(1), 1)?, Prepared::Ready);
+    assert_eq!(receiver.retained_channel_count(), 1);
+    for seq in 1..512u64 {
+        let bytes = raw(l, 0, seq, (seq % 251) as u8);
+        receiver.admit_validated_batch_authenticated_into(
+            &[unit(seq, seq, &bytes)],
+            Tick(1),
+            &mut outcomes[..1],
+        )?;
+        assert_eq!(outcomes[0], Admission::Accepted);
+    }
+    assert_eq!(receiver.retained_channel_count(), 1);
+    assert_eq!(receiver.pending().ok_or("pending lost")?.bytes, [1; 10]);
+    // A malformed body on top of the 512-record backlog must fail and roll back cleanly.
+    let mut bad = vec![0u8; l.body.symbol_bytes];
+    bad[0] = 0;
+    bad[1..3].copy_from_slice(&512u16.to_be_bytes());
+    bad[3] = 6; // implicit body requiring header context -> Body error
+    bad[4..10].fill(0xff);
+    let saved = receiver.status();
+    assert!(matches!(
+        receiver.admit_validated_batch_authenticated_into(
+            &[unit(512, 512, &bad)],
+            Tick(2),
+            &mut outcomes[..1],
+        ),
+        Err(Error::Body(_))
+    ));
+    assert_eq!(receiver.status(), saved);
+    assert_eq!(
+        receiver.pending().ok_or("pending lost after err")?.bytes,
+        [1; 10]
+    );
+    // Commit pending and drain all 512 records cleanly.
+    receiver.commit_delivery(Tick(2))?;
+    for seq in 1..512u64 {
+        assert_eq!(receiver.prepare(ChannelId(0), Tick(2), 1)?, Prepared::Ready);
+        assert_eq!(
+            receiver.pending().ok_or("missing record")?.bytes,
+            [(seq % 251) as u8; 10]
+        );
+        receiver.commit_delivery(Tick(2))?;
+    }
+    assert_eq!(receiver.status().retained_records, 0);
+    assert_eq!(receiver.retained_channel_count(), 0);
+    assert_eq!(payloads(&receiver)?, pointers);
+    Ok(())
+}
+
+#[test]
+fn idle_cache_skips_redundant_scans_and_invalidates_on_token_change_and_admission() -> Result {
+    let mut l = limits();
+    l.channels = 4;
+    l.source_window = 64;
+    l.record_window = 64;
+    l.lookahead_records = 64;
+    l.lookahead_bytes = 64 * 64;
+    let mut receiver = reserved(l)?;
+    // Admit out-of-order records 1..=16 on channel 0 (record 0 missing) and defer them on token 7.
+    for seq in 1..=16u64 {
+        let bytes = raw(l, 0, seq, seq as u8);
+        receiver.admit_authenticated(unit(seq, seq, &bytes).identity, &bytes, Tick(1))?;
+    }
+    assert_eq!(receiver.retained_channel_count(), 1);
+    let checks = std::cell::Cell::new(0usize);
+    let mut changed_flag = false;
+    // First pass defers all 16 records on token 7 and hits Idle, populating IdleCache.
+    assert_eq!(
+        receiver.prepare_with_independent_packets(
+            ChannelId(0),
+            Tick(1),
+            32,
+            |_| {
+                checks.set(checks.get() + 1);
+                changed_flag
+            },
+            |_, _| EarlyDecision::Wait(7),
+        )?,
+        Prepared::Idle
+    );
+    // Second pass with unchanged token 7 must hit IdleCache in O(1) (only 1 token check, not 16).
+    checks.set(0);
+    assert_eq!(
+        receiver.prepare_with_independent_packets(
+            ChannelId(0),
+            Tick(1),
+            32,
+            |t| {
+                assert_eq!(t, 7);
+                checks.set(checks.get() + 1);
+                changed_flag
+            },
+            |_, _| EarlyDecision::Wait(7),
+        )?,
+        Prepared::Idle
+    );
+    assert_eq!(checks.get(), 1);
+    // Flipping changed(7) = true wakes immediately and delivers record 1.
+    changed_flag = true;
+    assert_eq!(
+        receiver.prepare_with_independent_packets(
+            ChannelId(0),
+            Tick(1),
+            32,
+            |_| changed_flag,
+            |_, _| EarlyDecision::Allow,
+        )?,
+        Prepared::Ready
+    );
+    assert_eq!(receiver.pending().ok_or("missing")?.record, RecordId(1));
+    receiver.commit_delivery(Tick(1))?;
+    // Admitting a record on channel 2 increases retained_channel_count to 2.
+    let ch2 = raw(l, 2, 0, 99);
+    receiver.admit_authenticated(unit(20, 0, &ch2).identity, &ch2, Tick(1))?;
+    assert_eq!(receiver.retained_channel_count(), 2);
+    Ok(())
+}
+
+#[test]
+fn scan_prefix_cache_skips_deferred_prefix_when_tail_records_arrive() -> Result {
+    let mut l = limits();
+    l.channels = 4;
+    l.source_window = 64;
+    l.record_window = 64;
+    l.lookahead_records = 64;
+    l.lookahead_bytes = 64 * 64;
+    let mut receiver = reserved(l)?;
+    // Admit records 1..=16 (record 0 missing) and defer them on token 7.
+    for seq in 1..=16u64 {
+        let bytes = raw(l, 0, seq, seq as u8);
+        receiver.admit_authenticated(unit(seq, seq, &bytes).identity, &bytes, Tick(1))?;
+    }
+    assert_eq!(
+        receiver.prepare_with_independent_packets(
+            ChannelId(0),
+            Tick(1),
+            32,
+            |_| false,
+            |_, _| EarlyDecision::Wait(7),
+        )?,
+        Prepared::Idle
+    );
+    // Admit a new record at the tail (seq=17): prefix cache [1..=16] stays intact.
+    let tail = raw(l, 0, 17, 17);
+    receiver.admit_authenticated(unit(17, 17, &tail).identity, &tail, Tick(1))?;
+    let checks = std::cell::Cell::new(0usize);
+    assert_eq!(
+        receiver.prepare_with_independent_packets(
+            ChannelId(0),
+            Tick(1),
+            32,
+            |t| {
+                assert_eq!(t, 7);
+                checks.set(checks.get() + 1);
+                false
+            },
+            |_, _| EarlyDecision::Allow,
+        )?,
+        Prepared::Ready
+    );
+    // Only 1 token check on the cached prefix (not 16) and delivered record 17 directly.
+    assert_eq!(checks.get(), 1);
+    assert_eq!(
+        receiver.pending().ok_or("missing tail")?.record,
+        RecordId(17)
+    );
+    receiver.commit_delivery(Tick(1))?;
+    // Admitting the missing head (seq=0) invalidates the prefix cache and delivers record 0.
+    let head = raw(l, 0, 0, 0);
+    receiver.admit_authenticated(unit(0, 0, &head).identity, &head, Tick(1))?;
+    assert_eq!(
+        receiver.prepare_with_independent_packets(
+            ChannelId(0),
+            Tick(1),
+            32,
+            |_| false,
+            |_, _| EarlyDecision::Allow,
+        )?,
+        Prepared::Ready
+    );
+    assert_eq!(
+        receiver.pending().ok_or("missing head")?.record,
+        RecordId(0)
+    );
+    receiver.commit_delivery(Tick(1))?;
+    Ok(())
+}
+
+#[test]
+fn incremental_validation_handles_independent_short_behind_gap_without_fallback() -> Result {
+    let mut l = limits();
+    l.body.independent_short_frame_bytes = 32;
+    l.channels = 4;
+    l.source_window = 512;
+    l.record_window = 512;
+    l.lookahead_records = 300;
+    l.lookahead_bytes = 300 * 64;
+    let mut receiver = reserved(l)?;
+    // Admit one independent_short record far ahead of a gap (record 400).
+    let ahead = raw(l, 0, 400, 99);
+    receiver.admit_authenticated(unit(400, 400, &ahead).identity, &ahead, Tick(1))?;
+    // Now admit 256 sequential validated records 0..256 on channel 0 while record 400 sits undelivered.
+    let mut outcomes = [Admission::Duplicate; 1];
+    for seq in 0..256u64 {
+        let bytes = raw(l, 0, seq, (seq % 200) as u8);
+        receiver.admit_validated_batch_authenticated_into(
+            &[unit(seq, seq, &bytes)],
+            Tick(1),
+            &mut outcomes,
+        )?;
+        assert_eq!(outcomes[0], Admission::Accepted);
+    }
+    // Drain all 256 contiguous records + the ahead short frame cleanly.
+    for seq in 0..256u64 {
+        assert_eq!(receiver.prepare(ChannelId(0), Tick(2), 1)?, Prepared::Ready);
+        assert_eq!(receiver.pending().ok_or("missing")?.record, RecordId(seq));
+        receiver.commit_delivery(Tick(2))?;
+    }
+    assert_eq!(receiver.prepare(ChannelId(0), Tick(2), 1)?, Prepared::Ready);
+    assert_eq!(
+        receiver.pending().ok_or("missing ahead")?.record,
+        RecordId(400)
+    );
+    receiver.commit_delivery(Tick(2))?;
+    Ok(())
+}

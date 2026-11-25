@@ -232,3 +232,72 @@ fn selected_compact_packed_preview_keeps_gap_deduplication_and_original_expiry()
     }
     Ok(())
 }
+
+#[test]
+fn packed_preview_leaves_headroom_so_multi_unit_head_never_deadlocks_on_capacity() -> TestResult {
+    let mut cfg = config(64);
+    cfg.base.receiver.lookahead_records = 16;
+    cfg.base.receiver.lookahead_bytes = 16 * 65535;
+    cfg.base.receiver.lookahead_fragments = 16 * cfg.base.receiver.max_fragments_per_record;
+    cfg.base.receiver.source_window = 64;
+    cfg.base.receiver.record_window = 64;
+    cfg.base.recovery.arq.send_records = 16;
+    cfg.base.recovery.arq.receive_records = 16;
+    cfg.base.recovery.arq.send_bytes = 16 * cfg.base.recovery.arq.max_source_bytes;
+    cfg.base.recovery.arq.receive_bytes = 16 * cfg.base.recovery.arq.max_source_bytes;
+    cfg.base.recovery.fec.block.max_sources = 1;
+    cfg.base.recovery.repair_symbols = 0;
+    cfg.base.recovery.max_restored_packets = 17;
+    cfg.base.recovery.max_restored_bytes = 17 * cfg.base.recovery.fec.block.max_source_bytes;
+    cfg.max_units = 4;
+
+    let mut sender = packed::Endpoint::new(cfg, tests::context(EndpointRole::Initiator))?;
+    let mut emitted = Vec::new();
+    let mut allowance = OutboundBudget {
+        packets: 64,
+        wire_bytes: 64 * (sender.max_packet_bytes() + 28),
+    };
+    // Emit 6 packed sources, each carrying 4 short independent frames (24 total frames).
+    for source_idx in 0..6u8 {
+        for unit_idx in 0..4u8 {
+            let tag = source_idx * 4 + unit_idx;
+            sender.enqueue_admitted(ChannelId(0), &[tag; 16], ms(u64::from(source_idx) * 2))?;
+        }
+        sender.flush(ms(u64::from(source_idx) * 2))?;
+        let mut buf = vec![0; sender.max_packet_bytes()];
+        while let Some(len) =
+            sender.poll_data(ms(u64::from(source_idx) * 2 + 1), &mut buf, &mut allowance)?
+        {
+            emitted.push(buf[..len].to_vec());
+        }
+    }
+    assert_eq!(emitted.len(), 6);
+
+    let mut receive = receiver(cfg, true)?;
+    // Deliver sources 1..6 out of order (source 0 missing) and drain early previews.
+    for (idx, pkt) in emitted.iter().enumerate().skip(1) {
+        receive.receive_authenticated(pkt, ms(20 + idx as u64))?;
+    }
+    let mut delivered = Vec::new();
+    while receive.prepare(ChannelId(0), ms(30), 32)? == receiver::Prepared::Ready {
+        let frame = receive.pending().ok_or("missing early frame")?;
+        delivered.push(frame.bytes[0]);
+        receive.commit_delivery(ms(30))?;
+    }
+    // Previews must have left enough lookahead headroom for source 0's 4-unit batch.
+    assert!(!delivered.is_empty());
+    // Now deliver missing head source 0: ordered admission must succeed immediately
+    // without rolling back on Capacity, and all 24 frames must drain with 0 retained.
+    receive.receive_authenticated(&emitted[0], ms(40))?;
+    while receive.prepare(ChannelId(0), ms(40), 32)? != receiver::Prepared::Idle {
+        if let Some(frame) = receive.pending() {
+            delivered.push(frame.bytes[0]);
+            receive.commit_delivery(ms(40))?;
+        }
+    }
+    delivered.sort_unstable();
+    assert_eq!(delivered, (0..24u8).collect::<Vec<_>>());
+    assert_eq!(receive.status().receiver.retained_records, 0);
+    assert_eq!(receive.status().receiver.early_tombstones, 0);
+    Ok(())
+}

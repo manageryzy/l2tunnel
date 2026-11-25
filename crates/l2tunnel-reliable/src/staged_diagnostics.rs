@@ -75,8 +75,11 @@ pub struct Ack {
     pub observed: Duration,
     /// Validated cumulative prefix and selective bitmap from the original parser.
     pub prefix: u64,
-    /// Validated selective bitmap, not a replay/authentication decision.
+    /// Validated selective bits for offsets 0..64; a wide ACK's first 8 bytes.
+    /// Not a replay/authentication decision.
     pub bitmap: u64,
+    /// Length of a wide ACK bitmap in bytes; zero for the legacy 64-bit form.
+    pub bitmap_bytes: usize,
     /// Actual oldest retained source immediately before ACK application.
     pub before: Option<AckOldest>,
     /// Actual oldest retained source immediately after ACK application.
@@ -264,9 +267,18 @@ impl Snapshot {
         if self.terminal.is_some() {
             return;
         }
-        let PacketView::Ack { prefix, bitmap } = view else {
-            self.invalid = true;
-            return;
+        let (prefix, bitmap, bitmap_bytes) = match view {
+            PacketView::Ack { prefix, bitmap } => (prefix, bitmap, 0),
+            PacketView::WideAck { prefix, bitmap } => {
+                let mut low = [0_u8; 8];
+                let head = bitmap.len().min(8);
+                low[..head].copy_from_slice(&bitmap[..head]);
+                (prefix, u64::from_le_bytes(low), bitmap.len())
+            }
+            PacketView::Data { .. } => {
+                self.invalid = true;
+                return;
+            }
         };
         let Some((before, after)) = before.zip(after) else {
             self.invalid = true;
@@ -300,6 +312,7 @@ impl Snapshot {
             observed,
             prefix,
             bitmap,
+            bitmap_bytes,
             before: before
                 .oldest
                 .zip(before_pending)

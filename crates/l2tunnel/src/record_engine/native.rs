@@ -6,8 +6,8 @@ impl Engine {
     pub fn native_scan_visits(&self) -> usize {
         let channels = usize::from(self.receive_channels);
         match &self.owner {
-            Owner::Rolling(endpoint) => channels.min(endpoint.record_status().retained_records),
-            Owner::Research(endpoint) => channels.min(endpoint.record_status().retained_records),
+            Owner::Rolling(endpoint) => channels.min(endpoint.retained_channel_count()),
+            Owner::Research(endpoint) => channels.min(endpoint.retained_channel_count()),
             _ => channels,
         }
     }
