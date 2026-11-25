@@ -239,7 +239,7 @@ impl Profile {
         let mut result = self.clone();
         result.maintained = Some(Box::new(value));
         let contract = result.maintained_contract(role(outer)?)?;
-        result.requested_catalog = Some(self.catalog.clone());
+        result.requested_catalog = Some(Box::new(self.catalog.clone()));
         result.envelope = contract.envelope();
         result.initial = contract.initial();
         result.data = contract.data_digest();

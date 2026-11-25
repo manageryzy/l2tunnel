@@ -841,24 +841,34 @@ fn write_event(out: &mut dyn Write, event: &EventState) -> io::Result<()> {
     }
 }
 
+type ExchangeFuture<'a> = std::pin::Pin<
+    Box<
+        dyn std::future::Future<Output = Result<Box<OperationReply>, (Exit, io::Error)>>
+            + Send
+            + 'a,
+    >,
+>;
+
 /// One exchange; connection failures are reported as unreachable.
-async fn exchange(
-    socket: &PathBuf,
-    action: OperationAction,
-) -> Result<OperationReply, (Exit, io::Error)> {
-    let submits = action.submits();
-    local::request_operation(socket, &OperationRequest::new(action))
-        .await
-        .map_err(|error| {
-            (
-                if submits && !local::client::unsent(&error) {
-                    Exit::Unknown
-                } else {
-                    Exit::Unreachable
-                },
-                error,
-            )
-        })
+/// Boxed so `execute`'s debug future does not inline a copy of `request_operation`
+/// and `OperationReply` at every command arm.
+fn exchange<'a>(socket: &'a PathBuf, action: OperationAction) -> ExchangeFuture<'a> {
+    Box::pin(async move {
+        let submits = action.submits();
+        local::request_operation(socket, &OperationRequest::new(action))
+            .await
+            .map(Box::new)
+            .map_err(|error| {
+                (
+                    if submits && !local::client::unsent(&error) {
+                        Exit::Unknown
+                    } else {
+                        Exit::Unreachable
+                    },
+                    error,
+                )
+            })
+    })
 }
 fn refused(output: &Output, reply: &OperationReply) -> Exit {
     output.reply(reply, |out| writeln!(out, "refused: {}", reply.code));
@@ -996,7 +1006,7 @@ async fn execute(parsed: Parsed) -> Exit {
         Command::Diagnostics {
             output: file,
             include_addresses,
-        } => match local::diagnostics::collect(&socket, include_addresses).await {
+        } => match Box::pin(local::diagnostics::collect(&socket, include_addresses)).await {
             Ok(report) => match local::diagnostics::write_new(&file, &report) {
                 Ok(()) => {
                     let _written = if output.json {
@@ -1028,7 +1038,7 @@ async fn execute(parsed: Parsed) -> Exit {
             Err((exit, error)) => failed(exit, error),
         },
         Command::Revoke { allow_key, watch } => {
-            sessions::revoke(&socket, &allow_key, watch, output.json).await
+            Box::pin(sessions::revoke(&socket, &allow_key, watch, output.json)).await
         }
         Command::Profile(query) => {
             let action = match &query {
@@ -1211,27 +1221,30 @@ async fn execute(parsed: Parsed) -> Exit {
             watch: bound,
         } => {
             // The same shared step the GUI uses: key selection and lost-reply class.
-            let (key, reply) =
-                match local::client::submit(&socket, key, |key| action.action(key)).await {
-                    Ok(local::client::Submitted { key, reply }) => (key, reply),
-                    Err(local::client::SubmitFailure::Unreachable(error)) => {
-                        return failed(Exit::Unreachable, error);
-                    }
-                    Err(local::client::SubmitFailure::Refused(reply)) => {
-                        return refused(&output, &reply);
-                    }
-                    Err(local::client::SubmitFailure::NoKey) => {
-                        note("service offers no request key (closed)");
-                        return Exit::Unreachable;
-                    }
-                    Err(local::client::SubmitFailure::OutcomeUnknown { key, error }) => {
-                        note(format!("submission failed: {error}"));
-                        note(format!(
-                            "outcome unknown; retry with --request-key {key} to reattach"
-                        ));
-                        return Exit::Unknown;
-                    }
-                };
+            let (key, reply) = match Box::pin(local::client::submit(&socket, key, |key| {
+                action.action(key)
+            }))
+            .await
+            {
+                Ok(local::client::Submitted { key, reply }) => (key, reply),
+                Err(local::client::SubmitFailure::Unreachable(error)) => {
+                    return failed(Exit::Unreachable, error);
+                }
+                Err(local::client::SubmitFailure::Refused(reply)) => {
+                    return refused(&output, &reply);
+                }
+                Err(local::client::SubmitFailure::NoKey) => {
+                    note("service offers no request key (closed)");
+                    return Exit::Unreachable;
+                }
+                Err(local::client::SubmitFailure::OutcomeUnknown { key, error }) => {
+                    note(format!("submission failed: {error}"));
+                    note(format!(
+                        "outcome unknown; retry with --request-key {key} to reattach"
+                    ));
+                    return Exit::Unknown;
+                }
+            };
             if !reply.ok {
                 return refused(&output, &reply);
             }
@@ -1265,7 +1278,9 @@ async fn execute(parsed: Parsed) -> Exit {
                         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
                     }
                 }
-                Some(seconds) => watch(&output, &socket, id, reply.service, seconds).await,
+                Some(seconds) => {
+                    Box::pin(watch(&output, &socket, id, reply.service, seconds)).await
+                }
             }
         }
         Command::Show(id, service) => {
@@ -1291,7 +1306,9 @@ async fn execute(parsed: Parsed) -> Exit {
                 Err((exit, error)) => failed(exit, error),
             }
         }
-        Command::Watch(id, service, seconds) => watch(&output, &socket, id, service, seconds).await,
+        Command::Watch(id, service, seconds) => {
+            Box::pin(watch(&output, &socket, id, service, seconds)).await
+        }
         Command::Cancel(id, service) => {
             match exchange(
                 &socket,

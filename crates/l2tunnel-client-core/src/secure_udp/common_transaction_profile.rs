@@ -30,16 +30,16 @@ pub struct Profile {
     envelope: EnvelopeDigest,
     initial: Configuration,
     data: ConfigDigest,
-    carrier: Option<CarrierBinding>,
-    raw: Option<raw::RawSelection>,
+    carrier: Option<Box<CarrierBinding>>,
+    raw: Option<Box<raw::RawSelection>>,
     maintained: Option<Box<maintained::Selection>>,
-    requested_catalog: Option<Catalog>,
+    requested_catalog: Option<Box<Catalog>>,
     // Live-tuning catalog generated after setup (docs/modules/live-tuning.md);
     // the setup identity stays the base plan's.
-    live_catalog: Option<Catalog>,
+    live_catalog: Option<Box<Catalog>>,
     // Client choices / server limits for live tuning at connect.
     tuning: super::live_tuning::Policy,
-    proxy: Option<l2tunnel_runtime::proxy::Config>,
+    proxy: Option<Box<l2tunnel_runtime::proxy::Config>>,
     proxy_retirement: bool,
     // Keep an absent optional policy from enlarging every carrier setup future.
     proxy_measured: Option<Box<l2tunnel_runtime::proxy::measured::Config>>,
@@ -350,7 +350,7 @@ impl Profile {
     }
     /// Exact fixed base policy for either proxy family; absent for transparent Common.
     pub fn proxy_config(&self) -> Option<&l2tunnel_runtime::proxy::Config> {
-        self.proxy.as_ref()
+        self.proxy.as_deref()
     }
     #[allow(clippy::too_many_arguments)]
     fn new_selected(
@@ -434,10 +434,12 @@ impl Profile {
         maintained: Option<super::maintained::Settings>,
     ) -> io::Result<Self> {
         let selected_proxy = proxy.is_some();
-        let (compact_wire, [initiator, responder], catalog) = match compact_wire {
-            Some(selection) => (selection, [initiator, responder], catalog),
+        let mut resources = [initiator, responder];
+        let mut catalog = catalog;
+        let compact_wire = match compact_wire {
+            Some(selection) => selection,
             None => {
-                let selection = compact::authenticated_selection(initiator, responder)?;
+                let selection = compact::authenticated_selection(&resources[0], &resources[1])?;
                 let physical = if let Some(carrier) = maintained {
                     carrier.geometry.charged_overhead_bytes
                 } else if let Some(policy) = raw_policy {
@@ -455,16 +457,12 @@ impl Profile {
                 } else {
                     28
                 };
-                let (resources, catalog) = compact::rebase_parameters(
-                    [initiator, responder],
-                    catalog,
-                    physical,
-                    selection,
-                )?;
-                (selection, resources, catalog)
+                catalog =
+                    compact::rebase_parameters(&mut resources, &catalog, physical, selection)?;
+                selection
             }
         };
-        let ([initiator, responder], catalog) = if selected_proxy {
+        if selected_proxy {
             let physical = if let Some(carrier) = maintained {
                 carrier.geometry.charged_overhead_bytes
             } else if let Some(policy) = raw_policy {
@@ -482,17 +480,16 @@ impl Profile {
             } else {
                 28
             };
-            compact::rebase_parameters_with_data_overhead(
-                [initiator, responder],
-                catalog,
+            catalog = compact::rebase_parameters_with_data_overhead(
+                &mut resources,
+                &catalog,
                 physical,
                 compact_wire
                     .data_overhead()
                     .max(l2tunnel::secure_record::compact::AUTHENTICATED_OVERHEAD),
-            )?
-        } else {
-            ([initiator, responder], catalog)
-        };
+            )?;
+        }
+        let [initiator, responder] = resources;
         let base = connection.session()?;
         if initiator.rolling_fragments != responder.rolling_fragments {
             return Err(invalid(
@@ -631,7 +628,7 @@ impl Profile {
             requested_catalog: None,
             live_catalog: None,
             tuning: super::live_tuning::Policy::default(),
-            proxy,
+            proxy: proxy.map(Box::new),
             proxy_retirement: false,
             proxy_measured: None,
             connection_reuse: false,
@@ -709,29 +706,29 @@ impl Profile {
             configuration: requested_configuration,
         };
         let mut result = self.clone();
-        result.requested_catalog = Some(self.catalog.clone());
-        let contract = result.carrier_contract(binding, role)?;
+        result.requested_catalog = Some(Box::new(self.catalog.clone()));
+        let contract = result.carrier_contract(&binding, role)?;
         binding.configuration = contract.expected_configuration();
         result.envelope = contract.envelope();
         result.initial = contract.initial();
         result.data = contract.data_digest();
-        result.carrier = Some(binding);
+        result.carrier = Some(Box::new(binding));
         result.establish_config(role)?;
         Ok(result)
     }
     /// Genuine completed outer observation, absent for the original UDP selection.
     pub fn carrier_binding(&self) -> Option<establish::carrier::AuthenticatedOuter> {
-        self.carrier.map(|value| value.outer)
+        self.carrier.as_deref().map(|value| value.outer)
     }
     /// Original offline setup identity H0, before a fresh outer session is known.
     pub fn requested_configuration(&self) -> io::Result<security::ConfigDigest> {
         if let Some(value) = &self.maintained {
             return Ok(value.requested);
         }
-        if let Some(raw) = self.raw {
+        if let Some(raw) = self.raw.as_deref() {
             return Ok(raw.requested);
         }
-        match self.carrier {
+        match self.carrier.as_deref() {
             Some(value) => Ok(value.requested_configuration),
             None => self.configuration(),
         }
@@ -741,15 +738,16 @@ impl Profile {
         if let Some(value) = &self.maintained {
             return value.envelope;
         }
-        if let Some(raw) = self.raw {
+        if let Some(raw) = self.raw.as_deref() {
             return raw.envelope;
         }
         self.carrier
+            .as_deref()
             .map_or(self.envelope, |value| value.requested_envelope)
     }
     /// Full original offline catalog, including its unchanged canonical root.
     pub fn requested_catalog(&self) -> &Catalog {
-        self.requested_catalog.as_ref().unwrap_or(&self.catalog)
+        self.requested_catalog.as_deref().unwrap_or(&self.catalog)
     }
     /// Exact role-specific factory input; copied observations create no authority.
     /// Bound OpenVPN profiles retain the bootstrap opcode and effective setup
@@ -765,7 +763,7 @@ impl Profile {
         if self.raw.is_some() {
             return self.establish_raw(config, role);
         }
-        if let Some(binding) = self.carrier {
+        if let Some(binding) = self.carrier.as_deref() {
             if role != outer_role(binding.outer)? {
                 return Err(invalid(
                     "bound common profile belongs to the other local role",
@@ -796,7 +794,7 @@ impl Profile {
             return Err(invalid("live-tuning catalog changes the initial entry"));
         }
         let mut result = self.clone();
-        result.live_catalog = Some(catalog);
+        result.live_catalog = Some(Box::new(catalog));
         Ok(result)
     }
     /// This profile with a live-tuning policy (client choices or server
@@ -811,13 +809,13 @@ impl Profile {
     }
     /// The live-tuning catalog in use, when the session was tuned.
     pub fn live_catalog(&self) -> Option<&Catalog> {
-        self.live_catalog.as_ref()
+        self.live_catalog.as_deref()
     }
     fn apply_live_catalog(
         &self,
         contract: transport::CommonTransactionContract,
     ) -> io::Result<transport::CommonTransactionContract> {
-        match &self.live_catalog {
+        match self.live_catalog.as_deref() {
             Some(catalog) => contract.with_live_catalog(catalog.clone()),
             None => Ok(contract),
         }
@@ -825,7 +823,7 @@ impl Profile {
     /// Whole supported catalog in effect, without pruning to fit storage:
     /// the live-tuning catalog when the session was tuned, else the plan's.
     pub fn catalog(&self) -> &Catalog {
-        self.live_catalog.as_ref().unwrap_or(&self.catalog)
+        self.live_catalog.as_deref().unwrap_or(&self.catalog)
     }
     /// The plan's own catalog, which live tuning extends.
     pub fn plan_catalog(&self) -> &Catalog {
@@ -848,10 +846,10 @@ impl Profile {
         if let Some(value) = &self.maintained {
             return Ok(value.configuration);
         }
-        if let Some(raw) = self.raw {
+        if let Some(raw) = self.raw.as_deref() {
             return Ok(raw.configuration);
         }
-        if let Some(binding) = self.carrier {
+        if let Some(binding) = self.carrier.as_deref() {
             return Ok(binding.configuration);
         }
         Ok(self
@@ -869,7 +867,7 @@ impl Profile {
         if self.raw.is_some() {
             return self.raw_contract(role);
         }
-        if let Some(binding) = self.carrier {
+        if let Some(binding) = self.carrier.as_deref() {
             if role != outer_role(binding.outer)? {
                 return Err(invalid(
                     "bound common profile belongs to the other local role",
@@ -957,7 +955,7 @@ impl Profile {
 
     fn carrier_contract(
         &self,
-        binding: CarrierBinding,
+        binding: &CarrierBinding,
         role: security::Role,
     ) -> io::Result<transport::CommonTransactionContract> {
         let contract = transport::CommonTransactionContract::new_on_carrier_paired_compact(

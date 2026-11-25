@@ -192,28 +192,29 @@ impl Profile {
             self.parameters,
             self.compact_wire,
         )?;
-        self.raw = Some(RawSelection {
+        self.raw = Some(Box::new(RawSelection {
             policy,
             base,
             requested: security::ConfigDigest(requested.0),
             envelope: self.envelope,
             configuration: security::ConfigDigest(requested.0),
             outer: None,
-        });
+        }));
         Ok(self)
     }
     /// Explicit original raw policy, without any TLS/member or packet capability.
     pub fn raw_policy(&self) -> Option<PacketPolicy> {
-        self.raw.map(|v| v.policy)
+        self.raw.as_deref().map(|v| v.policy)
     }
     /// Genuine completed raw proof, absent before actual original authentication.
     pub fn raw_binding(&self) -> Option<AuthenticatedRaw> {
-        self.raw.and_then(|v| v.outer)
+        self.raw.as_deref().and_then(|v| v.outer)
     }
     /// Check both actual directional resource/catalog geometries without proof minting.
     pub fn validate_raw_request(&self) -> io::Result<()> {
         let raw = self
             .raw
+            .as_deref()
             .ok_or_else(|| invalid("Common profile has no selected raw policy"))?;
         transport::CommonTransactionContract::validate_raw_requested_compact(
             raw.base,
@@ -231,8 +232,9 @@ impl Profile {
     }
     /// Bind effective E1/H1 only to a genuine completed original PacketCarrier.
     pub fn bind_raw(&self, outer: AuthenticatedRaw) -> io::Result<Self> {
-        let mut raw = self
+        let mut raw = *self
             .raw
+            .as_deref()
             .ok_or_else(|| invalid("Common profile has no selected raw policy"))?;
         if raw.outer.is_some() || self.carrier.is_some() {
             return Err(invalid("Common profile already bound"));
@@ -254,13 +256,13 @@ impl Profile {
         let role = raw_role(outer);
         let contract = self.make_raw_contract(raw, outer, role)?;
         let mut result = self.clone();
-        result.requested_catalog = Some(self.catalog.clone());
+        result.requested_catalog = Some(Box::new(self.catalog.clone()));
         result.envelope = contract.envelope();
         result.initial = contract.initial();
         result.data = contract.data_digest();
         raw.outer = Some(outer);
         raw.configuration = contract.expected_configuration();
-        result.raw = Some(raw);
+        result.raw = Some(Box::new(raw));
         result.establish_config(role)?;
         Ok(result)
     }
@@ -268,8 +270,9 @@ impl Profile {
         &self,
         role: security::Role,
     ) -> io::Result<transport::CommonTransactionContract> {
-        let raw = self
+        let raw = *self
             .raw
+            .as_deref()
             .ok_or_else(|| invalid("missing raw Common selection"))?;
         let outer = raw
             .outer
@@ -305,6 +308,7 @@ impl Profile {
     ) -> io::Result<establish::Config> {
         let raw = self
             .raw
+            .as_deref()
             .ok_or_else(|| invalid("missing raw Common selection"))?;
         let outer = raw
             .outer

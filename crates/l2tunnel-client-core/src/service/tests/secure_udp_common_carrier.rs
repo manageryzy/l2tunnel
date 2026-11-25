@@ -290,244 +290,247 @@ async fn actual_compact_wire_openvpn_service_preserves_four_family_switches_and_
 async fn exercise_carrier_wire(
     wire: Option<l2tunnel::secure_record::compact::Selection>,
 ) -> Result {
-    timeout(Duration::from_secs(30), async {
-        for appearance in support::appearances() {
-            let hosts = support::hosts();
-            let CarrierPlans {
-                plans: [a, b],
-                addresses,
-                requested,
-            } = carrier_plans_wire(appearance, &hosts, false, wire)?;
-            let (client, run) = channel();
-            let (server, peer) = channel();
-            let task = tokio::spawn(run);
-            let peer_task = tokio::spawn(peer);
-            let accepted = [
-                client
-                    .connect(a, client.next_key().map_err(submit)?)
-                    .map_err(submit)?,
-                server
-                    .connect(b, server.next_key().map_err(submit)?)
-                    .map_err(submit)?,
-            ];
-            let (a, b) = tokio::try_join!(
-                connected(&client, accepted[0]),
-                connected(&server, accepted[1])
-            )?;
-            let handles = [client, server];
-            let originals = [common_frame(&handles[0])?, common_frame(&handles[1])?];
-            let effective = &originals[0].requested;
-            let supported = effective.catalog().configurations(effective.envelope())?;
-            assert_eq!(supported.len(), 4);
-            let configurations = [
-                effective.initial(),
-                *supported
-                    .iter()
-                    .find(|value| {
-                        matches!(
-                            value.descriptor().profile(),
-                            common::Profile::Aligned { .. }
-                        )
-                    })
-                    .ok_or("effective aligned absent")?,
-                *supported
-                    .iter()
-                    .find(|value| {
-                        matches!(value.descriptor().profile(), common::Profile::Packed { .. })
-                    })
-                    .ok_or("effective packed absent")?,
-                *supported
-                    .iter()
-                    .find(|value| {
-                        matches!(
-                            value.descriptor().profile(),
-                            common::Profile::Rolling { .. }
-                        )
-                    })
-                    .ok_or("effective rolling absent")?,
-            ];
-            assert_eq!(originals[0].info.binding, originals[1].info.binding);
-            let epoch = originals[0]
-                .runtime
-                .as_ref()
-                .ok_or("missing runtime")?
-                .epoch
-                .0;
-            for (side, generation) in [a, b].into_iter().enumerate() {
-                let frame = &originals[side];
-                assert_eq!(frame.info.local_addr, addresses[side]);
-                assert_eq!(frame.info.peer_addr, addresses[1 - side]);
-                assert_eq!(frame.requested.configuration()?, effective.configuration()?);
-                assert_eq!(frame.requested.envelope(), effective.envelope());
-                assert_eq!(
-                    frame.requested.requested_configuration()?,
-                    requested.configuration()?
-                );
-                assert_eq!(frame.requested.requested_envelope(), requested.envelope());
-                assert_ne!(frame.requested.configuration()?, requested.configuration()?);
-                assert_ne!(frame.requested.envelope(), requested.envelope());
-                let status = frame.status()?;
-                let protection = status
-                    .compact_wire
-                    .as_ref()
-                    .ok_or("current wire status absent")?;
-                assert_eq!(
-                    protection.requested,
-                    crate::secure_udp::common_status::CompactWireSelection::from_selection(
-                        requested.compact_wire(),
-                    )?
-                );
-                assert_eq!(protection.effective, Some(protection.requested));
-                assert_eq!(effective.catalog().root(), requested.catalog().root());
-                assert_eq!(
-                    frame
-                        .requested
-                        .runtime_contract(frame.info.role)?
-                        .resources()
-                        .control
-                        .wire_overhead,
-                    28 + l2tunnel::secure_record::compact::AUTHENTICATED_OVERHEAD
-                );
-                assert!(status.raw_carrier.is_none());
-                assert!(serde_json::to_value(&status)?.get("raw_carrier").is_none());
-                let carrier = status
-                    .original_carrier
-                    .as_ref()
-                    .ok_or("missing actual carrier")?;
-                let proof = frame
-                    .requested
-                    .carrier_binding()
-                    .ok_or("missing genuine outer proof")?;
-                assert_eq!(status.carrier, "openvpn-like");
-                assert_eq!(
-                    carrier.requested_configuration,
-                    requested.configuration()?.0
-                );
-                assert_eq!(carrier.requested_envelope, *requested.envelope().as_bytes());
-                assert_eq!(
-                    carrier.effective_configuration,
-                    effective.configuration()?.0
-                );
-                assert_eq!(carrier.effective_envelope, *effective.envelope().as_bytes());
-                assert_eq!(
-                    carrier.requested_catalog,
-                    *requested.catalog().root().as_bytes()
-                );
-                assert_eq!(
-                    carrier.effective_catalog,
-                    *effective.catalog().root().as_bytes()
-                );
-                assert_eq!(carrier.session, proof.info().session_id);
-                assert_eq!(carrier.configuration, proof.info().config.digest.0);
-                assert_eq!(carrier.binding, proof.binding());
-                assert_eq!(
-                    proof
-                        .expected_binding(
-                            frame.requested.establish_config(frame.info.role)?,
-                            frame.info.peers,
-                            frame.info.binding.session,
-                        )?
-                        .outer,
-                    frame.info.authenticated.outer,
-                );
-                assert_eq!(proof.endpoints(), (addresses[0], addresses[1]));
-                assert_eq!(
-                    support::observation(&handles[side], generation)?.original_timeout_micros,
-                    3_000_000
-                );
-                assert_common(frame, configurations[0], epoch, frame, generation)?;
-            }
-            exchange_stage(&hosts, &handles, configurations[0], epoch, 0).await?;
-            // A requested E0 configuration cannot acquire an effective E1 operation.
-            assert_eq!(
-                handles[0]
-                    .apply_common(requested.initial(), handles[0].next_key().map_err(submit)?),
-                Err(SubmitError::InvalidConfiguration),
-            );
-            for (stage, target) in [
-                configurations[1],
-                configurations[2],
-                configurations[3],
-                configurations[0],
-            ]
-            .into_iter()
-            .enumerate()
-            {
-                let operation = handles[0]
-                    .apply_common(target, handles[0].next_key().map_err(submit)?)
-                    .map_err(submit)?;
-                assert_eq!(
-                    timeout(Duration::from_secs(4), handles[0].wait(operation.operation))
-                        .await?
+    timeout(
+        Duration::from_secs(30),
+        Box::pin(async move {
+            for appearance in support::appearances() {
+                let hosts = support::hosts();
+                let CarrierPlans {
+                    plans: [a, b],
+                    addresses,
+                    requested,
+                } = carrier_plans_wire(appearance, &hosts, false, wire)?;
+                let (client, run) = channel();
+                let (server, peer) = channel();
+                let task = tokio::spawn(run);
+                let peer_task = tokio::spawn(peer);
+                let accepted = [
+                    client
+                        .connect(a, client.next_key().map_err(submit)?)
                         .map_err(submit)?,
-                    Completed::Common {
-                        configuration: target,
-                        outcome: Ok(l2tunnel_core::Epoch(epoch + stage as u64 + 1))
-                    },
-                );
-                await_common(&handles[1], target, epoch + stage as u64 + 1, 0, None).await?;
-                exchange_stage(
-                    &hosts,
-                    &handles,
-                    target,
-                    epoch + stage as u64 + 1,
-                    stage as u8 + 1,
-                )
-                .await?;
+                    server
+                        .connect(b, server.next_key().map_err(submit)?)
+                        .map_err(submit)?,
+                ];
+                let (a, b) = tokio::try_join!(
+                    connected(&client, accepted[0]),
+                    connected(&server, accepted[1])
+                )?;
+                let handles = [client, server];
+                let originals = [common_frame(&handles[0])?, common_frame(&handles[1])?];
+                let effective = &originals[0].requested;
+                let supported = effective.catalog().configurations(effective.envelope())?;
+                assert_eq!(supported.len(), 4);
+                let configurations = [
+                    effective.initial(),
+                    *supported
+                        .iter()
+                        .find(|value| {
+                            matches!(
+                                value.descriptor().profile(),
+                                common::Profile::Aligned { .. }
+                            )
+                        })
+                        .ok_or("effective aligned absent")?,
+                    *supported
+                        .iter()
+                        .find(|value| {
+                            matches!(value.descriptor().profile(), common::Profile::Packed { .. })
+                        })
+                        .ok_or("effective packed absent")?,
+                    *supported
+                        .iter()
+                        .find(|value| {
+                            matches!(
+                                value.descriptor().profile(),
+                                common::Profile::Rolling { .. }
+                            )
+                        })
+                        .ok_or("effective rolling absent")?,
+                ];
+                assert_eq!(originals[0].info.binding, originals[1].info.binding);
+                let epoch = originals[0]
+                    .runtime
+                    .as_ref()
+                    .ok_or("missing runtime")?
+                    .epoch
+                    .0;
                 for (side, generation) in [a, b].into_iter().enumerate() {
-                    assert_common(
-                        &common_frame(&handles[side])?,
+                    let frame = &originals[side];
+                    assert_eq!(frame.info.local_addr, addresses[side]);
+                    assert_eq!(frame.info.peer_addr, addresses[1 - side]);
+                    assert_eq!(frame.requested.configuration()?, effective.configuration()?);
+                    assert_eq!(frame.requested.envelope(), effective.envelope());
+                    assert_eq!(
+                        frame.requested.requested_configuration()?,
+                        requested.configuration()?
+                    );
+                    assert_eq!(frame.requested.requested_envelope(), requested.envelope());
+                    assert_ne!(frame.requested.configuration()?, requested.configuration()?);
+                    assert_ne!(frame.requested.envelope(), requested.envelope());
+                    let status = frame.status()?;
+                    let protection = status
+                        .compact_wire
+                        .as_ref()
+                        .ok_or("current wire status absent")?;
+                    assert_eq!(
+                        protection.requested,
+                        crate::secure_udp::common_status::CompactWireSelection::from_selection(
+                            requested.compact_wire(),
+                        )?
+                    );
+                    assert_eq!(protection.effective, Some(protection.requested));
+                    assert_eq!(effective.catalog().root(), requested.catalog().root());
+                    assert_eq!(
+                        frame
+                            .requested
+                            .runtime_contract(frame.info.role)?
+                            .resources()
+                            .control
+                            .wire_overhead,
+                        28 + l2tunnel::secure_record::compact::AUTHENTICATED_OVERHEAD
+                    );
+                    assert!(status.raw_carrier.is_none());
+                    assert!(serde_json::to_value(&status)?.get("raw_carrier").is_none());
+                    let carrier = status
+                        .original_carrier
+                        .as_ref()
+                        .ok_or("missing actual carrier")?;
+                    let proof = frame
+                        .requested
+                        .carrier_binding()
+                        .ok_or("missing genuine outer proof")?;
+                    assert_eq!(status.carrier, "openvpn-like");
+                    assert_eq!(
+                        carrier.requested_configuration,
+                        requested.configuration()?.0
+                    );
+                    assert_eq!(carrier.requested_envelope, *requested.envelope().as_bytes());
+                    assert_eq!(
+                        carrier.effective_configuration,
+                        effective.configuration()?.0
+                    );
+                    assert_eq!(carrier.effective_envelope, *effective.envelope().as_bytes());
+                    assert_eq!(
+                        carrier.requested_catalog,
+                        *requested.catalog().root().as_bytes()
+                    );
+                    assert_eq!(
+                        carrier.effective_catalog,
+                        *effective.catalog().root().as_bytes()
+                    );
+                    assert_eq!(carrier.session, proof.info().session_id);
+                    assert_eq!(carrier.configuration, proof.info().config.digest.0);
+                    assert_eq!(carrier.binding, proof.binding());
+                    assert_eq!(
+                        proof
+                            .expected_binding(
+                                frame.requested.establish_config(frame.info.role)?,
+                                frame.info.peers,
+                                frame.info.binding.session,
+                            )?
+                            .outer,
+                        frame.info.authenticated.outer,
+                    );
+                    assert_eq!(proof.endpoints(), (addresses[0], addresses[1]));
+                    assert_eq!(
+                        support::observation(&handles[side], generation)?.original_timeout_micros,
+                        3_000_000
+                    );
+                    assert_common(frame, configurations[0], epoch, frame, generation)?;
+                }
+                exchange_stage(&hosts, &handles, configurations[0], epoch, 0).await?;
+                // A requested E0 configuration cannot acquire an effective E1 operation.
+                assert_eq!(
+                    handles[0]
+                        .apply_common(requested.initial(), handles[0].next_key().map_err(submit)?),
+                    Err(SubmitError::InvalidConfiguration),
+                );
+                for (stage, target) in [
+                    configurations[1],
+                    configurations[2],
+                    configurations[3],
+                    configurations[0],
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    let operation = handles[0]
+                        .apply_common(target, handles[0].next_key().map_err(submit)?)
+                        .map_err(submit)?;
+                    assert_eq!(
+                        timeout(Duration::from_secs(4), handles[0].wait(operation.operation))
+                            .await?
+                            .map_err(submit)?,
+                        Completed::Common {
+                            configuration: target,
+                            outcome: Ok(l2tunnel_core::Epoch(epoch + stage as u64 + 1))
+                        },
+                    );
+                    await_common(&handles[1], target, epoch + stage as u64 + 1, 0, None).await?;
+                    exchange_stage(
+                        &hosts,
+                        &handles,
                         target,
                         epoch + stage as u64 + 1,
-                        &originals[side],
-                        generation,
-                    )?;
-                    assert_eq!(hosts[side].opened.load(Ordering::SeqCst), 1);
-                    assert_no_native_replay(&hosts[side])?;
-                }
-            }
-            let stopped = [
-                handles[0]
-                    .disconnect(handles[0].next_key().map_err(submit)?)
-                    .map_err(submit)?,
-                handles[1]
-                    .disconnect(handles[1].next_key().map_err(submit)?)
-                    .map_err(submit)?,
-            ];
-            for (side, generation) in [a, b].into_iter().enumerate() {
-                assert_eq!(
-                    handles[side]
-                        .wait(stopped[side].operation)
-                        .await
-                        .map_err(submit)?,
-                    Completed::Aborted
-                );
-                assert_eq!(
-                    handles[side]
-                        .wait_stopped(generation)
-                        .await
-                        .map_err(submit)?,
-                    Terminal::Aborted
-                );
-                assert_eq!(hosts[side].live.load(Ordering::SeqCst), 0);
-            }
-            // The sole actor abort is asynchronous on drop; wait only for owned ports.
-            timeout(Duration::from_secs(1), async {
-                loop {
-                    if support::assert_ports_free(addresses).is_ok() {
-                        break;
+                        stage as u8 + 1,
+                    )
+                    .await?;
+                    for (side, generation) in [a, b].into_iter().enumerate() {
+                        assert_common(
+                            &common_frame(&handles[side])?,
+                            target,
+                            epoch + stage as u64 + 1,
+                            &originals[side],
+                            generation,
+                        )?;
+                        assert_eq!(hosts[side].opened.load(Ordering::SeqCst), 1);
+                        assert_no_native_replay(&hosts[side])?;
                     }
-                    tokio::time::sleep(Duration::from_millis(1)).await;
                 }
-            })
-            .await?;
-            task.abort();
-            peer_task.abort();
-            let _ = task.await;
-            let _ = peer_task.await;
-        }
-        Ok::<(), Error>(())
-    })
+                let stopped = [
+                    handles[0]
+                        .disconnect(handles[0].next_key().map_err(submit)?)
+                        .map_err(submit)?,
+                    handles[1]
+                        .disconnect(handles[1].next_key().map_err(submit)?)
+                        .map_err(submit)?,
+                ];
+                for (side, generation) in [a, b].into_iter().enumerate() {
+                    assert_eq!(
+                        handles[side]
+                            .wait(stopped[side].operation)
+                            .await
+                            .map_err(submit)?,
+                        Completed::Aborted
+                    );
+                    assert_eq!(
+                        handles[side]
+                            .wait_stopped(generation)
+                            .await
+                            .map_err(submit)?,
+                        Terminal::Aborted
+                    );
+                    assert_eq!(hosts[side].live.load(Ordering::SeqCst), 0);
+                }
+                // The sole actor abort is asynchronous on drop; wait only for owned ports.
+                timeout(Duration::from_secs(1), async {
+                    loop {
+                        if support::assert_ports_free(addresses).is_ok() {
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                    }
+                })
+                .await?;
+                task.abort();
+                peer_task.abort();
+                let _ = task.await;
+                let _ = peer_task.await;
+            }
+            Ok::<(), Error>(())
+        }),
+    )
     .await?
 }
 

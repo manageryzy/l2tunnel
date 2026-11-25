@@ -13,7 +13,7 @@ impl Profile {
         selection: l2tunnel::secure_record::compact::Selection,
     ) -> io::Result<Self> {
         selection.validate().map_err(io::Error::other)?;
-        if self.raw.is_some_and(|raw| raw.outer.is_some())
+        if self.raw.as_deref().is_some_and(|raw| raw.outer.is_some())
             || self.carrier.is_some()
             || self.maintained.is_some()
         {
@@ -22,7 +22,7 @@ impl Profile {
                 "compact selection requires an unbound carrier profile",
             ));
         }
-        let raw_policy = self.raw.map(|raw| raw.policy);
+        let raw_policy = self.raw.as_deref().map(|raw| raw.policy);
         let physical = if let Some(policy) = raw_policy {
             let final_geometry = policy
                 .final_record_geometry_with_tls_cover(
@@ -38,12 +38,8 @@ impl Profile {
         } else {
             28
         };
-        let (resources, catalog) = rebase_parameters(
-            [self.initiator, self.responder],
-            self.catalog,
-            physical,
-            selection,
-        )?;
+        let mut resources = [self.initiator, self.responder];
+        let catalog = rebase_parameters(&mut resources, &self.catalog, physical, selection)?;
         let mut settings = self.settings;
         settings.application = self.application;
         let mut result = Self::new_selected(
@@ -55,7 +51,7 @@ impl Profile {
             catalog,
             self.parameters,
             raw_policy,
-            self.proxy,
+            self.proxy.map(|value| *value),
             Some(selection),
         )?;
         result.proxy_retirement = self.proxy_retirement;
@@ -75,8 +71,8 @@ impl Profile {
 /// explicit short-check selection. The packet gap follows the existing key-use
 /// limits; the finite failed-check bound is authenticated with the complete plan.
 pub(super) fn authenticated_selection(
-    initiator: transport::Config,
-    responder: transport::Config,
+    initiator: &transport::Config,
+    responder: &transport::Config,
 ) -> io::Result<l2tunnel::secure_record::compact::Selection> {
     let selection = l2tunnel::secure_record::compact::Selection {
         protection: security::compact::Protection::ChaCha20Poly1305,
@@ -97,20 +93,20 @@ pub(super) fn authenticated_selection(
 }
 
 pub(super) fn rebase_parameters(
-    resources: [transport::Config; 2],
-    catalog: Catalog,
+    resources: &mut [transport::Config; 2],
+    catalog: &Catalog,
     physical: usize,
     selection: l2tunnel::secure_record::compact::Selection,
-) -> io::Result<([transport::Config; 2], Catalog)> {
+) -> io::Result<Catalog> {
     rebase_parameters_with_data_overhead(resources, catalog, physical, selection.data_overhead())
 }
 
 pub(super) fn rebase_parameters_with_data_overhead(
-    mut resources: [transport::Config; 2],
-    catalog: Catalog,
+    resources: &mut [transport::Config; 2],
+    catalog: &Catalog,
     physical: usize,
     data_overhead: usize,
-) -> io::Result<([transport::Config; 2], Catalog)> {
+) -> io::Result<Catalog> {
     let data = physical
         .checked_add(data_overhead)
         .ok_or_else(|| invalid("final data accounting overflow"))?;
@@ -120,7 +116,7 @@ pub(super) fn rebase_parameters_with_data_overhead(
     let stream_overhead = control
         .checked_add(l2tunnel_management::control_streams::HEADER_BYTES)
         .ok_or_else(|| invalid("final control stream accounting overflow"))?;
-    for resource in &mut resources {
+    for resource in resources.iter_mut() {
         resource.control.wire_overhead = control;
         if let Some(fragments) = resource.rolling_fragments.as_mut() {
             fragments.forward.framing.outer_overhead_bytes = data;
@@ -137,11 +133,9 @@ pub(super) fn rebase_parameters_with_data_overhead(
         .try_reserve_exact(catalog.descriptors().len())
         .map_err(io::Error::other)?;
     for descriptor in catalog.descriptors() {
-        descriptors.push(rebase(*descriptor, data)?);
+        descriptors.push(rebase(descriptor, data)?);
     }
-    let catalog =
-        Catalog::new(rebase(catalog.initial(), data)?, &descriptors).map_err(io::Error::other)?;
-    Ok((resources, catalog))
+    Catalog::new(rebase(&catalog.initial(), data)?, &descriptors).map_err(io::Error::other)
 }
 fn reliable(
     config: l2tunnel::reliable::CompactReliableConfig,
@@ -149,7 +143,7 @@ fn reliable(
 ) -> io::Result<l2tunnel::reliable::CompactReliableConfig> {
     l2tunnel::reliable::CompactReliableConfig::new(config.arq(), overhead).map_err(io::Error::other)
 }
-fn rebase(descriptor: common::Descriptor, overhead: usize) -> io::Result<common::Descriptor> {
+fn rebase(descriptor: &common::Descriptor, overhead: usize) -> io::Result<common::Descriptor> {
     let mut profile = *descriptor.profile();
     match &mut profile {
         common::Profile::Swift { .. } => {}
