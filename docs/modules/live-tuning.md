@@ -334,4 +334,4 @@ largest; `CommonTransactionContract::resolve` refuses anything else).
   golden checks and the simulator suite (need numpy), and workspace-wide
   Clippy/tests (another session's in-progress Windows code does not
   compile: `l2tunnel_platform_windows::local_pipe`).
-- [ ] [LT-06] Real run: switch FEC and MTU live on a connected session.
+- [x] [LT-06] Real run: switch FEC and MTU live on a connected session. Evidence: [live tuning service](../../crates/l2tunnel-client-core/src/service/tuning_local.rs), [rate budget service](../../crates/l2tunnel-client-core/src/service/rate_budget_local.rs), and local isolated-namespace real-TUN `l2tunneld` + `l2tunnelctl` receipt `work/quick-close-20261125/receipt.json` (real kernel `tun0` MTU `1500 -> 1400 -> 1500` on both peers with `failures: 0`, live FEC `off -> 1/4 -> off` with `0%` ping loss at every step, and live `tune budget --symmetric 250` accepted).
