@@ -116,7 +116,7 @@ necessary. No packet/network ACK is treated as actual native consumption.
 - [x] [MOD-OBS-09] Test malformed/oversized/stale/duplicate/wrong-scope/unknown-flow inputs and arithmetic/time boundaries. Evidence: [adversarial tests](../../crates/l2tunnel-active/src/observation/tests.rs).
 - [x] [MOD-OBS-10] Test real two-engine measured growth from actual queued demand, explicit pressure and no-measurement fallback. Evidence: [two-engine actual-payload test](../../crates/l2tunnel-active/src/observation/tests.rs).
 - [x] [MOD-OBS-11] Run focused tests, formatting, warning-denied Clippy and checklist validation with precise receipts. Evidence: [local verification receipt](#local-verification-receipt).
-- [x] [MOD-OBS-12] Negotiate and integrate observation frames, real timer/native samples and bounded common control admission in the native runtime. Evidence: [runtime integration](../../crates/l2tunnel-runtime/src/active.rs), [native measured receipt](../../work/native-active-measured/receipt.json), [finite native scope](#native-integration-evidence).
+- [x] [MOD-OBS-12] Negotiate and integrate observation frames, real timer/native samples and bounded common control admission in the native runtime. Evidence: [runtime integration (retired in Common cutover)](compact-wire-cleanup.md), [native measured receipt](../../work/native-active-measured/receipt.json), [finite native scope](#native-integration-evidence).
 
 ## Local verification receipt
 

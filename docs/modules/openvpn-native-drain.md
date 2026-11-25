@@ -13,7 +13,7 @@ Privileged native clean-drain qualification remains a separate unimplemented gat
 
 ## Existing ownership and the missing seam
 
-The [device adapter](../../crates/l2tunnel-runtime/src/openvpn.rs) owns one native
+The [device adapter (retired in Common cutover)](compact-wire-cleanup.md) owns one native
 fragment batch, one pending source handoff, one source reader, one reassembly and
 a bounded native queue. Carrier `send` completion means recovery admission;
 carrier `receive` releases its application permit before the native device write.
@@ -261,8 +261,8 @@ changes are needed for this design checkpoint.
 - [ ] [MOD-OVPNDRAIN-03] Implement fixed control parsing/state with wrong length/role/scope/sequence/reserved fields, altered duplicates, counter overflow, bounded output and canceled-owner tests.
 - [ ] [MOD-OVPNDRAIN-04] Implement authoritative send seal, count/byte prefixes and receive ceiling; test reserved-send races, barrier-before-data, preaccepted beyond-fence sources, duplicates and extra post-fence data.
 - [x] [MOD-OVPNDRAIN-05] Integrate genuine full and paired control capabilities with existing TLS/recovery/budget/quiet owners and preserve legacy factory bytes/domains. Evidence: [actual full/paired native tests](../../crates/l2tunnel-openvpn/src/native/tests.rs), [OVC1 byte regression](../../crates/l2tunnel-openvpn/src/heartbeat.rs), [unchanged legacy configuration domain](../../crates/l2tunnel-openvpn/src/config.rs).
-- [x] [MOD-OVPNDRAIN-06] Implement native accepted/complete/confirmed counters, exact empty-owner proof and retained-handle transition using one actor; test WouldBlock and a stopped, still-draining multi-fragment original. Evidence: [direct actor](../../crates/l2tunnel-runtime/src/openvpn/drain.rs), [blocked native and 32 KB drain tests](../../crates/l2tunnel-runtime/src/openvpn/drain/tests.rs).
-- [x] [MOD-OVPNDRAIN-07] Test zero-packet, one-sided and simultaneous stop in both duplex modes, TAP/TUN and None/LZ4 with byte-exact mock-device native receipts over actual TLS/UDP. Evidence: [seven focused device tests](../../crates/l2tunnel-runtime/src/openvpn/drain/tests.rs).
+- [x] [MOD-OVPNDRAIN-06] Implement native accepted/complete/confirmed counters, exact empty-owner proof and retained-handle transition using one actor; test WouldBlock and a stopped, still-draining multi-fragment original. Evidence: [direct actor (retired in Common cutover)](compact-wire-cleanup.md), [blocked native and 32 KB drain tests (retired in Common cutover)](compact-wire-cleanup.md).
+- [x] [MOD-OVPNDRAIN-07] Test zero-packet, one-sided and simultaneous stop in both duplex modes, TAP/TUN and None/LZ4 with byte-exact mock-device native receipts over actual TLS/UDP. Evidence: [seven focused device tests (retired in Common cutover)](compact-wire-cleanup.md).
 - [ ] [MOD-OVPNDRAIN-08] Test peer-only stop while local native output is blocked, missing/mismatched fences/acks, early carrier EOF, ACK-flush ordering, timeout/cancellation during every phase and no deadline restart during joins.
 - [x] [MOD-OVPNDRAIN-09] Run strict focused checks and coordinated workspace aggregate, retaining all failures and finite evidence limits. Evidence: [focused commands](#focused-implementation-checkpoint), [stable wave9 aggregate](../../work/implementation-wave9/validation.json); no CLI or privileged native-drain qualification is implied.
 - [ ] [MOD-OVPNDRAIN-10] Separately review client typed shutdown selection and owned native clean-close evidence; keep outage tests and broader carrier matrix independent.

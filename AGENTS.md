@@ -1,9 +1,11 @@
 # Engineering rules
 
 This repository contains a Python simulator and a Rust protocol workspace. The
-Rust workspace includes a runnable Linux TCP/TLS slice and independently tested
-protocol modules. Read the implementation status before treating any broader
-planned carrier, platform or simulator mode as implemented.
+Rust workspace includes the runnable Common record runtime (UDP, raw-packet,
+TCP/TLS, QUIC carriers), desktop GUI, local control API v5, Windows service/
+Wintun host, and independently tested protocol modules. Read
+`docs/implementation-status.md` before treating any broader planned carrier,
+platform or simulator mode as implemented or natively qualified.
 
 ## Evidence and scope
 
@@ -40,8 +42,10 @@ planned carrier, platform or simulator mode as implemented.
 - Do not write custom cryptographic primitives. Use a maintained TLS/crypto
   implementation and domain-separated keys. Integrity and replay protection are
   required even when optional payload confidentiality is disabled.
-- `unsafe` is forbidden in the initial workspace. Future FFI/driver adapters need
-  a narrow, documented exception and safety review; never weaken library defaults.
+- `unsafe` is forbidden in workspace protocol, runtime, client-core, and UI
+  crates. Platform FFI/driver adapters (`l2tunnel-platform-linux`,
+  `l2tunnel-platform-windows`) require narrow, documented exceptions and safety
+  review; never weaken library defaults.
 - All user traffic, including latency probes and TCP control frames, uses the same
   MUX admission policy and configured channel budget.
 - Hot switching requires negotiated epochs, matching configuration digests,

@@ -98,8 +98,8 @@ scoped statements above. It is not a current implementation inventory.
 | UDP admission | `l2tunnel-udp-control` has bounded cookies, retries, replay checks and reliable control bytes, used by standalone OpenVPN-like TLS. | These mechanisms do not establish a WireGuard-like authenticated session or remove the stream dependency. |
 | Platform/runtime | Finite Linux native receipts exist for named compositions. Windows is a CLI scaffold; Android is a staging library without JNI/VpnService. | No new common-session platform support follows from this design. |
 
-Source entry points: [Swift factory](../../crates/l2tunnel-client-core/src/swift.rs),
-[Swift runtime](../../crates/l2tunnel-runtime/src/swift.rs),
+Source entry points: [Swift factory (retired in Common cutover)](compact-wire-cleanup.md),
+[Swift runtime (retired in Common cutover)](compact-wire-cleanup.md),
 [pure engine](../../crates/l2tunnel-swift/src/lib.rs),
 [auth adapter](../../crates/l2tunnel-auth/src/lib.rs),
 [common control](../../crates/l2tunnel-management/src/session_control.rs) and

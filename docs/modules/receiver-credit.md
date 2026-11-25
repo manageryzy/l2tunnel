@@ -99,11 +99,12 @@ allocation:
   more than their length, so half is the payload it can hold without drops.
   The raw and carrier paths have no UDP socket to read and use 106,496 bytes,
   half of Linux's default receive buffer; status reports which one is in use.
-- Receive buffer (decided 2026-11-24): before that read-back, the UDP data
-  socket requests a receive buffer of `ceiling_bytes`, with `SO_RCVBUFFORCE`
-  on Linux when `net.core.rmem_max` would cap it (the daemon has
-  `CAP_NET_ADMIN` for TUN). Credit can let up to `ceiling_bytes` be in flight,
-  so a buffer that holds it keeps a receiver stall from overflowing the
+- Receive and send buffers: before that read-back, `credit_observe_udp` requests
+  a receive buffer of `ceiling_bytes` (using `SO_RCVBUFFORCE` on Linux when
+  `net.core.rmem_max` would cap it; the daemon holds `CAP_NET_ADMIN` for TUN)
+  and also requests `SO_SNDBUF` up to 4 MiB so high-BDP bursts do not hit small
+  default kernel send buffers. Credit can let up to `ceiling_bytes` be in flight,
+  so a receive buffer that holds it keeps a receiver stall from overflowing the
   socket; the kernel charges only queued bytes. Without the request, every UDP
   cell ran on the 212,992-byte default and the Packed receivers dropped up to
   8.9% of datagrams (`work/full-matrix-20261123`). The allowance stays capped:
@@ -143,8 +144,10 @@ Sending: nothing is due before the first processed data datagram (the sender
 starts with the floor, so an idle session sends no credit). Afterwards a new
 Credit is due when `limit` grew by at least a quarter of `window_datagrams`
 since the last one sent, or `period` has passed since the last one sent and a
-data datagram was processed during that period. With no data for a whole
-period, a heartbeat Credit is still sent every `idle_period`. Credit takes the
+data datagram was processed during that period. When traffic stops, the
+receiver transitions immediately to idle and sends a heartbeat Credit starting
+at `idle_period` with exponential backoff up to 10 s (`MAX_QUIET_IDLE_PERIOD`)
+so an idle session emits minimal traffic. Credit takes the
 control slot before the reliable streams: at the top of `prepare_control`
 (UDP and carrier send loops) and in the single raw management slot
 (`prepare_raw_management`), so every path sends it. On receipt it is
@@ -196,8 +199,13 @@ any drain it is the configured rate. Pacing at a fixed gain over the drain let
 each Credit release its window as a burst (the modeled socket queue swung by
 the drain over one Credit interval), and a gain of 5/4 alone took seconds to
 reach the receiver's real rate. The allowance term keeps the rate above the
-drain while the receiver has headroom. Its burst is
-`min(session burst, 16 maximum data datagrams)`. When data is credit- or
+drain while the receiver has headroom. Its pacing burst (`pacing_burst`) scales
+to 5 ms of the configured send rate (capped at 2 MiB, with a floor of
+`16 * max_datagram`) so high-BDP sessions (200–1000 Mbit/s) do not stall
+between loop turns. Live speed-budget updates (`ProfileTag::RateBudgetV1`)
+adjust the active pacing rate and credit ceiling in place via
+`set_configured_rate`, `raise_ceiling`, and `raise_ceiling_for_rates`. When
+data is credit- or
 pacing-blocked, the send loop's wake (`wake_common_with_custody`) includes the
 pacing bucket's ready time; a newly accepted Credit wakes the loop.
 

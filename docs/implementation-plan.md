@@ -7,292 +7,38 @@ checks and separately qualified upstream comparisons. `P-kcp-like-l2` is additiv
 existing FEC modes, the pinned `P-kcp-baseline`, management, platforms and the
 single-flow throughput target retain their original requirements.
 
-Status: finish the current-format cutover, resolve affected regression failures,
-and run the required aggregate check before calling this batch complete. Current
-runtime integration and remaining capability work are separate deliverables;
-removing an obsolete entry does not implement its replacement.
+Status: compact Common cutover is active and operational on Linux with
+cross-compiled Windows/Android service components; full native/platform
+qualification and remaining parity gates stay tracked in
+[docs/implementation-checklist.md](implementation-checklist.md) and
+[docs/implementation-status.md](implementation-status.md). Removing an obsolete
+entry never counts as implementing its replacement.
 
-The owner-authorized [current cutover](modules/compact-wire-cleanup.md) removes
-obsolete production entry points and wire encoders; Git retains their history.
-The owner explicitly approved deletion before every replacement capability is
-ready. **Common active TUN credit and the Windows Common service entry remain
-pending.** Their former entry points are not evidence that the current format
-implements them. Portable helpers and Linux-hosted fixtures do not qualify a
-Windows or Android runtime. No full mode or platform gate closes through deletion.
-The subsequent explicit old-Records removal also retires the fixed and
-refreshable final-wire wrappers. Fresh-DH integration with the sole current
-Compact owner remains a required gap; the lower handshake/security primitives
-and full lifecycle acceptance are retained. This is separate from negotiated
-data-profile epoch switching.
+The owner-authorized [compact cutover](modules/compact-wire-cleanup.md) removed
+obsolete standalone entry points and legacy wire encoders (Git retains their
+history). **Common per-flow transparent TUN active credit** remains pending
+(session-level receiver credit `L2CR` is implemented and active across Common
+profiles), alongside **fresh-DH integration with the Compact owner** and
+**native Windows/Android device qualification**.
 
 Current Common Records use a five-byte kind/reader and packet-number prefix.
 Data protection adds a 16-byte ChaCha20-Poly1305 tag by default (21 bytes total),
 a 32-byte HMAC-SHA256 tag (37 bytes), or an explicitly selected four-byte CCM tag
 or unkeyed CRC32C check (9 bytes). Management and recovery feedback use their
-independent full-tag domain (21 bytes). Proxy records carrying lifecycle or
-credit controls use the strong authenticated-data arm when ordinary data selects
-a short check. These are record costs: algorithm union fields, packing, fragments
-and the selected carrier remain additional. Raw IPv4/TCP adds 40 bytes, giving
-49, 61 or 77 bytes before algorithm fields for the respective data selections;
-its bootstrap geometry is separate. Genuine TLS and QUIC retain their mandatory
-outer protection and transport behavior.
-
-Selected Block FEC systematic records also transmit only their exact original
-length-prefixed source extent. Existing reserved decoder rows restore the omitted
-algebraic zero tail; repair equations retain their complete actual generation
-width. Common configuration/catalog domains are v5 with unchanged policy bytes.
-The [batch18 local evidence](modules/buffer-observability.md#coordinated-local-buffer-batch18-validation)
-passes. [Native18](modules/buffer-observability.md#native18-exact-source-fill-and-remaining-admission-stalls)
-observes zero Cauchy systematic fill; its selected data phases still fail their
-original acceptance criteria. Native throughput and full acceptance gates remain open.
-
-Rolling, Research and sliding repairs serialize the maximum encoded source
-extent in their complete support. The receiver restores omitted zero columns in
-bounded symbol storage; meaningful trailing zeros and the encoded source length
-remain present. Current repair grammar and configuration versions must agree.
-The [Rolling version regression](../work/compact-cutover-20261117/fec/rolling-version-parser-attempt2.log)
-passes both current source formats and rejects prior version identifiers. The
-actual UDP lost-source fixture and capture also pass, including meaningful
-trailing zeros, held repair custody and actual byte charging. Runtime failures
-from the broad attempt now have passing focused continuations; remaining client
-service checks and aggregate closure are tracked in the cutover ledger.
-
-See the [current verification and remaining work](modules/compact-wire-cleanup.md#evidence-and-remaining-work)
-for source-bound receipts, failed attempts, captures and required aggregate-check
-status. Ordinary overhead targets are not guarantees for every packet or mode.
-The shared CLI/GUI service keeps requested and observed configuration separate;
-API4 switches complete authenticated Common catalog entries, including native
-compression policy, while API1 retains current proxy controls. Historical
-checkpoint descriptions below do not preserve retired defaults or qualify the
-current revision. All 47 P-* definitions, full SW-11, native/platform, raw-kernel,
-resource, protocol-identification and measured QoS/performance gates remain in
-scope.
-
-The Batch16/17 closeout integrates authenticated same-owner reuse through API4,
-precise Research feedback/physical ordering on original carriers, legacy
-admission-time repair credit and actual source/repair batch packing, measured
-Common physical receipt retention, and fixed/full raw TCP proxy composition with
-bounded Aligned units. See [the closeout receipt](../work/parallel-features-20261115/parallel-closeout-scoped-validation.json).
-Finite component and authenticated shared-service cases pass through preserved
-scoped continuations. Raw cases use owned injected PacketIo; they do not qualify
-kernel raw/TUN behavior. The required batch check and remaining stages are retained,
-including 1,658 simulator passes. Its existing standalone OpenVPN impaired-close
-failure remains open; no pristine full-suite result is claimed. Default-stack
-construction and new fixture errors were repaired without renewing original caps.
-The legacy 21-row oracle stops before physical completion, so its complete
-feedback differential remains LAA-03. Full PCOR/PCO/PBA/RRP/PCOM, all47, SW-11,
-native/platform/resource/performance gates retain their complete definitions.
-Prior numbered checkpoint descriptions below retain their historical scope.
-
-The Batch15 checkpoint integrates the existing measured TCP proxy controller
-through retained Common original UDP and its explicit CLI/API1 presenter, bounded
-Windows foreground status/disconnect/reconnect, and pure legacy sliding/hybrid
-FEC components. See [the scoped Batch15 receipt](../work/parallel-features-20261115/parallel-batch15-scoped-validation.json).
-The five measured selection/service/CLI cases, 14 legacy recovery and three explicit
-coefficient cases, and 31 portable Windows cases pass. Required check stages and
-affected Windows GNU lint/link pass through preserved continuations. The aggregate
-QUIC timeout retains its passing same-binary retry with cause unqualified; optional
-configuration stack growth and a Unix helper guard were repaired. This is not a
-pristine single-invocation pass or native Windows execution. External receipts
-remain source-bound history.
-Legacy admission/packer timing still differs from the corresponding Python model
-and is an active correction, not a completed parity claim. Native Windows, full
-proxy/native-window, all47, SW-11, resource and performance gates remain open.
-
-The Batch14 checkpoint implements explicit retained proxy EOF/ARQ retirement
-and Common proxy CLI selection, plus actual Research Engine/Bank, original UDP
-runtime and shared-service composition. The private per-connection reuse
-prerequisite is protocol-tested; authenticated runtime reuse remains unfinished
-and its capability stays false. See [the scoped Batch14 receipt](../work/parallel-features-20261115/parallel-batch14-scoped-validation.json).
-All 14 new focused cases pass, including actual protected-UDP/shared-service
-integration. The required full attempt and scoped continuations preserve initial
-integration errors, a drain-fixture repair and a default-stack API repair; the
-remaining required stages and affected Windows GNU lint/link pass. This is not
-a pristine single-invocation suite pass or native Windows execution. Async Research
-carrier ordering, complete PCOM/PCO/RRP deliverables, all47, SW-11 and full native,
-platform, resource and performance gates retain their original definitions.
-
-The preceding Batch13 integration brings three reviewed feature deltas into this
-checkout: the existing fixed/full single-channel TCP proxy actor through actual
-Common records and the shared service; the Windows foreground TCP/TLS TUN entry
-point with a safe-dependency Wintun device; and pure recursive parity, fallback
-and rolling-accumulator owners using the maintained GF/storage engines. See
-[Common proxy](modules/common-tcp-proxy.md), [Windows Wintun](modules/windows-wintun.md)
-and [research components](modules/research-recursive.md). External source-bound
-receipts remain historical; current root validation is recorded separately in the
-[Batch13 receipt](../work/parallel-features-20261115/parallel-batch13-scoped-validation.json).
-The integrated checkpoint passes all 66 selected new/affected cases and the
-remaining required check stages. The first full attempt retains two existing
-runtime failures; each passed one same-binary recheck without a code change.
-Their causes remain unqualified, so this is not a pristine full-suite pass.
-Affected Windows GNU lint/link checks pass; native execution remains unverified. Windows native device
-execution and complete proxy/Common acceptance remain open at their full existing
-definitions. Batch14 above adds scoped retained close and Research runtime composition.
-No new default carrier, periodic key exchange or reduced parity gate is implied.
-
-The preceding Batch12 implementation installs the selected independent Compact
-collection in the actual Engine/Bank/Common runtime and shared service, including
-bounded source-free ACK custody with original arrival/deadline and observable
-fixed-cohort limitations. It adds explicit authenticated Rolling input custody and
-selected fragment Engine/Bank/runtime composition, with whole-group charging,
-fresh per-fragment protection and physical completion. The original raw TCP
-Full/Half owners now feed the same Common service and strict CLI, with genuine
-TLS/member and initial Noise/member admission, fresh lower reconnect and unchanged
-setup caps. These are implemented slices with finite protocol/protected-I/O
-receipts, not complete named Python profiles or kernel/platform qualification.
-
-The [Batch12 scoped receipt](../work/parallel-features-20261115/parallel-batch12-scoped-validation.json)
-retains actual source identities, failed attempts, focused continuations and the
-required batch check separately. See [independent owners](modules/connection-records.md),
-[Rolling ingress](modules/common-rolling-ingress.md),
-[record fragmentation](modules/common-record-fragmentation.md) and
-[raw Common carrier](modules/raw-common-carrier.md). Full flow reuse, the named
-1460/1500/global8192/local128/every16/copies/ACK composition, native/platform/
-resource/performance, all47 and complete SW-11 remain open. External Windows,
-recursive-FEC and TCP-proxy/Common commits were excluded from that preceding
-checkpoint; they are integrated in Batch13 above.
-
-The preceding Batch11 implementation adds explicit bounded benchmark ACK ingress
-through actual Engine/Bank/Common ownership, requested/effective APIv4 policy and
-paired resource binding; decoded-channel reverse learning in the same Pipeline;
-and a pure fixed-cohort collection of independently reserved Compact owners.
-Finite cases pass actual ACK backpressure and record switching, independent-owner
-source/feedback loss, genuine catalog-bound Compact service setup/switching and
-Rolling silent-tail native progress. These are distinct compositions: the complete
-independent16 profile, raw TCP/Common installation and named8192/128/copies/ACK
-profile remain open. See [ACK ingress](modules/common-ack-ingress.md),
-[independent owners](modules/connection-records.md) and
-[Compact composition](modules/compact-endpoint.md).
-
-The [Batch11 scoped receipt](../work/parallel-features-20261115/parallel-batch11-scoped-validation.json)
-retains109 distinct focused passing leaves and the exact failed attempts. Full
-workspace formatting and Clippy pass; successful Rust targets/doctests total1,750,
-with524 additional runtime passes and one streamed UDP WouldBlock failure. That
-unchanged case passes an isolated rerun; its concurrent failure cause remains
-unresolved. Affected rustdoc passes. The full check remains failed and its later
-stages were not reached. This is not full Python, native or throughput acceptance.
-
-The preceding [Batch10 scoped checkpoint](../work/parallel-features-20261115/parallel-batch10-scoped-validation.json)
-installs explicit AlignedCompact/PackedCompact policies through actual reserved
-Engine owners and the original UDP Driver. Finite integration covers lossy source
-and feedback, retained authenticated feedback across delayed physical receipts,
-L3 TCP context/delta/replay, exact native bytes and negotiated record switching.
-All16 affected Common cases pass. Both Compact forms refuse unsupported physical
-copy counts before provisioning while retaining the complete requested policy.
-
-The full check passed workspace Clippy and formatting, with1,739 passing Rust cases
-in successful targets plus522 runtime passes; one legacy Packed pressure case
-failed. Its production staging loop now stops retrying unchanged sealed work in
-the same burst: all22 affected Aligned/Packed cases pass with original limits and
-timeouts. The two Compact endpoint/capability cases and affected strict checks
-also pass. Earlier failures remain preserved; these continuations are not a full
-check pass, and later full-check stages were not reached. Genuine new-profile
-service setup, complete named Python topologies, native/platform/resource/
-performance, all47 and full SW-11 remain open. See [actual composition](modules/compact-endpoint.md).
-
-The preceding [Batch9 scoped evidence](../work/parallel-features-20261115/parallel-batch9-scoped-validation.json)
-adds finite selected CompactARQ/Python-event differential and Reliable R0 passes,
-actual UDP Rolling three-copy delivery/switching, shared production proxy CLI
-adapter/Unix lifecycle checks, and native-IP codec/Aligned/Packed protocol tests.
-These are separate finite compositions: selected Compact Common installation and
-L3 runtime/native integration remain open. The exact Aligned FIFO pressure repair
-passes, while Packed pressure still fails under its original caps. Full-check
-attempt2 passed 1,735 Rust cases and 65 Python tooling cases before a runtime loss
-fixture stack overflow aborted its test binary; the simulator stage was not reached.
-That fixture now stores its actual Driver in the existing fallible StateCell:
-all five affected loss/liveness cases pass with unchanged stack limits, timeouts
-and assertions. The earlier Clippy failure is also corrected. Affected format,
-strict Clippy and rustdoc pass; these continuations are not a whole-batch pass.
-Full Python behavior, native, resource, platform, all47 and SW-11 gates retain
-their complete definitions.
-
-The preceding [TCP scoped checkpoint](../work/parallel-features-20261115/parallel-tcp-scoped-validation.json)
-adds independent verified SNI, retained raw send observations, supported CLI naming
-and actual fixed/measured shared-service readiness/cleanup. Affected strict checks
-and finite TLS/Unix-device cases pass; failed attempts remain preserved. At that
-checkpoint, production
-proxy CLI migration, Python behavior alignment and complete native/platform/
-resource/performance gates remained open; the finite CLI follow-on is recorded
-above. See [naming](modules/tcp-carrier-naming.md),
-[proxy service](modules/tcp-proxy-service.md) and [Python alignment](modules/python-behavior-alignment.md).
-
-The preceding [Wave8 checkpoint](../work/parallel-features-20261115/parallel-wave8-scoped-validation.json)
-implements [physical ARQ send confirmation](modules/arq-physical-send.md) through
-Reliable/Aligned/Packed/Common, [same-flow transient UDP recovery](modules/common-flow-recovery.md),
-[explicit short-source copy selection](modules/source-copy-policy.md), and
-[committed Rolling feedback snapshots](modules/rolling-storage.md).
-Affected protocol/runtime cases and strict checks pass; failed aggregate attempts
-remain preserved. Real8192/local128/every16 old-hole recovery is finite component
-evidence. Copy selection is implemented in the codec; authenticated policy and
-repeated physical sends remain SCP-04. Same-flow recovery retains the original
-socket/session and deadlines; replacement/restart reconciliation remains SEC-08.
-No periodic fresh-DH or new cryptographic replay domain is selected. Reconnect
-remains in the underlying service. Native and full-stage evidence is recorded
-separately; all47 mode gates, full SW-11, complete resources, Windows/Android and
-80 Mbit/s performance remain open.
-
-That Wave8 checkpoint preserved open aggregate failures. Its
-`tools/check.py` invocation failed in the legacy Packed pressure case and runtime
-fixture stack limits; its successful stages and exact continuations are retained.
-The full simulator passed 1,658 cases. Three current Linux native cases passed;
-the fourth requires a retry after bounded receipt-publication tooling was fixed.
-Unverified legacy actor and fixture repairs are excluded from this checkpoint.
-No full-suite pass or completed four-case current native matrix is claimed.
-
-The preceding [scoped checkpoint](../work/parallel-features-20261115/parallel-wave7-scoped-validation.json)
-adds implemented and protocol-tested [Rolling independent-short delivery](modules/rolling-records.md)
-and four finite [production Common native CLI cases](modules/common-carrier-cli-native.md).
-TAP/TUN with both inner appearances pass genuine outer TLS/member and inner
-Noise/member authentication, all64 catalog inspection/paging, four-family
-switching, exact bytes/liveness, runtime-failure API survival, fresh-session
-reconnect, capture and cleanup. One representative per family is activated;
-this is clean Linux IPv4 integration evidence, not full catalog or early-short
-native acceptance. The shared service retains the management API after an
-established backend fails. Automatic retained-state recovery, optional fresh-DH
-installation, full SW-11, all47 modes, complete resources, Windows/Android and
-80 Mbit/s performance remain open. No periodic exchange or new replay-domain
-wire decision is introduced.
-
-The preceding [record checkpoint](../work/parallel-features-20261115/parallel-wave6-scoped-validation.json)
-provides explicit ARQ-only Aligned/Packed and finite Packed short gap/expiry
-evidence. Its receipts retain their original Unix packet-device/pure scope.
-Earlier checkpoint descriptions below report their then-qualified scope; current
-native evidence is the finite CCN-01/02 leaf above, not completion of its parents.
+independent full-tag domain (21 bytes). Raw IPv4/TCP adds 40 bytes (plus 5 bytes
+with `--udp-cover tls-like`). Selected Block FEC systematic records transmit
+only their exact original length-prefixed source extent, and Rolling/Research/
+sliding repairs serialize the maximum encoded source extent in their support.
 
 Use the [implementation checklist](implementation-checklist.md) as the durable
-progress ledger. Detailed FC, MG, VX, UDP and CL checklists cover the new TUN active
-flow control, QoS, internal L2 management, VXLAN, carrier covers and GUI/CLI work.
-Update checkbox evidence and capability status with every implementation change.
-
-The preceding parallel carrier batch adds genuine requested-to-effective Common
-profile binding, the actual original-carrier shared service and explicit
-complete-plan CLI selection. The [finite carrier
-ledger](modules/common-carrier-service.md) and [scoped
-evidence](../work/parallel-features-20261115/parallel-wave5-scoped-validation.json)
-distinguish actual four-family service delivery from external offline
-inspection. Automatic retained recovery, full managed lifecycle, production
-native CLI startup and every unchanged mode/resource/platform/performance
-acceptance gate remain required.
-
-The preceding finite wave4 now provides [initial-only carrier Common execution](modules/managed-common-runtime.md),
-[typed failed-backend fresh reconnect](modules/generic-client-service.md) and
-[external Common control/inspection CLI](modules/common-client-api.md) against
-actual authenticating programmatic shared-service owners. Its [last passed receipt](../work/parallel-features-20261115/parallel-wave4-cases-attempt-3/validation.json)
-records nine exact cases in 7.936 s and both-cover CLI execution in 4.131 s, including
-exact clock and structural stack repair evidence. The preserved wave4 attempts
-contain 26 distinct positive cases, not 26 delivered features; managed contract/
-controller evidence is finite pure protocol testing. The [final scoped validation](../work/parallel-features-20261115/parallel-wave4-scoped-validation.json) records successful runtime-only Build4,
-both final affected regressions and affected strict Clippy/rustdoc/format
-checks, plus checklist and diff checks. Full `tools/check.py` was not run,
-avoiding unrelated suites. Initial-only does not schedule
-periodic fresh-DH; reconnect is underlying carrier/session service responsibility.
-Production CLI connect/serve/TAP startup, full carrier service, automatic retained
-recovery, complete resources, all 47 modes, full SW-11/RLNC/parity/rolling/packed/
-proxy and native/platform/performance acceptance remain unchanged required work.
-
-The next [Compact consumer slice](modules/compact-endpoint.md) installs genuine
-Compact recovery in the existing Aligned/Packed/Engine owners. Its focused
-validation is in progress, including selected native-IP runtime integration.
+progress ledger. Detailed FC, MG, VX, UDP and CL checklists cover TUN active
+flow control, QoS, internal L2 management, VXLAN, carrier covers and GUI/CLI
+work. Update checkbox evidence and capability status with every implementation
+change. All 49 entries in `config/mode-catalog.toml` (`48 planned`, `1 implemented`:
+`kcp-like-l2`), full SW-11, native/platform, raw-kernel, resource,
+protocol-identification and measured QoS/performance gates remain in scope. See
+[implementation status](implementation-status.md) and
+[compact-wire-cleanup.md](modules/compact-wire-cleanup.md#evidence-and-remaining-work).
 
 ## Target architecture and migration scope
 
@@ -312,7 +58,7 @@ OpenVPN-like UDP, QUIC header cover, minimal RTP audio/video-like UDP, or the
 original HTTPS TCP/TLS-to-raw path. Swift provides packing, ordering and recovery
 inside the selected carrier; it is not an independent default carrier. Its
 existing AEAD behavior must survive moving security into the common session.
-All other recovery, codec, packed, rolling, proxy and 47 Python-parity requirements
+All other recovery, codec, packed, rolling, proxy and 49 catalog-parity requirements
 remain in scope, including SW-11 switching between Swift and other record profiles.
 QUIC header cover does not require the native QUIC congestion controller. Existing
 genuine QUIC remains a separate implemented transport/reference capability. The
@@ -470,132 +216,56 @@ migration for end-to-end delivery. All existing full acceptance gates remain.
 
 | Project | Responsibility | Current state |
 | --- | --- | --- |
-| `crates/l2tunnel` | Public embedding facade | Exports actual pure reserved Swift/Aligned/Packed/Rolling Engine/mixed Bank, complete rolling tag4, shared native pool/counts and explicit carrier/native completion; full resources/runtime qualification remains separate |
-| `crates/l2tunnel-core` | Typed IDs, capabilities, policy and config validation | Initial mode types and structural validation |
+| `crates/l2tunnel` | Public embedding facade | Exports pure reserved Engine/mixed Bank, live tuning (`live_tuning`), shared native pool/counts, and record profiles |
+| `crates/l2tunnel-core` | Typed IDs, capabilities, policy and config validation | Mode types and structural validation |
 | `crates/l2tunnel-wire`, `crates/l2tunnel-session` | Versioned records, parsers, session contracts | Bounded wire/framing and local reload guard; distributed transactions live in management |
-| `crates/l2tunnel-auth` | Verified TLS and member authentication | Retained TCP/TLS and generic I/O TLS, exporter/member/config binding and negative tests |
-| `crates/l2tunnel-identity` | Reusable existing-member keys and possession proofs | Pure Ed25519 extraction and explicit Noise-bound member gate; same-carrier runtime integration has its own ledger |
-| `crates/l2tunnel-security` | Shared opaque protection and explicit Swift v2 compatibility | Pure AEAD/HMAC, domains, metadata, replay and adjacent ratchets; existing Swift runtime consumes byte-compatible owners |
-| `crates/l2tunnel-handshake` | Maintained fixed-pattern Noise adapter | Protocol-tested pinned-peer proof, caller entropy/time and final-confirmation custody; explicit managed initial runtime handoff now passes actual UDP/member cases. Production Common timed-v2/fresh-DH installation and full lifecycle remain open |
-| `crates/l2tunnel-cover` | Explicit QUIC-header/RTP-like appearance | Bounded pure codecs, without standard transport validity, identification or ISP classification claims |
-| `crates/l2tunnel-swift` | Reusable packing/recovery, numbered records and policy negotiation | Pure full-record and directional policy engines, plus bounded canonical feedback; legacy TLS and common-UDP adapters share the coordinator |
-| `crates/l2tunnel-transport` | Carrier selection semantics | Capability-aware explicit fallback contract; actual adapters below |
-| `crates/l2tunnel-mux`, `crates/l2tunnel-packet`, `crates/l2tunnel-pipeline` | Classification, connection affinity, common admission | Real parsed frames, bounded affinity/channel scheduling and DRR composition |
-| `crates/l2tunnel-codec` | L2/L3 fragmentation and compression | None/LZ4 frame bytes, bounded reassembly, Python timestamp/delta and aligned body primitives; complete mode integration pending |
-| `crates/l2tunnel-recovery`, `crates/l2tunnel-fec`, `crates/l2tunnel-reliable` | Feedback, ARQ, actual FEC and shared budgets | Selective repeat plus actual Cauchy payload repair and finite compositions; all catalog families pending |
-| `crates/l2tunnel-flow-control`, `crates/l2tunnel-qos`, `crates/l2tunnel-active` | Tunnel credit, QoS, demand and measured adaptation | Bounded credits/DRR, authenticated retirement and optional measured target control; no endpoint TCP-window ownership |
-| `crates/l2tunnel-management` | Fixed authenticated control framing and mode transactions | Prepare/drain/commit/retire state machine; runtime compression switching qualified; pure whole-message custody, stream gates and leased final-reply authority have protocol/original-UDP fixtures; explicit Swift runtime integration is tracked separately from generic dispatch |
-| `crates/l2tunnel-datagram`, `crates/l2tunnel-udp` | Protected custom UDP envelopes and lanes | AEAD/integrity profiles with retained TCP/TLS bootstrap/control; native tests passed |
-| `crates/l2tunnel-quic` | Genuine standalone QUIC carrier | UDP-only maintained QUIC/member auth and 36 native TAP/TUN/VXLAN cases with physical MTU captures |
-| `crates/l2tunnel-udp-control`, `crates/l2tunnel-openvpn-wire`, `crates/l2tunnel-openvpn` | Preserved standalone control; pure standard OpenVPN outer wire and actual retained TLS/member carrier | Historical custom-gate receipts remain separate. Same-socket outer layouts, opaque transport and actual physical send tickets have focused evidence; actual Common bootstrap/member/Parts/Driver/service selection has finite Linux TAP/TUN evidence; complete lifecycle/native/platform and dissector qualification remain open |
-| `crates/l2tunnel-raw-tcp`, `crates/l2tunnel-raw-io` | Single-owner userspace TCP and native adapter | Retained TLS-to-protected-packet transition, runtime and explicit shared client are implemented; original native packet captures and startup sampling are under separate qualification; congestion control, clean drain and broader path behavior remain open |
-| `crates/l2tunnel-tcp-proxy` | Explicit TCP ownership and reliable relay | Maintained-TCP legs and ACK-based fixed credit; clean Linux TUN full/half native split, exact-byte/FIN and lane-close tests passed; adaptive proxy windows pending |
+| `crates/l2tunnel-auth` | Verified TLS and member authentication | Retained TCP/TLS and generic I/O TLS, configurable named SNI (`ClientSni::Named`), exporter/member/config binding |
+| `crates/l2tunnel-identity` | Reusable member keys and possession proofs | Pure Ed25519 keys and Noise-bound member authentication |
+| `crates/l2tunnel-security` | Compact record protection and key ratchets | 5-byte compact prefix, ChaCha20-Poly1305 / HMAC-SHA256 / AES-CCM-4 / ChaCha20+CRC32C, replay and key generations |
+| `crates/l2tunnel-handshake` | Maintained Noise IK/IKpsk2 adapter (`snow`) | Pinned-peer proof, M1/M2 live-tuning proposal/verdict payloads, confirmation context binding; timed fresh-DH runtime integration remains open |
+| `crates/l2tunnel-cover` | Explicit UDP/raw cover appearance | Pure codecs for `quic-like`, `media-like`, and `tls-like` (no transport-interoperability or ISP classification claim) |
+| `crates/l2tunnel-swift` | Systematic sliding-window packing/recovery & policy | Pure multi-channel Swift codec with SIMD GF(2^8), base-first rotating gap requests, tighter RTT retries, and bounded HoL retry copy protection |
+| `crates/l2tunnel-aligned` | Aligned/packed frame codec & compact endpoint owners | Aligned/Packed ARQ, Cauchy FEC, and Compact/KCP-like L2 endpoints |
+| `crates/l2tunnel-transport` | Carrier selection semantics | Capability-aware explicit fallback contract |
+| `crates/l2tunnel-mux`, `crates/l2tunnel-packet`, `crates/l2tunnel-pipeline` | Classification, connection affinity, common admission | Parsed frames, bounded affinity/channel scheduling and DRR composition |
+| `crates/l2tunnel-codec` | L2/L3 fragmentation and compression | None/LZ4 frames, bounded reassembly, Python timestamp/delta and aligned body primitives |
+| `crates/l2tunnel-recovery`, `crates/l2tunnel-fec`, `crates/l2tunnel-reliable` | Feedback, ARQ, Cauchy/Rolling/Striped/Research FEC | Selective repeat, CompactARQ/KCP-like, Cauchy, Rolling, Striped, Research, and Legacy Sliding recovery |
+| `crates/l2tunnel-flow-control`, `crates/l2tunnel-qos`, `crates/l2tunnel-active` | Receiver credit, tunnel credit, QoS, demand | Live `session_credit` (`L2CR`, quiescent backoff, high-BDP bursts/ceilings), `delivery_window`, bounded credits/DRR; per-flow transparent TUN active credit pending |
+| `crates/l2tunnel-management` | Fixed authenticated control framing and mode transactions | `L2SC` PREPARE/READY/DRAIN/COMMIT/RETIRE, control streams, and `ProfileTag` 1..=6 (`SwiftPolicyV1`, `SessionRefreshV1`, `SlotReuseV1`, `TunnelTestV1`, `MetersV1`, `RateBudgetV1`) |
+| `crates/l2tunnel-meters` | Control/status register (CSR) catalog, snapshots & wire paging | Typed local and in-band remote CSR meters |
+| `crates/l2tunnel-tunnel-test` | In-process authenticated TCP speed & ICMP ping tester/responder | Embedded `smoltcp` stack with 4 MiB buffers and adaptive upload/download send-queue caps |
+| `crates/l2tunnel-datagram`, `crates/l2tunnel-udp` | Protected UDP envelopes and lanes | UDP framing and socket helpers |
+| `crates/l2tunnel-quic`, `crates/l2tunnel-https` | Genuine Quinn QUIC and TLS/HTTP2 carriers | Maintained QUIC Common carrier (`--carrier quic`); `l2tunnel-https` HTTP/2 streaming crate (runtime exposure `MOD-HTTPS-07` open) |
+| `crates/l2tunnel-udp-control`, `crates/l2tunnel-openvpn-wire`, `crates/l2tunnel-openvpn` | OpenVPN outer handshake/control and carrier | Standard outer OpenVPN handshake composed with Common inner session on one UDP socket (dissector audit open) |
+| `crates/l2tunnel-raw-tcp`, `crates/l2tunnel-raw-io` | Userspace TCP and raw-packet carrier | Real TCP/TLS handshake to synchronous fast-path raw packet phase, optional `--udp-cover tls-like`; broader NAT/firewall qualification open |
+| `crates/l2tunnel-tcp-proxy` | Explicit TCP ownership and reliable relay | Maintained-TCP legs and fixed-buffer relay; adaptive TCP receive-window ownership pending |
 | `crates/l2tunnel-device` | Packet-device abstraction and adapter capability rules | Native packet-layer validation and trait |
-| `crates/l2tunnel-runtime` | Tokio/clock/I/O orchestration | Retained TCP/TLS, managed compression, active TUN, protected UDP and standalone QUIC; explicit same-socket Common Driver uses the actual four-family Bank and leased State in the sole loop, with finite Unix packet-device switching/liveness/custody and explicit rolling work evidence. Actual OpenVPN inner factory/opaque Parts, Driver/service and four production TAP/TUN cases now have finite initial-only integration evidence |
-| `crates/l2tunnel-platform-linux`, `crates/l2tunnel-platform-vxlan`, `crates/l2tunnel-vxlan` | Native device/VTEP boundaries and portable VXLAN codec | Linux TAP/TUN and fixed-peer VXLAN qualified; broad VTEP switching/offloads pending |
-| `crates/l2tunnel-client-core` | Shared CLI/GUI lifecycle and local API | Managed TCP, base UDP and Swift paths use the shared service; explicit Common Prepared/Handle and APIv4 carry full configuration/status/catalog/keyed operations, with finite authenticated original-UDP/local-socket cross-profile evidence. Existing APIv1/v2/v3 bytes remain unchanged; Common CLI is wired to the same Prepared/Run and has strict full64 plan/inspection evidence. Four production Linux TAP/TUN cases pass external CLI execution and runtime-failure API survival. Complete failure/resource/lifecycle/native matrices, default retained recovery and GUI remain open |
-| `apps/l2tunneld`, `apps/l2tunnel-linux` | Linux server/client entry points | Real authenticated packet forwarding and supported local administrative actions |
-| `apps/l2tunnel-windows` | Windows service/client, Wintun or TAP | Explicit foreground TCP/TLS TUN via shared service and owned Wintun; portable/cross-build evidence only, native/service/L2 gates open |
-| `apps/l2tunnel-android` | Rust Android embedding library; later narrow JNI | rlib/cdylib staging crate, no JNI |
-| `apps/l2tunnelctl` | Local status and reload control | Private Unix status/compression requests; full versioned deployable config parser pending |
-| `simulator/` | Existing reference algorithms, experiments and golden oracle generation | Preserved existing Python project |
-| `tools/` | Local checks, isolated topology and native qualification | Source-hashed checks, immutable binary snapshots, TAP/TUN/VXLAN/netem, payload/path/cleanup receipts |
-| `config/` | Mode requirement catalog; later versioned deployable profiles | Catalog is an inventory, not a daemon config |
+| `crates/l2tunnel-runtime` | Tokio/clock/I/O orchestration | Sole Common `secure_udp` driver (`L2CR` credit, live tuning + MTU gate, live speed budget, CSR meters, tunnel tests), `retained_tls`, `proxy`, `buffer_metrics` |
+| `crates/l2tunnel-platform-linux`, `crates/l2tunnel-platform-vxlan`, `crates/l2tunnel-vxlan` | Linux TAP/TUN/rtnetlink and VXLAN boundaries | Linux TAP/TUN + rtnetlink `netconf.rs` and fixed-peer VXLAN qualified |
+| `crates/l2tunnel-platform-windows` | Windows Wintun L3 and named-pipe ACL/owner FFI | Narrow documented `unsafe` FFI boundary; cross-compiled and Wine-tested, native Windows run open |
+| `crates/l2tunnel-client-core` | Shared CLI/GUI lifecycle, `daemon`, and local API v1/v4/v5 | Profile store, host device/route mgmt, `pkexec` systemd installer, live tuning, live speed budget, CSR meters, tunnel tests, 15 grouped CLI commands on Unix & Windows |
+| `crates/l2tunnel-desktop-ui` | Shared `egui`/`eframe` desktop GUI | 8-page GUI (`l2tunnel-linux-gui`, `l2tunnel-windows-gui`), version-mismatch service installer; SOCKS5 & live carrier switch remain open |
+| `apps/l2tunneld`, `apps/l2tunnel-linux`, `apps/l2tunnelctl` | Linux server/client/GUI and cross-platform grouped CLI | Thin frontends delegating to `l2tunnel-client-core` and `l2tunnel-desktop-ui` |
+| `apps/l2tunnel-windows` | Windows Common UDP service, foreground host, and GUI | `service install|start|install-start|uninstall|run`, `foreground`, `l2tunnel-windows-gui`; cross-compiled/Wine-tested, native Windows run open |
+| `apps/l2tunnel-android` | Android embedding library and FD-broker service binary | `rlib`/`cdylib` plus `l2tunnel-android-service` (`ScmRights` TUN + `protect`); Kotlin app & JNI shell remain open |
+| `simulator/` | Reference Python algorithms, experiments and golden oracle | Preserved Python simulator |
+| `tools/` | Local checks, isolated namespace labs and native campaign runners | Source-hashed checks, `common_native_campaign.py`, `local_real_pair.py`, `fake_local_service.py`, golden generators |
+| `config/` | Mode requirement catalog (49 entries) | Inventory validated by `tools/check.py` |
 
-The [shared UDP client factory](modules/client-secure-udp.md) passed the
-[frozen-source local aggregate](../work/shared-session-client-20261113/validation.json),
-including actual same-socket cookie/Noise establishment, existing-member proof
-and protected Swift/control over both appearances. The
-[Swift record extraction](modules/swift-record-engine.md) removes duplicated
-packing/channel/header processing from the legacy runtime. Their ledgers record
-the actual checks. Neither source presence nor factory authentication completes
-the selected shared-service/native data path or remaining carrier/lifecycle
-requirements.
-
-The [new common-UDP runtime/service focused checks](../work/secure-udp-integrated-focused-20261113/attempt-3/validation.json)
-passed with unchanged compiled-source inputs, including actual original-socket
-transport, native readiness/backpressure fixtures, authenticated Swift policy
-changes, explicit credential/CLI validation, versioned local API and manual fresh
-reconnect. This follows the factory checkpoint; it does not qualify actual
-CLI/TAP throughput. The [separate native lab](modules/secure-udp-native.md) retains
-clean, delay, 1%/15% loss, sixteen-flow ACK-return, reverse-bulk stress, payload,
-policy/lifecycle and capture acceptance without reducing parent gates.
-The [preceding deadline-correction aggregate](../work/secure-udp-native-progress-20261113/attempt-1/validation.json)
-passed with stable source inputs. The subsequent [immutable CLI/TAP baselines](modules/secure-udp-native.md#initial-immutable-native-baseline)
-exercise exact bytes, real policy commits and manual reconnect for both appearances.
-Clean/delay QUIC-like cases passed; both impaired cases failed the unchanged
-80 Mbit/s target. Source-backed deadline/wakeup corrections and the remaining
-matched matrix require new recorded qualification; these finite observations do
-not close FIX-04, FIX-13 or full SW-11.
-
-The [counter-guided correction](modules/secure-udp-native.md#counter-guided-performance-correction)
-now has [source-stable focused evidence](../work/secure-udp-performance-focused-20261113/attempt-4/validation.json)
-for production class/credit/native observations, shared bounded reports/logging,
-original control-loss bounds and output-drain scheduling. The initial-rate burst
-and write pre-drain improve finite impaired QUIC-like goodput to70.6236Mbit/s,
-with reported native-pressure rejection removed;80Mbit/s remains unqualified.
-The later [expanded focus](../work/secure-udp-performance-focused-20261113/attempt-5/validation.json)
-and actual immutable CLI proofs validate the IPC-only helper scheduler correction;
-build8 reaches77.3464Mbit/s impaired and still fails80. Kernel perf and simultaneous
-process I/O observations do not establish disk I/O as the primary cause.
-SUR-11 now reproduces and corrects the independent saturated native-read fairness
-defect, with a [passing focus](../work/secure-udp-performance-focused-20261113/attempt-8/validation.json)
-and both-cover forward/reverse native observations. Build9 forward16 measures
-78.6206/78.2435Mbit/s, still failing80; the separate reverse-stress receipts pass
-their functional gates. Simulator
-overhead sensitivity, sampled CPU/credit and historical-binary replay remain
-separate evidence, not a reduction of any mode, lifecycle or performance gate.
-The [preceding source-stable aggregate](../work/secure-udp-performance-progress-20261113/attempt-3/validation.json)
-passed the complete ordinary workspace checks. Both earlier failed aggregate
-attempts remain preserved; actual native80Mbit/s acceptance remains open.
-The scheduler checkpoint's [required aggregate](../work/secure-udp-fairness-progress-20261113/attempt-2/validation.json) also passes
-1528 Rust cases including doctests, 295 Python tooling cases and 1658 simulator cases, without changing assertions or deadlines. The
-conditional wire-capacity estimate in the native ledger preserves the target
-and requires separate validation of any future framing/rate proposal.
-
-
-The additive [generic Swift runtime](modules/generic-secure-udp.md#current-explicit-runtime-checkpoint)
-now has explicit runtime-library and shared Prepared/service/APIv3 selection in
-that same sole I/O loop. Finite Unix tests use actual original UDP sockets,
-maintained authentication, canonical H0/D0 scopes, reserved engines and physical
-native writes through two nonzero asymmetric switches. The actual shared service
-also passes both-cover traffic, complete-C/key operations, IPC v3 status/switch,
-liveness and fresh-session reconnect with periodic reporting disabled. Actual
-observations precede successful completion; requested/current/physical values
-and incomplete resources remain distinct. All three generic control streams
-now use actual reserved ARQ backing; sole-loop inputs are charged and moved once.
-The additive [complete-plan CLI](modules/generic-transaction-cli.md) now exposes
-explicit generic selection, complete-C APIv3 commands and bounded full-catalog
-inspection. Its [source-stable batch](../work/generic-transaction-cli-20261114/aggregate-attempt-2/validation.json)
-passes1960 Rust cases including doctests,376 tooling cases and1658 simulator
-cases. The external probe executes34 real CLI processes per cover against
-actual authenticated shared-service owners and UnixDatagram PacketDevices,
-including2 switches and fresh reconnect. It does not qualify successful
-production CLI TAP/TUN startup. Existing defaults and fixed v1/v2 bytes remain
-preserved. The complete generic IPC/negative-service/fault matrix, full
-reservation, cross-profile SW-11 and broader carrier/lifecycle/platform/performance
-acceptance remain open. No new native or performance run is inferred.
-
-Additional unfinished source and integration boundaries:
+Remaining unfinished source and qualification boundaries:
 
 | Unfinished boundary | Responsibility |
 | --- | --- |
-| Native Windows/Android adapter crates | Reviewed driver/FD/JNI boundaries and native device lifecycle |
-| `apps/l2tunnel-linux` (`gui` feature), `clients/android` | Desktop GUI (`l2tunnel-linux-gui`, egui) and future Kotlin Android GUI/VpnService shell |
-| Cross-carrier secure-session lifecycle | Complete the existing pure security/Noise/control implementation draft across every carrier, including fresh-DH exchange and default retained-state recovery; parent SEC-* gates remain open |
-| Additional carrier and appearance composition | Preserve implemented QUIC-header/RTP codecs and the selected UDP driver while qualifying native use and other carriers; no native QUIC controller or full WebRTC is implied |
+| Native Windows & Android device qualification | Real-host Windows driver/service/ACL/L2 TAP tests and Android Kotlin/JNI `VpnService` app |
+| Desktop GUI remaining gaps | SOCKS5 (`DGUI-08`) and live carrier switching |
+| Cross-carrier secure-session lifecycle | Timed fresh-DH rekey integration on Compact owner and default state-retaining automatic outage recovery (`CL-38`, `SEC-*`) |
+| Native high-BDP & parity qualification | Real Linux kernel/netns high-BDP sweeps (`200/20`..`1000/100`), per-flow transparent TUN active credit, adaptive TCP-proxy receive windows, and remaining 48 `planned` catalog modes |
 
 [Client design](client-design.md) assigns service/runtime/platform responsibilities;
 [flow control](flow-control.md) and [overlays](overlay-and-carriers.md) define protocol
-contracts. The second table identifies unfinished boundaries; it does not imply
-that another empty package or duplicated secure protocol is needed.
-
-Split actual OS implementations into dedicated adapter crates when native FFI
-appears, keeping `unsafe` exceptions outside protocol crates. The runtime crate
-owns Tokio orchestration and telemetry. Avoid exposing Tokio
-or platform handles in public pure APIs. Add `testkit/` golden fixtures and a Rust
-in-memory integration driver at M2; add `bench/` baseline adapters at M5. These
-additional projects are planned, not empty claims of functionality.
+contracts. Golden codec vectors are generated and verified via
+`tools/generate_*_goldens.py` into crate test data directories, and public
+protocol crates remain free of Tokio, OS handles, and `unsafe`.
 
 ## Approved parallel execution order
 
@@ -622,65 +292,32 @@ stable task IDs and complete acceptance definitions below.
 6. Deliver shared CLI/GUI and Linux/Windows/Android integration after schema/API
    stability. Retain the existing toolkit decision and actual-device evidence
    gates; public protocol libraries remain independent of runtimes and OS handles.
-7. Complete all 47 P-* parity gates, including the15 causal research families.
+7. Complete all 49 P-* parity gates, including the 15 causal research families.
    Their independent work may start once interfaces stabilize rather than waiting
    for platform work. Existing primitives are reused after source/evidence audit.
 8. After functionality, concentrate native performance, kernel profiling, original
-   80Mbit/s acceptance and controlled real-path carrier/QoS comparisons in matched,
-   immutable campaigns. Preserve negative results and historical receipts.
+   80 Mbit/s acceptance, high-BDP sweeps, and controlled real-path carrier/QoS
+   comparisons in matched, immutable campaigns. Preserve negative results and
+   historical receipts.
 
 Each coherent source batch receives cross-review and affected regression checks.
 Combine the full frozen-source aggregate and required native acceptance at stage
 boundaries. Repair failures with focused dependency-aware checks; do not repeat
 unaffected suites after each leaf. Run independent functional tests with bounded
 parallelism, retaining shared-resource isolation and explicit reused evidence.
-Performance campaigns remain deferred and controlled. This scheduling approval does not change
-any mode requirement or select unresolved wire formats, timeout values, a desktop
-toolkit, package publication or a project license. Engineering interface choices
-remain distinct from owner decisions.
-
-The [current scoped foundation](../work/common-foundation-20261114/scoped-checkpoint-validation.json)
-provides the [directional record owners](modules/directional-record-endpoints.md),
-[Swift adapter](modules/swift-record-adapter.md) and actual
-[control wrapper backing](modules/control-wrapper-storage.md). It retains full
-stage acceptance and common cross-profile composition as open work. Complete
-directional Aligned/Packed encoding exceeds the transaction configuration's
-legacy512-byte bound. The explicit
-[CompleteV2 extension](modules/transaction-configuration-encoding.md) and shared
-scalar validation now pass a [119-test affected batch](../work/record-composition-20261114/foundation-attempt-1/validation.json).
-The [complete configuration](modules/record-configuration.md) source preserves
-every selected field and independent direction. The
-[448-case affected checkpoint](../work/record-composition-20261114/scoped-checkpoint-validation.json)
-also protocol-tests the [fresh-DH contract's](modules/session-refresh.md) selected
-initial/managed Joining/member/refresh/Records path. The subsequent
-[actual common Engine and backing checkpoint](../work/common-record-engine-20261114/scoped-checkpoint-validation.json)
-implements transactional real-queue admission, reserved FEC/Reliable/Aligned/Packed
-libraries and the explicit functional three-profile Engine. It passes affected
-library and selected downstream caller tests with bounded parallelism. Reserved
-mixed-profile Bank and selected runtime/resource/API composition, full stage acceptance, runtime fresh-DH
-lifecycle and complete retained recovery remain open. Passing unaffected
-checks are reused; a failed new expected literal was repaired with one exact
-test rerun rather than repeating the whole batch.
-
-The [actual reserved common Engine checkpoint](../work/common-reserved-records-20261115/scoped-checkpoint-validation.json)
-adds complete real queue backing, borrowed admission and one move-only Swift
-owner. Actual reserved Swift/Aligned/Packed Engine constructors pass142 distinct
-affected cases, including32 new cases, with paired TAP/TUN, asymmetric roles,
-full64 byte/identity/witness/charge comparisons and exact Full/Busy retries.
-Initial failures and exact reuse bindings remain preserved. Complete mixed Bank,
-shared external owners, nested allocator/drop qualification, selected runtime,
-full-stage/native/platform/performance acceptance remain open. Unchanged tooling,
-simulator and unrelated performance suites were not repeated.
+Owner selected `egui`/`eframe` for the desktop GUI (`crates/l2tunnel-desktop-ui`);
+package publication and project license remain explicit owner decisions.
 
 ## Ordered milestones and exit gates
 
 ### M0: contracts, inventory and tooling
 
 The initial foundation supplied the workspace, library boundaries, CLI
-scaffolds, first parser/MUX/reload primitives, a 47-family parity inventory, code
-conventions, CI definitions and dry-run network topology. Complete M0 before M1
-by reviewing the architecture, freezing canonical config encoding and adding a
-strict versioned TOML loader/schema. The current catalog is checked as TOML but is
+scaffolds, first parser/MUX/reload primitives, the initial 47-family parity
+inventory (now 49 entries in `config/mode-catalog.toml`), code conventions, CI
+definitions and dry-run network topology. Complete M0 before M1 by reviewing
+the architecture, freezing canonical config encoding and adding a strict
+versioned TOML loader/schema. The current catalog is checked as TOML but is
 not the runtime schema; unsupported options must not be silently accepted.
 
 Local exit evidence: fmt, Clippy with warnings denied, unit/doc tests, rustdoc,

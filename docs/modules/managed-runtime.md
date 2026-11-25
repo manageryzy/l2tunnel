@@ -84,11 +84,11 @@ remain separate work. The shared CLI uses the private Unix local API.
 
 ## Acceptance evidence
 
-- [x] [MOD-MANAGED-01] Validate negotiated digest, role, layer and supported profiles before reading the device. Evidence: [real authenticated runtime tests](../../crates/l2tunnel-runtime/src/managed_tests.rs).
-- [x] [MOD-MANAGED-02] Run real authenticated full/half loopback forwarding with monotonic outer/control counters and fixed queue limits. Evidence: [real authenticated runtime tests](../../crates/l2tunnel-runtime/src/managed_tests.rs).
-- [x] [MOD-MANAGED-03] Switch None/LZ4 both ways under queued payload and device WouldBlock; prove byte-exact delivery and epoch agreement. Evidence: [real authenticated runtime tests](../../crates/l2tunnel-runtime/src/managed_tests.rs).
-- [x] [MOD-MANAGED-04] Reject user-origin control spoofing, unsupported changes, stale epochs and malformed authenticated records. Evidence: [real authenticated runtime tests](../../crates/l2tunnel-runtime/src/managed_tests.rs).
-- [x] [MOD-MANAGED-05] Exercise timeout/uncertain failure and EOF with pending requests; never report local-only configuration success. Evidence: [real authenticated runtime tests](../../crates/l2tunnel-runtime/src/managed_tests.rs).
+- [x] [MOD-MANAGED-01] Validate negotiated digest, role, layer and supported profiles before reading the device. Evidence: [real authenticated runtime tests (retired in Common cutover)](compact-wire-cleanup.md).
+- [x] [MOD-MANAGED-02] Run real authenticated full/half loopback forwarding with monotonic outer/control counters and fixed queue limits. Evidence: [real authenticated runtime tests (retired in Common cutover)](compact-wire-cleanup.md).
+- [x] [MOD-MANAGED-03] Switch None/LZ4 both ways under queued payload and device WouldBlock; prove byte-exact delivery and epoch agreement. Evidence: [real authenticated runtime tests (retired in Common cutover)](compact-wire-cleanup.md).
+- [x] [MOD-MANAGED-04] Reject user-origin control spoofing, unsupported changes, stale epochs and malformed authenticated records. Evidence: [real authenticated runtime tests (retired in Common cutover)](compact-wire-cleanup.md).
+- [x] [MOD-MANAGED-05] Exercise timeout/uncertain failure and EOF with pending requests; never report local-only configuration success. Evidence: [real authenticated runtime tests (retired in Common cutover)](compact-wire-cleanup.md).
 - [x] [MOD-MANAGED-06] Run owned-namespace/native-device compression reload qualification and integrate the local API into clients. Evidence: [nine native cases](../../work/native-managed-logical/receipt.json).
 
 Executed locally: `cargo fmt -p l2tunnel-runtime`,

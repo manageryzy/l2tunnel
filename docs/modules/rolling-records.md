@@ -1,7 +1,7 @@
 # Compact records over actual rolling recovery
 
 Selected compact v3 now uses this module through the existing runtime owners.
-See [runtime algorithm migration](compact-wire-cleanup.md#runtime-algorithm-migration)
+See [runtime algorithm migration](compact-wire-cleanup.md)
 for the selected wire representation, exact-cost boundaries and validation scope.
 Legacy constructors and historical receipts below retain their original meaning.
 

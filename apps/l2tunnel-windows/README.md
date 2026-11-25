@@ -27,7 +27,7 @@ HOST_OPTIONS: --profile ABSOLUTE_DIR --wintun-dll ABSOLUTE_DLL
 
 l2tunnelctl service status --control-socket \\.\pipe\l2tunnel
 l2tunnelctl service connect --control-socket \\.\pipe\l2tunnel --watch 60
-l2tunnel-windows-gui --socket \\.\pipe\l2tunnel
+l2tunnel-windows-gui [--socket \\.\pipe\l2tunnel]   # defaults to \\.\pipe\l2tunnel
 ```
 
 The service starts disconnected and opens the adapter only when a client

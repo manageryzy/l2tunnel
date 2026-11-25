@@ -1,66 +1,52 @@
-# Swift algorithm and current protected-UDP composition
+# Swift algorithm and Common composition
 
-The pure engine's subsequent [bounded bulk-prefix correction](swift-bulk-copy.md)
-preserves bytes and ownership at its two deque extraction sites. CPU improvement
-is measured separately from the still-open impaired native performance and clean
-ICMP capture qualification; no carrier or recovery requirement is removed.
+The pure `l2tunnel-swift` engine preserves exact packet boundaries and bounded
+ownership, including the [bounded bulk-prefix correction](swift-bulk-copy.md)
+and high-BDP optimizations (SIMD GF(2^8) repair arithmetic, base-first rotating
+`request_cursor`, `1.125× RTT + 5 ms` retry spacing, and bounded head-of-line
+`extra_copies`).
 
-Status: the pure Swift packing/recovery engine is implemented and protocol-tested.
-The current explicit `--record-profile swift --carrier udp` composition is
-implemented, with historical integration receipts from Linux TAP in owned
-unprivileged network namespaces. It authenticates over TCP/TLS and sends data
-over a separate UDP socket; it is not the target selected-carrier architecture.
-It is not the default connection mode. Real devices, privileged host namespaces,
-IPv6 underlay runs, Swift TUN qualification, Windows/Android, remote CI and
-long-duration soak remain open.
-
-The target is a reusable Swift data algorithm above the explicitly selected
-carrier, using the [common secure session](secure-session.md) for inner
-authentication, AEAD, replay protection and key lifecycle on every carrier,
-including HTTPS. The fixed-peer session retains the selected carrier's socket
-and five-tuple from handshake through data and management. A WireGuard-like
-security model does not select a library, require WireGuard wire compatibility,
-or make the current Swift-specific security protocol the common protocol.
-The common implementation and bounded automatic recovery are planned; the
-current CLI and wire formats below describe observed behavior.
+Status: the pure Swift packing/recovery engine is implemented and protocol-tested,
+and now runs as a Common profile (`Profile::Swift`) over the shared Noise/compact
+secure session and selected carriers ([service lifecycle tests](../../crates/l2tunnel-client-core/src/service/tests/secure_udp_common_swift_lifecycle.rs)).
+The earlier standalone `--record-profile swift --carrier udp` (TCP/TLS bootstrap
+plus separate UDP socket, `--swift-restart`, and private `set-swift` TLS policy
+change) was retired in the Common wire consolidation ([compact-wire-cleanup.md](compact-wire-cleanup.md)).
+Historical integration receipts from that standalone Linux TAP slice remain
+preserved under `work/` as historical observations. Real devices, privileged host
+namespaces, IPv6 underlay runs, full Swift TUN qualification, Windows/Android,
+remote CI and long-duration soak remain open.
 
 - [x] [SW-01] Pure bounded engine: pack native packets across fixed-capacity source symbols, send each once, recover by receiver-requested retransmission with optional sliding-window GF(256) repairs, and deliver one exact ordered stream. Evidence: [engine](../../crates/l2tunnel-swift/src/lib.rs) with [loss, reordering, tail, flush, back-pressure and malformed-input tests](../../crates/l2tunnel-swift/src/tests.rs).
 - [x] [SW-02] Stateless connection classification into ordering channels for Ethernet (one VLAN tag) and raw IPv4/IPv6, with fragments kept together and unknown input on channel zero. Evidence: [classifier and tests](../../crates/l2tunnel-swift/src/flow.rs).
 - [x] [SW-03] Exact TCP/IPv4 header records on an ordered channel: delta fields, reconstructed length and checksums, compressor self-verification and literal fallback. Evidence: [codec and exactness, mutation and rejection tests](../../crates/l2tunnel-swift/src/header.rs).
-- [x] [SW-04] Runtime: ChaCha20-Poly1305 datagrams keyed from the TLS exporter, packet-number replay window, IP-byte token-bucket pacing, readiness-driven device and socket I/O, aggregated feedback and bounded delivery batches. Evidence: [runtime with protected-engine, channel-independence, pacing, replay and two-endpoint loopback tests](../../crates/l2tunnel-runtime/src/swift.rs).
-- [x] [SW-05] Shared client module and CLI selection with the complete policy bound into the authenticated session digest and rejected before credentials or sockets when invalid. Evidence: [client module](../../crates/l2tunnel-client-core/src/swift.rs), [CLI frontend](../../crates/l2tunnel-client-core/src/swift/cli.rs).
+- [x] [SW-04] Runtime: ChaCha20-Poly1305 datagrams keyed from the TLS exporter, packet-number replay window, IP-byte token-bucket pacing, readiness-driven device and socket I/O, aggregated feedback and bounded delivery batches. Evidence: originally implemented in the standalone Swift runtime (retired in [compact-wire-cleanup.md](compact-wire-cleanup.md)); superseded by Common secure-session runtime composition in [Common Swift lifecycle tests](../../crates/l2tunnel-client-core/src/service/tests/secure_udp_common_swift_lifecycle.rs).
+- [x] [SW-05] Shared client module and CLI selection with the complete policy bound into the authenticated session digest and rejected before credentials or sockets when invalid. Evidence: originally implemented in the standalone Swift CLI (retired in [compact-wire-cleanup.md](compact-wire-cleanup.md)); superseded by Common profile selection and [live tuning](live-tuning.md).
 - [x] [SW-06] Unprivileged Linux TAP self-test under HTB and netem with verified payload, clean close, same-window wire accounting and layer-2 checks in both directions (ARP, full-MTU unfragmented ping, UDP from 1 to 1472 bytes). Evidence: [tool](../../tools/selftest.py), [helper tests](../../tools/test_selftest.py), [clean](../../work/swift-selftest41/clean.json), [delay](../../work/swift-selftest41/delay.json) and [1% loss](../../work/swift-selftest41/loss1.json) receipts.
 - [x] [SW-07] Match the simulator at equal byte overhead within 2.5% on every self-test path. Evidence: [three reference runs](../../work/swift-selftest41/impaired-1.json), [kernel-default RTO run](../../work/swift-selftest41/impaired-kernel-rto.json), [simulator on the reference path](../../work/swift-simulator-reference38/output.log) and [on the control paths](../../work/swift-simulator-reference40/output.log).
-- [x] [SW-12] Read-only `status` over the private local control socket, reporting phase and counters of the live session. Evidence: [response and tests](../../crates/l2tunnel-client-core/src/swift/cli.rs); every [self-test receipt](../../work/swift-selftest41/impaired-1.json) queries both endpoints with the real `status` command.
-- [x] [SW-08] Route swift through the shared service API with disconnect and reconnect: the service owns the authenticated session, sockets and device as one backend; the CLI only parses and prints. Evidence: [service backend](../../crates/l2tunnel-client-core/src/service/owner.rs), [two-service lifecycle test over real loopback TLS and UDP](../../crates/l2tunnel-client-core/src/service/tests/swift.rs), [CLI adapter](../../crates/l2tunnel-client-core/src/swift/cli.rs), and the `lifecycle` block of the [self-test receipts](../../work/swift-selftest43/impaired.json), which disconnects and reconnects the live tunnel with the real commands.
+- [x] [SW-12] Read-only `status` over the private local control socket, reporting phase and counters of the live session. Evidence: standalone CLI retired in [compact-wire-cleanup.md](compact-wire-cleanup.md); superseded by Common local API v5 (`status`, [local operations](local-operations.md)); every [self-test receipt](../../work/swift-selftest41/impaired-1.json) queried both endpoints with the real `status` command.
+- [x] [SW-08] Route swift through the shared service API with disconnect and reconnect: the service owns the authenticated session, sockets and device as one backend; the CLI only parses and prints. Evidence: [service backend](../../crates/l2tunnel-client-core/src/service/owner.rs), [Common Swift lifecycle test](../../crates/l2tunnel-client-core/src/service/tests/secure_udp_common_swift_lifecycle.rs) (replacing the standalone Swift service test retired in [compact-wire-cleanup.md](compact-wire-cleanup.md)), and the `lifecycle` block of the historical [self-test receipts](../../work/swift-selftest43/impaired.json).
 - [ ] [SW-09] Qualify on real devices and privileged host namespaces, IPv6 underlay, TUN, long soak, CPU and memory.
-- [x] [SW-10] Rekeying and sequence rollover without reconnecting: each direction's datagram key changes every 2^28 datagrams through an HKDF-SHA256 chain with no message, and source sequences are 64-bit inside the engine with their low 32 bits on the wire. Evidence: [key chain and ratchet test](../../crates/l2tunnel-runtime/src/swift.rs) covering many generations in both directions, a reordered straggler, forged and skipped generations and retirement; [boundary-crossing engine test](../../crates/l2tunnel-swift/src/tests.rs) under 15% loss with and without repairs. A production-cadence rekey (2^28 datagrams, hours at the reference rate) has not been observed in a live run.
+- [x] [SW-10] Rekeying and sequence rollover without reconnecting: each direction's datagram key changes every 2^28 datagrams through an HKDF-SHA256 chain with no message, and source sequences are 64-bit inside the engine with their low 32 bits on the wire. Evidence: standalone key-chain test retired in [compact-wire-cleanup.md](compact-wire-cleanup.md) (superseded by compact record key rotation in [packet security](packet-security.md)); [boundary-crossing engine test](../../crates/l2tunnel-swift/src/tests.rs) under 15% loss with and without repairs. A production-cadence rekey (2^28 datagrams, hours at the reference rate) has not been observed in a live run.
 - [ ] [SW-11] Negotiated epoch switching between swift and the other record profiles, retaining authenticated management, matching digests, drain barriers, bounded retries and old-epoch rejection. Cross-profile selection is currently startup-only. SW-13 does not narrow or complete this gate.
-- [ ] [SW-13] Negotiated in-place change of the swift policy (budgets, channels, repair window and proportion, path MTU) on a live session: proposal and digest agreement on the retained authenticated stream, then a per-direction drain barrier, with datagram numbers and keys never reset. Implemented with focused tests ([control messages](../../crates/l2tunnel-swift/src/control.rs), [engine state machine, refusal and violation tests, two-runtime loopback test with two changes under traffic](../../crates/l2tunnel-runtime/src/swift.rs), [service and local `set-swift`](../../crates/l2tunnel-client-core/src/service/tests/swift.rs)); the original total deadline now covers silent proposal/barrier waits, receive flushing and terminal control writes, with injected-time and paused-runtime regressions. See the [checkpoint validation result and source identity](../../work/swift-policy-deadline-20261113/validation.json). The earlier [focused check](../../work/udp-framing-wording-20261113-final/focused-validation.json) passed, but its required aggregate check failed and [native receipts are mixed](#policy-change-receipts). Complete the remaining failure and native qualification gates before checking this item. Its Swift-specific policy change is not a substitute for SW-11.
+- [ ] [SW-13] Negotiated in-place change of the swift policy (budgets, channels, repair window and proportion, path MTU) on a live session: proposal and digest agreement on the retained authenticated stream, then a per-direction drain barrier, with datagram numbers and keys never reset. Historical standalone implementation ([control messages](../../crates/l2tunnel-swift/src/control.rs); standalone runtime/service files retired in [compact-wire-cleanup.md](compact-wire-cleanup.md)) is superseded by Common catalog switching, [live tuning](live-tuning.md), and authenticated live speed-budget updates (`ProfileTag::RateBudgetV1`). See the [checkpoint validation result and source identity](../../work/swift-policy-deadline-20261113/validation.json) and [policy-change receipts](#policy-change-receipts). Its Swift-specific policy change is not a substitute for SW-11.
 - [ ] [SW-14] Compose the pure Swift algorithm over the explicitly selected carrier and common secure session, without an independent Swift connection/default or mandatory separate TCP/TLS bootstrap. Preserve packing, exact header records, channels, retransmission and optional repairs; prove handshake/data/control socket and five-tuple continuity, exact bytes, replay rejection, carrier overhead and unsupported-combination reporting. Implementation depends on the [common secure-session gates](secure-session.md).
 - [ ] [SW-15] Move Swift policy changes and full SW-11 switching onto the common authenticated session-control service, independent of data profile and carrier. Retain digest agreement, per-direction drain, idempotent retries, original deadlines, delayed old feedback rejection and bounded control progress under saturated traffic. Preserve all other record profiles and Python parity requirements.
 - [ ] [SW-16] Qualify fixed-peer bounded automatic recovery through the shared client/service API, enabled by default in the target design. Retain eligible logical-session delivery and mode-transaction state through temporary path loss and security-key refresh; distinguish peer state loss or explicit replacement sessions requiring authenticated reconciliation or reported loss. Bound liveness, proposal, barrier and retry waits and expose requested/effective recovery state and terminal failure. Test short loss, silent blackholes, restored paths, explicit disconnect and failed reauthentication without changing the host's network state.
 
-## Current layering and target correction
+## Layering (current Common path vs retired standalone path)
 
-The current client reuses the existing TLS/member authentication and directional
-exporter secrets, and the shared service owns connect/disconnect/reconnect/status.
-The pure `l2tunnel-swift` engine has no cryptography, socket or real clock.
-The runtime now delegates protection, replay and its key chain to the explicit
-`l2tunnel_security::swift_v2` compatibility owners. Their byte-exact legacy format
-and TLS exporter roots remain unchanged; the new common packet format is a
-separate API, not silently enabled on an existing Swift connection. See the
-[packet-security extraction](packet-security.md). SW-13 still uses its private
-TLS control codec rather than the common management transaction. AEAD and HKDF
-continue to use maintained `ring` primitives.
-
-The target correction preserves the algorithm and historical experiments while
-converging authentication/security and management on common session services.
-Carrier appearance and its handshake remain separate from Swift recovery.
-The selected carrier must carry both session control and protected user data;
-a separate protected UDP data flow after TCP/TLS bootstrap does not satisfy continuity.
-Outer parseability, endpoint interoperability and measured ISP classification
-remain separate acceptance claims. No current Swift result proves any of them.
+In the current codebase, `l2tunnel-swift` is a pure data algorithm (no
+cryptography, sockets, or real clocks) composed inside the Common secure-session
+runtime (`Profile::Swift`) using Noise IK/IKpsk2 + Ed25519 + compact AEAD records
+([packet security](packet-security.md), [secure session](secure-session.md)),
+Common catalog hot-switching, [live tuning](live-tuning.md), and live speed-budget
+updates (`ProfileTag::RateBudgetV1`). The sections below (`Current wire format`,
+`Lifecycle`, `Negotiated policy change`, and `Historical measured results`)
+retain the record of the retired standalone TCP/TLS+UDP Swift composition and its
+saved `work/` receipts for historical traceability; the wire format of the pure
+`l2tunnel-swift` source/repair/feedback bodies remains active inside Common
+records.
 
 ## Why this design
 

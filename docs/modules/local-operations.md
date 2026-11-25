@@ -1,14 +1,15 @@
 # Local operation API (v5) and grouped CLI
 
-Status: implemented and locally contract-tested on Linux (fake/seeded service
-entries, a real retained Common plan without I/O, and real Unix sockets); no
-native daemon run, Windows named pipe or GUI uses it yet. This module adds the
-asynchronous operation surface required by [CL-04](../client-design.md),
+Status: implemented and tested on Linux (`l2tunneld daemon`, `l2tunnel-linux-gui`,
+`l2tunnelctl`, fake-service and real-daemon integration tests) and cross-compiled
+for Windows (`l2tunnel-windows` named-pipe service, `l2tunnel-windows-gui`, and
+`l2tunnelctl`; native Windows execution remains open under
+[WLS-02..WLS-08](windows-local-service.md)). This module adds the asynchronous
+operation surface required by [CL-04](../client-design.md),
 [CL-12](../client-design.md) and [CL-14](../client-design.md) on top of the
 existing [shared local API](local-api.md). It does not complete those parent
-items by itself: CL-04 also requires diagnostics/configuration-apply operations
-and revisions (CL-05), CL-12 also lists profile, capability and diagnostics
-groups that need CL-06/CL-07/CL-16 first, and CL-15 GUI parity is separate.
+items by itself: CL-04 also requires broader configuration-apply operations and
+revisions (CL-05), and CL-15 full cross-platform GUI parity remains open.
 
 ## Selected design
 
@@ -89,8 +90,10 @@ request version first and then the strict typed request for that version.
 | `operation_cancel` | `operation`, optional `service` | `operation` |
 | `events` | `after`, `limit` 1..=32, `timeout_ms` 0..=30000, optional `service` | `events`; on a gap also `status`, code `gap` |
 | `catalog` | `generation`, `catalog`, `offset`, `limit` 1..=4 | `observation` (Common catalog page) |
-| `tuning_get` | — | `tuning` ([live tuning](live-tuning.md) decision 10): `live`, `current` setting, the choices of each control (`repair` with `off` first then ascending rates, `device_mtu`, `path_mtu` ascending), every reachable `entries` setting (at most 64) and the service's `device` MTU state; code `closed` without a Common session |
-| `tuning_switch` | `request_key`, `setting` (`repair` `off` or `N/D`, `device_mtu`, `path_mtu`) | `operation` (kind `common_switch`): the service resolves the setting to the exact catalog member (the current entry with only the tuned fields changed when the catalog holds it, else the single entry with that setting) and runs the normal hot switch; codes `invalid_setting`, `not_in_catalog`, `ambiguous_setting` before any key is consumed |
+| `tuning_get` | — | `tuning` ([live tuning](live-tuning.md) decision 10): `live`, `current` setting, the choices of each control (`repair` with `off` first then ascending rates, `device_mtu`, `path_mtu` ascending), every reachable `entries` setting (at most 64, across Swift, Aligned, and Packed catalog members) and the service's `device` MTU state; code `closed` without a Common session |
+| `tuning_switch` | `request_key`, `setting` (`repair` `off` or `N/D`, `device_mtu`, `path_mtu`) | `operation` (kind `common_switch`): the service resolves the setting to the exact catalog member across Swift, Aligned, and Packed (preferring the active protocol family with only the tuned fields changed when the catalog holds it, else the single entry with that setting) and runs the normal hot switch; codes `invalid_setting`, `not_in_catalog`, `ambiguous_setting`, `status_unavailable` before any key is consumed |
+| `rate_budget_set` | `upload_bps`, `download_bps` (1 Mbit/s..=10 Gbit/s, unkeyed live control) | applies authenticated live speed-budget update (`ProfileTag::RateBudgetV1 = 6`) on both peers, scaling pacing bursts, credit ceilings, and runtime work batches; codes `not_running`, `invalid_budget`, `unsupported` |
+| `test_start`, `test_get`, `test_cancel` | `test` / `id?, timeout_ms` / `id` (unkeyed) | `test` ([tunnel tests](tunnel-tests.md)); capability `tests` |
 | `service_info` | — | `info` (version, role, API, uptime, per-feature capabilities with reasons) |
 | `metrics` | — | `metrics` (cumulative counters computed from the [meter CSR](meter-csr.md); `unreported` names the missing paths); code `not_running` while idle |
 | `meters_read` | `side` (`local`/`remote`), `prefix`, optional `cursor`, `limit` 1..=256 | `meters` page (`side`, `generation`, `sampled_ms`, `age_ms`, `entries`, `next`); codes `not_running`, `invalid_limit`, `invalid_prefix`, `invalid_cursor`, `busy`, `peer_timeout`, `peer_malformed`, `remote_unavailable` (non-Common backends) |
@@ -113,22 +116,22 @@ removes its routes when the session ends. A profile connect prepares the plan
 only for a new key, so an exact retry never rereads credentials; the plan
 becomes the retained plan for later `reconnect`.
 
-Reply: `{version:5, ok, code, service, status?, operation?, events?, observation?}`
+Reply: `{version:5, ok, code, service, status?, operation?, events?, observation?,
+info?, metrics?, meters?, meter_catalog?, devices?, routes?, profiles?, profile?,
+check?, keys?, sessions?, tuning?, test?}`
 with `service` as 16 lowercase hex characters. `status` holds the service
 `phase` (`disconnected`, `preparing`, `authenticating`, `connected`, `applying`,
 `stopping`, `failed`, `closed`), current `operation`, `generation`, `terminal`,
 `next_request_key`, `event_cursor`, `listening`, the existing backend
 `observation` (the version-1/4 `Snapshot` projection, unchanged) and, when
 known, the stored `profile` the plan came from and `connected_ms` since the
-live session connected (connected phase only; both optional, added
-2026-11-24). Profile summaries carry an optional `device` (the profile's
-`--device`). Tunnel tests add the unkeyed actions `test_start`, `test_get`
-and `test_cancel` with the optional reply field `test` and capability
-`tests` ([design](tunnel-tests.md)). An operation
+live session connected (connected phase only; both optional). Profile summaries
+carry an optional `device` (the profile's `--device`). An operation
 view holds `id`, `kind`, `state` (`pending` or `completed`), remaining
 `deadline_ms`, `cancel_requested`, optional `setup` evidence and optional
 `result` (`connected`, `aborted`, `applied`, `rejected`, `common_committed`,
-`common_refused`, `reuse_confirmed`, `reuse_refused`, `cancelled`,
+`common_refused`, `reuse_confirmed`, `reuse_refused`, `host_applied`,
+`host_refused`, `profile_applied`, `profile_refused`, `cancelled`,
 `outcome_unknown`, `failed`).
 
 A supplied `service` that differs from the instance identifier returns
@@ -149,8 +152,11 @@ an explicit `unsupported_version` reply. `Server::serve_service(handle)`, used
 by the Common and proxy CLI frontends, also dispatches version 5. A
 `--control-socket` endpoint of any profile therefore answers status while an
 operation runs. Each connection keeps the 5-second
-read and write bounds; long-polls hold their slot for at most 30 seconds. A
-status request is answered while a reconnect or switch is running. Version 1/4
+read and write bounds; long-polls (`operation_wait`, `events`, `test_get`) hold
+their slot for at most 30 seconds and release the slot immediately via
+`cancel_on_eof` if the client disconnects while waiting; remote `meters_read`
+waits up to its bounded `DEADLINE_MS` (2 s). A status request is answered while
+a reconnect or switch is running. Version 1/4
 requests are dispatched exactly as before (`lifecycle_request`). Local-API
 timing instrumentation records each request's original timestamps and replays
 them atomically under one lock, preserving its single-request accounting.
@@ -176,18 +182,20 @@ reply after a submission exits 5 and prints the key to retry. Human-readable tex
 is the default; `--json` prints each version-5 reply as one JSON line.
 `connect`/`serve` (foreground daemon entry points) stay flat.
 
-Later groups (see [desktop GUI](desktop-gui.md) for the parity table):
-`service info`, `service connect|reconnect --profile NAME`, `stats show|watch`,
-`device list|create|configure|delete`, `route list|add|remove|default`,
-`profile list|show|validate|export|import|delete|default`,
+Additional groups (see [desktop GUI](desktop-gui.md) for the full parity table):
+`service info|start|stop`, `service connect|reconnect --profile NAME`,
+`tune show|set`, `test speed|ping|status|cancel`, `stats show|watch`,
+`meters read|catalog|watch`, `device list|create|configure|delete`,
+`route list|add|remove|default`, `profile list|show|validate|export|import|delete|default|keys`,
+`key generate|generate-noise|generate-secret`, `session list|kick`, `member revoke`,
 `diagnostics export`. `daemon --control-socket PATH --state-dir DIR` is the
 long-running Linux service that hosts stored profiles.
 
 ## File ownership
 
-`crates/l2tunnel-client-core/src/local/operations*.rs`, `local/transport.rs`,
+`crates/l2tunnel-client-core/src/local/operations.rs`, `local/transport.rs`,
 `service/events.rs` plus the lock-guard and accessor hooks in `service.rs` and
-`service/owner.rs`, `cli/groups.rs` and the dispatch hook in `cli.rs`.
+`service/owner.rs`, `cli_groups*.rs` and the dispatch hook in `cli.rs`.
 
 ## Tasks
 
@@ -225,6 +233,7 @@ long-running Linux service that hosts stored profiles.
   and `RUSTDOCFLAGS='-D warnings' cargo doc -p l2tunnel-client-core --no-deps --locked` passed.
   `--no-deps` was needed because concurrent uncommitted runtime work failed Clippy.
 - `cargo check -p l2tunnel-client-core -p l2tunnel-windows --target x86_64-pc-windows-gnu`
-  compiled (cross-compilation only; the grouped CLI is Unix-only).
+  compiled (cross-compilation only; `l2tunnelctl` grouped v5 commands now build
+  for Windows as well, see [Windows local service](windows-local-service.md)).
 - Binary smoke: `l2tunnelctl` usage errors exit 2, a missing socket exits 3,
   and the legacy flat `status` keeps exit 1.

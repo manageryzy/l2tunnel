@@ -1,9 +1,15 @@
 # Windows foreground Wintun boundary
 
-Current status: the obsolete foreground service and staging chain have been
-removed. The owner approved deleting the old entry before the Common Windows
-service migration is complete; that migration remains pending. Portable device,
-input, setup and diagnostic helpers are not an implemented tunnel service.
+Current status: the older standalone TCP/TLS foreground slice (`native.rs`, now
+a thin stub returning `Unsupported`) has been superseded by the Common Windows
+service host (`apps/l2tunnel-windows/src/host.rs`, `service.rs`), named-pipe
+local API v5 (`l2tunnel-platform-windows/src/local_pipe`), and shared GUI
+(`l2tunnel-windows-gui`), which are implemented and cross-compiled for
+`x86_64-pc-windows-gnu` (see [Windows local service](windows-local-service.md)).
+Native Windows execution remains open until a native Windows receipt records
+actual Wintun device traffic, named-pipe ACLs, cancellation and resource
+cleanup. Compilation, portable tests, Wine checks, `help`, `version` and `plan`
+are not native tunnel evidence.
 
 The descriptions and receipts below document the retired foreground slice;
 they do not qualify the current application. Its prior portable and GNU checks
@@ -104,8 +110,10 @@ must return construction errors, not an effective connected capability.
 
 No DLL or driver is bundled or published by this change. Wintun's official
 distribution terms and native architecture selection must be resolved by any
-future package work. The foreground process is explicitly elevated; an
-unprivileged CLI and installed service are separate unfinished work.
+future package work. The Common Windows service host, named-pipe local API v5,
+and unprivileged `l2tunnelctl`/`l2tunnel-windows-gui` frontends are now
+implemented and cross-compiled (native qualification open under
+[Windows local service](windows-local-service.md)).
 
 ## Device ownership and packet contract
 
@@ -217,8 +225,9 @@ peer-delivery counters). Requested TCP/TLS, no UDP cover and system traffic are
 explicit; effective carrier is absent until actual running status. Diagnostics
 are best-effort through a bounded, nonblocking text queue; a blocked output
 writer owns no native/service/credential handles and cannot delay cancellation.
-The full Windows service event-log requirement remains CL-27. No Windows local
-IPC endpoint or GUI is claimed by this foreground adapter.
+The full Windows service event-log requirement remains CL-27. The newer Windows
+named-pipe local API v5 endpoint and shared GUI are tracked separately in
+[Windows local service](windows-local-service.md).
 
 Example native Windows invocation, after locally provisioning the official
 architecture-matching DLL and existing DER/PKCS#8 member credentials in

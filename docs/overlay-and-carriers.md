@@ -1,12 +1,12 @@
 # Internal management, VXLAN and carrier profiles
 
-Status: **design requirements under review**, 2026-11-13 (Asia/Tokyo). This document extends the
+Status: target contracts and acceptance requirements, with core control
+(`L2SC`, `L2CR`), VXLAN, Noise/Ed25519 common inner session, and all selectable
+carriers/covers implemented with finite Linux evidence. This document extends
 [architecture](architecture.md) and [implementation plan](implementation-plan.md).
-It specifies target contracts and acceptance work. Existing protocol components
-and finite Linux runtime receipts are recorded in [implementation status](implementation-status.md)
-and module ledgers; they do not implement every composition specified here.
-All unchecked items require implementation evidence before their status changes.
-This requirements update changes no runtime behavior or historical receipt.
+Current implementation status is summarized in
+[implementation status](implementation-status.md) and module ledgers; unchecked
+items below remain open until their full qualification gates pass.
 
 ## Internal Layer 2 management channel
 
@@ -55,10 +55,13 @@ Retransmission uses a fresh transport packet number while preserving the request
 ID and content; conflicting content for the same request is rejected.
 
 Messages cover capability/status exchange, `PREPARE`, `READY`, directional
-`BARRIER`, `COMMIT`, `COMMIT_ACK`, `RETIRE`, reconciliation and explicit rejection.
-Liveness and credit/feedback records share bounded control service but have
-separate message types and counters. A user-generated latency probe, TCP ACK or
-SYN cannot become a management message by selecting a QoS class.
+`BARRIER`, `COMMIT`, `COMMIT_ACK`, `RETIRE`, reconciliation and explicit rejection
+(`L2SC` in `l2tunnel-management`), plus authenticated profile-control extensions
+(`ProfileTag` 1..=6: `SwiftPolicyV1`, `SessionRefreshV1`, `SlotReuseV1`,
+`TunnelTestV1`, `MetersV1`, `RateBudgetV1`). Liveness and unreliable `L2CR`
+receiver-credit records share bounded control service with separate message
+types and counters. A user-generated latency probe, TCP ACK or SYN cannot become
+a management message by selecting a QoS class.
 
 ### Service reservation and switching liveness
 
@@ -112,10 +115,10 @@ an explicitly specified persisted resume protocol proves prior state.
 Provide two independently selectable behaviors. Neither makes an ordinary TUN
 device into an Ethernet device, and neither is the outer UDP cover profile.
 
-| Mode | Planned behavior | Ownership |
+| Mode | Behavior | Ownership |
 | --- | --- | --- |
 | Transparent nested pass-through | Carry existing VXLAN outer packets as ordinary user IP or Ethernet bytes. Preserve nested bytes; the external VTEPs own VNI and learning. | Normal packet/codec pipeline; no VXLAN termination. |
-| Explicit VTEP adapter | Receive/validate VXLAN UDP, map an authorized VNI to a bridge domain, inject the decapsulated Ethernet frame into the L2 tunnel pipeline, and encapsulate authorized egress frames. | Runtime owns sockets; a portable bounded codec/policy module owns parsing and mapping. |
+| Explicit VTEP adapter (`l2tunnel-vxlan`, `l2tunnel-platform-vxlan`, CLI `--vxlan-bind`/`--vxlan-peer`/`--vni`) | Receive/validate VXLAN UDP, map an authorized VNI to a bridge domain, inject the decapsulated Ethernet frame into the L2 tunnel pipeline, and encapsulate authorized egress frames. | Runtime owns sockets; a portable bounded codec/policy module owns parsing and mapping (qualified on Linux). |
 
 RFC 7348 defines an 8-byte VXLAN header, a 24-bit VNI and default UDP destination
 port 4789. It describes MAC learning and broadcast/unknown-destination delivery,
@@ -207,23 +210,23 @@ an experiment and existing implementation, not the target selected-carrier desig
 Reconnection after terminal failure is a new observable connection attempt, not a
 claim that the original connection survived.
 
-| Selected cover | Target connection contract | Evidence and remaining composition gate |
+| Selected cover | Target connection contract | Evidence and remaining qualification gate |
 | --- | --- | --- |
-| OpenVPN-like | Actual OpenVPN-format outer handshake and corresponding control/data packet layout on one UDP socket; our own authenticated tunnel payload follows. | The existing standalone profile has real TLS over custom reliable UDP control and finite Linux receipts. Its custom gate/control format does not satisfy the actual OpenVPN wire-handshake requirement. Composition with the common inner session remains open. |
-| QUIC-like | Selected QUIC-looking outer header layout over one UDP socket, with the common inner session and selected recovery. | Header appearance is the requirement; native QUIC ACK/congestion machinery and complete QUIC dissector validity are not required. The current custom prefix is not evidence of effective ISP classification. Genuine QUIC remains a separate implemented/reference capability. |
-| HTTPS-like | Real TCP/TLS handshake, then independently protected TCP-shaped packets on the original ports and sequence space, without ordinary TCP ACK-driven data transport. | The Linux raw transition has finite, separately scoped evidence. General-path qualification and composition with the common inner session remain open. Actual HTTP/2 streaming is an optional distinct compatibility profile, not a substitute. |
-| Minimal media | Audio/video/RTP-like outer packet layout on fixed UDP lanes, with the same common inner authentication, control and data protocol. | New planned cover. Freeze concrete headers, identifiers, sequence/timestamp behavior and handshake placement. This does not request a complete WebRTC/ICE/STUN/TURN/DTLS-SRTP/SCTP stack or valid encoded media. |
+| OpenVPN-like (`--carrier openvpn-like`) | Standard OpenVPN outer handshake/control layout on one UDP socket composed with the common Noise/member inner session (`l2tunnel-openvpn-wire`, `l2tunnel-openvpn`). | Implemented with finite Linux TAP/TUN evidence; unmodified dissector audit and full qualification remain open. |
+| QUIC-like (`--carrier quic-like`) | Selected QUIC-looking outer header layout (`l2tunnel-cover`) over one UDP socket, with the common inner session and selected recovery. | Implemented and integration-tested on Linux. Header appearance is not standards-conformant QUIC or evidence of ISP classification; genuine Quinn QUIC (`--carrier quic`) remains a separate capability. |
+| TLS-like (`--udp-cover tls-like`) | 17-byte TLS 1.3 record framing over UDP (`Appearance::TlsLike`), or 5-byte TLS 1.3 Application Data framing on `--carrier raw-packet --udp-cover tls-like`. | Implemented in `l2tunnel-cover` / `l2tunnel-raw-io` and selectable in CLI/GUI; ISP classification remains a measurement hypothesis. |
+| HTTPS-like (`--carrier raw-packet`) | Real TCP/TLS handshake, then independently protected TCP-shaped packets on the original ports and sequence space (`l2tunnel-raw-tcp`, `l2tunnel-raw-io`, synchronous RAW fast-path send). | Implemented and composed with the Common inner session on Linux (with optional `--udp-cover tls-like`). General-path/firewall/NAT qualification remains open. Actual HTTP/2 streaming (`l2tunnel-https`) is a separate compatibility profile. |
+| Minimal media (`--carrier media-like`) | 14-byte audio/video/RTP-like outer packet layout (`Appearance::MediaLike`) on fixed UDP lanes, with the same common inner authentication, control and data protocol. | Implemented in `l2tunnel-cover` and integrated across runtime/service/CLI/GUI. Not a WebRTC stack or encoded media claim. |
 
 ### Common inner authenticated session
 
 Every cover, including TCP/HTTPS-like, uses one reusable inner authentication,
-key-exchange, replay, rekey and management contract. The selected direction is a
-lightweight WireGuard-like authenticated session lifecycle; the concrete maintained
-implementation and adaptation are still review gates. See the
-[secure-session design](modules/secure-session.md). A library choice, exact wire
-format, new trust provisioning scheme or unsafe exception is not implied by this
-direction. Public protocol APIs still inject time and I/O and own no OS handles,
-privileges, Tokio runtime or device setup.
+key-exchange, replay, rekey and management contract implemented by
+`l2tunnel-handshake` (Noise IK/IKpsk2 via `snow`), `l2tunnel-identity`
+(Ed25519), and `l2tunnel-security` (compact 5-byte prefix + AEAD/CCM4/CRC32C).
+See [secure-session design](modules/secure-session.md). Public protocol APIs
+still inject time and I/O and own no OS handles, privileges, Tokio runtime or
+device setup.
 
 The deployment is fixed point-to-point between configured clients and servers.
 Peer identity is not inferred from the outer header, SNI, address alone or a
@@ -291,12 +294,13 @@ initial packets influence this ISP's classification is a measurement hypothesis.
 
 ### HTTPS-like packet ownership and failure gates
 
-Retain the original real TCP/TLS handshake requirement. Configurable TLS SNI is an
-outer name; server authentication stays anchored to our own roots/pins/identity
-configuration. Neither an arbitrary cover name nor SNI off permits accepting an
-untrusted server. Decide and verify the exact verifier/name/pin behavior before
-enabling named SNI. Once data leaves TLS record and TCP stream semantics, call it
-a custom HTTPS-like TCP-shaped carrier, not continuing HTTPS.
+Retain the original real TCP/TLS handshake requirement. Configurable TLS SNI
+(`ClientSni::Named`, `--sni`) is an outer name; server authentication stays
+anchored to our own roots/pins/identity configuration (`crates/l2tunnel-auth/src/sni.rs`).
+Neither an arbitrary cover name nor SNI off permits accepting an untrusted
+server; certificate pin verification remains an open gate. Once data leaves
+TLS record and TCP stream semantics, call it a custom HTTPS-like TCP-shaped
+carrier, not continuing HTTPS.
 
 Prefer one packet owner from SYN through TLS and the packet phase. A normal kernel
 TCP socket continues ACK/window/retransmission processing and can generate RSTs;
@@ -322,7 +326,7 @@ authentication/reconnection as specified by the recovery policy. Do not resurrec
 discarded TCP/TLS ownership or silently select HTTP/2/UDP. Keep control-loss,
 key-exhaustion, unconfirmed-drain and permission failures distinguishable.
 
-Carrier work does not narrow the 47-family mode inventory, RLNC/parity, rolling,
+Carrier work does not narrow the 49-mode catalog inventory, RLNC/parity, rolling,
 packed, proxy or other existing mode-parity gates. SW-11 still requires negotiated
 epoch switching between Swift and the other record profiles over stable control.
 

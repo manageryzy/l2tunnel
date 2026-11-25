@@ -100,7 +100,7 @@ Cauchy repair with selective-repeat fallback, not completion of every Python FEC
 mode. Native tests must run the selected profile; enum/configuration alone is not
 evidence of FEC data-path use.
 
-- [x] [MOD-UCLIENT-07] Bind explicit optional Cauchy settings through the shared client runtime builder and reject incompatible CLI combinations. Evidence: [settings builder](../../crates/l2tunnel-client-core/src/udp.rs), [binding/CLI rejection tests](../../crates/l2tunnel-client-core/src/cli.rs).
+- [x] [MOD-UCLIENT-07] Bind explicit optional Cauchy settings through the shared client runtime builder and reject incompatible CLI combinations. Evidence: [settings builder (retired in Common cutover)](compact-wire-cleanup.md), [binding/CLI rejection tests](../../crates/l2tunnel-client-core/src/cli.rs).
 - [x] [MOD-UCLIENT-08] Qualify actual selected native Cauchy TAP/TUN/VXLAN forwarding and retain exact configuration/binary receipts. Evidence: [36-case Cauchy audit](../../work/native-fec-matrix-audit.json).
 
 ## Lifecycle and ownership
@@ -118,10 +118,10 @@ actual payload checksums, MTU fragmentation and loss/reorder. TCP control being
 reachable is not proof that UDP data traversed the configured path; UDP qdisc/
 capture counters and a failed-path case must establish the data transport.
 
-- [x] [MOD-UCLIENT-01] Implement strict explicit carrier/profile/address validation before network/device work. Evidence: [shared settings and validation](../../crates/l2tunnel-client-core/src/udp.rs).
-- [x] [MOD-UCLIENT-02] Compose retained authenticated full/paired-half UDP sessions with shared client APIs. Evidence: [client assembly](../../crates/l2tunnel-client-core/src/udp.rs), [native receipt](../../work/native-udp-buffer/receipt.json).
+- [x] [MOD-UCLIENT-01] Implement strict explicit carrier/profile/address validation before network/device work. Evidence: [shared settings and validation (retired in Common cutover)](compact-wire-cleanup.md).
+- [x] [MOD-UCLIENT-02] Compose retained authenticated full/paired-half UDP sessions with shared client APIs. Evidence: [client assembly (retired in Common cutover)](compact-wire-cleanup.md), [native receipt](../../work/native-udp-buffer/receipt.json).
 - [x] [MOD-UCLIENT-03] Route the Linux CLI to the actual UDP runtime and expose precise supported behavior. Evidence: [CLI](../../crates/l2tunnel-client-core/src/cli.rs), [native receipt](../../work/native-udp-buffer/receipt.json).
-- [x] [MOD-UCLIENT-04] Test wrong profile, incomplete half pairing, bad endpoints and forbidden TCP/UDP option mixtures. Evidence: [settings tests](../../crates/l2tunnel-client-core/src/udp.rs), [CLI option tests](../../crates/l2tunnel-client-core/src/cli.rs).
+- [x] [MOD-UCLIENT-04] Test wrong profile, incomplete half pairing, bad endpoints and forbidden TCP/UDP option mixtures. Evidence: [settings tests (retired in Common cutover)](compact-wire-cleanup.md), [CLI option tests](../../crates/l2tunnel-client-core/src/cli.rs).
 - [x] [MOD-UCLIENT-05] Run owned TAP/TUN/VXLAN UDP integrity/MTU/loss qualification with transport evidence. Evidence: [36-case capture and receipt audit](../../work/native-udp-matrix-audit.json), [native matrix](#initial-native-receipt).
 - [ ] [MOD-UCLIENT-06] Add UDP data-mode hot switches, controlled fallback, standalone UDP bootstrap and native Windows/Android qualification.
 

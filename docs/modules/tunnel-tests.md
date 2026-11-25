@@ -1,9 +1,8 @@
 # Tunnel speed and ping tests
 
-Status: in design and implementation. The pure endpoint crate and the
-service/API/CLI/GUI belong to the GUI/CLI session. The framing flag and
-runtime hook (TT-02) were the protocol-core session's; with no protocol
-session running, the owner had the GUI/CLI session take them (2026-11-24).
+Status: implemented and loopback integration-tested on Common TUN sessions
+(TT-01 and TT-02 done; API/CLI/GUI/real-service path implemented; real-TUN
+qualification TT-05 and remaining TT-03/04 sign-off open).
 
 ## Owner decisions (2026-11-24)
 
@@ -89,8 +88,9 @@ native packets.
   - outgoing test packets are admitted through the same bank entry as
     device reads (`enqueue_borrowed`, or `ingest_borrowed_at` for
     connection-record scopes), so they share MUX admission, the channel
-    budget and the protocol's ARQ/FEC; at most 64 per loop turn, and a
-    refused packet is offered again first;
+    budget and the protocol's ARQ/FEC; at most 256 per loop turn
+    (`INJECT_PER_TURN = 256`), with buffer recycling, a 50 ms report
+    throttle, and a refused packet offered again first;
   - at the device write, a packet for this end's active test address goes
     to the endpoint instead of the TUN device; nothing is captured outside a
     test, and a responder with no traffic for 40 s is released;
@@ -123,8 +123,11 @@ feature.
 
 ## Bounds
 
-- Responder: 8 TCP sockets; each connection lives at most 32 s; 256 KiB
-  buffers per socket; at most 256 queued outbound packets per endpoint.
+- Responder: 8 TCP sockets; each connection lives at most 32 s; 4 MiB
+  buffers per socket (`SOCKET_BYTES = 4 MiB`, with adaptive send-queue sizing
+  `adaptive_send_queue` / `fill_zeros_capped` for high-BDP upload and
+  download); at most 1024 queued outbound packets per endpoint
+  (`PACKET_SLOTS = 1024`).
 - Tests: one at a time per service. Speed: 1..=8 streams, 1..=30 s, at most
   30 one-second samples. Ping: 1..=100 probes, 100..=1000 ms apart, 1 s
   timeout each. A test fails when its session ends. The last test stays
@@ -153,33 +156,33 @@ The capability is `tests`. It stays unavailable, with a reason, until the
 runtime hook exists.
 
 CLI: `l2tunnelctl test speed [--download] [--streams N] [--seconds S]
-[--watch]`, `l2tunnelctl test ping [--count N] [--interval-ms MS] [--watch]`,
-`l2tunnelctl test status [ID]` and `l2tunnelctl test cancel ID`.
+[--detach]`, `l2tunnelctl test ping [--count N] [--interval-ms MS] [--detach]`,
+`l2tunnelctl test status [ID]` and `l2tunnelctl test cancel ID` (CLI watches
+until completion by default; `--detach` returns immediately after start).
 
-GUI: a "Test the tunnel" panel on the Connection page. It has a speed test
-(direction, streams, seconds, Start, live chart and result) and a ping test
-(count, Start, round-trip times and loss).
+GUI: a "Test the tunnel" card on the Connection page with speed test
+(Upload/Download, streams, duration, Start/Cancel, Average/Last 1 s/Peak/
+Transferred metric tiles, progress bar, and live throughput chart) and ping
+test (probes, interval, Start/Cancel, round-trip times, and loss).
 
 ## Tasks
 
 - [x] [TT-01] Pure endpoint crate: smoltcp tester and responder on internal addresses, test wire, bounds; unit-tested back to back with loss. Evidence: [crate](../../crates/l2tunnel-tunnel-test/src/lib.rs), [back-to-back tests](../../crates/l2tunnel-tunnel-test/src/tests.rs) (`cargo test -p l2tunnel-tunnel-test`: 6 passed on 2026-11-24, simulated 120 Mbit/s link measured within bounds for upload and download, 2% loss, 20 ms ping round trips, total loss, no responder, cancel, bad headers and garbage packets); Clippy clean.
 - [x] [TT-02] Pre-test address exchange on the control channel and runtime test port through native admission (owner decisions 6 and 7 replaced the framing flag). Evidence: [port](../../crates/l2tunnel-runtime/src/secure_udp/transport_tunnel_tests.rs) and its [back-to-back tests](../../crates/l2tunnel-runtime/src/secure_udp/transport_tunnel_tests_tests.rs) (`cargo test -p l2tunnel-runtime --lib tunnel_tests`: 4 passed on 2026-11-24: speed and ping complete on negotiated addresses, a pair the peer uses is refused and replaced, an unanswered offer times out, cancel, session end, TAP refusal, malformed control ignored), [control grammar](../../crates/l2tunnel-tunnel-test/src/control.rs) and [addresses](../../crates/l2tunnel-tunnel-test/src/addresses.rs) (`cargo test -p l2tunnel-tunnel-test`: 9 passed), `cargo test -p l2tunnel-management`: 146 passed; Clippy clean.
 - [ ] [TT-03] Local API `test_start`/`test_get`/`test_cancel`, capability `tests`, CLI `l2tunnelctl test`, fake-service parity. Status: API types ([tunnel_test.rs](../../crates/l2tunnel-client-core/src/local/tunnel_test.rs)), CLI ([cli_groups_test.rs](../../crates/l2tunnel-client-core/src/cli_groups_test.rs)) and fake-service simulation are implemented and contract-tested (`tools.test_fake_local_service`: start, follow, busy, cancel, usage). The real service now maps them onto the running Common session ([tunnel_tests_local.rs](../../crates/l2tunnel-client-core/src/service/tunnel_tests_local.rs)) and reports the capability with the session's reason when unavailable.
-- [ ] [TT-04] GUI panel on the Connection page. Status: [implemented](../../crates/l2tunnel-desktop-ui/src/test_panel.rs) and checked by screenshots against the fake service (live progress and chart, ping round trips with lost probes, cancel); real-service use waits for TT-02.
-- [ ] [TT-05] Real run through a connected session. Status: unprivileged end to end passed: two real services joined by real loopback UDP with in-memory devices (`tunnel_tests_cross_the_real_session_and_never_reach_a_device`, 2026-11-24, debug build, fixture plan): upload 6.9 Mbit/s and download 3.6 Mbit/s over 2 streams, ping 5/5 at 8.1-9.3 ms, and no test packet reached either device. The installed system service still runs the earlier binary; a run through it needs the owner to reinstall the service.
+- [ ] [TT-04] GUI panel on the Connection page. Status: [implemented](../../crates/l2tunnel-desktop-ui/src/test_panel.rs) and exercised against both the fake service and real Common services (speed/ping controls, metric tiles, progress bar, live chart, cancel); kept open until TT-05 real-TUN qualification completes.
+- [ ] [TT-05] Real run through a connected session. Status: unprivileged end to end passed: two real services joined by real loopback UDP with in-memory devices (`tunnel_tests_cross_the_real_session_and_never_reach_a_device`, debug build, fixture plan): upload 6.9 Mbit/s and download 3.6 Mbit/s over 2 streams, ping 5/5 at 8.1-9.3 ms, and no test packet reached either device. High-BDP loopback release runs are also recorded separately; full real-TUN installed-service qualification remains open.
 
 ## Executed checks (2026-11-24, local Linux, unprivileged)
 
 - `cargo test -p l2tunnel-tunnel-test`: 9 passed. `-p l2tunnel-management`:
   146 passed. `-p l2tunnel-runtime --lib`: 394 passed.
   `-p l2tunnel-desktop-ui`: 24 passed.
-- `cargo test -p l2tunnel-client-core --lib`: 262 passed, 1 ignored, with
-  `RUST_MIN_STACK=4194304`. At the default 2 MiB test stack,
-  `generic_apply_waiter_replay_catalog_and_replacement_preserve_one_actual_switch`
-  overflows. Its body is documented as a ~400 KB debug future held just
-  under that limit. It still overflowed with every tunnel-test hook removed
-  from the loop and the service (bisected by hand), so the cause was not
-  isolated; it is recorded here, not fixed.
+- `cargo test -p l2tunnel-client-core --lib`: 262 passed, 1 ignored (originally
+  required `RUST_MIN_STACK=4194304` due to a 2 MiB stack overflow in
+  `generic_apply_waiter_replay_catalog_and_replacement_preserve_one_actual_switch`;
+  that stack overflow was subsequently fixed in commit `ab03a9f` so default
+  `cargo test` passes without `RUST_MIN_STACK`).
 - Clippy (`--no-deps`, `-D warnings`) clean on tunnel-test, management,
   runtime, client-core and desktop-ui; rustfmt clean on the edited files.
 - Not run: the installed system service still runs the earlier binary, and

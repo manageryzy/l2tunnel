@@ -38,7 +38,7 @@ not implement raw TCP, UDP, proxy TCP, automatic reconnect or privileged routing
 
 - [x] [MOD-RT-01] Implement bounded persistent record reader/writer and validate session, sequence and layer. Evidence: [implementation/tests](../../crates/l2tunnel-runtime/src/lib.rs).
 - [x] [MOD-RT-02] Implement paired authenticated half duplex and explicit full duplex. Evidence: [implementation/tests](../../work/native-wave4/receipt.json).
-- [x] [MOD-RT-03] Test packet forwarding, backpressure, partial streams, invalid records and EOF using an injected device. Evidence: [implementation/tests](../../crates/l2tunnel-runtime/src/tests.rs).
+- [x] [MOD-RT-03] Test packet forwarding, backpressure, partial streams, invalid records and EOF using an injected device. Evidence: [implementation/tests (retired in Common cutover)](compact-wire-cleanup.md).
 - [x] [MOD-RT-04] Exercise real TLS and native Linux TAP and TUN through the same runtime. Evidence: [implementation/tests](../../work/native-wave4/receipt.json).
 - [ ] [MOD-RT-05] Integrate codec, management, credit, QoS and validated hot switching.
 - [ ] [MOD-RT-06] Add bounded multi-peer service, reconnect and platform wrappers.

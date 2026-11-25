@@ -1,27 +1,35 @@
 # Client architecture and delivery checklist
 
-Status: full client delivery plan with a partial Linux implementation. This document expands the client work in
-[the implementation plan](implementation-plan.md), using the protocol boundaries
-in [the architecture](architecture.md) and the mode requirements in
-[the parity inventory](mode-parity.md). The broad checkboxes below remain open
-until their complete cross-platform contract is met. Linux/server/administrative
-entry points now share real TCP/TLS connect/serve, TAP/TUN/VXLAN device forwarding,
-exclusive identity generation and private Unix status/compression-switch commands.
-Managed TCP, base UDP and Swift CLI paths use a shared lifecycle owner, with
-different supported status/apply operations. Other profiles still have separate
-lifecycle paths; no complete GUI/API parity or default state-retaining outage
-recovery is claimed by that partial implementation.
-See [client runtime](modules/client-runtime.md), [local API](modules/local-api.md)
-and [native evidence](implementation-status.md) for exact implemented scope.
-[Local operations](modules/local-operations.md) adds local API version 5
-(accepted operations, bounded wait/cancel, an exact service event log) and the
-grouped `l2tunnelctl` commands with a fixed exit-code contract. That work goes
-toward CL-04, CL-12 and CL-14 but does not complete them: revisions (CL-05),
-profiles/capabilities/diagnostics (CL-06/07/16) and GUI parity remain open.
-The [desktop GUI](modules/desktop-gui.md) is the Rust/egui binary
-`l2tunnel-linux-gui` over version 5; its first slice is implemented and its
-full design (devices, routes, SOCKS5, statistics, management) is planned.
-Windows remains a staging entry point; Android has no JNI or application shell.
+Status: full client delivery plan with substantial Linux implementation and
+cross-compiled Windows/Android components. This document expands the client work
+in [the implementation plan](implementation-plan.md), using the protocol
+boundaries in [the architecture](architecture.md) and the mode requirements in
+[the parity inventory](mode-parity.md). Broad checkboxes below remain open until
+their complete cross-platform contract is met.
+
+Implemented today:
+- Common CLI (`l2tunneld`, `l2tunnel-linux`, `l2tunnelctl`) and `daemon` profile
+  store over local API v5 (async keyed operations, event ring, compare-and-set
+  profiles, host device/route management, live tuning, live speed-budget tuning,
+  local/remote CSR meters, in-process tunnel speed/ping tests, redacted
+  diagnostics export, and elevated `pkexec` systemd service install/restart).
+- Shared `egui`/`eframe` desktop GUI (`crates/l2tunnel-desktop-ui`, built as
+  `l2tunnel-linux-gui` and `l2tunnel-windows-gui`) implementing Overview,
+  Connection (live tuning, speed budget, catalog switch, tunnel tests), Devices,
+  Routes, Statistics (rolling charts + CSR meters), Management (profiles, keys,
+  service info/update/stop, server sessions), and Events (diagnostics export).
+  SOCKS5 and live carrier switching remain open.
+- Windows Common UDP service host (`apps/l2tunnel-windows`,
+  `crates/l2tunnel-platform-windows`: Wintun L3, named-pipe API v1/v4/v5,
+  `service install|start|install-start|uninstall|run`, `foreground`, GUI),
+  cross-compiled and Wine-tested; native Windows execution remains open.
+- Android `l2tunnel-android-service` binary with abstract-Unix-socket
+  `ScmRights` TUN descriptor handoff and outer-socket `protect` callback;
+  Kotlin application and JNI shell remain open.
+
+See [local operations](modules/local-operations.md),
+[desktop GUI](modules/desktop-gui.md), [Windows local service](modules/windows-local-service.md),
+and [implementation status](implementation-status.md) for current evidence.
 
 Keep task IDs stable when splitting work into issues. Completing a design does
 not complete its implementation item. Each completed item needs an evidence link
@@ -47,19 +55,19 @@ protocol crates remain independent of Tokio, OS handles, clocks and privileges.
 
 | Source project | Responsibilities | Consumers and boundary |
 | --- | --- | --- |
-| Existing `crates/l2tunnel*` protocol crates | Packet processing, authenticated session, peer management, MUX, QoS, recovery and codec state machines | Portable embedding API; injected time and I/O |
-| Existing partial `crates/l2tunnel-client-core` | Shared managed TCP, base UDP and Swift lifecycle/CLI slices; other profile lifecycles remain separate | Typed service ownership with profile-specific connect/cancel/abort/reconnect/apply support; portable command schema, separate Unix IPC; no widgets |
-| Existing `client-core::local`; possible later `l2tunnel-control-api` crate | Bounded Unix status/switch schema; richer events, revisions and operation IDs remain planned | Service/client boundary; distinct from the peer wire protocol |
-| Existing partial `crates/l2tunnel-runtime` | Async execution, timers, socket ownership and managed device forwarding; persistence/telemetry remain planned | Runtime outside public protocol API; injected backend interfaces for client-core |
-| Existing partial `crates/l2tunnel-platform-linux` | TAP/TUN descriptors; helper, network setup and service lifecycle remain planned | Linux-only adapter with one documented ioctl FFI boundary |
-| Planned `crates/l2tunnel-platform-windows` | Wintun/TAP adapters, Windows service integration, native credentials and owned network configuration | Windows-only adapter; independently reviewed driver/FFI boundary |
-| Existing `apps/l2tunnel-linux`; staging `apps/l2tunnel-windows` | Runnable Linux entry point; Windows currently provides help/version/plan only and rejects runtime startup | Planned common client-core/runtime reuse; Windows service/device behavior requires independent implementation and native qualification |
-| Existing `apps/l2tunneld` | Listener/server lifecycle and administrative endpoint | Reuse local control types where meaningful; reject client-only operations |
-| Existing `apps/l2tunnelctl` | CLI commands and machine-readable output | Uses local API; an explicit foreground mode may embed the same client-core |
-| Existing `apps/l2tunnel-linux` `gui` feature (`l2tunnel-linux-gui`) | Nonprivileged desktop GUI, profiles, status, operation progress and diagnostics | egui/eframe (owner selection, CL-17); Windows GUI later in `apps/l2tunnel-windows`; no second protocol engine |
-| Existing `apps/l2tunnel-android` staging crate | rlib/cdylib status entry point; no JNI, VpnService or descriptor handoff yet | Planned narrow Android embedding boundary with explicit descriptor/socket ownership and no unwinding across FFI |
+| Existing `crates/l2tunnel*` protocol crates | Packet processing, authenticated session, peer management, MUX, QoS, recovery, CSR meters, tunnel tests and codec state machines | Portable embedding API; injected time and I/O |
+| Existing `crates/l2tunnel-client-core` | Common lifecycle/service, `daemon` profile store, host device/route management, elevated service install, live tuning, live speed-budget tuning, CSR meters, tunnel tests, grouped CLI | Shared service/client core on Unix sockets and Windows named pipes; no widgets |
+| Existing `client-core::local` | Versioned local API (v1/v4/v5): async keyed operations, bounded event ring, profiles, tuning, meters, tunnel tests, diagnostics | Service/client boundary; distinct from the peer wire protocol |
+| Existing `crates/l2tunnel-runtime` | Async Tokio execution, timers, carrier/socket ownership, session credit, meters, live tuning/MTU, speed budget, tunnel tests | Runtime outside public protocol API; injected backend interfaces for client-core |
+| Existing `crates/l2tunnel-platform-linux` | TAP/TUN descriptors (`ioctl`), rtnetlink device/route management (`netconf.rs`) | Linux-only adapter with narrow documented FFI boundary |
+| Existing `crates/l2tunnel-platform-windows` | Wintun L3 adapter (`tun-rs`), Windows named-pipe ACL/owner-check FFI (`local_pipe.rs`) | Windows-only adapter with narrow documented FFI boundary; cross-compiled/Wine-tested, native run open |
+| Existing `apps/l2tunnel-linux` & `apps/l2tunnel-windows` | Runnable Linux client/service/GUI and Windows Common UDP service/foreground/GUI host | Shared `client-core`/`desktop-ui` reuse; Windows native qualification remains open |
+| Existing `apps/l2tunneld` | Listener/server lifecycle and administrative endpoint | Reuses `client-core`; rejects client-only operations |
+| Existing `apps/l2tunnelctl` | Grouped CLI commands and machine-readable `--json` output | Uses local API v5 over Unix sockets and Windows named pipes |
+| Existing `crates/l2tunnel-desktop-ui` (`l2tunnel-linux-gui`, `l2tunnel-windows-gui`) | Nonprivileged `egui`/`eframe` desktop GUI (profiles, connection, live tuning, speed budget, tunnel tests, devices, routes, statistics/meters, management, events) | Calls local API v5 only; no second protocol engine; SOCKS5 & live carrier switch remain open |
+| Existing `apps/l2tunnel-android` | `rlib`/`cdylib` plus `l2tunnel-android-service` binary with abstract-Unix-socket `ScmRights` TUN handoff & `protect` callback | No JNI or Kotlin shell yet |
 | Planned `clients/android` | Kotlin application, VpnService lifecycle, permission UI, notifications and platform credential adapter | Calls the shared Rust core; Android GUI is independent of desktop toolkit choice |
-| Planned `testkit/client` | Fake device/service backend, local API contract fixtures and scripted client workflows | CLI/GUI parity and lifecycle tests before privileged native validation |
+| Existing `tools/fake_local_service.py` & unit fixtures | Fake v5 local service backend and scripted client workflows | CLI/GUI contract parity tests before privileged native validation |
 
 ### Shared core and local control API
 
@@ -108,15 +116,16 @@ nor the peer management messages are forwarded to a user's TAP bridge or VXLAN.
   implementation/qualification status and the reason for fallback. Keep default
   half duplex, full duplex, physical lanes and MUX channels distinct. No preference
   setting may silently weaken authentication or enable an unimplemented backend.
-- [ ] [CL-08] Expose OpenVPN-like, QUIC-header and minimal RTP audio/video-like UDP
+- [ ] [CL-08] Expose OpenVPN-like, QUIC-header, TLS-like, and minimal RTP audio/video-like UDP
   cover choices separately from the original HTTPS TCP/TLS-to-raw path, retained
   TCP/TLS, optional HTTPS/H2 streaming, genuine QUIC and L2TP profiles. Show actual
   handshake/outer-layout, parseability and compatibility status; a project-specific
   framing profile is not a claim of OpenVPN/QUIC interoperability. QUIC header
   cover does not require native QUIC congestion control; minimal RTP does not
   imply full WebRTC. Keep endpoint address, trust/pin, SNI policy and optional
-  cover name separate, with a strict no-SNI option. Current root/name verification
-  with SNI disabled does not implement configurable cover SNI or pin verification.
+  cover name separate, with a strict no-SNI option. Configurable independent
+  cover SNI (`ClientSni::Named`, `--sni`) is implemented; pin verification
+  remains open.
 - [ ] [CL-09] Add TUN/TAP settings and explicit VXLAN attachment settings: local
   device, addresses/routes, MTU, bridge, VNI, endpoints, UDP port, learning/flood
   policy and tenant limits. Advertise supported combinations from the backend;
@@ -143,7 +152,7 @@ instead of hiding why a saved profile cannot run on another platform. Every
 [mode inventory](mode-parity.md) entry needs a capability/status mapping; only
 implemented and qualified combinations may be activated. Retain explicit
 experimental labels and benchmark-only labels.
-All 47 P-* parity entries and every requested recovery, packed, rolling and proxy
+All 49 P-* parity entries and every requested recovery, packed, rolling and proxy
 profile retain their full acceptance definitions. SW-11 includes Swift-to-other-
 record-profile epoch switching; exposing only in-Swift parameter changes does not
 complete it.
@@ -215,11 +224,11 @@ complete it.
   Compare a Rust-native UI (for example Slint or iced), a thin Tauri/webview UI,
   and native platform shells using a small prototype. Evaluate accessibility,
   packaging/signing, resource usage, licensing, localization, Linux desktop
-  coverage, service IPC and maintenance. Select and record one after the shared
-  API is stable; no framework is selected by this plan.
-  Owner selection 2026-11-23: egui/eframe (see
-  [desktop GUI](modules/desktop-gui.md)). The prototype comparison above was
-  not performed, so this box stays open.
+  coverage, service IPC and maintenance.
+  Owner selection 2026-11-23: `egui`/`eframe` (implemented in
+  `crates/l2tunnel-desktop-ui`; see [desktop GUI](modules/desktop-gui.md)). The
+  formal multi-toolkit comparison matrix was skipped by owner decision, so this
+  box stays open.
 - [ ] [CL-18] Implement a nonprivileged desktop GUI over the local API: service
   discovery, profile workflow, connect/disconnect, effective state, errors and
   reconnect handling. Run privileged setup through the platform service/helper;

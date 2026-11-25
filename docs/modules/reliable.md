@@ -1,7 +1,7 @@
 # Reliable selective repeat with optional systematic block FEC
 
 Selected compact v3 now uses this module through the existing runtime owners.
-See [runtime algorithm migration](compact-wire-cleanup.md#runtime-algorithm-migration)
+See [runtime algorithm migration](compact-wire-cleanup.md)
 for the selected wire representation, exact-cost boundaries and validation scope.
 Legacy constructors and historical receipts below retain their original meaning.
 
@@ -19,7 +19,7 @@ cost before an attempt is committed. Encoder error or `None` retains original
 custody; accepted output retains the existing physical witness until confirmation.
 This path omits the eight-byte Reliable envelope and exposes `receive_compact_view_at`
 without reparsing a private legacy wrapper. The 40-case suite and direct final
-record/UDP composition are recorded in the [compact checkpoint](compact-wire-cleanup.md#selected-checkpoint-evidence).
+record/UDP composition are recorded in the [compact checkpoint](compact-wire-cleanup.md#evidence-and-remaining-work).
 The configuration and envelope costs below describe preserved compatibility
 paths; this addition does not migrate Aligned/Packed or the other FEC profiles.
 

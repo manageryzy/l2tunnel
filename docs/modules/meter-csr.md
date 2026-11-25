@@ -1,11 +1,13 @@
 # Meter CSR and management query
 
-Status: in progress, 2026-11-24. MCSR-01, MCSR-11 and MCSR-13 pass. The
-local slice is implemented and contract-tested: always-on collectors, the
-Common runtime publishing its CSR with each snapshot, the local API, the
-`metrics` view and the CLI. MCSR-02/03/10 are partial (see Tasks). The meter
-families (MCSR-04..07), the in-band remote read (MCSR-08 wire codec only;
-MCSR-09 dispatch) and the GUI remain open. This document does not change
+Status: in progress. MCSR-01, MCSR-11 and MCSR-13 pass. The always-on collector,
+Common CSR publisher, local API (`meters_read`/`meters_catalog` and CSR-derived
+`metrics`), CLI (`l2tunnelctl meters`), Common in-band remote reads over `Liveness`
+(`ProfileTag::MetersV1`, MCSR-09 partial), and the GUI Statistics CSR meters panel
+(MCSR-12 partial) are implemented and contract-tested. Full meter-family coverage
+(MCSR-04..07), a dedicated negotiated `Meters = 5` stream/capability bit (MCSR-08/09),
+TCP-proxy remote reads (MCSR-10), histogram percentiles in the GUI (MCSR-12), and
+real-pair overhead receipts (MCSR-14) remain open. This document does not change
 the [buffer coverage inventory](buffer-observability.md) or its measurement
 contract; it adds a live, queryable home for those meters and for further
 meter families.
@@ -39,7 +41,11 @@ The owner settled these, one question each:
     interval through the same sink that carries `CommonSnapshot`. A read
     returns the latest table and its age.
 11. Remote reads use a new negotiated control stream, `Meters = 5`, under
-    whole-message custody.
+    whole-message custody. *(Implementation note: Common sessions currently
+    carry remote reads over the existing authenticated `Liveness` stream using
+    `ProfileTag::MetersV1` in `Control` scope with stream-bounded paging; a
+    dedicated `Meters = 5` stream and capability bit remain tracked under
+    MCSR-08/09.)*
 12. Every live inner flow up to the runtime's flow-table bound gets CSR
     instances.
 13. Paths are named after the owning Rust component, not ledger row codes.
@@ -187,8 +193,8 @@ rule in [local operations](local-operations.md):
 
 | Action | Fields | Reply |
 |---|---|---|
-| `meters_read` | `side` (`local`/`remote`), `prefix`, optional `cursor`, `limit` | `meters{side, generation, sampled_ms, owners[{owner, sampled_us}], entries[{path, value}], next?}`; codes `not_running`, `peer_unsupported`, `peer_timeout`, `busy` |
-| `meters_catalog` | `prefix`, optional `cursor`, `limit` | `catalog[{pattern, kind, unit, state, reason?}], next?` |
+| `meters_read` | `side` (`local`/`remote`), `prefix`, optional `cursor`, `limit` (1..=256) | `meters{side, generation, sampled_ms, age_ms, entries[{path, value}], next?}`; codes `not_running`, `invalid_limit`, `invalid_prefix`, `invalid_cursor`, `busy`, `peer_timeout`, `peer_malformed`, `remote_unavailable` |
+| `meters_catalog` | `prefix`, optional `cursor`, `limit` (1..=256) | `meter_catalog{version, entries[{pattern, kind, unit, state, reason?}], next?}` |
 
 Replies stay within the existing local reply limit, so a large prefix pages
 through `cursor`. `metrics` keeps its schema but is computed from CSR paths;
@@ -206,8 +212,10 @@ its `unreported` list then names the missing paths.
 - At most one remote read is in flight per session, with a minimum interval
   between reads. Excess local requests get `busy`, never a queue.
 - The answering side builds the reply from its own CSR, with flow IDs only and
-  no labels. A peer without meter support is reported as `peer_unsupported`
-  (from negotiated capability), never as empty or zero values.
+  no labels. Non-Common backends report `remote_unavailable`, while an
+  unresponsive or incompatible peer reports `peer_timeout` or `peer_malformed`
+  (never empty or zero values; `peer_unsupported` is reserved for future
+  negotiated capability signaling).
 - Typed refusals and decode failures never panic and never change session
   state.
 
@@ -252,7 +260,7 @@ changes there are minimal, made with the Edit tool, and formatted per file.
 | Read with no session running | `not_running`; no partial table |
 | Profile lacks a meter | Path absent; catalog shows it, or `unavailable` with reason; never zero |
 | Generation changes between two reads | Client restarts every rate series |
-| Remote peer without meter capability | `peer_unsupported` |
+| Remote peer unavailable or without meter support | `remote_unavailable` / `peer_timeout` (or `peer_unsupported` once negotiated) |
 | Second remote read while one is in flight | `busy`; first read unaffected |
 | Remote read under saturated user traffic | Served within MUX admission and channel budget; user traffic keeps its admission policy |
 | Remote reply over the byte cap | Paged with `next`; never truncated silently |

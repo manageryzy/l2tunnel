@@ -1,10 +1,27 @@
 # Validation plan and isolated Linux lab
 
-`tools/netns_lab.py` provides a deterministic topology plan and an explicitly
-enabled topology setup/cleanup implementation. It does **not** launch a tunnel
-daemon, run traffic, or prove that a protocol mode works. The Rust implementation
-must supply those pieces before end-to-end acceptance is possible. Here, "qc"
-is interpreted as Linux `tc` qdisc, with `netem` for delay and loss.
+`tools/netns_lab.py` provides the standalone topology setup/cleanup helper
+(dry-run by default). End-to-end Linux namespace integration runners and local
+harnesses live alongside it in `tools/`:
+
+- **Common native campaign & matrix runners:** `tools/common_native_campaign.py`,
+  `common_native_matrix.py`, `common_native_cell.py`, `common_native_traffic.py`,
+  `common_native_netem_seed.py`, `common_native_switch.py`, `common_native_observe.py`,
+  `common_native_outer_tcp.py`, `common_native_report.py` (serialized isolated
+  namespaces, seeded netem, captures, qdisc dumps, binary hashes, TAP/TUN,
+  1/4/16 flows, paced/bulk-random/mixed-real workloads, live protocol switching,
+  and raw-TCP RST observation; see [tools/common_native_matrix.md](../tools/common_native_matrix.md)).
+- **Focused native smoke & reference runners:** `tools/selftest.py` (unprivileged
+  user-namespace TAP self-test), `tools/native_smoke.py`, `tools/kcp_native_reference.py`,
+  `tools/native_throughput.py`, `tools/native_perf_profile.py`,
+  `tools/path_bundle_netns_lab.py`.
+- **Unprivileged local & in-process harnesses:** `tools/local_real_pair.py`
+  (real loopback/forwarding daemon pair with `--replace` restart),
+  `tools/fake_local_service.py` (API v5 contract harness), `common_cli_process_probe`
+  (external CLI probe run by `tools/check.py`), and in-process tunnel speed/ping
+  tests (`l2tunnel-tunnel-test` / `l2tunnelctl test` / GUI Tunnel Test card).
+
+Here, "qc" is interpreted as Linux `tc` qdisc, with `netem` for delay and loss.
 
 ## Safe default and topology
 
@@ -80,16 +97,17 @@ it. Inspect such leftovers manually. External root processes can still race
 namespace changes; this is an operational lab boundary, not isolation from a
 host administrator. The harness never kills a process to make cleanup succeed.
 
-## Integration runner to implement
+## Integration runner requirements
 
-The future runner should retain a receipt for each run containing the exact Git
-revision, build features, negotiated mode IDs and configuration epochs, kernel
-and iproute2 versions, namespace plan, endpoint capabilities, qdisc/class dumps,
-offload settings, counters, seed information where available, traffic commands,
-timestamps, and output paths. Capture on both traffic-host interfaces, both TAP
-interfaces, and both underlay interfaces; record capture drops. Avoid placing
-private keys or authentication secrets in receipts. Captures may contain test
-payloads and require explicit retention rules.
+Native campaign runners (such as `tools/common_native_campaign.py` and
+`tools/common_native_matrix.py`) retain a receipt for each run containing the
+exact Git revision, build features, negotiated mode IDs and configuration epochs,
+kernel and iproute2 versions, namespace plan, endpoint capabilities, qdisc/class
+dumps, offload settings, counters, seed information where available, traffic
+commands, timestamps, and output paths. Capture on both traffic-host interfaces,
+both TAP/TUN interfaces, and both underlay interfaces; record capture drops.
+Avoid placing private keys or authentication secrets in receipts. Captures may
+contain test payloads and require explicit retention rules.
 
 Start both daemons on their own `tap0` and bind underlay sockets to their
 namespace addresses. Authenticate and negotiate the selected mode, then perform
@@ -124,13 +142,11 @@ occupancy, and effective loss by direction. Keep offered load and delivered
 throughput distinct. Explicitly record failures, timeouts, unsupported modes,
 and missing measurements rather than treating them as zero.
 
-Repeat with multiple independent seeds/traces once a seeded runner exists.
+Repeat with multiple independent seeds/traces (`tools/common_native_netem_seed.py`).
 Calibrate clean-link, delay-only, rate-only, loss-only, and combined profiles
-before attributing a difference to a protocol strategy. Additional non-baseline
-profiles and automatic captures are planned, not implemented by the current
-fixed-profile harness. A Linux namespace pass is not Windows/Android device
-integration evidence; those platforms need adapter-level and native-system
-tests of their own.
+before attributing a difference to a protocol strategy. A Linux namespace pass
+is not Windows/Android device integration evidence; those platforms need
+adapter-level and native-system tests of their own.
 
 ## Current verification boundary
 
@@ -145,8 +161,8 @@ any end-to-end tunnel behavior exists.
 ## Added traffic, management, overlay and client gates
 
 The [master checklist](implementation-checklist.md) and FC/MG/VX/UDP/CL detailed
-checklists are the source of completion status. The existing topology script
-still implements only its fixed TAP plan; the following extensions are pending:
+checklists are the source of completion status. Remaining qualification gates
+beyond the implemented Linux smoke/matrix runners:
 
 | Workstream | Required real test | Distinguishing evidence |
 | --- | --- | --- |
@@ -166,14 +182,12 @@ No added gate above has been executed by this planning change.
 
 ## Carrier consistency and classification campaign
 
-Status: **planned validation**, 2026-11-13 (Asia/Tokyo). This campaign qualifies the
-selected-cover/common-inner-session architecture in
-[carrier profiles](overlay-and-carriers.md) and [secure-session design](modules/secure-session.md).
-It is not an execution receipt. Existing TCP/TLS, protected UDP, genuine QUIC,
-OpenVPN-like and raw packet-phase receipts keep their original source hashes,
-acceptance criteria, failures and finite scopes. The old TCP/TLS-bootstrap plus
-separate UDP data experiments remain historical controls, not evidence of the
-target same-flow design.
+Status: **planned qualification campaign** (carrier covers and common inner
+session are implemented with finite Linux evidence; full dissector and ISP QoS
+campaigns remain open). This campaign qualifies the selected-cover/common-inner-session
+architecture in [carrier profiles](overlay-and-carriers.md) and
+[secure-session design](modules/secure-session.md). Existing receipts keep
+their original source hashes, acceptance criteria, failures and finite scopes.
 
 ### Protocol and lifecycle gates before ISP measurements
 
@@ -203,9 +217,10 @@ unsupported, bound-exhausted, protocol failure and tool failure separately.
   unmodified standard dissector and a declared protocol/profile to inspect reset,
   session/packet/ACK fields and reassembled outer TLS where visible. Separately
   verify our inner membership, selected recovery and data protection. A custom
-  opcode prefix or successful project parser does not complete this gate. The
-  composition of that outer exchange with the common inner handshake remains
-  design work; standard OpenVPN endpoint interoperability is not required.
+  opcode prefix or successful project parser does not complete this gate.
+  Standard OpenVPN outer handshake/common-inner composition is implemented with
+  finite Linux TAP/TUN evidence; unmodified dissector verification remains open,
+  and standard OpenVPN endpoint interoperability is not required.
 - QUIC-like checks only its frozen initial/established header-appearance contract,
   lengths, identifiers and consistency across the same socket. Record what an
   unmodified dissector recognizes and rejects, without demanding or claiming a

@@ -387,7 +387,7 @@ The current recovery `OutboundBudget` is an allowance, not a congestion
 controller. Removing smoltcp reliability also removes its normal Reno path.
 Initially this profile is owned-lab-only with a predeclared aggregate pace/byte
 cap. General network use remains blocked on the independent aggregate raw/UDP
-congestion-control gate [FC-08](../flow-control.md#checklist); extra lanes and FEC
+congestion-control gate [FC-08](../flow-control.md#implementation-and-acceptance-checklist); extra lanes and FEC
 must not multiply that allowance. Authenticate actual probes/delivery feedback;
 neither fabricated TCP retirement nor static configured capacity is an RTT or
 congestion measurement.

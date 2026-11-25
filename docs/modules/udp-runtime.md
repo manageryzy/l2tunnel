@@ -79,9 +79,9 @@ EOF with pending work fails explicitly; reconnect/resume is not implemented.
 
 ## Acceptance tasks
 
-- [x] [MOD-UDP-RUNTIME-01] Canonical binding, constructor validation, real pair proof. Evidence: [constructors and digest](../../crates/l2tunnel-runtime/src/udp.rs), [binding and constructor tests](../../crates/l2tunnel-runtime/src/udp_tests.rs).
-- [x] [MOD-UDP-RUNTIME-02] Actual native packet bytes over real TCP/TLS/UDP, full and paired half, TAP/TUN contracts, both covers/protections, MTU fragmentation, exact delivery under deterministic loss/reorder. Evidence: [16-case loopback matrix](../../crates/l2tunnel-runtime/src/udp_tests.rs).
-- [x] [MOD-UDP-RUNTIME-03] WouldBlock credit bounds, malformed/authenticated dispatch separation, retained TLS closure, coalesced blocked writer, retry/reassembly terminal failure and native sentinel limit. Evidence: [focused failure tests](../../crates/l2tunnel-runtime/src/udp_tests.rs).
+- [x] [MOD-UDP-RUNTIME-01] Canonical binding, constructor validation, real pair proof. Evidence: [constructors and digest (retired in Common cutover)](compact-wire-cleanup.md), [binding and constructor tests (retired in Common cutover)](compact-wire-cleanup.md).
+- [x] [MOD-UDP-RUNTIME-02] Actual native packet bytes over real TCP/TLS/UDP, full and paired half, TAP/TUN contracts, both covers/protections, MTU fragmentation, exact delivery under deterministic loss/reorder. Evidence: [16-case loopback matrix (retired in Common cutover)](compact-wire-cleanup.md).
+- [x] [MOD-UDP-RUNTIME-03] WouldBlock credit bounds, malformed/authenticated dispatch separation, retained TLS closure, coalesced blocked writer, retry/reassembly terminal failure and native sentinel limit. Evidence: [focused failure tests (retired in Common cutover)](compact-wire-cleanup.md).
 - [x] [MOD-UDP-RUNTIME-04] Local fmt, tests, Clippy, rustdoc and aggregate checks. Evidence: [validation commands below](#local-validation), [aggregate runner](../../tools/check.py).
 - [x] [MOD-UDP-RUNTIME-05] Privileged owned-namespace/native UDP qualification: 36 no-FEC profile cases and nine fixed-Lz4 cases. Evidence: [independent native UDP audit](../../work/native-udp-matrix-audit.json), [Lz4 receipt](../../work/native-udp-lz4/receipt.json).
 - [ ] [MOD-UDP-RUNTIME-06] Additional FEC profiles, hot switching, rekey, standalone UDP
@@ -169,10 +169,10 @@ snapshots. Superseded ACK reservations are not refunded. Credit and heartbeat
 writes acquire their allowance from the same ledger, so control never has an
 unaccounted bypass. Writer waits do not cancel/restart partial frames.
 
-- [x] [MOD-UDP-FEC-01] Freeze recovery/budget helpers and bind exact derived configuration; reject over-MTU or unsupported settings before device reads. Evidence: [configuration and binding](../../crates/l2tunnel-runtime/src/udp.rs), [configuration tests](../../crates/l2tunnel-runtime/src/udp_tests.rs).
-- [x] [MOD-UDP-FEC-02] Compose authoritative Reliable split polling/inspection with per-lane framing, bounded ARQ fallback and unchanged logical native credit. Evidence: [Engine adapter and runtime](../../crates/l2tunnel-runtime/src/udp.rs).
-- [x] [MOD-UDP-FEC-03] Enforce one finite common interval allowance with reserved internal control service, including TLS ACK/credit/heartbeats under blocked writers. Evidence: [shared Ledger and writer](../../crates/l2tunnel-runtime/src/udp.rs), [cross-lane, distinct-framing and low-quota tests](../../crates/l2tunnel-runtime/src/udp_tests.rs).
-- [x] [MOD-UDP-FEC-04] Test actual authenticated UDP loss repaired before first RTO, insufficient parity followed by real ARQ fallback, full/half TAP/TUN, bounded backpressure and exact maximum wire framing. Evidence: [18 UDP tests including 16-case Cauchy matrix](../../crates/l2tunnel-runtime/src/udp_tests.rs).
+- [x] [MOD-UDP-FEC-01] Freeze recovery/budget helpers and bind exact derived configuration; reject over-MTU or unsupported settings before device reads. Evidence: [configuration and binding (retired in Common cutover)](compact-wire-cleanup.md), [configuration tests (retired in Common cutover)](compact-wire-cleanup.md).
+- [x] [MOD-UDP-FEC-02] Compose authoritative Reliable split polling/inspection with per-lane framing, bounded ARQ fallback and unchanged logical native credit. Evidence: [Engine adapter and runtime (retired in Common cutover)](compact-wire-cleanup.md).
+- [x] [MOD-UDP-FEC-03] Enforce one finite common interval allowance with reserved internal control service, including TLS ACK/credit/heartbeats under blocked writers. Evidence: [shared Ledger and writer (retired in Common cutover)](compact-wire-cleanup.md), [cross-lane, distinct-framing and low-quota tests (retired in Common cutover)](compact-wire-cleanup.md).
+- [x] [MOD-UDP-FEC-04] Test actual authenticated UDP loss repaired before first RTO, insufficient parity followed by real ARQ fallback, full/half TAP/TUN, bounded backpressure and exact maximum wire framing. Evidence: [18 UDP tests including 16-case Cauchy matrix (retired in Common cutover)](compact-wire-cleanup.md).
 - [x] [MOD-UDP-FEC-05] Run local formatting/tests/Clippy/rustdoc and aggregate checks, with native receipts and remaining modes recorded separately. Evidence: [FEC validation below](#fec-validation), [aggregate runner](../../tools/check.py).
 
 ## Native qualification for this adapter
@@ -211,4 +211,4 @@ separate evidence for the complete concurrent implementation wave.
 
 ## Mandatory byte-delivery profile migration
 
-- [ ] [MOD-UDP-RUNTIME-07] Qualify the new mandatory delivery-policy profile in separately bound native runs; its [source28 aggregate](../../work/implementation-wave28/validation.json) passed. Focused [shared delivery tests](../../crates/l2tunnel-runtime/src/packet_delivery_tests.rs), [actual-carrier contract](../../crates/l2tunnel-runtime/src/packet_delivery_actor_tests.rs), and [current scoped evidence](../../work/base-delivery28/) do not replace the historical native gates or establish80Mbit/s. See [packet-delivery contract](packet-delivery.md) and [FIX-01](../implementation-checklist.md).
+- [ ] [MOD-UDP-RUNTIME-07] Qualify the new mandatory delivery-policy profile in separately bound native runs; its [source28 aggregate](../../work/implementation-wave28/validation.json) passed. Focused [shared delivery tests (retired in Common cutover)](compact-wire-cleanup.md), [actual-carrier contract (retired in Common cutover)](compact-wire-cleanup.md), and [current scoped evidence](../../work/base-delivery28/) do not replace the historical native gates or establish80Mbit/s. See [packet-delivery contract](packet-delivery.md) and [FIX-01](../implementation-checklist.md).

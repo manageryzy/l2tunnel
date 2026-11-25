@@ -23,7 +23,10 @@ and restart the rust-analyzer server if the editor was already running. Check
 
 - Rust 2024, pinned toolchain in `rust-toolchain.toml`; public errors are explicit.
 - `cargo fmt` is authoritative. Clippy warnings are errors in checks/CI. Public
-  items require docs. Runtime code may not use unwrap, expect, panic or unsafe.
+  items require docs. Protocol, runtime, client-core, and UI code may not use
+  unwrap, expect, panic or unsafe; only narrow, documented platform FFI
+  boundaries (`l2tunnel-platform-linux`, `l2tunnel-platform-windows`) may use
+  reviewed `unsafe`.
 - No implicit network/device side effects in library constructors; inject time,
   I/O and bounded buffers. Use newtypes for unrelated sequence spaces.
 - Validate external lengths before indexing/allocation. Bound retained bytes,
@@ -66,16 +69,19 @@ python3 -m venv .venv
 python3 tools/check.py
 ```
 
-This runs formatting, Clippy, Rust tests including the raw-native example and
-the codec's no-default-features branch, rustdoc, catalog validation, CLI
-status/failure checks, Linux-only unprivileged lab tests and, on Linux, the complete
-simulator test suite including its native KCP C adapter. The full Linux check requires the simulator's dev and QUIC
-dependencies; it fails explicitly if these are missing. Ordinary simulator
-users may still run non-QUIC tests without the optional QUIC dependency.
-It does not run
-privileged networking, install drivers, rerun the simulator sweeps or certify
-cross-platform execution. `.github/workflows/checks.yml` additionally defines
-Windows host checks and an Android compile-only job.
+This runs mode-catalog/parity validation, checklist ID validation
+(`tools/check_checklists.py`), vendored `smoltcp` source verification
+(`tools/check_smoltcp_source.py`), golden-vector `--check` generators,
+formatting, Clippy (`-D warnings`), workspace Rust tests plus the codec's
+no-default-features branch, warning-denied rustdoc, CLI plan/failure checks, the
+Linux external `common_cli_process_probe` against the built `l2tunneld` binary,
+Linux-only unprivileged lab tests and, on Linux, the complete simulator test
+suite including its native KCP C adapter. The full Linux check requires the
+simulator's dev and QUIC dependencies; it fails explicitly if these are missing.
+Ordinary simulator users may still run non-QUIC tests without the optional QUIC
+dependency. It does not run privileged networking, install drivers, rerun the
+simulator sweeps or certify cross-platform execution. `.github/workflows/checks.yml`
+additionally defines Windows host checks and an Android compile-only job.
 
 Use focused behavioral tests for parsing, recovery, cryptographic failures and
 state transitions. Golden codec vectors must include arbitrary nonzero payloads,

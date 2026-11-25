@@ -1,10 +1,14 @@
 # Linux desktop GUI over local API v5
 
-Status: the first slice (status, connect/reconnect, disconnect, cancel and live
-events) is implemented as the Rust binary `l2tunnel-linux-gui` and tested
-against a real in-process local API endpoint and, in a window, against the FAKE
-service. Everything under [Full GUI design](#full-gui-design) is **planned**:
-it is a design awaiting owner review, not implemented behavior. This does not
+Status: implemented for Linux (`l2tunnel-linux-gui`, shared `l2tunnel-desktop-ui`)
+and cross-compiled for Windows (`l2tunnel-windows-gui`), covering the sidebar frame,
+Overview, Connection (protocol catalog hot switching, live FEC/MTU tuning, live
+speed-budget tuning, and in-process tunnel speed/ping tests), Devices, Routes,
+Statistics (rolling charts, lane/channel/flow/device tables, and local/remote CSR
+meters), Management (carrier-aware profile editor, keys, service info/stop, server
+sessions), Events, and elevated service installation/restart. SOCKS5 (`DGUI-08`),
+live carrier switching (protocol work), native Windows execution (`WLS-07`), and
+full real-TUN qualification (`DGUI-03`) remain open. This does not by itself
 complete CL-18..CL-23 or CL-33 in [client design](../client-design.md).
 
 ## Recorded decisions (owner, 2026-11-23)
@@ -74,14 +78,17 @@ complete CL-18..CL-23 or CL-33 in [client design](../client-design.md).
 - "Just start an installer": the prompt runs a short installer/starter, never
   the network-facing service. On Linux, `pkexec PROGRAM system-service
   install|start --uid UID` copies PROGRAM to the root-owned
-  `/usr/local/libexec/l2tunnel/l2tunnel-linux` and writes
-  `/etc/systemd/system/l2tunnel-UID.service`; systemd runs the daemon as UID
-  with only CAP_NET_ADMIN (ambient and bounding set), `NoNewPrivileges`,
-  `ProtectSystem=strict`, `ProtectHome=read-only`, serving
+  `/usr/local/libexec/l2tunnel/l2tunnel-linux`, writes
+  `/etc/systemd/system/l2tunnel-UID.service`, and runs `systemctl restart` on
+  install/upgrade so an already-running service adopts the new binary; systemd
+  runs the daemon as UID with only CAP_NET_ADMIN (ambient and bounding set),
+  `NoNewPrivileges`, `ProtectSystem=strict`, `ProtectHome=read-only`, serving
   `/run/l2tunnel-UID/api.sock` (private runtime directory, so the same-UID
-  socket rule is unchanged) with state in `/var/lib/l2tunnel-UID`. It starts
-  on request only (no `[Install]` section) and `service stop` leaves it
-  stopped. On Windows the UAC prompt runs `l2tunnel-windows.exe service
+  socket rule is unchanged) with state in `/var/lib/l2tunnel-UID`. On startup
+  the GUI compares its binary version against `service_info` and shows an
+  `"Install & restart service…"` banner if the installed service is outdated.
+  It starts on request only (no `[Install]` section) and `service stop` leaves
+  it stopped. On Windows the UAC prompt runs `l2tunnel-windows.exe service
   start`, or `service install-start` to register it first (the existing
   LocalSystem, manual-start service). One prompt per start on both
   platforms. Implementation: `local::elevate` (shared), `system-service`
@@ -120,14 +127,14 @@ Windows GUI subsystem (no console window). Status: cross-compiled only. It has
 not run on Windows (WLS-07), and the worker test that binds a Unix socket is
 Unix-only.
 
-## Full GUI design
+## GUI design and current layout
 
 ### Shared frame
 
 ```
 ┌──────────────────────────────────────────────────────────────────────────┐
-│ ● connected  client · profile office  UDP / quic-like (req. QUIC-like)   │
-│ socket /run/l2tunnel/api.sock [Attach]   [Reconnect] [Disconnect] [Cancel]│
+│ ● Connected · demo-client · client · UDP / quic-like · swift · ARQ       │
+│ Service: /run/l2tunnel-1000/api.sock  [Change service…]                  │
 ├─────────────┬────────────────────────────────────────────────────────────┤
 │ Overview    │                                                            │
 │ Connection  │                  selected page                             │
@@ -138,13 +145,13 @@ Unix-only.
 │ Management  │                                                            │
 │ Events      │                                                            │
 ├─────────────┴────────────────────────────────────────────────────────────┤
-│ operation 7 (switch): committed (epoch 4)        Closing ≠ disconnecting  │
+│ operation 7 (common_switch): completed, committed (epoch 7)              │
 └──────────────────────────────────────────────────────────────────────────┘
 ```
 
-- The top bar shows role, phase, active profile, and the **requested versus
-  effective** carrier, UDP cover and traffic policy whenever they differ
-  (AGENTS.md: requested and effective stay observable).
+- The top bar shows phase, active profile, role, the **requested versus
+  effective** carrier/UDP cover, and the active protocol badge, with the
+  service socket selector behind `"Change service…"`.
 - The service reports its role and capabilities. Pages the service cannot
   serve are shown disabled with the service's reason (for example "SOCKS5
   needs the tcp-proxy profile", "server role only"), never hidden silently.
@@ -156,35 +163,37 @@ Unix-only.
 
 ### Overview
 
-```
- State      connected        Generation 3   Epoch 4
- Peer       203.0.113.7:24440                Algorithm  x25519
- Carrier    UDP / quic-like                  Uptime     01:12:40
- ↑ 12.4 Mb/s   ↓ 48.1 Mb/s   RTT 31 ms   loss 0.2 %
- ┌ throughput, last 60 s ──────────────────────────────────────┐
- │ ▁▂▃▅▇▆▅▄▅▆▇▇▆▅▄▃▄▅▆▇                                         │
- └─────────────────────────────────────────────────────────────┘
- Recent events (last 10)                         [Open Events]
-```
+Shows connection state, generation, epoch, peer, carrier, uptime, quick
+connect/disconnect/profile selector, recent throughput, and recent events.
 
-### Connection (protocol and carrier switching)
+### Connection (protocol, live tuning, speed budget, and tunnel tests)
 
-```
- Profile   [office ▾]                         [Connect with profile]
- Carrier   requested QUIC-like   effective UDP/quic-like
- Allowed configurations (service catalog, page 1/16)
-   ● #12 UDP · quic-like · swift-arq        current
-   ○ #13 UDP · media-like · swift-arq       hot switch
-   ○ #20 TLS-like · rolling                 hot switch
-   ○ other profile / outside catalog        needs reconnect (drops flows)
- [Switch]   progress: prepared → both peers ready → drain → committed
-```
+Three-card layout:
+
+1. **Status summary card**: phase, profile, uptime, epoch, peer address,
+   effective carrier, active protocol descriptor, and current upload/download
+   plan speed budget.
+2. **Protocol & Live tuning card**:
+   - **Live tuning**: FEC toggle, repair-rate picker, and inner device MTU /
+     outer path MTU pickers resolved by `tuning_get` / `tuning_switch` across
+     Swift, Aligned, and Packed catalog entries.
+   - **Speed budget**: Upload and Download Mbit/s inputs (`1..=10000 Mbit/s`)
+     plus quick presets (symmetric 50 / 100 / 250 / 500 Mb/s / 1 Gb/s and
+     asymmetric presets), applied live on both peers via `rate_budget_set`.
+   - **Protocol catalog**: human-readable entries from the negotiated session
+     catalog (up to 64 members) with hot switch (`switch_common_configuration`)
+     and collapsible session details.
+3. **Test the tunnel card**: in-process TCP speed test (Upload/Download,
+   streams, duration) and ICMP ping test (probes, interval) with live metric
+   tiles (Average, Last 1 s, Peak, Transferred), progress bar, and throughput
+   chart ([tunnel tests](tunnel-tests.md)).
 
 - Switching within the negotiated catalog is a hot switch
   (`switch_common_configuration`): negotiated epoch, matching digests, drain
   barrier, and the explicit point after which cancelling is unsafe (CL-20).
-- Anything else is a reconnect. The page states its consequence (session
-  replaced, inner flows dropped) and asks for confirmation before submitting.
+- Switching to another profile outside the catalog is a reconnect with stated
+  consequences (session replaced, inner flows dropped). Live carrier switching
+  remains planned protocol work.
 
 ### Devices
 
@@ -246,45 +255,35 @@ Unix-only.
 
 ### Statistics
 
-```
- Window [60 s ▾]  (GUI history; 1 s samples)
- Carrier lanes   id  carrier   ↑ Mb/s  ↓ Mb/s  RTT   loss  retransmits
- MUX channels    id  class     queued  admitted  dropped  budget
- Inner flows     id  5-tuple   ↑      ↓        state
- [chart: rate per lane]  [chart: queue depth per channel]
-```
-
-- The three counts (carrier lane, MUX channel, inner flow) stay in separate
-  tables, fields and charts (AGENTS.md). Rates are derived from cumulative
-  counters and the service's monotonic timestamp; a counter reset (new
-  service instance or session generation) starts a new series instead of
-  producing a negative rate.
+- Window selector (`60 s` / `10 min`, 1 s samples) with four rolling charts:
+  sent on the network, packets received from the network, packets into the
+  tunnel, and packets out of the tunnel.
+- Separate tables for **Carrier lanes**, **MUX channels**, **Inner flows**, and
+  **Device** counters (keeping the three domains separate per `AGENTS.md`).
+  Rates are derived from cumulative counters and the service's monotonic
+  timestamp; a counter reset (new service instance or session generation)
+  starts a new series instead of producing a negative rate.
+- Collapsible **CSR meters (flow control, runtime, MUX)** panel with
+  Local / Remote peer toggle, prefix filter, manual `Read`, optional
+  `Auto (2 s)` refresh, and rate deltas ([meter CSR](meter-csr.md)).
 
 ### Management
 
-Four sections; the server role adds Peers and sessions.
+Four sections (the server role adds **Peers and sessions**):
 
-```
- Profiles   name     carrier     device  routes  SOCKS5  valid
-            office   QUIC-like   l2t0    2       on      ✓
-            [New] [Edit] [Duplicate] [Import…] [Export…] [Validate] [Delete]
- Keys       member key  ed25519 …4f2a   [Generate] [Show public] [Rotate]
-            trusted peers: srv-1 …a91c   [Add] [Remove]
- Service    version 0.1.0  role client  API 5  instance 8e1c…  uptime 3 d
-            [Stop service]   (start: "Start service…" on any page while offline)
- Peers and sessions (server role)
-            member  address          epoch  carrier   since   ↑/↓
-            m-0007  198.51.100.4:5121  4    UDP/quic  02:11   1.2/9.8 GB
-            [Kick session]  [Revoke member]
-```
-
-- Profiles live in the service's store. Import/export never copies private
-  key material; exports carry credential references (CL-24). A profile edit
-  never silently rewrites an unknown newer profile version (CL-19).
-- Kicking ends one session; revoking also removes the member's trust so it
-  cannot reconnect. Both are operations with confirmation. The server is
-  point-to-point, so the list holds at most one row (see the sessions
-  decision); it is re-read with every one-second metrics sample once open.
+- **Profiles**: service-owned cards with carrier-aware 5-group editor
+  (Connection, Security & keys, Tunnel device, Protocol, Live tuning; plus
+  "Other options") distinguishing blocking save errors from non-blocking
+  warnings. Import/export never copies private key material; exports carry
+  credential references (CL-24). A profile edit never silently rewrites an
+  unknown newer profile version (CL-19).
+- **Keys**: local generation of member identity, Noise pair, and 32-byte
+  secret files, plus service-side key inspection (`profile_keys`).
+- **Service**: version, role, API level, instance ID, uptime, and confirmed
+  `Stop service` (offline pages offer `Start service…`).
+- **Peers and sessions (server role)**: lists at most the one live
+  point-to-point session (resampled every second while open), with confirmed
+  `Kick session` and `Revoke member` actions.
 
 ### Events
 
@@ -301,11 +300,15 @@ queries; everything that changes state is a keyed operation.
 | Top bar, Overview | `service status`, `service info` | `status`, `service_info` (role, capabilities with reasons) | implemented |
 | Connect / Reconnect / Disconnect / Cancel | `service connect\|reconnect\|disconnect`, `operation cancel` | existing | implemented |
 | Connection: catalog, hot switch | `config catalog`, `config switch` | `catalog`, `switch_common_configuration` | implemented |
+| Connection: live FEC/MTU tuning | `tune show`, `tune set` | `tuning_get`, `tuning_switch` | implemented (Swift, Aligned, Packed) |
+| Connection: live speed budget | — (v5 action; CLI command pending) | `rate_budget_set` | implemented (Common sessions, 1 Mbit/s..=10 Gbit/s) |
+| Connection: tunnel speed & ping tests | `test speed\|ping\|status\|cancel` | `test_start`, `test_get`, `test_cancel` | implemented (Common TUN sessions) |
 | Connect with profile | `service connect\|reconnect --profile NAME` | keyed `profile_connect{name, replace}` | implemented (daemon); TCP-proxy profiles refused until the daemon hosts the proxy frontend |
 | Devices | `device list\|create\|configure\|delete` | `device_list`; keyed `device{change}` (`op`: `create`, `configure`, `delete`) | implemented on Linux (`--state-dir`); privileged run pending |
 | Routes | `route list\|add\|remove`, `route default on\|off` | `route_list`; keyed `route{change}` (`op`: `add`, `remove`, `default`) | implemented on Linux (`--state-dir`); privileged run pending |
 | SOCKS5 | `socks show\|set\|flows` | `socks_get`, `socks_set`, `socks_flows` | planned |
 | Statistics | `stats show`, `stats watch` | `metrics` | implemented (counters the runtime does not report are listed as `unreported`) |
+| CSR meters | `meters read\|catalog\|watch` | `meters_read`, `meters_catalog` | implemented (local + Common remote over `Liveness`; MCSR-04..07 & GUI percentiles open) |
 | Profiles | `profile list\|show\|validate\|export\|import\|delete\|default` | `profile_list`, `profile_get`, `profile_validate`; keyed `profile{change}` | implemented (daemon, Linux); GUI editor edits options as rows |
 | Keys | `key generate` (member), `key generate-noise`, `key generate-secret` (local); `profile keys NAME` | `profile_keys` | implemented; rotation/revocation are file edits plus a profile save (owner decision: files only) |
 | Service | `service info`, `service stop` | `service_info`, keyed `service_stop` | implemented; stop only in the daemon (capability `stop`): disconnect, release session routes, exit |
@@ -324,12 +327,12 @@ owner chose the point-to-point mapping instead.
 - [x] [DGUI-01] Drive status, connect/reconnect, disconnect, cancel and live events over version 5 with bounded replies and restart resynchronization. Evidence: [model](../../crates/l2tunnel-desktop-ui/src/model.rs), [model tests](../../crates/l2tunnel-desktop-ui/src/model_tests.rs), [worker and real-endpoint test](../../crates/l2tunnel-desktop-ui/src/worker.rs).
 - [x] [DGUI-02] Provide a fake version-5 service accepted by the strict Rust client for GUI/CLI development. Evidence: [fake service](../../tools/fake_local_service.py), [CLI tests against it](../../tools/test_fake_local_service.py).
 - [ ] [DGUI-03] Run the GUI against the real loopback daemon pair (`tools/local_real_pair.py`) and record connect, disconnect, reconnect and the real backend rows.
-- [ ] [DGUI-04] Shared frame: sidebar pages, top bar with requested/effective carrier, role and capability discovery, disabled pages with reasons.
-- [ ] [DGUI-05] Connection page: profile selection, catalog hot switch with progress, reconnect with stated consequences.
+- [ ] [DGUI-04] Shared frame: sidebar pages, top bar with requested/effective carrier, role and capability discovery, disabled pages with reasons. Status: implemented on Linux (`l2tunnel-desktop-ui`, `l2tunnel-linux-gui`, startup version-mismatch banner, protocol badge, `"Change service…"`) and cross-compiled on Windows; real-TUN and native Windows qualification remain open.
+- [ ] [DGUI-05] Connection page: profile selection, catalog hot switch with progress, reconnect with stated consequences. Status: implemented on Linux (3-card layout with summary, Protocol & Live tuning + Speed budget + protocol catalog, and Test the tunnel); live carrier switching and native Windows qualification remain open.
 - [ ] [DGUI-06] Devices: service-owned TUN/TAP create/configure/delete, preexisting devices selectable only; GUI and CLI. Status: implemented and contract-tested ([host operations](../../crates/l2tunnel-client-core/src/service/host.rs), [Linux host](../../crates/l2tunnel-client-core/src/service/host_linux.rs), [netlink](../../crates/l2tunnel-platform-linux/src/netconf.rs), [CLI](../../crates/l2tunnel-client-core/src/cli_groups_host.rs), [GUI page](../../crates/l2tunnel-desktop-ui/src/pages.rs), [fake-service CLI test](../../tools/test_fake_local_service.py)). Open: the ignored private-namespace netlink test has not run (needs CAP_NET_ADMIN).
 - [ ] [DGUI-07] Routes: owned route add/remove, default route with peer exception, undo on disconnect/failure; GUI and CLI. Status: implemented and contract-tested with DGUI-06; the same privileged run is open.
 - [ ] [DGUI-08] SOCKS5 entry over the TCP-proxy profile: settings, allowed clients, flow list; GUI and CLI.
-- [ ] [DGUI-09] Statistics: `metrics` snapshot, separate lane/channel/flow tables, bounded client history and charts; GUI and CLI. Planned source: the [meter CSR](meter-csr.md) (MCSR-10..12), with local and remote views.
+- [ ] [DGUI-09] Statistics: `metrics` snapshot, separate lane/channel/flow tables, bounded client history and charts; GUI and CLI. Status: implemented for `metrics` (4 rolling charts, carrier/MUX/flow/device tables) plus collapsible Local/Remote CSR meters view ([meter CSR](meter-csr.md)); per-channel/flow CSR population (MCSR-07) and histogram percentiles (MCSR-12) remain open.
 - [ ] [DGUI-10] Management: service-owned profiles, keys and trusted peers, service info/stop; GUI and CLI. Status: service info and the profile store are implemented ([store](../../crates/l2tunnel-client-core/src/service/profile_store.rs), [keyed operations](../../crates/l2tunnel-client-core/src/service/profiles.rs), [daemon](../../crates/l2tunnel-client-core/src/cli_daemon.rs), [CLI](../../crates/l2tunnel-client-core/src/cli_groups_profile.rs), [GUI](../../crates/l2tunnel-desktop-ui/src/profiles.rs), [real-daemon test](../../tools/test_profile_daemon.py)). Keys: [local generation and service-side inspection](../../crates/l2tunnel-client-core/src/local/keys.rs), GUI section in [profiles](../../crates/l2tunnel-desktop-ui/src/profiles.rs); the real-daemon test checks that the server profile's trusted member and pinned Noise key equal the client's. Service stop: keyed `service_stop` ([owner](../../crates/l2tunnel-client-core/src/service/owner.rs)), confirmed GUI button, CLI waits until the service stops answering; covered by the real-daemon test (exit status 0, empty stderr). Open: TCP-proxy profiles in the daemon.
 - [ ] [DGUI-13] Elevated service start through an installer (owner decisions 2026-11-24); GUI and CLI. Status: implemented and contract-tested ([shared start and unit](../../crates/l2tunnel-client-core/src/local/elevate.rs), [Linux installer](../../crates/l2tunnel-client-core/src/cli_system_service.rs), [CLI](../../crates/l2tunnel-client-core/src/cli_groups_start.rs), [GUI panel](../../crates/l2tunnel-desktop-ui/src/start.rs), [Windows service start](../../apps/l2tunnel-windows/src/service.rs), [fake-pkexec test](../../tools/test_service_start.py)). Open: a real pkexec install and start on Linux (root), and UAC on native Windows.
 - [ ] [DGUI-11] Server role: session list, kick and member revoke; GUI and CLI. Status: implemented and contract-tested ([service](../../crates/l2tunnel-client-core/src/service/sessions_local.rs), [admission test](../../crates/l2tunnel-client-core/src/service/tests/atomic_local.rs), [shared revoke](../../crates/l2tunnel-client-core/src/local/client.rs), [CLI](../../crates/l2tunnel-client-core/src/cli_groups_sessions.rs), [GUI](../../crates/l2tunnel-desktop-ui/src/pages.rs), [fake-service CLI test](../../tools/test_fake_local_service.py), [real-daemon server checks](../../tools/test_profile_daemon.py)). Open: kick and revoke over a real authenticated pair (needs the DGUI-03 TUN devices).
@@ -345,9 +348,11 @@ owner chose the point-to-point mapping instead.
   Nothing is authenticated or
   forwarded, and the carrier rows stay empty against it.
 - `tools/local_real_pair.py` prepares and runs the REAL `l2tunneld` server and
-  client on 127.0.0.1 UDP. Each side needs a persistent user-owned TUN device
-  created once with root (`sudo ip tuntap add dev l2tdemo-a mode tun user
-  $USER`, likewise `-b`).
+  client on 127.0.0.1 UDP (auto-selecting the release build when present, with
+  `--symmetric-rate` defaulting to 125,000,000 B/s = 1 Gbit/s, 10 s ping
+  interval, and `--replace` to swap a running server cleanly). Each side needs
+  a persistent user-owned TUN device created once with root (`sudo ip tuntap
+  add dev l2tdemo-a mode tun user $USER`, likewise `-b`).
   On loopback the devices stay down and nothing is forwarded. `prepare
   --forwarding` instead puts the server's carrier on a veth pair to the owned
   namespace `l2tdemo`, which also holds `l2tdemo-b`; the TUN ends get
@@ -414,9 +419,10 @@ profile), the owner chose a live carrier switch as protocol work.
   one in use, and "Switch protocol" submits the keyed hot switch. Catalogs of
   up to 32 members load as one list; the list reloads when the generation or
   catalog root changes.
-- Carrier: shows the carrier in use and a choice of the TLS-like and
-  QUIC-like carriers (owner 2026-11-23). "Switch carrier" stays disabled
-  with its reason until the service supports a live carrier switch.
+- Carrier: the summary card shows the effective carrier in use; live carrier
+  switching remains planned protocol work (the earlier placeholder disabled
+  carrier-switch widget was removed when the Connection page moved to the
+  three-card layout).
 - Limitation: a hot switch can only choose a member of the shared plan's
   catalog. Plans exported for benchmarks have one member. For the local
   demo pair, six UDP rows (swift/aligned/packed, each ARQ and FEC) with an

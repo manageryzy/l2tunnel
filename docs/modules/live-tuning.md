@@ -1,7 +1,13 @@
 # Live protocol tuning
 
-Status: in progress (LT-01..LT-05 done; LT-06, the owner's real run, open). Owner: the GUI/CLI session
-(no protocol session running, owner 2026-11-24).
+Status: implemented and integration-tested in loopback/service suites (LT-01..LT-05
+done; LT-06, the owner's real-TUN run, open). Note: handshake M1/M2 catalog
+proposal generation remains Swift-only, while the local API/GUI tuning controls
+(`tuning_get` / `tuning_switch`) now tune FEC and MTU across Swift, Aligned, and
+Packed catalog entries, and authenticated live speed-budget tuning
+(`ProfileTag::RateBudgetV1 = 6`, local API `rate_budget_set`) scales forward/reverse
+caps (1 Mbit/s..=10 Gbit/s), pacing bursts, credit ceilings, and runtime work
+batches live on both peers without reconnecting.
 
 ## Owner request (2026-11-24)
 
@@ -105,7 +111,8 @@ largest; `CommonTransactionContract::resolve` refuses anything else).
   - Handshake message 2 now carries the server's authenticated verdict
     whenever message 1 carried a proposal (`set_response_payload`,
     `response_payload`, at most 64 bytes): `[0]` accepts, `[code]` refuses
-    with a stable reason code (`live_tuning::Refusal`, codes 1..=11), so a
+    with a stable reason code (`live_tuning::Refusal`, codes 1..=12, where
+    `12 = Memory`), so a
     refused client ends with the server's exact reason instead of a
     timeout. Without a proposal message 2 is the original 48 bytes.
   - The final-confirmation custody (`ConfirmationCache`) keeps the longer

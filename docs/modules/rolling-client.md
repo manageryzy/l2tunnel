@@ -81,15 +81,15 @@ opens another socket just to furnish status.
 
 ## Checklist
 
-- [x] [MOD-ROLLINGCL-01] Implement strict bounded versioned policy and complete pre-auth runtime binding; test unknown/duplicate/nested/missing/limit/geometry cases. Evidence: [strict policy and all-field digest tests](../../crates/l2tunnel-client-core/src/rolling/tests.rs).
-- [x] [MOD-ROLLINGCL-02] Reuse actual UDP/QUIC full/half lifecycle under one original deadline and cancellation ownership; test both layers, mismatch, timeout and listener reuse. Evidence: [actual eight-scenario byte matrix](../../crates/l2tunnel-client-core/src/rolling/tests.rs), [authenticated first-lane/deadline and original socket ownership regressions](../../crates/l2tunnel-client-core/src/rolling/failure_tests.rs).
-- [x] [MOD-ROLLINGCL-03] Wire explicit CLI selection/dispatch and bounded requested/effective local status through the shared API; test unsupported action and unchanged defaults. Evidence: [frontend selection/status tests and actual shared Session dispatch](../../crates/l2tunnel-client-core/src/rolling/cli.rs), [optional legacy-compatible local snapshot](../../crates/l2tunnel-client-core/src/local.rs).
+- [x] [MOD-ROLLINGCL-01] Implement strict bounded versioned policy and complete pre-auth runtime binding; test unknown/duplicate/nested/missing/limit/geometry cases. Evidence: [strict policy and all-field digest tests (retired in Common cutover)](compact-wire-cleanup.md).
+- [x] [MOD-ROLLINGCL-02] Reuse actual UDP/QUIC full/half lifecycle under one original deadline and cancellation ownership; test both layers, mismatch, timeout and listener reuse. Evidence: [actual eight-scenario byte matrix (retired in Common cutover)](compact-wire-cleanup.md), [authenticated first-lane/deadline and original socket ownership regressions (retired in Common cutover)](compact-wire-cleanup.md).
+- [x] [MOD-ROLLINGCL-03] Wire explicit CLI selection/dispatch and bounded requested/effective local status through the shared API; test unsupported action and unchanged defaults. Evidence: [frontend selection/status tests and actual shared Session dispatch (retired in Common cutover)](compact-wire-cleanup.md), [optional legacy-compatible local snapshot](../../crates/l2tunnel-client-core/src/local.rs).
 - [x] [MOD-ROLLINGCL-04] Join and pass root's next stable `tools/check.py` aggregate; scoped checks do not close this gate. Evidence: [immutable source19 aggregate](../../work/implementation-wave19/validation.json), 629 unchanged inputs, 999 Rust and 154 Python cases, formatting, strict Clippy/rustdoc and golden/CLI checks.
 - [x] [MOD-ROLLINGCL-04A] Pass scoped tests, strict lint/docs/formatting and exact-file review receipt. Evidence: [113 library and 19 example tests, strict checks and exact files](../../work/rolling-client19/validation.json).
 - [ ] [MOD-ROLLINGCL-05] Qualify separately selected native owned-lab/capture, large-window service and full Python-family behavior before closing parent gates.
 - [ ] [MOD-ROLLINGCL-06] Require and bind the version2 canonical bandwidth/RTT/byte/record delivery policy through the shared API, CLI and native harness. Reject old/missing/unknown policies and prove each field changes authentication; pass the actual carrier/layer/duplex matrix and root aggregate before accepting the replacement.
 - [x] [MOD-ROLLINGCL-07] Anchor the paired-QUIC deadline fixture to actual first-lane authentication and second-lane Initial, advancing the controlled clock across the original 200 ms deadline. Reject a renewed inner pairing budget and prove socket release. Evidence: [positive and negative fixture receipt](../../work/client-fixture-deadlines26b/validation.json). No production deadline was increased.
-- [x] [MOD-ROLLINGCL-08] Accept an optional `scheduling.source_wire` of `padded` or `exact` in the strict rolling policy. An absent field keeps the padded format and is not re-serialised, so existing policy files keep their authenticated identity; unknown values are rejected. Evidence: [policy test](../../crates/l2tunnel-client-core/src/rolling/tests.rs), [source34 aggregate](../../work/implementation-wave34/validation.json). The native rolling harness does not select the exact format yet.
+- [x] [MOD-ROLLINGCL-08] Accept an optional `scheduling.source_wire` of `padded` or `exact` in the strict rolling policy. An absent field keeps the padded format and is not re-serialised, so existing policy files keep their authenticated identity; unknown values are rejected. Evidence: [policy test (retired in Common cutover)](compact-wire-cleanup.md), [source34 aggregate](../../work/implementation-wave34/validation.json). The native rolling harness does not select the exact format yet.
 
 ## Finite evidence and operating boundary
 
@@ -104,7 +104,7 @@ attempt sockets. Cancelled accepts preserve borrowed listener owners. A wrong
 native device layer fails before forwarding. No test interprets task cancellation
 as clean drain or application consumption.
 
-The [complete strict example policy](../../crates/l2tunnel-client-core/src/rolling/test-policy.json)
+The [complete strict example policy (retired in Common cutover)](compact-wire-cleanup.md)
 uses W8 for finite tests; it is not a deployment recommendation. The current
 runtime validation caps support at 128. The client matrix itself uses clean local
 loopback; loss/feedback-loss/backpressure evidence belongs to the independently

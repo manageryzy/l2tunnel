@@ -78,7 +78,7 @@ fixture constructions.
 ## Sole-owner test composition
 
 Implement a new `transport_generic_fault_tests.rs` child of the existing
-[Generic runtime tests](../../crates/l2tunnel-runtime/src/secure_udp/transport_generic_tests.rs).
+[Generic runtime tests (retired in Common cutover)](compact-wire-cleanup.md).
 It reuses their actual `parts_pair` Noise/member roots, original connected UDP
 sockets, checked `TransactionContract`, production `Driver`, reserved engine
 Bank/leased State, common Records security, control Owner and Unix PacketDevice.

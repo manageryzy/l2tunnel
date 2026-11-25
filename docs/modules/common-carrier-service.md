@@ -24,7 +24,7 @@ aborted with a stack overflow. The
 passed in 60.963 s. The initial failed build and failed service case remain
 preserved; neither is relabeled by these finite passes.
 
-The later [compact carrier migration](compact-wire-cleanup.md#selected-outer-carrier-migration)
+The later [compact carrier migration](compact-wire-cleanup.md)
 adds explicitly selected initial-only framing through the same Profile, strict
 plan CLI and shared service. It preserves full catalog/resource commitments and
 actual outer proof binding; final OpenVPN packets omit the bootstrap DataV1 and

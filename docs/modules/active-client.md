@@ -42,7 +42,7 @@ The native lab adds an explicit TUN/TCP active selection, checks both duplex mod
 and impaired links, and preserves hashes/cleanup. Native fairness/target-growth
 claims require additional multi-flow measurements beyond connectivity checks.
 
-- [x] [MOD-ACLIENT-01] Compose the active canonical authentication profile through shared bounded connection APIs. Evidence: [active client](../../crates/l2tunnel-client-core/src/active.rs), [shared lifecycle](../../crates/l2tunnel-client-core/src/lib.rs).
+- [x] [MOD-ACLIENT-01] Compose the active canonical authentication profile through shared bounded connection APIs. Evidence: [active client (retired in Common cutover)](compact-wire-cleanup.md), [shared lifecycle](../../crates/l2tunnel-client-core/src/lib.rs).
 - [x] [MOD-ACLIENT-02] Add strict active-only traffic/MUX/flow/DSCP CLI policy validation and honest status. Evidence: [shared CLI](../../crates/l2tunnel-client-core/src/cli.rs).
 - [x] [MOD-ACLIENT-03] Test forbidden profiles, duplicate/out-of-range DSCP and canonical policy binding. Evidence: [active policy tests](../../crates/l2tunnel-client-core/src/cli.rs).
 - [x] [MOD-ACLIENT-04] Run native TUN full/paired-half and loss cases through the active runtime with checksummed payloads. Evidence: [uncompressed native receipt](../../work/native-active-plain/receipt.json), [LZ4 native receipt](../../work/native-active-lz4/receipt.json).

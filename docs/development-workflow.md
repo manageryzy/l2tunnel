@@ -1,9 +1,9 @@
 # Parallel module design, implementation and verification
 
-This is the recurring workflow for the Rust implementation. Use all available
-independent worker slots: currently three module workers plus the integrator,
-who also owns an independent module. Concurrency does not relax API, security,
-resource or evidence gates. A blocker in one module does not stop independent work.
+This is the recurring workflow for the Rust implementation. Use available
+independent worker slots with disjoint file ownership and a single integrator.
+Concurrency does not relax API, security, resource or evidence gates. A blocker
+in one module does not stop independent work.
 
 ## Durable inputs and status
 
@@ -60,8 +60,12 @@ API. No task is complete just because its enum/trait or crate compiles.
    does not satisfy a larger end-to-end gate.
 7. **Run the required suite at stage acceptance.** Combine ready module changes
    before the full regression. Do not repeat unrelated simulator, native or
-   tooling suites after each leaf repair. Run `python3 tools/check.py` through
-   `tools/record_check.py --output work/<fresh-wave>`; save output, source
+   tooling suites after each leaf repair. Run `python3 tools/check.py` (mode/
+   parity validation, `check_checklists.py`, `check_smoltcp_source.py`, golden-
+   vector `--check` generators, `cargo fmt`, strict Clippy, workspace +
+   no-default-features tests, warning-denied rustdoc, external
+   `common_cli_process_probe`, Python tooling/GUI/service tests, and the
+   simulator suite) directly or through `tools/record_check.py --output work/<fresh-wave>`; save output, source
    hashes and tested scope. The input map covers Rust/app/tool/config/docs/vendor
    files, CI/Cargo configuration, root manifests and `.editorconfig`, and the
    complete `simulator/src` oracle tree used by golden checks (excluding caches).

@@ -98,6 +98,15 @@ preserved through cleanup.
 These were previously edited into per-campaign copies under `work/`; they are now
 options of the maintained runner:
 
+- `common_benchmark_plan` also supports `--budget-mbps FWD:REV` (for example
+  `200:20`, `500:50`, `1000:100`, scaling pacing, credit ceilings, and Swift/ARQ
+  budgets), `--symmetric-rate BYTES_PER_SEC`, `--lease-seconds SECS`, and
+  `--raw-tls-like` (raw-packet carrier over real TLS handshake).
+- `--sample-seconds S` configures the shared measurement window (default 10 s).
+- `--workload paced|bulk-random|mixed-real` (via `common_native_traffic.py`),
+  `--traffic-seed N`, and `--testcase-id ID` select realistic or deterministic
+  synthetic bulk/mixed traffic workloads in `common_native_matrix.py` and
+  `common_native_cell.py`.
 - `--flow-count 1|4|16` offers 512-byte timestamped records at 90 Mbit/s aggregate,
   divided equally over that many CUBIC connections, and records per-flow record
   latency (p50/p95/p99) and steady retransmissions. Requires `--phase forward`.
@@ -241,7 +250,7 @@ binary/input/helper hashes; the separate build receipt binds the executable to
 its source revision. Credentials remain in an owned private temporary directory
 and are removed after the run.
 
-No result from this Linux lab establishes all47 Python parity gates, Windows or
+No result from this Linux lab establishes all 49 Python parity gates, Windows or
 Android operation, public ISP QoS classification, or production performance. This
 runner's unprivileged parser/socketpair tests are separate from real namespace
 execution, which requires its own preserved receipts.

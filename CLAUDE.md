@@ -103,23 +103,29 @@ into four tiers:
    `wire`, `codec`, `mux`, `recovery`, `fec`, `reliable`, `flow-control`, `qos`,
    `packet`, `pipeline`, `active`, `aligned`, `datagram`, `management`,
    `udp-control`, `vxlan`, `raw-tcp`, `tcp-proxy`, `session`, `transport`,
-   `device`, `swift` (all prefixed `l2tunnel-`). The `l2tunnel` crate is a facade that
-   re-exports them; `crates/l2tunnel/tests/pipeline.rs` holds cross-module
-   tests.
-2. **I/O adapters**: `l2tunnel-auth` (rustls TLS 1.3 plus Ed25519 member
-   authentication), `-udp`, `-quic`, `-https`, `-openvpn`, `-raw-io`,
-   `-platform-linux` (TAP/TUN) and `-platform-vxlan`.
-3. **`l2tunnel-runtime`**: Tokio runtimes that compose tiers 1 and 2, one
-   module per profile (`managed`, `udp`, `quic`, `active`, `aligned`, `packed`,
-   `rolling`, `proxy`, `openvpn`, `raw_packet`, `drained`, `swift`).
-4. **`l2tunnel-client-core`**: the shared client lifecycle, with a matching
-   module per profile, the versioned private local control API (`local`), the
-   shared service (`service`) and the CLI adapter (`cli`).
+   `device`, `swift`, `cover`, `identity`, `security`, `handshake`,
+   `openvpn-wire`, `meters`, `tunnel-test` (all prefixed `l2tunnel-`). The
+   `l2tunnel` crate is a facade that re-exports core protocol pieces;
+   `crates/l2tunnel/tests/pipeline.rs` holds cross-module tests.
+2. **I/O and platform adapters**: `l2tunnel-auth` (rustls TLS 1.3 plus Ed25519
+   member authentication), `-udp`, `-quic`, `-https`, `-openvpn`, `-raw-io`,
+   `-platform-linux` (TAP/TUN + rtnetlink netconf), `-platform-vxlan`, and
+   `-platform-windows` (Wintun + named-pipe ACL/owner FFI).
+3. **`l2tunnel-runtime`**: Tokio runtimes that compose tiers 1 and 2 (`secure_udp`
+   Common driver, `retained_tls`, `proxy`, `buffer_metrics`, `configuration`,
+   `initialization_timing`).
+4. **`l2tunnel-client-core` & `l2tunnel-desktop-ui`**: the shared client/server
+   lifecycle, versioned private local control API (`local`, v1/v4/v5 over Unix
+   sockets and Windows named pipes), shared service (`service`), grouped CLI
+   adapter (`cli`), and the cross-platform `egui`/`eframe` desktop GUI crate.
 
 The app binaries are deliberately thin. `l2tunneld`, `l2tunnel-linux` and
-`l2tunnelctl` all call `l2tunnel_client_core::cli::main_entry`, so behavior
-belongs in `client-core`, never in an app `main.rs`. `l2tunnel-windows` and
-`l2tunnel-android` are scaffolds with no network runtime.
+`l2tunnelctl` delegate to `l2tunnel_client_core` (with `l2tunnel-linux-gui` and
+`l2tunnel-windows-gui` delegating to `l2tunnel-desktop-ui`). `l2tunnel-windows`
+implements the Common UDP Windows service/foreground host and Wintun adapter
+(cross-compiled and Wine-tested; native Windows run still open).
+`l2tunnel-android` builds `l2tunnel-android-service` with an abstract-Unix-socket
+FD broker (no JNI or Kotlin app shell yet).
 
 Three counts are independent and must stay separate in fields and metrics: a
 carrier lane (an authenticated physical connection), a MUX channel (an
@@ -143,9 +149,3 @@ code's shape:
   integrate → receipt → checkpoint-commit cycle.
 
 Update the relevant ledger entries in the same change as the code.
-
-### Known stale statement
-
-`README.md` still says the tree has no Git metadata. A local repository was
-initialized on 2026-11-12 (`docs/checkpoints/2026-11-12.md`); there is still no
-remote and no chosen license.

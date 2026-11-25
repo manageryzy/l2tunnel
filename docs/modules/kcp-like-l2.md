@@ -121,7 +121,9 @@ cargo run --locked -p l2tunnel-client-core --example common_benchmark_plan -- \
   --output-dir NEW_DIRECTORY --kcp-like-l2
 ```
 
-The manifest contains three encodings across four carriers. Each row supplies
+The manifest contains five row variants across four carriers (20 plans total:
+raw, raw `ChannelOrdered`, header-compressed, LZ4, and LZ4 `ChannelOrdered`
+across UDP, raw TCP, real TLS, and real QUIC). Each row supplies
 the exact shared CLI flags, Common configuration and any required carrier policy.
 The real daemon's `inspect-common-transaction-plan` validates these together with
 the normal member/Noise credentials. Connecting or serving still requires the

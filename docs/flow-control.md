@@ -1,12 +1,18 @@
 # TUN active flow control and cross-flow QoS
 
-Status: parent requirements with partial implemented and independently tested
-modules. Bounded credit/QoS, measured relay targets and a runnable fixed-buffer
-Linux TCP proxy exist; actual adaptive native receive-window control, sustained
-performance and the complete FC gates remain open. See the
-[implementation evidence](implementation-status.md) and
-[native window qualification](modules/native-window-qualification.md).
-Python throughput results do not validate these mechanisms.
+Status: parent requirements with implemented session-level receiver credit and
+independently tested credit/QoS/proxy modules. **Session receiver credit**
+(`L2CR` on Control records: processed-window + drain-rate pacing, quiescent
+idle-heartbeat backoff up to 10 s, UDP `SO_RCVBUF`/`SO_SNDBUF` sizing, and
+high-BDP 200–1000 Mbit/s pacing burst/ceiling scaling) and authenticated live
+speed-budget tuning (`ProfileTag::RateBudgetV1`, `1 Mbit/s..=10 Gbit/s`) are
+live across Common profiles (see [receiver-credit.md](modules/receiver-credit.md)).
+Pure credit/QoS/delivery-window/active modules and a runnable fixed-buffer
+Linux TCP proxy also exist; per-flow transparent TUN active credit, adaptive
+native TCP receive-window control, sustained performance, and the full FC gates
+remain open. See [implementation status](implementation-status.md) and
+[native window qualification](modules/native-window-qualification.md). Python
+throughput results do not validate these mechanisms.
 
 ## Profiles and ownership
 

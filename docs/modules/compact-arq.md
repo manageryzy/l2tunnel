@@ -1,7 +1,7 @@
 # Selected CompactARQ protocol implementation
 
 Selected compact v3 now uses this module through the existing runtime owners.
-See [runtime algorithm migration](compact-wire-cleanup.md#runtime-algorithm-migration)
+See [runtime algorithm migration](compact-wire-cleanup.md)
 for the selected wire representation, exact-cost boundaries and validation scope.
 Legacy constructors and historical receipts below retain their original meaning.
 
@@ -33,9 +33,9 @@ The initial checkpoint's Recovery (57 cases), Reliable (40 cases) and final-reco
 new path, including bidirectional UDP loss/retry and strongly authenticated
 retiring feedback. That checkpoint preceded Common Compact/Aligned runtime
 integration; its first selected runtime route was Swift-only. The subsequent
-[runtime algorithm migration](compact-wire-cleanup.md#runtime-algorithm-migration)
+[runtime algorithm migration](compact-wire-cleanup.md)
 adds finite original-UDP and shared-service evidence. See the
-[complete checkpoint and remaining scope](compact-wire-cleanup.md#selected-compact-implementation-checkpoint).
+[complete checkpoint and remaining scope](compact-wire-cleanup.md#evidence-and-remaining-work).
 The L2ARv2 wire description below remains the explicit compatibility format.
 
 ## Exact selected API

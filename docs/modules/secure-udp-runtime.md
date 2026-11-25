@@ -63,7 +63,7 @@ raw reports, distinguish sampled intervals from the common20s goodput window and
 avoid claiming a bottleneck from counters alone. Native retests and matched
 simulator sensitivity runs retain their own exact inputs and failed outcomes.
 
-- [x] [SUR-10] Implement and validate observational scheduling, batch, class-cost, wire-credit and native-pressure counters with nonmutating bounded per-channel snapshots. Reconcile actual protected socket attempts and exact credit waits against production driver fixtures; preserve original protocol, deadline and scheduling behavior. Evidence: [performance state](../../crates/l2tunnel-runtime/src/secure_udp/transport_performance.rs), [actual production-driver metrics fixtures](../../crates/l2tunnel-runtime/src/secure_udp/transport_metrics_tests.rs), and the [source-stable focused check](../../work/secure-udp-performance-focused-20261113/attempt-4/validation.json). Counter hooks remain observational; the burst and output-order changes have their own explicit tests and native outcomes below. Saturation, fractional refill, nonmutating open waits, idle/not-yet-due feedback exclusion, class charges, actual WouldBlock and irreversible terminal I/O accounting passed.
+- [x] [SUR-10] Implement and validate observational scheduling, batch, class-cost, wire-credit and native-pressure counters with nonmutating bounded per-channel snapshots. Reconcile actual protected socket attempts and exact credit waits against production driver fixtures; preserve original protocol, deadline and scheduling behavior. Evidence: [performance state](../../crates/l2tunnel-runtime/src/secure_udp/transport_performance.rs), [actual production-driver metrics fixtures (retired in Common cutover)](compact-wire-cleanup.md), and the [source-stable focused check](../../work/secure-udp-performance-focused-20261113/attempt-4/validation.json). Counter hooks remain observational; the burst and output-order changes have their own explicit tests and native outcomes below. Saturation, fractional refill, nonmutating open waits, idle/not-yet-due feedback exclusion, class charges, actual WouldBlock and irreversible terminal I/O accounting passed.
 
 The [first immutable instrumented impaired run](../../work/secure-udp-native-20261113/quic-impaired-perf-attempt-1/receipt.json) retains40.0928032Mbit/s and passes
 exact bytes/EOF, policy changes, manual reconnect, captures and owned cleanup;
@@ -113,11 +113,11 @@ real device pressure, partial/batch limits and exact/original expiry before
 claiming the correction or a native performance result.
 
 The [same focused check](../../work/secure-udp-performance-focused-20261113/attempt-4/validation.json)
-passed all five new [output-drain regressions](../../crates/l2tunnel-runtime/src/secure_udp/transport_drain_tests.rs)
+passed all five new [output-drain regressions (retired in Common cutover)](compact-wire-cleanup.md)
 for both appearances: a writable full FIFO with queued original-socket UDP,
 actual paired-runtime FIFO1 bursts, Pending/WouldBlock with opposite input and
 authenticated control, shared attempt quotas/FIFO remainder, and original expiry
-with irreversible completion accounting. Five separate [control-loss fixtures](../../crates/l2tunnel-runtime/src/secure_udp/transport_loss_tests.rs)
+with irreversible completion accounting. Five separate [control-loss fixtures (retired in Common cutover)](compact-wire-cleanup.md)
 discard actual protected socket emissions. Initial Ping/Pong loss, lost receipts,
 out-of-order custody and shared-credit pressure recover within the existing
 bounds; five lost copies still reach the original five-second challenge expiry.

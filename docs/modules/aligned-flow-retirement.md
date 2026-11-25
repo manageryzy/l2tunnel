@@ -48,8 +48,8 @@ requirements. No P-* or broader native gate follows from this repair.
 ## Checklist
 
 - [x] [MOD-ALIGNEDFLOW-01] Reproduce default 1024→1025 terminal ingress after empty queues and elapsed idle time before production edits; preserve the failed observation. Evidence: [before failure](../../work/aligned-flow-retirement20/before.log).
-- [x] [MOD-ALIGNEDFLOW-02] Implement bounded idle scan and registration-dependency-safe retirement, selected-key exclusion and nonterminal exact capacity retention at ingress/inbound learn. Evidence: [actor and ownership handling](../../crates/l2tunnel-runtime/src/aligned.rs), [bounded pure scan](../../crates/l2tunnel-pipeline/src/lib.rs).
-- [x] [MOD-ALIGNEDFLOW-03] Regress selected/endpoint/recovery/native WouldBlock ownership, late same-key/channel reuse and actual aligned/packed flow churn beyond configured capacity. Evidence: [ownership and churn regressions](../../crates/l2tunnel-runtime/src/aligned_flow_tests.rs), [packed cases](../../crates/l2tunnel-runtime/src/packed_tests.rs).
+- [x] [MOD-ALIGNEDFLOW-02] Implement bounded idle scan and registration-dependency-safe retirement, selected-key exclusion and nonterminal exact capacity retention at ingress/inbound learn. Evidence: [actor and ownership handling (retired in Common cutover)](compact-wire-cleanup.md), [bounded pure scan](../../crates/l2tunnel-pipeline/src/lib.rs).
+- [x] [MOD-ALIGNEDFLOW-03] Regress selected/endpoint/recovery/native WouldBlock ownership, late same-key/channel reuse and actual aligned/packed flow churn beyond configured capacity. Evidence: [ownership and churn regressions (retired in Common cutover)](compact-wire-cleanup.md), [packed cases (retired in Common cutover)](compact-wire-cleanup.md).
 - [x] [MOD-ALIGNEDFLOW-04] Pass scoped Rust tests, strict lint/docs/fmt and freeze exact source/command receipt. Evidence: [frozen scoped receipt](../../work/aligned-flow-retirement20/validation.json).
 - [ ] [MOD-ALIGNEDFLOW-05] Pass the required combined `python3 tools/check.py` snapshot validation after root integration.
 
