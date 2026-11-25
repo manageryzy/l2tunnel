@@ -756,6 +756,26 @@ fn write_status(
         "terminal      {}",
         dash(status.terminal.as_ref().map(terminal_text))
     )?;
+    if let Some(reason) = &status.terminal_reason {
+        writeln!(out, "reason        {reason}")?;
+    }
+    if let Some(recovery) = &status.recovery {
+        let state = if recovery.active {
+            let wait = recovery
+                .next_retry_ms
+                .map_or_else(|| "now".to_owned(), |ms| format!("{ms} ms"));
+            format!(
+                "retrying {}/{} in {wait} ({}; {} recovered)",
+                recovery.attempt, recovery.max_attempts, recovery.reason, recovery.total_recoveries
+            )
+        } else {
+            format!(
+                "idle ({}; {} recovered)",
+                recovery.reason, recovery.total_recoveries
+            )
+        };
+        writeln!(out, "recovery      {state}")?;
+    }
     writeln!(out, "next key      {}", dash(status.next_request_key))?;
     writeln!(out, "event cursor  {}", status.event_cursor)?;
     writeln!(out, "listening     {}", dash(status.listening.as_ref()))?;

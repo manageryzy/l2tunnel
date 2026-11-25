@@ -29,6 +29,29 @@ pub struct Headline {
     pub detail: Option<String>,
 }
 
+/// Why a session ended, in words, preferring the distinct `terminal_reason`
+/// when reported by the service.
+pub fn ended_reason_text(reason: Option<&str>, terminal: Option<&TerminalState>) -> String {
+    if let Some(reason) = reason {
+        return match reason {
+            "lease_expired" => "the session lease expired".into(),
+            "counter_exhausted" => "the session packet-counter limit was reached".into(),
+            "peer_timeout" => "the peer stopped answering liveness checks".into(),
+            "native_stall" => "the local tunnel device stalled writing packets".into(),
+            "policy_timeout" => "a live protocol switch timed out waiting for the peer".into(),
+            "recovery_exhausted" => "automatic recovery retries were exhausted".into(),
+            "cancelled" => "it was disconnected".into(),
+            "closed" | "proxy_retired" => "the session closed normally".into(),
+            "protocol" => "the profile or the peer sent something invalid".into(),
+            other => format!("an error occurred ({})", other.replace('_', " ")),
+        };
+    }
+    match terminal {
+        Some(terminal) => ended_text(terminal),
+        None => "an unexpected error occurred".into(),
+    }
+}
+
 /// Why a session ended, in words.
 pub fn ended_text(terminal: &TerminalState) -> String {
     match terminal {
@@ -74,6 +97,23 @@ pub fn headline(model: &Model) -> Headline {
         .setup_stage()
         .map(|stage| format!(" ({})", stage.replace('_', " ")))
         .unwrap_or_default();
+    if let Some(recovery) = status.recovery.as_ref().filter(|r| r.active) {
+        let wait = recovery
+            .next_retry_ms
+            .map(|ms| format!(" in {:.1} s", ms as f64 / 1000.0))
+            .unwrap_or_default();
+        return Headline {
+            text: format!(
+                "Reconnecting (attempt {}/{})…",
+                recovery.attempt, recovery.max_attempts
+            ),
+            tone: Tone::Busy,
+            detail: Some(format!(
+                "Automatic fresh-authentication recovery{wait} after {}.",
+                ended_reason_text(Some(recovery.reason.as_str()), status.terminal.as_ref())
+            )),
+        };
+    }
     match status.phase.as_str() {
         "connected" => Headline {
             text: "Connected".into(),
@@ -106,13 +146,19 @@ pub fn headline(model: &Model) -> Headline {
         "failed" => Headline {
             text: "Connection failed".into(),
             tone: Tone::Bad,
-            detail: Some(match &status.terminal {
-                Some(terminal) => format!(
-                    "The session ended because {}. Reconnect to try again.",
-                    ended_text(terminal)
-                ),
-                None => "Reconnect to try again.".into(),
-            }),
+            detail: Some(
+                if status.terminal_reason.is_some() || status.terminal.is_some() {
+                    format!(
+                        "The session ended because {}. Reconnect to try again.",
+                        ended_reason_text(
+                            status.terminal_reason.as_deref(),
+                            status.terminal.as_ref()
+                        )
+                    )
+                } else {
+                    "Reconnect to try again.".into()
+                },
+            ),
         },
         "closed" => Headline {
             text: "Service closing".into(),
@@ -217,6 +263,18 @@ mod tests {
                 error_kind: "weird_thing".into()
             }),
             "an error occurred (weird thing)"
+        );
+        assert_eq!(
+            ended_reason_text(Some("lease_expired"), None),
+            "the session lease expired"
+        );
+        assert_eq!(
+            ended_reason_text(Some("peer_timeout"), None),
+            "the peer stopped answering liveness checks"
+        );
+        assert_eq!(
+            ended_reason_text(Some("recovery_exhausted"), None),
+            "automatic recovery retries were exhausted"
         );
         assert_eq!(carrier_words("UDP", "quic-like"), "UDP, looks like QUIC");
         assert_eq!(carrier_words("TCP", "—"), "TCP");

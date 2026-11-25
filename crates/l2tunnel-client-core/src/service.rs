@@ -36,6 +36,8 @@ mod owner;
 pub mod profile_store;
 pub mod profiles;
 mod proxy_backend;
+mod recovery;
+pub use recovery::{AutoRecoveryPolicy, MAX_RECOVERY_ATTEMPTS};
 mod sessions_local;
 mod socks_local;
 mod tuning_local;
@@ -479,6 +481,10 @@ struct State {
     connected_at: Option<Instant>,
     /// Stored profile the retained plan was prepared from.
     profile: Option<String>,
+    /// Distinct bounded stop reason for the most recent terminal session.
+    terminal_reason: Option<String>,
+    /// Bounded automatic outage / lease-expiry recovery scheduler (`CL-38`).
+    recovery: recovery::RecoveryTracker,
 }
 impl State {
     /// Arbitrate an idle runtime exit against disconnect admission under the same lock.
@@ -566,6 +572,12 @@ impl Handle {
     /// Latest recorded event sequence.
     pub fn event_cursor(&self) -> u64 {
         self.0.lock().events.last()
+    }
+    /// Configure bounded automatic outage and lease-expiry recovery (`CL-38`).
+    pub fn set_auto_recovery(&self, policy: AutoRecoveryPolicy) {
+        self.0.lock().recovery.set_policy(policy);
+        self.0.wake.notify_one();
+        self.0.changed();
     }
     /// Wait until an event after `after` is recorded. A closed service with no
     /// newer event returns Closed. Dropping this future has no effect.
@@ -1423,6 +1435,8 @@ fn create_channel(plan: Option<Prepared>) -> (Handle, Run) {
             events: events::EventLog::new(),
             connected_at: None,
             profile: None,
+            terminal_reason: None,
+            recovery: recovery::RecoveryTracker::default(),
         }),
         wake: Notify::new(),
         changed,

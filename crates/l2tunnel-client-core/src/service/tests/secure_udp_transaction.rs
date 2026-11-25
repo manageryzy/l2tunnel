@@ -36,6 +36,8 @@ struct TransactionFixtureOptions {
     // Live tuning: both Swift directions on one repair rate, and a client
     // that proposes a switchable choice (docs/modules/live-tuning.md).
     live: Option<Live>,
+    lease_override: Option<Duration>,
+    pong_timeout_override: Option<Duration>,
 }
 /// One switchable choice the tuned client proposes.
 #[derive(Clone, Copy)]
@@ -68,6 +70,8 @@ impl TransactionFixtureOptions {
             retained_bytes: 16 * 1024 * 1024,
             report_interval: None,
             live: None,
+            lease_override: None,
+            pong_timeout_override: None,
         }
     }
 }
@@ -141,6 +145,14 @@ fn transaction_plans_with(
     let mut responder = streamed(legacy.runtime(Role::Responder));
     initiator.report_interval = options.report_interval;
     responder.report_interval = options.report_interval;
+    if let Some(lease) = options.lease_override {
+        initiator.lifetime.lease = lease;
+        responder.lifetime.lease = lease;
+    }
+    if let Some(pong_timeout) = options.pong_timeout_override {
+        initiator.lifetime.pong_timeout = pong_timeout;
+        responder.lifetime.pong_timeout = pong_timeout;
+    }
     let mut forward = initiator.send;
     let mut reverse = initiator.receive;
     // Finite integration geometry, separate from the CLI's production capacity.
@@ -1591,6 +1603,142 @@ async fn csr_meters_populate_recovery_carrier_mux_channels_flows_and_rtt() -> Re
     client_task.abort();
     server_task.abort();
     let _ = tokio::join!(client_task, server_task);
+    Ok(())
+}
+
+#[tokio::test]
+async fn lease_expiry_and_peer_outage_trigger_bounded_fresh_auth_recovery() -> Result {
+    use crate::local::{OperationAction, OperationRequest};
+    use crate::service::AutoRecoveryPolicy;
+
+    let hosts = support::hosts();
+    let mut options = TransactionFixtureOptions::baseline();
+    options.lease_override = Some(Duration::from_millis(1_700));
+    options.pong_timeout_override = Some(Duration::from_millis(350));
+    options.setup_timeout = Duration::from_millis(900);
+    let TransactionPlans { plans, .. } =
+        transaction_plans_with(l2tunnel_cover::Appearance::QuicLike, &hosts, options)?;
+    let [client_plan, server_plan] = plans;
+    let (client, client_run) = channel();
+    let (server, server_run) = channel();
+    let policy = AutoRecoveryPolicy {
+        enabled: true,
+        max_attempts: 4,
+        initial_backoff: Duration::from_millis(80),
+        max_backoff: Duration::from_millis(250),
+    };
+    client.set_auto_recovery(policy);
+    server.set_auto_recovery(policy);
+    let client_task = tokio::spawn(client_run);
+    let server_task = tokio::spawn(server_run);
+
+    let client_connect = client
+        .connect(client_plan, client.next_key().map_err(submit)?)
+        .map_err(submit)?;
+    let server_connect = server
+        .connect(server_plan, server.next_key().map_err(submit)?)
+        .map_err(submit)?;
+    let (gen1, _) = tokio::try_join!(
+        connected(&client, client_connect),
+        connected(&server, server_connect)
+    )?;
+
+    // 1. Wait past the 1.7 s lease so both ends hit LeaseExpired and automatically
+    //    establish a fresh Noise+Ed25519 generation without user intervention.
+    let phase1 = timeout(Duration::from_secs(6), async {
+        loop {
+            let reply = client
+                .operations_request(OperationRequest::new(OperationAction::Status {}))
+                .await;
+            if let Some(st) = reply.status
+                && st.phase == "connected"
+                && st.generation.is_some_and(|g| g != gen1.value())
+                && st
+                    .recovery
+                    .as_ref()
+                    .is_some_and(|r| !r.active && r.total_recoveries >= 1)
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(40)).await;
+        }
+    })
+    .await;
+    if phase1.is_err() {
+        let cst = client
+            .operations_request(OperationRequest::new(OperationAction::Status {}))
+            .await;
+        let sst = server
+            .operations_request(OperationRequest::new(OperationAction::Status {}))
+            .await;
+        return Err(
+            format!("phase1 lease recovery timed out:\nclient={cst:?}\nserver={sst:?}").into(),
+        );
+    }
+
+    // Verify bidirectional frames flow over the newly recovered session.
+    let pkt = packet(0x77, 256);
+    hosts[0].send(&pkt)?;
+    timeout(Duration::from_secs(2), async {
+        let mut out = [0_u8; 1601];
+        loop {
+            let read = {
+                let app = hosts[1]
+                    .application
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                app.as_ref().ok_or("device closed")?.recv(&mut out)
+            };
+            match read {
+                Ok(n) => {
+                    assert_eq!(&out[..n], pkt);
+                    return Ok::<(), Error>(());
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+    })
+    .await??;
+
+    // 2. Simulate an unrecoverable peer outage with max_attempts = 1 and verify
+    //    the client stops cleanly with terminal_reason = "recovery_exhausted".
+    client.set_auto_recovery(AutoRecoveryPolicy {
+        enabled: true,
+        max_attempts: 1,
+        initial_backoff: Duration::from_millis(50),
+        max_backoff: Duration::from_millis(100),
+    });
+    server_task.abort();
+    let _ = server_task.await;
+
+    let phase2 = timeout(Duration::from_secs(6), async {
+        loop {
+            let reply = client
+                .operations_request(OperationRequest::new(OperationAction::Status {}))
+                .await;
+            if let Some(st) = reply.status
+                && st.phase == "failed"
+                && st.terminal_reason.as_deref() == Some("recovery_exhausted")
+                && st.recovery.as_ref().is_some_and(|r| !r.active)
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(40)).await;
+        }
+    })
+    .await;
+    if phase2.is_err() {
+        let cst = client
+            .operations_request(OperationRequest::new(OperationAction::Status {}))
+            .await;
+        return Err(format!("phase2 exhaustion timed out:\nclient={cst:?}").into());
+    }
+
+    client_task.abort();
+    let _ = client_task.await;
     Ok(())
 }
 

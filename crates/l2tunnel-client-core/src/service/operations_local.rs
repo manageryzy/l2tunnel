@@ -208,13 +208,16 @@ impl Handle {
         response.state
     }
     fn service_status(&self) -> ServiceStatus {
-        let (snapshot, cursor, profile, connected_at) = {
+        let now = Instant::now();
+        let (snapshot, cursor, profile, connected_at, terminal_reason, recovery) = {
             let state = self.0.lock();
             (
                 Self::snapshot_locked(&state),
                 state.events.last(),
                 state.profile.clone(),
                 state.connected_at,
+                state.terminal_reason.clone(),
+                state.recovery.snapshot(now),
             )
         };
         let connected_ms = connected_at
@@ -233,6 +236,8 @@ impl Handle {
             observation: self.observation(&snapshot),
             profile,
             connected_ms,
+            terminal_reason,
+            recovery,
         }
     }
     fn operation_reply(&self, ok: bool, code: &str, id: OperationId) -> OperationReply {

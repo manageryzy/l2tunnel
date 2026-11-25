@@ -426,6 +426,32 @@ pub struct ServiceStatus {
     /// Milliseconds since the live session connected (connected phase only).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub connected_ms: Option<u64>,
+    /// Distinct bounded termination reason (e.g. `lease_expired`, `peer_timeout`,
+    /// `native_stall`, `policy_timeout`, `recovery_exhausted`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_reason: Option<String>,
+    /// Bounded automatic outage / lease-expiry recovery status (`CL-38`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery: Option<RecoveryStatus>,
+}
+
+/// Bounded automatic outage and lease-expiry recovery state (`CL-38`).
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecoveryStatus {
+    /// True while waiting for or running an automatic fresh-auth reconnect.
+    pub active: bool,
+    /// Current or last retry attempt number (`1..=max_attempts`).
+    pub attempt: u32,
+    /// Configured maximum automatic retry attempts before stopping.
+    pub max_attempts: u32,
+    /// Remaining milliseconds until the next retry attempt, when waiting in backoff.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_retry_ms: Option<u64>,
+    /// Bounded termination reason that triggered recovery.
+    pub reason: String,
+    /// Total successful automatic recoveries in this service lifetime.
+    pub total_recoveries: u64,
 }
 /// Latest setup evidence of a connect/reconnect operation.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

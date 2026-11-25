@@ -13,6 +13,8 @@ fn status(phase: &str, operation: Option<u64>, cursor: u64) -> ServiceStatus {
         observation: None,
         profile: None,
         connected_ms: None,
+        terminal_reason: None,
+        recovery: None,
     }
 }
 fn reply(code: &str, service: u64) -> OperationReply {

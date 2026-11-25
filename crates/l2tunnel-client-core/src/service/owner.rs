@@ -57,9 +57,10 @@ pub(super) fn finish(shared: &Shared, id: OperationId, result: Completed) {
     drop(state);
     shared.changed();
 }
-fn stopped(shared: &Shared, active: &mut Option<Active>, terminal: Terminal) {
+fn stopped(shared: &Shared, active: &mut Option<Active>, terminal: Terminal) -> &'static str {
     let generation = active.as_ref().map(|a| a.generation);
     let observation = active.as_ref().and_then(|a| a.backend.observe());
+    let reason = recovery::classify_stop_reason(observation.as_ref(), terminal);
     let proxy_close_report = observation
         .as_ref()
         .and_then(Observation::proxy)
@@ -97,6 +98,7 @@ fn stopped(shared: &Shared, active: &mut Option<Active>, terminal: Terminal) {
             proxy_close_report,
         });
         state.snapshot.terminal = Some(terminal);
+        state.terminal_reason = Some(reason.to_owned());
     }
     if state.snapshot.operation.is_none() {
         state.snapshot.phase = match terminal {
@@ -106,6 +108,7 @@ fn stopped(shared: &Shared, active: &mut Option<Active>, terminal: Terminal) {
     }
     drop(state);
     shared.changed();
+    reason
 }
 fn failed(error: io::Error) -> Completed {
     #[cfg(test)]
@@ -382,6 +385,7 @@ fn commit_ready(
     state.snapshot.generation = Some(session.generation);
     state.connected_at = Some(Instant::now());
     state.snapshot.terminal = None;
+    state.terminal_reason = None;
     state.snapshot.operation = None;
     state.snapshot.phase = Phase::Connected;
     if let Some(entry) = state
@@ -413,6 +417,7 @@ pub(super) async fn run(shared: Arc<Shared>) -> io::Result<()> {
             }
             match command {
                 Command::Disconnect => {
+                    shared.lock().recovery.cancel();
                     if let Some(session) = active.as_mut()
                         && matches!(session.backend, ObservedBackend::Proxy(_))
                         && let Err(error) = proxy::stop(session, accepted.deadline).await
@@ -421,7 +426,7 @@ pub(super) async fn run(shared: Arc<Shared>) -> io::Result<()> {
                         finish(&shared, accepted.operation, failed(error));
                         continue;
                     }
-                    stopped(&shared, &mut active, Terminal::Aborted);
+                    let _ = stopped(&shared, &mut active, Terminal::Aborted);
                     finish(&shared, accepted.operation, Completed::Aborted);
                 }
                 Command::Common(configuration) => {
@@ -477,6 +482,7 @@ pub(super) async fn run(shared: Arc<Shared>) -> io::Result<()> {
                     finish(&shared, accepted.operation, result);
                 }
                 Command::Connect(plan) | Command::Reconnect(plan) => {
+                    shared.lock().recovery.cancel();
                     // An expired queued reconnect must not abort the still-live
                     // old generation before its original permission is checked.
                     if accepted
@@ -497,7 +503,7 @@ pub(super) async fn run(shared: Arc<Shared>) -> io::Result<()> {
                         continue;
                     }
                     if active.is_some() {
-                        stopped(&shared, &mut active, Terminal::Aborted);
+                        let _ = stopped(&shared, &mut active, Terminal::Aborted);
                     }
                     let mut setup = establish(shared.clone(), plan, accepted);
                     let result = loop {
@@ -589,6 +595,7 @@ pub(super) async fn run(shared: Arc<Shared>) -> io::Result<()> {
                     finish(&shared, accepted.operation, Completed::Host(result));
                 }
                 Command::Stop => {
+                    shared.lock().recovery.cancel();
                     if let Some(session) = active.as_mut()
                         && matches!(session.backend, ObservedBackend::Proxy(_))
                         && let Err(error) = proxy::stop(session, accepted.deadline).await
@@ -597,7 +604,7 @@ pub(super) async fn run(shared: Arc<Shared>) -> io::Result<()> {
                         finish(&shared, accepted.operation, failed(error));
                         continue;
                     }
-                    stopped(&shared, &mut active, Terminal::Aborted);
+                    let _ = stopped(&shared, &mut active, Terminal::Aborted);
                     // The process exits next: release session routes first.
                     if let Some(host) = shared.host.get() {
                         host.release().await;
@@ -659,11 +666,107 @@ pub(super) async fn run(shared: Arc<Shared>) -> io::Result<()> {
                     let terminal = if clean { Terminal::Closed } else {
                         Terminal::Failed(Failure { kind: result.err().map_or(io::ErrorKind::UnexpectedEof, |error| error.kind()) })
                     };
-                    stopped(&shared, &mut active, terminal);
+                    let reason = stopped(&shared, &mut active, terminal);
+                    let scheduled = {
+                        let mut state = shared.lock();
+                        if let Some(role) = state.plan.as_ref().map(Prepared::role) {
+                            state.recovery.schedule_on_stop(reason, role)
+                        } else {
+                            false
+                        }
+                    };
+                    if scheduled {
+                        shared.changed();
+                    }
                 },
             }
         } else {
-            shared.wake.notified().await;
+            let next_retry = shared.lock().recovery.next_retry();
+            if let Some((retry_at, _attempt, reason, role)) = next_retry {
+                tokio::select! {
+                    () = shared.wake.notified() => {
+                        continue;
+                    }
+                    () = tokio::time::sleep_until(retry_at) => {}
+                }
+                let attempt_plan = {
+                    let mut state = shared.lock();
+                    if state.queued.is_some() {
+                        None
+                    } else if let (Some(_), Some(plan)) =
+                        (state.recovery.take_due(), state.plan.clone())
+                    {
+                        let next_gen = state
+                            .snapshot
+                            .generation
+                            .map_or(0, OperationId::value)
+                            .max(1_000_000)
+                            .saturating_add(1);
+                        let accepted = Accepted {
+                            operation: OperationId(next_gen),
+                            deadline: Instant::now().checked_add(plan.setup_timeout()),
+                        };
+                        state.snapshot.phase = Phase::Authenticating;
+                        state.snapshot.operation = None;
+                        Some((plan, accepted))
+                    } else {
+                        None
+                    }
+                };
+                let Some((plan, accepted)) = attempt_plan else {
+                    continue;
+                };
+                shared.changed();
+                let mut setup = establish(shared.clone(), plan, accepted);
+                let result = loop {
+                    if shared.lock().queued.is_some() {
+                        break None;
+                    }
+                    tokio::select! {
+                        result = &mut setup => break Some(result),
+                        () = shared.wake.notified() => {},
+                    }
+                };
+                drop(setup);
+                match result {
+                    None => {
+                        // A user command arrived during automatic recovery; cancel and serve it.
+                        shared.lock().recovery.cancel();
+                        shared.changed();
+                    }
+                    Some(Ok(session)) => {
+                        if matches!(session.backend, ObservedBackend::Proxy(_)) {
+                            // Automatic recovery currently targets non-proxy Common sessions.
+                            drop(session);
+                            let mut state = shared.lock();
+                            let exhausted = state.recovery.record_attempt_failure(reason, role);
+                            if exhausted {
+                                state.terminal_reason = Some("recovery_exhausted".into());
+                            }
+                            state.snapshot.phase = Phase::Failed;
+                            drop(state);
+                            shared.changed();
+                        } else if let Some(ready) = publish_ready(&shared, session, accepted) {
+                            shared.lock().recovery.mark_recovered();
+                            shared.changed();
+                            active = Some(ready);
+                        }
+                    }
+                    Some(Err(_)) => {
+                        let mut state = shared.lock();
+                        state.snapshot.listening = None;
+                        state.snapshot.phase = Phase::Failed;
+                        let exhausted = state.recovery.record_attempt_failure(reason, role);
+                        if exhausted {
+                            state.terminal_reason = Some("recovery_exhausted".into());
+                        }
+                        drop(state);
+                        shared.changed();
+                    }
+                }
+            } else {
+                shared.wake.notified().await;
+            }
         }
     }
 }

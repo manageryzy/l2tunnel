@@ -383,9 +383,14 @@ this change fixed (owner: "go ahead in that order"):
 1. Sessions ended after exactly 120 s with TimedOut. Cause, from the
    protocol-core session: benchmark plans set a 120 s logical-session lease
    that nothing renews. `tools/local_real_pair.py prepare` now writes a
-   one-hour lease (as in `secure-udp-service.md`). Open on the protocol side
-   (owner's call): renewal or reconnect at lease end, and a distinct "lease
-   expired" reason instead of a generic TimedOut.
+   one-hour lease (as in `secure-udp-service.md`), `ServiceStatus` now exposes
+   a distinct `terminal_reason` (`lease_expired`, `counter_exhausted`,
+   `peer_timeout`, `native_stall`, `policy_timeout`, `recovery_exhausted`)
+   rendered in plain language by [present.rs](../../crates/l2tunnel-desktop-ui/src/present.rs),
+   and `l2tunneld daemon` enables bounded automatic fresh-authentication
+   recovery (`AutoRecoveryPolicy::default_enabled`, [recovery.rs](../../crates/l2tunnel-client-core/src/service/recovery.rs))
+   on lease expiry, counter exhaustion, and peer timeout (in-session fresh-DH
+   rekey without re-handshake remains tracked under `SREF-*`).
 2. The window opened "not attached" although the per-user service was
    running. It now attaches to this user's socket by default and offers
    Start service when nothing answers; the socket moved behind

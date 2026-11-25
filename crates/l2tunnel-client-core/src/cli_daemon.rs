@@ -36,6 +36,7 @@ pub(super) async fn run(options: &BTreeMap<String, String>) -> io::Result<()> {
     let state = required(options, "--state-dir")?.to_owned();
     let api = local::Server::bind(socket)?;
     let (handle, owner) = service::channel();
+    handle.set_auto_recovery(service::AutoRecoveryPolicy::default_enabled());
     // Checks the state directory and releases routes a crashed run left.
     service::host::attach_state_dir(&handle, Some(&state)).await?;
     let store = service::profile_store::FileStore::open(
