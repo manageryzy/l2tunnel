@@ -145,6 +145,10 @@ impl Config {
     }
 
     fn validate(self) -> Result<(), Error> {
+        // Control keeps the fixed 48-byte ACK its charges and parser assume.
+        if self.arq.wide_feedback() {
+            return Err(Error::Configuration);
+        }
         for address in [self.path.client, self.path.server] {
             if address.port() == 0
                 || address.ip().is_unspecified()

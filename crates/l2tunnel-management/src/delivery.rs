@@ -134,6 +134,10 @@ fn validate_settings(
     }
     let refill_at = now.checked_add(settings.interval).ok_or(Error::Settings)?;
     settings.recovery.validate()?;
+    // Control delivery keeps the fixed 48-byte ACK its charges assume.
+    if settings.recovery.wide_feedback() {
+        return Err(Error::Settings);
+    }
     let max_packet = (l2tunnel_recovery::DATA_HEADER_BYTES + settings.recovery.max_source_bytes)
         .max(ACK_PACKET_BYTES);
     let max_charge = max_packet

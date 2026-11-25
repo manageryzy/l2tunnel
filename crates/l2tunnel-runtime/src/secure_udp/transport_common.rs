@@ -68,6 +68,9 @@ pub struct CommonSnapshot {
     pub compact_feedback_number: Option<security::PacketNumber>,
     /// Actual sticky per-domain check failures under the original selected cap.
     pub compact_check_status: Option<record::compact::CheckStatus>,
+    /// Device MTU kept in step with live inner-size switches, when the
+    /// service gave a setter.
+    pub device_mtu: Option<super::DeviceMtuSnapshot>,
     /// True only after the sole native runtime publishes readiness.
     pub running: bool,
     /// Injected microseconds since the original driver origin.
@@ -114,8 +117,14 @@ pub struct CommonSnapshot {
     pub striped_sources: Option<l2tunnel::striped_records::SourceStatus>,
     /// Actual current receiver generation's optional bounded TCP native hold.
     pub rolling_native_reorder: Option<l2tunnel::rolling_records::NativeReorderStatus>,
+    /// Actual current research receiver, including hole abandonment;
+    /// absent for every other record family.
+    /// Boxed: snapshots are held inline in large service futures.
+    pub research_receiver: Option<Box<l2tunnel_fec::research::ReceiverStatus>>,
     /// Actual current generation's release order and return guard.
     pub rolling_delivery: Option<l2tunnel::rolling_records::DeliveryStatus>,
+    /// Requested and effective session receiver credit.
+    pub credit: Option<super::CreditSnapshot>,
     /// Actual current Engine fragment selection; absent for other record families.
     pub rolling_fragments: Option<engine::FragmentPolicy>,
     /// Actual independently retained reassembly and completed-body custody.
@@ -162,6 +171,9 @@ pub struct CommonSnapshot {
     pub path_recovery: SameFlowRecovery,
     /// Original bounded terminal category, absent while running.
     pub terminal: Option<StopReason>,
+    /// Live meter CSR sampled with this snapshot; absent when it could not
+    /// be assembled (never a protocol failure).
+    pub meters: Option<std::sync::Arc<l2tunnel_meters::Table>>,
 }
 
 /// Actual native-byte window status, separate from recovery debt and TCP cwnd.
@@ -188,22 +200,45 @@ pub struct CommonStopped {
 
 pub(super) type TransactionReply = oneshot::Sender<Result<core::Epoch, SwitchError>>;
 
-/// Shared producer of complete supported generic configurations.
+/// Shared producer of complete supported generic configurations, and the
+/// service's side of the built-in tunnel tests.
 #[derive(Clone)]
-pub struct CommonControlHandle(pub(super) mpsc::Sender<Command>);
+pub struct CommonControlHandle(
+    pub(super) mpsc::Sender<Command>,
+    pub(super) std::sync::Arc<super::tunnel_tests::Shared>,
+);
 
 /// Unique bounded complete-configuration request receiver.
-pub struct CommonControlRequests(pub(super) mpsc::Receiver<Command>);
+pub struct CommonControlRequests(
+    pub(super) mpsc::Receiver<Command>,
+    pub(super) std::sync::Arc<super::tunnel_tests::Shared>,
+    pub(super) Option<std::sync::Arc<dyn super::DeviceMtu>>,
+);
+impl CommonControlRequests {
+    /// Let the session set its device MTU around live inner-size switches
+    /// (docs/modules/live-tuning.md, decision 9).
+    #[must_use]
+    pub fn with_device_mtu(mut self, setter: std::sync::Arc<dyn super::DeviceMtu>) -> Self {
+        self.2 = Some(setter);
+        self
+    }
+}
 #[allow(clippy::large_enum_variant)] // The single bounded slot already owns the complete inline configuration.
 pub(super) enum Command {
     Switch(C, TransactionReply),
     Reuse(super::common_reuse::Request, super::common_reuse::Reply),
+    /// A tunnel test was queued in the shared state; wake the loop.
+    TestWake,
 }
 
 /// Allocate exactly one queued request; dropping a waiter never cancels custody.
 pub fn common_channel() -> (CommonControlHandle, CommonControlRequests) {
     let (sender, receiver) = mpsc::channel(1);
-    (CommonControlHandle(sender), CommonControlRequests(receiver))
+    let tests = std::sync::Arc::new(super::tunnel_tests::Shared::default());
+    (
+        CommonControlHandle(sender, tests.clone()),
+        CommonControlRequests(receiver, tests, None),
+    )
 }
 
 impl CommonControlHandle {
@@ -217,6 +252,39 @@ impl CommonControlHandle {
                 mpsc::error::TrySendError::Closed(_) => SwitchError::Closed,
             })?;
         receiver.await.unwrap_or(Err(SwitchError::Closed))
+    }
+    /// Start a built-in tunnel test on the running session (TT-02). The
+    /// two ends agree on test addresses first; follow it with
+    /// [`Self::tunnel_test_report`].
+    pub fn tunnel_test_start(
+        &self,
+        request: super::tunnel_tests::TunnelTestRequest,
+    ) -> Result<u64, super::tunnel_tests::TunnelTestRefusal> {
+        let id = self.1.start(request)?;
+        // A full channel already holds a request that wakes the loop.
+        let _ = self.0.try_send(Command::TestWake);
+        Ok(id)
+    }
+    /// The latest tunnel test of this session.
+    pub fn tunnel_test_report(&self) -> Option<super::tunnel_tests::TunnelTestReport> {
+        self.1.report()
+    }
+    /// Cancel tunnel test `id`; false when it is not running.
+    pub fn tunnel_test_cancel(&self, id: u64) -> bool {
+        let cancelled = self.1.cancel(id);
+        if cancelled {
+            let _ = self.0.try_send(Command::TestWake);
+        }
+        cancelled
+    }
+    /// Why this session cannot run tunnel tests, when it cannot.
+    pub fn tunnel_test_unavailable(&self) -> Option<String> {
+        self.1.unavailable()
+    }
+    /// Install the host check that keeps agreed test addresses off
+    /// addresses an interface or route on this host uses.
+    pub fn tunnel_test_address_check(&self, check: super::tunnel_tests::AddressCheck) {
+        self.1.set_check(check);
     }
 }
 
@@ -298,6 +366,8 @@ pub(super) struct Runtime {
     pub(super) sealed: Option<PendingWire>,
     pub(super) unsealed: Option<PendingPlain>,
     pub(super) raw_control: Option<PendingRawControl>,
+    /// Session receiver credit for data datagrams (required for Common).
+    pub(super) credit: Option<super::credit::State>,
     pub(super) raw_control_turn: bool,
     pub(super) raw_final_geometry:
         Option<l2tunnel_raw_io::handoff::pairing::packet::RecordGeometry>,
@@ -662,12 +732,9 @@ impl Driver {
                 .checked_add(1)
                 .ok_or_else(exhausted)?,
         )?;
-        let max_native = contract
-            .initial()
-            .descriptor()
-            .local(role)
-            .receive()
-            .max_native();
+        // Sized for the largest catalog entry: a hot switch may change the
+        // inner packet size (docs/modules/live-tuning.md, decision 8).
+        let max_native = common_contract::largest_native(contract.catalog())?;
         let native_plan = native_storage::Queue::<common_native::CommonNative>::plan(
             config.native.pending_packets,
             config.native.pending_bytes,
@@ -948,6 +1015,11 @@ impl Driver {
                 .report_interval
                 .map(|interval| add(0, interval))
                 .transpose()?;
+            // How far past its highest accepted number the peer's record
+            // receiver can open; credit keeps data within half of it.
+            let credit_range = config.security.packets_per_key.min(u64::from(
+                contract.compact_wire().limits.max_forward_packets,
+            ));
             let common = owner::StateCell::new(Runtime {
                 wire_metrics,
                 buffer_metrics,
@@ -967,6 +1039,15 @@ impl Driver {
                 sealed: None,
                 unsealed: None,
                 raw_control: None,
+                credit: Some(super::credit::State::new(
+                    config
+                        .credit
+                        .ok_or_else(|| invalid("common data requires session receiver credit"))?,
+                    config.path_mtu,
+                    send_rate,
+                    u64::try_from(burst).map_err(invalid)?,
+                    credit_range,
+                )?),
                 raw_control_turn: false,
                 raw_final_geometry: None,
                 wire,
@@ -1038,6 +1119,8 @@ impl Driver {
                     lease,
                     next_report,
                     terminal: None,
+                    tunnel_tests: None,
+                    device_mtu: None,
                 },
             )
         });
@@ -1093,7 +1176,11 @@ impl Driver {
                 });
             }
         }
-        Ok(CommonSnapshot {
+        let mut snapshot = CommonSnapshot {
+            device_mtu: self
+                .device_mtu
+                .as_deref()
+                .map(super::device_mtu::Gate::snapshot),
             native_delivery,
             maintained: runtime.contract.maintained_outer(),
             send_boundary: runtime
@@ -1143,7 +1230,12 @@ impl Driver {
             rolling_repair_budget: state.engine(state.epoch())?.rolling_repair_budget(),
             striped_sources: state.engine(state.epoch())?.striped_sources(),
             rolling_native_reorder: state.engine(state.epoch())?.rolling_native_reorder(),
+            research_receiver: state
+                .engine(state.epoch())?
+                .research_status()
+                .map(|(_, receiver)| Box::new(receiver)),
             rolling_delivery: state.engine(state.epoch())?.rolling_delivery(),
+            credit: runtime.credit.as_ref().map(|credit| credit.snapshot(now)),
             rolling_fragments: state.engine(state.epoch())?.fragment_policy(),
             fragment_ingress: state.engine(state.epoch())?.fragment_ingress_snapshot(),
             fragment_statistics: state.engine(state.epoch())?.fragment_statistics(),
@@ -1181,7 +1273,10 @@ impl Driver {
             liveness: self.live,
             path_recovery: runtime.path,
             terminal: self.terminal,
-        })
+            meters: None,
+        };
+        snapshot.meters = super::meters::publish(&snapshot, runtime.buffer_metrics.as_ref(), now);
+        Ok(snapshot)
     }
 }
 

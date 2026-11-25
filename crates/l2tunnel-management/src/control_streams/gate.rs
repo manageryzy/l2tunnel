@@ -203,7 +203,15 @@ impl Gate {
         let actual = envelope.binding;
         let binding = self.settings.binding;
         match (stream, envelope.body) {
-            (Stream::Liveness, Body::Ping { .. } | Body::Pong { .. }) => {
+            (
+                Stream::Liveness,
+                Body::Ping { .. }
+                | Body::Pong { .. }
+                | Body::ProfileControl {
+                    tag: ProfileTag::TunnelTestV1,
+                    ..
+                },
+            ) => {
                 if actual.scope != self.settings.control {
                     return Err(Error::Scope);
                 }

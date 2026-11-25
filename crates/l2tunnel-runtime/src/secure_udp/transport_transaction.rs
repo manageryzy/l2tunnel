@@ -321,7 +321,13 @@ impl<F: Family> TransactionState<F> {
         owner: &mut control_owner::Owner,
         sample: impl FnMut() -> io::Result<Duration>,
     ) -> io::Result<Progress> {
-        self.dispatch_preparations(owner, true, sample)
+        self.dispatch_preparations(owner, true, |_| true, sample)
+    }
+
+    /// A peer message waits for local admission (it may be held for a
+    /// device MTU change).
+    pub(super) fn awaiting_admission(&self) -> bool {
+        self.pending_admission.is_some()
     }
 
     /// Reuse the exact leased preview and original cap for immutable profiles.
@@ -332,6 +338,7 @@ impl<F: Family> TransactionState<F> {
         &mut self,
         owner: &mut control_owner::Owner,
         allow_preparation: bool,
+        mut admit: impl FnMut(&F::Value) -> bool,
         mut sample: impl FnMut() -> io::Result<Duration>,
     ) -> io::Result<Progress> {
         let now = sample()?;
@@ -374,6 +381,14 @@ impl<F: Family> TransactionState<F> {
         }
         let kind = management_kind_for::<F::Value>(view.envelope())?;
         let intent = view.into_preparation();
+        // The target is acknowledged only once the local side is ready for
+        // it (a lowered device MTU); the peer's message stays pending.
+        if intent
+            .as_ref()
+            .is_some_and(|intent| !admit(intent.config()))
+        {
+            return Ok(Progress::Blocked);
+        }
         if !self.dispatch_capacity(kind, intent.is_some())? {
             return Ok(Progress::Blocked);
         }

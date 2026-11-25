@@ -17,10 +17,17 @@ impl CommonTransactionContract {
         selection: record::compact::Selection,
     ) -> io::Result<()> {
         let geometry = policy.record_geometry().map_err(invalid)?;
-        let physical = policy
-            .final_record_geometry()
-            .map_err(invalid)?
-            .ip_tcp_bytes;
+        let tls_cover = covers[0].appearance() == cover::Appearance::TlsLike;
+        if covers[1].appearance() != covers[0].appearance() {
+            return Err(invalid("raw Common peer covers differ"));
+        }
+        let final_geometry = policy
+            .final_record_geometry_with_tls_cover(tls_cover)
+            .map_err(invalid)?;
+        let physical = final_geometry
+            .ip_tcp_bytes
+            .checked_add(final_geometry.record_overhead_bytes)
+            .ok_or_else(|| invalid("raw physical overhead overflow"))?;
         let requested = Self::raw_requested_configuration_compact(
             base, envelope, catalog, resources, covers, settings, selection,
         )?;
@@ -164,11 +171,18 @@ impl CommonTransactionContract {
             ));
         }
         let geometry = outer.geometry();
-        let physical = outer
+        let tls_cover = covers[0].appearance() == cover::Appearance::TlsLike;
+        if covers[1].appearance() != covers[0].appearance() {
+            return Err(invalid("raw Common peer covers differ"));
+        }
+        let final_geometry = outer
             .policy()
-            .final_record_geometry()
-            .map_err(invalid)?
-            .ip_tcp_bytes;
+            .final_record_geometry_with_tls_cover(tls_cover)
+            .map_err(invalid)?;
+        let physical = final_geometry
+            .ip_tcp_bytes
+            .checked_add(final_geometry.record_overhead_bytes)
+            .ok_or_else(|| invalid("raw physical overhead overflow"))?;
         let descriptor = catalog.initial();
         let layer = match descriptor
             .direction(mg::Role::Client)
@@ -280,6 +294,7 @@ pub(super) fn bind_covers(
         hash.update(&[match config.appearance() {
             cover::Appearance::QuicLike => 1,
             cover::Appearance::MediaLike => 2,
+            cover::Appearance::TlsLike => 3,
         }]);
         for n in [
             config.limits().max_packet_bytes,

@@ -91,6 +91,7 @@ fn selected_kind(
         + match kind {
             cover::Appearance::QuicLike => 30,
             cover::Appearance::MediaLike => cover::MEDIA_OVERHEAD,
+            cover::Appearance::TlsLike => cover::TLS_OVERHEAD,
         };
     setup.binding.configuration = contract.expected_configuration().0;
     Ok((setup, contract))

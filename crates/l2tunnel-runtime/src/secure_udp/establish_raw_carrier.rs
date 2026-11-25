@@ -239,6 +239,7 @@ impl<I: PacketIo + Send + 'static> RawOuter<I> {
         admission: gate::Secret,
         entropy: &mut (impl hs::Entropy + Send),
         observe: &mut diagnostics::Observer<'_>,
+        tuning: Tuning<'_>,
     ) -> Result<RawInitialEstablished<I>, Error> {
         validate_config(self.proof, config, hs::Role::Initiator)?;
         let adapter = RawAdapter::new(self.carrier)?;
@@ -252,6 +253,7 @@ impl<I: PacketIo + Send + 'static> RawOuter<I> {
             entropy,
             &mut report,
             None,
+            tuning,
         ))
         .await;
         if let Err(error) = &result {
@@ -269,6 +271,7 @@ impl<I: PacketIo + Send + 'static> RawOuter<I> {
         admission: &mut RawInitialServerAdmission,
         entropy: &mut (impl hs::Entropy + Send),
         observe: &mut diagnostics::Observer<'_>,
+        tuning: Tuning<'_>,
     ) -> Result<RawInitialEstablished<I>, Error> {
         validate_config(self.proof, admission.inner.config(), hs::Role::Responder)?;
         if admission.outer != self.proof.binding {
@@ -287,6 +290,7 @@ impl<I: PacketIo + Send + 'static> RawOuter<I> {
             entropy,
             &mut report,
             None,
+            tuning,
         ))
         .await;
         report.server(admission.inner.statistics());
@@ -410,7 +414,9 @@ pub(in crate::secure_udp) fn validate_cover_geometry(
     policy: PacketPolicy,
 ) -> Result<(), Error> {
     let bootstrap = policy.record_geometry().map_err(raw_error)?;
-    let final_records = policy.final_record_geometry().map_err(raw_error)?;
+    let final_records = policy
+        .final_record_geometry_with_tls_cover(cover.appearance() == cover::Appearance::TlsLike)
+        .map_err(raw_error)?;
     let limits = cover.limits();
     let bootstrap_bytes = limits
         .max_protected_bytes

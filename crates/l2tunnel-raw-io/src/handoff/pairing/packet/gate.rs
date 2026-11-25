@@ -93,6 +93,7 @@ pub(super) struct GateState {
     pub transaction: [u8; 16],
     pub opener: Option<PacketOpener>,
     pub final_context: Option<[u8; 32]>,
+    pub tls_record_cover: bool,
     pub bootstrap_filter: Option<super::compact::BootstrapFilter>,
     pub fence: Option<Fence>,
     early: Option<Early>,
@@ -168,6 +169,7 @@ impl GateState {
             transaction: [0; 16],
             opener: None,
             final_context: None,
+            tls_record_cover: false,
             bootstrap_filter: None,
             fence: None,
             early: None,
@@ -696,7 +698,11 @@ impl<I: PacketIo> PacketIo for GateIo<I> {
         if p.payload.is_empty() {
             return Ok(s.fence.is_none().then_some(n));
         }
-        if s.final_context.is_some() && super::compact::FinalKind::inspect(p.payload).is_some() {
+        if s.final_context.is_some()
+            && s.unwrap_final_payload(p.payload)
+                .and_then(super::compact::FinalKind::inspect)
+                .is_some()
+        {
             s.ingest_final(&out[..n]).map_err(io::Error::other)?;
             return Ok(None);
         }

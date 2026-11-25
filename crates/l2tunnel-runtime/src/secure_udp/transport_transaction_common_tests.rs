@@ -469,7 +469,7 @@ fn pending_prepare(lab: &Lab) -> Result<Option<(control_owner::Incoming, Duratio
 fn immutable_dispatch_refuses_same_configuration_prepare_before_admission() -> Result {
     let mut lab = Lab::new()?;
     assert_eq!(
-        lab.states[1].dispatch_preparations(&mut lab.owners[1], false, || Ok(lab.now))?,
+        lab.states[1].dispatch_preparations(&mut lab.owners[1], false, |_| true, || Ok(lab.now))?,
         Progress::Idle
     );
     let current = *lab.states[0].current();
@@ -487,7 +487,7 @@ fn immutable_dispatch_refuses_same_configuration_prepare_before_admission() -> R
     let before = lab.states[1].usage();
     let original = lab.states[1].engine(Epoch(10))? as *const l2tunnel::record_engine::Engine;
     let error = lab.states[1]
-        .dispatch_preparations(&mut lab.owners[1], false, || Ok(lab.now))
+        .dispatch_preparations(&mut lab.owners[1], false, |_| true, || Ok(lab.now))
         .err()
         .ok_or("immutable PREPARE was admitted")?;
     assert_eq!(error.kind(), io::ErrorKind::Unsupported);

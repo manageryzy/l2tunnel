@@ -84,12 +84,31 @@ fn contracts_with_catalog_and_work(
 ) -> Result<[CommonTransactionContract; 2]> {
     contracts_with_catalog_and_options(kind, catalog, work, rolling_work, None)
 }
+/// As `contracts_with_catalog`, with the shared base resources edited first.
+fn contracts_with_catalog_and_base(
+    kind: cover::Appearance,
+    catalog: Catalog,
+    work: usize,
+    edit: fn(&mut Config),
+) -> Result<[CommonTransactionContract; 2]> {
+    contracts_with_catalog_and_edit(kind, catalog, work, None, None, edit)
+}
 fn contracts_with_catalog_and_options(
     kind: cover::Appearance,
     catalog: Catalog,
     work: usize,
     rolling_work: Option<l2tunnel_fec::rolling::WorkBudget>,
     rolling_ingress: Option<l2tunnel::rolling_records::IngressLimits>,
+) -> Result<[CommonTransactionContract; 2]> {
+    contracts_with_catalog_and_edit(kind, catalog, work, rolling_work, rolling_ingress, |_| {})
+}
+fn contracts_with_catalog_and_edit(
+    kind: cover::Appearance,
+    catalog: Catalog,
+    work: usize,
+    rolling_work: Option<l2tunnel_fec::rolling::WorkBudget>,
+    rolling_ingress: Option<l2tunnel::rolling_records::IngressLimits>,
+    edit: fn(&mut Config),
 ) -> Result<[CommonTransactionContract; 2]> {
     let mut base = config(kind);
     base.rolling_work = rolling_work;
@@ -116,6 +135,7 @@ fn contracts_with_catalog_and_options(
     base.streams = Some(control_owner::Settings {
         streams: [selected; 3],
     });
+    edit(&mut base);
     let make = |role| -> Result<CommonTransactionContract> {
         Ok(CommonTransactionContract::new_compact_wire(
             security::ConfigDigest([3; 32]),
@@ -1001,6 +1021,8 @@ fn common_original_operation_cap_guards_physical_write_and_preserves_late_succes
         })
 }
 
+#[path = "transport_common_credit_tests.rs"]
+mod credit;
 #[path = "transport_common_feedback_tests.rs"]
 mod feedback;
 
@@ -1054,3 +1076,6 @@ fn current_common_scope_matches_canonical_digest_without_allocating_encoder() ->
     }
     Ok(())
 }
+
+#[path = "transport_common_live_tuning_tests.rs"]
+mod live_tuning;

@@ -53,6 +53,8 @@ pub enum Reason {
     CounterExhausted,
     /// Injected monotonic time or its conversion was invalid.
     Clock,
+    /// A live-tuning proposal was refused, with the exact reason.
+    LiveTuning(l2tunnel::live_tuning::Refusal),
     /// No more specific typed class was observed.
     Unknown,
 }
@@ -181,6 +183,7 @@ pub fn establishment_reason(error: &establish::Error) -> Reason {
         establish::Error::Refresh(error) => refresh_reason(*error),
         establish::Error::Cover(_) => Reason::Cover,
         establish::Error::Io(_) => Reason::LocalIo,
+        establish::Error::Tuning(refusal) => Reason::LiveTuning(*refusal),
     }
 }
 

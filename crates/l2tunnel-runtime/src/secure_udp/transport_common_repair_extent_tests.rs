@@ -11,7 +11,7 @@ fn current_contracts() -> Result<([CommonTransactionContract; 2], rolling::Confi
     let selection = record::compact::Selection {
         protection: security::compact::Protection::ChaCha20Poly1305,
         limits: security::compact::Selection {
-            max_forward_packets: 1024,
+            max_forward_packets: 8192,
             max_failed_checks: 16,
         },
     };

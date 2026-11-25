@@ -95,8 +95,11 @@ fn config(_kind: cover::Appearance) -> Config {
         },
         security: security::Limits {
             max_body_bytes: 1300,
-            packets_per_key: 8,
-            max_body_bytes_per_key: 100000,
+            // Four credit window ceilings (MOD-RCREDIT-09); shorter key
+            // rotation is covered by l2tunnel-security's own tests.
+            packets_per_key: 8192,
+            // Room for 8,192 maximum bodies, so keys rotate by packet count.
+            max_body_bytes_per_key: 16 << 20,
         },
         control: delivery::Settings {
             recovery: recovery::ArqConfig {
@@ -131,6 +134,14 @@ fn config(_kind: cover::Appearance) -> Config {
         connection_ingress: None,
         rolling_fragments: None,
         rolling_ingress: None,
+        credit: Some(l2tunnel_flow_control::session_credit::Config {
+            floor_datagrams: 64,
+            ceiling_datagrams: 2048,
+            floor_bytes: 102_400,
+            ceiling_bytes: 16 << 20,
+            period: Duration::from_millis(10),
+            idle_period: Duration::from_millis(250),
+        }),
         native: NativeBudget {
             pending_packets: 16,
             pending_bytes: 8192,

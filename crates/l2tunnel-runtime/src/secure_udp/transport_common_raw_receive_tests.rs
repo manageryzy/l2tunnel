@@ -19,7 +19,11 @@ async fn poll_raw_current_turn(socket: &mut RawIo, receive: bool) -> Result {
     Ok(())
 }
 
-fn stage_candidate(pair: &mut SelectedRuntimePair, management: bool, value: u8) -> Result {
+fn stage_candidate(
+    pair: &mut SelectedRuntimePair,
+    management: bool,
+    value: u8,
+) -> Result<raw_carrier::SendProgress> {
     let (kind, raw_kind, scope) = if management {
         (
             record::compact::Kind::Control,
@@ -69,13 +73,21 @@ fn stage_candidate(pair: &mut SelectedRuntimePair, management: bool, value: u8) 
             &wire[..sealed.bytes],
         )?
     };
-    assert!(matches!(progress, raw_carrier::SendProgress::Pending));
-    Ok(())
+    if management {
+        assert!(matches!(progress, raw_carrier::SendProgress::Pending));
+    }
+    Ok(progress)
 }
 
-async fn flush_candidates(pair: &mut SelectedRuntimePair, management: bool) -> Result {
-    poll_raw_once(&mut pair.a, false).await?;
-    assert!(pair.a.take_user()?.is_some());
+async fn flush_candidates(
+    pair: &mut SelectedRuntimePair,
+    user_pending: bool,
+    management: bool,
+) -> Result {
+    if user_pending || management {
+        poll_raw_once(&mut pair.a, false).await?;
+    }
+    assert_eq!(pair.a.take_user()?.is_some(), user_pending);
     assert_eq!(pair.a.take_control()?.is_some(), management);
     Ok(())
 }
@@ -130,14 +142,19 @@ async fn half_raw_drains_both_received_lanes_and_rotates_under_first_lane_load()
         progress_owner(&mut pair.a, &mut pair.ad).await?;
         progress_owner(&mut pair.b, &mut pair.bd).await?;
     }
-    assert_eq!(pair.ad.config.security.packets_per_key, 8);
+    assert_eq!(pair.ad.config.security.packets_per_key, 8192);
     let deadline = pair.ad.origin + duration(pair.ad.lease);
-    // More than one original key interval: each turn supplies First data and
-    // Second management. Drain both without another PacketIo receive call.
+    // Each turn supplies First data and Second management. Drain both without
+    // another PacketIo receive call. (With the former 8-packet key interval
+    // this also crossed key generations; that is now covered on the UDP path
+    // by `common_data_crosses_key_generations_at_the_floor_interval`.)
     for value in 0..12 {
-        stage_candidate(&mut pair, false, value)?;
+        let user_pending = matches!(
+            stage_candidate(&mut pair, false, value)?,
+            raw_carrier::SendProgress::Pending
+        );
         stage_candidate(&mut pair, true, value + 32)?;
-        flush_candidates(&mut pair, true).await?;
+        flush_candidates(&mut pair, user_pending, true).await?;
         poll_raw_once(&mut pair.b, true).await?;
         let calls = receive_calls(&pair);
         accept_candidate(&mut pair, 0, value).await?;
@@ -152,13 +169,19 @@ async fn half_raw_drains_both_received_lanes_and_rotates_under_first_lane_load()
     }
     // If only one candidate is consumed in a turn, a new First packet must not
     // overtake the already retained Second candidate on the next turn.
-    stage_candidate(&mut pair, false, 90)?;
+    let user_pending = matches!(
+        stage_candidate(&mut pair, false, 90)?,
+        raw_carrier::SendProgress::Pending
+    );
     stage_candidate(&mut pair, true, 91)?;
-    flush_candidates(&mut pair, true).await?;
+    flush_candidates(&mut pair, user_pending, true).await?;
     poll_raw_once(&mut pair.b, true).await?;
     accept_candidate(&mut pair, 0, 90).await?;
-    stage_candidate(&mut pair, false, 92)?;
-    flush_candidates(&mut pair, false).await?;
+    let user_pending = matches!(
+        stage_candidate(&mut pair, false, 92)?,
+        raw_carrier::SendProgress::Pending
+    );
+    flush_candidates(&mut pair, user_pending, false).await?;
     poll_raw_once(&mut pair.b, true).await?;
     let calls = receive_calls(&pair);
     accept_candidate(&mut pair, 1, 91).await?;
@@ -208,14 +231,23 @@ async fn raw_new_final_output_progresses_after_idle_receipt_poll_without_new_tur
             // committing fresh, authenticated User or Control ciphertext.
             pair.a.begin_turn();
             pair.a.observe_completions().await;
-            stage_candidate(&mut pair, management, 31)?;
-            assert!(pair.a.take_user()?.is_none());
-            assert!(pair.a.take_control()?.is_none());
-            poll_raw_current_turn(&mut pair.a, false).await?;
-            let progress = if management {
-                pair.a.take_control()?.ok_or("same-turn Control receipt")?.0
-            } else {
-                pair.a.take_user()?.ok_or("same-turn User receipt")?.1
+            let staged = stage_candidate(&mut pair, management, 31)?;
+            let progress = match staged {
+                raw_carrier::SendProgress::Whole { receipt, late } => {
+                    assert!(!management);
+                    assert!(pair.a.take_user()?.is_none());
+                    raw_carrier::SendProgress::Whole { receipt, late }
+                }
+                raw_carrier::SendProgress::Pending => {
+                    assert!(pair.a.take_user()?.is_none());
+                    assert!(pair.a.take_control()?.is_none());
+                    poll_raw_current_turn(&mut pair.a, false).await?;
+                    if management {
+                        pair.a.take_control()?.ok_or("same-turn Control receipt")?.0
+                    } else {
+                        pair.a.take_user()?.ok_or("same-turn User receipt")?.1
+                    }
+                }
             };
             let raw_carrier::SendProgress::Whole { receipt, late } = progress else {
                 return Err("same-turn receipt was not physical".into());
@@ -285,17 +317,26 @@ async fn raw_fresh_output_repoll_keeps_original_turn_quota_and_pending_identity(
         // Each real PacketIo receive/authentication reservation and each send
         // spends the same original 32-unit budget. Fresh commits cannot reset it.
         for value in 0..=32 {
-            stage_candidate(&mut pair, false, value)?;
-            poll_raw_current_turn(&mut pair.a, false).await?;
-            if let Some((_, raw_carrier::SendProgress::Whole { receipt, late })) =
-                pair.a.take_user()?
-            {
-                assert!(!late);
-                assert_eq!(receipt.accepted_at, now);
-                assert_eq!(receipt.deadline, deadline);
-                accepted += 1;
-            } else {
-                break;
+            match stage_candidate(&mut pair, false, value)? {
+                raw_carrier::SendProgress::Whole { receipt, late } => {
+                    assert!(!late);
+                    assert_eq!(receipt.accepted_at, now);
+                    assert_eq!(receipt.deadline, deadline);
+                    accepted += 1;
+                }
+                raw_carrier::SendProgress::Pending => {
+                    poll_raw_current_turn(&mut pair.a, false).await?;
+                    if let Some((_, raw_carrier::SendProgress::Whole { receipt, late })) =
+                        pair.a.take_user()?
+                    {
+                        assert!(!late);
+                        assert_eq!(receipt.accepted_at, now);
+                        assert_eq!(receipt.deadline, deadline);
+                        accepted += 1;
+                    } else {
+                        break;
+                    }
+                }
             }
         }
         assert!(accepted > 0 && accepted < 32);

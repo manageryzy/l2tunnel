@@ -495,7 +495,8 @@ async fn establish_original_pair_inner(
             },
             l2tunnel_udp_control::Secret::new([7; 32]),
             &mut a_entropy,
-            &mut a_noop
+            &mut a_noop,
+            establish::Tuning::Off
         ),
         b.accept_initial(
             establish::Identity {
@@ -505,7 +506,8 @@ async fn establish_original_pair_inner(
             },
             &mut admission,
             &mut b_entropy,
-            &mut b_noop
+            &mut b_noop,
+            establish::Tuning::Off
         )
     )?;
     assert_eq!(
@@ -543,7 +545,7 @@ fn exercise_original_raw(half: bool) -> Pin<Box<dyn Future<Output = Result>>> {
             record::compact::Selection {
                 protection: security::compact::Protection::ChaCha20Poly1305,
                 limits: security::compact::Selection {
-                    max_forward_packets: 4096,
+                    max_forward_packets: 8192,
                     max_failed_checks: 128,
                 },
             },

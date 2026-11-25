@@ -1825,7 +1825,12 @@ fn opposite(role: mg::Role) -> mg::Role {
 }
 fn outgoing_stream(body: sc::Body<'_>) -> io::Result<streams::Stream> {
     match body {
-        sc::Body::Ping { .. } | sc::Body::Pong { .. } => Ok(streams::Stream::Liveness),
+        sc::Body::Ping { .. }
+        | sc::Body::Pong { .. }
+        | sc::Body::ProfileControl {
+            tag: sc::ProfileTag::TunnelTestV1,
+            ..
+        } => Ok(streams::Stream::Liveness),
         sc::Body::NativeReceipt {
             receipt: sc::NativeReceipt::Record { .. },
             ..

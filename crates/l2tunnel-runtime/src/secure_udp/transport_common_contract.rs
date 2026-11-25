@@ -190,6 +190,18 @@ impl Config {
         self.control
             .validate(base, Duration::ZERO, self.lifetime.lease)
             .map_err(invalid)?;
+        let credit = self
+            .credit
+            .ok_or_else(|| invalid("common data requires session receiver credit"))?;
+        credit
+            .validate(u64::try_from(self.path_mtu).map_err(invalid)?)
+            .map_err(invalid)?;
+        for value in [credit.period, credit.idle_period] {
+            let micros = u64::try_from(value.as_micros()).map_err(invalid)?;
+            if Duration::from_micros(micros) != value {
+                return Err(invalid("session credit timers require exact microseconds"));
+            }
+        }
         let selected = self
             .streams
             .ok_or_else(|| invalid("common transactions require explicit streams"))?;
@@ -331,10 +343,37 @@ impl Config {
         if let Some(policy) = self.rolling_fragments {
             fragments::update_hash(policy, &mut hash)?;
         }
+        if let Some(credit) = self.credit {
+            hash.update(b"l2tunnel/common-resources/session-credit/v1\0");
+            for value in [
+                credit.floor_datagrams,
+                credit.ceiling_datagrams,
+                credit.floor_bytes,
+                credit.ceiling_bytes,
+                u64::try_from(credit.period.as_micros()).map_err(invalid)?,
+                u64::try_from(credit.idle_period.as_micros()).map_err(invalid)?,
+            ] {
+                hash.update(&value.to_be_bytes());
+            }
+        }
         let mut bytes = [0; 32];
         bytes.copy_from_slice(hash.finish().as_ref());
         Ok(core::ConfigDigest(bytes))
     }
+}
+
+/// Largest inner packet of any catalog entry, in either direction. Native
+/// storage is sized for it (docs/modules/live-tuning.md, decision 8).
+pub(super) fn largest_native(catalog: &common::Catalog) -> io::Result<usize> {
+    catalog
+        .descriptors()
+        .iter()
+        .flat_map(|descriptor| {
+            [mg::Role::Client, mg::Role::Server]
+                .map(|sender| descriptor.direction(sender).max_native())
+        })
+        .max()
+        .ok_or_else(|| invalid("common native widths"))
 }
 
 impl CommonTransactionContract {
@@ -367,11 +406,9 @@ impl CommonTransactionContract {
                 "common requested duplex differs from selected carrier",
             ));
         }
-        let max_native = [mg::Role::Client, mg::Role::Server]
-            .into_iter()
-            .map(|sender| initial.descriptor().direction(sender).max_native())
-            .max()
-            .ok_or_else(|| invalid("common native widths"))?;
+        // Native storage covers the largest catalog entry, so a hot switch
+        // may change the inner packet size (live-tuning decision 8).
+        let max_native = largest_native(&catalog)?;
         resources.validate_common_resources(max_native)?;
         settings.validate(resources)?;
         if resources.path_mtu != initial.descriptor().path_mtu() {
@@ -446,6 +483,53 @@ impl CommonTransactionContract {
         }
         result.validate_message_capacity()?;
         Ok(result)
+    }
+    /// Replace the catalog with the live-tuning catalog both ends generated
+    /// from the base plan and the authenticated proposal
+    /// (docs/modules/live-tuning.md, decisions 1 and 6). The setup identity
+    /// H0, the envelope and the initial entry stay the base plan's: the
+    /// Noise prologue bound H0, and the handshake confirmation bound the
+    /// generated catalog's root. Every catalog-wide check runs again for the
+    /// new catalog. Apply before any proxy or connection-reuse binding.
+    pub fn with_live_catalog(mut self, catalog: common::Catalog) -> io::Result<Self> {
+        if self.proxy_binding.is_some() || self.connection_reuse {
+            return Err(invalid(
+                "live-tuning catalog must precede proxy and reuse binding",
+            ));
+        }
+        if catalog.initial() != self.catalog.initial() {
+            return Err(invalid("live-tuning catalog changes the initial entry"));
+        }
+        self.resources
+            .validate_common_resources(largest_native(&catalog)?)?;
+        if catalog_uses_near8(&catalog)
+            && (self.compact_wire.protection == security::compact::Protection::ChaCha20Crc32c
+                || self.outer.is_some()
+                || self.raw.is_some()
+                || self.maintained.is_some())
+        {
+            return Err(invalid("near8 is unavailable for this contract"));
+        }
+        if self.compact_wire.protection == security::compact::Protection::ChaCha20Crc32c
+            && catalog
+                .descriptors()
+                .iter()
+                .any(|d| matches!(d.profile(), common::Profile::Striped { .. }))
+        {
+            return Err(invalid(
+                "mixed packet recovery requires authenticated data members",
+            ));
+        }
+        self.catalog = catalog;
+        for value in self
+            .catalog
+            .configurations(self.envelope)
+            .map_err(invalid)?
+        {
+            self.resolve(value)?;
+        }
+        self.validate_message_capacity()?;
+        Ok(self)
     }
     /// Bind trusted construction metadata to an explicitly selected fixed proxy.
     /// The caller must include this complete policy digest in authenticated H0.
@@ -666,10 +750,8 @@ impl CommonTransactionContract {
                     "coded catalog requires explicit bounded scheduler work",
                 ));
             }
-            if view.max_native() != old.max_native()
-                || view.common().traffic().layer != old.common().traffic().layer
-            {
-                return Err(invalid("common catalog changes immutable native format"));
+            if view.common().traffic().layer != old.common().traffic().layer {
+                return Err(invalid("common catalog changes immutable native layer"));
             }
             let peer = if sender == mg::Role::Client {
                 mg::Role::Server
@@ -706,6 +788,10 @@ impl CommonTransactionContract {
                 return Err(invalid("common data/control/burst geometry"));
             }
         }
+        self.entry_plan(value)?;
+        Ok(value)
+    }
+    fn entry_plan(&self, value: common::Configuration) -> io::Result<engine::storage::Plan> {
         let context = engine::Context {
             session: 1,
             epoch: self.resources.data_epoch.0,
@@ -721,8 +807,21 @@ impl CommonTransactionContract {
             selected_fragment_policy(&value, self.resources.rolling_fragments),
             self.feedback_overhead_bytes()?,
         )
-        .map_err(invalid)?;
-        Ok(value)
+        .map_err(invalid)
+    }
+    /// Record-engine heap of the largest catalog entry: what a hot switch to
+    /// it reserves next to the running engine (live-tuning memory cap,
+    /// docs/modules/live-tuning.md decision 5).
+    pub fn largest_entry_bytes(&self) -> io::Result<usize> {
+        let mut largest = 0;
+        for value in self
+            .catalog
+            .configurations(self.envelope)
+            .map_err(invalid)?
+        {
+            largest = largest.max(self.entry_plan(value)?.heap_bytes());
+        }
+        Ok(largest)
     }
     pub(super) fn reserve(&self) -> io::Result<usize> {
         self.resources

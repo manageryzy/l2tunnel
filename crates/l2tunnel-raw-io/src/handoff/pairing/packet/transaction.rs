@@ -26,6 +26,7 @@ struct Detached<I: PacketIo> {
     sealer: Option<PacketSealer>,
     final_prepared: Option<(compact::FinalMetadata, Option<compact::FinalControl>)>,
     pending: Option<Pending>,
+    send_buf: Vec<u8>,
     tracked: Option<RecordToken>,
     completed: Option<SentRecord>,
     prepare_observations: [PrepareSnapshot; 4],
@@ -238,64 +239,70 @@ impl<I: PacketIo> Detached<I> {
         }
         Ok(())
     }
+    fn flush_pending(&mut self) -> Result<bool, Error> {
+        self.expire_controls()?;
+        let Some(p) = self.pending.as_ref() else {
+            return Ok(false);
+        };
+        match self.io.send(&p.bytes) {
+            Ok(()) => {
+                let mut p = self.pending.take().ok_or(Error::Proof)?;
+                // A staged header cannot grant physical report credit. Retain
+                // the exact snapshot until this same packet is accepted.
+                self.retirement_reported = self.retirement_reported.max(p.retired);
+                if !p.bootstrap && p.kind == wire::Kind::Ping {
+                    // Retry spacing starts at actual acceptance, while the
+                    // independent last_alive deadline remains unchanged.
+                    self.last_ping = self.io.last_send_at.ok_or(Error::Proof)?;
+                }
+                if let Some(token) = self.tracked.take() {
+                    if self.completed.is_some() {
+                        return Err(Error::Proof);
+                    }
+                    self.completed = Some(SentRecord {
+                        lane: if self.proof.lane == 0 {
+                            PairLane::First
+                        } else {
+                            PairLane::Second
+                        },
+                        token,
+                        sent_at: self.io.last_send_at.take().ok_or(Error::Proof)?,
+                    });
+                }
+                lock(&self.io.state)?
+                    .fence
+                    .as_mut()
+                    .ok_or(Error::Proof)?
+                    .sent = p.end;
+                match p.kind {
+                    wire::Kind::Hello => self.sent_hello = true,
+                    wire::Kind::Commit => self.sent_commit = true,
+                    wire::Kind::CommitAck => self.sent_ack = true,
+                    _ => {}
+                }
+                if matches!(
+                    p.kind,
+                    wire::Kind::Hello | wire::Kind::Commit | wire::Kind::CommitAck
+                ) {
+                    self.copies = self.copies.checked_add(1).ok_or(Error::Exhausted)?;
+                    self.last_transition = Some(Instant::now());
+                    self.last_transition_kind = Some(p.kind);
+                }
+                p.bytes.clear();
+                self.send_buf = p.bytes;
+                Ok(true)
+            }
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => Ok(false),
+            Err(e) => Err(e.into()),
+        }
+    }
     fn progress(&mut self) -> Result<bool, Error> {
         self.expire_controls()?;
         self.io.drain_early()?;
         let mut progress = false;
         let mut input = [0; 65_536];
         self.io.receive(&mut input)?;
-        self.expire_controls()?;
-        if let Some(p) = self.pending.as_ref() {
-            match self.io.send(&p.bytes) {
-                Ok(()) => {
-                    let p = self.pending.take().ok_or(Error::Proof)?;
-                    // A staged header cannot grant physical report credit. Retain
-                    // the exact snapshot until this same packet is accepted.
-                    self.retirement_reported = self.retirement_reported.max(p.retired);
-                    if !p.bootstrap && p.kind == wire::Kind::Ping {
-                        // Retry spacing starts at actual acceptance, while the
-                        // independent last_alive deadline remains unchanged.
-                        self.last_ping = self.io.last_send_at.ok_or(Error::Proof)?;
-                    }
-                    if let Some(token) = self.tracked.take() {
-                        if self.completed.is_some() {
-                            return Err(Error::Proof);
-                        }
-                        self.completed = Some(SentRecord {
-                            lane: if self.proof.lane == 0 {
-                                PairLane::First
-                            } else {
-                                PairLane::Second
-                            },
-                            token,
-                            sent_at: self.io.last_send_at.take().ok_or(Error::Proof)?,
-                        });
-                    }
-                    lock(&self.io.state)?
-                        .fence
-                        .as_mut()
-                        .ok_or(Error::Proof)?
-                        .sent = p.end;
-                    match p.kind {
-                        wire::Kind::Hello => self.sent_hello = true,
-                        wire::Kind::Commit => self.sent_commit = true,
-                        wire::Kind::CommitAck => self.sent_ack = true,
-                        _ => {}
-                    }
-                    if matches!(
-                        p.kind,
-                        wire::Kind::Hello | wire::Kind::Commit | wire::Kind::CommitAck
-                    ) {
-                        self.copies = self.copies.checked_add(1).ok_or(Error::Exhausted)?;
-                        self.last_transition = Some(Instant::now());
-                        self.last_transition_kind = Some(p.kind);
-                    }
-                    progress = true;
-                }
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
-                Err(e) => return Err(e.into()),
-            }
-        }
+        progress |= self.flush_pending()?;
         self.expire_controls()?;
         // An exact retained old-ACK send shares the same one pending I/O token.
         // Never send it while a protected output is blocked.
@@ -407,6 +414,7 @@ pub struct PacketCarrier<I: PacketIo + Send + 'static> {
     fault: Option<Error>,
     cursor: usize,
     final_context: Option<[u8; 32]>,
+    tls_record_cover: bool,
 }
 fn recover<I: PacketIo>(inputs: RawInputs<GateIo<I>>) -> RawInputs<I> {
     let raw = |input: RawInput<GateIo<I>>| RawInput {
@@ -926,6 +934,7 @@ impl<I: PacketIo + Send + 'static> PacketSetup<'_, I> {
             sealer: Some(sealer),
             final_prepared: None,
             pending: None,
+            send_buf: Vec::new(),
             tracked: None,
             completed: None,
             prepare_observations: [PrepareSnapshot::default(); 4],
@@ -978,6 +987,7 @@ impl<I: PacketIo + Send + 'static> PacketSetup<'_, I> {
             fault: None,
             cursor: 0,
             final_context: None,
+            tls_record_cover: false,
         });
         self.paired = None;
         Ok(())
@@ -1855,6 +1865,26 @@ impl<I: PacketIo + Send + 'static> PacketCarrier<I> {
             Ok(true) => Poll::Ready(Ok(())),
             Ok(false) => Poll::Pending,
             Err(e) => Poll::Ready(Err(self.fail(e))),
+        }
+    }
+    /// Attempt to send one already-committed final record on `lane` synchronously
+    /// using this turn's remaining work quota and pacing bucket, without running
+    /// a receive poll or replenishing the quota. Returns `true` only when the
+    /// underlying PacketIo actually accepted the packet (making its receipt
+    /// immediately observable via `take_sent_record_observed`).
+    pub fn flush_pending_final(&mut self, lane: PairLane) -> Result<bool, Error> {
+        self.check_live()?;
+        if self.final_context.is_none() {
+            return Err(Error::Configuration);
+        }
+        let owner = self
+            .lanes
+            .get_mut(lane.index())
+            .and_then(Option::as_mut)
+            .ok_or(Error::Configuration)?;
+        match owner.flush_pending() {
+            Ok(sent) => Ok(sent),
+            Err(e) => Err(self.fail(e)),
         }
     }
     /// Borrow the oldest locally committed authenticated recovery record.

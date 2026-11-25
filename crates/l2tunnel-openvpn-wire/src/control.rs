@@ -33,6 +33,12 @@ impl Config {
     /// Validate standard maximum headers and actual authoritative ARQ geometry.
     pub fn validate(self) -> Result<(), Error> {
         self.arq.validate().map_err(Error::Recovery)?;
+        // Control keeps the fixed 48-byte ACK its charges assume.
+        if self.arq.wide_feedback() {
+            return Err(Error::Recovery(
+                l2tunnel_recovery::RecoveryError::InvalidConfig,
+            ));
+        }
         if !(256..=65507).contains(&self.max_datagram_bytes)
             || self.lifetime.is_zero()
             || self

@@ -295,6 +295,7 @@ impl JoiningTail {
             + match self.cover.appearance() {
                 cover::Appearance::QuicLike => cover::QUIC_ESTABLISHED_OVERHEAD,
                 cover::Appearance::MediaLike => cover::MEDIA_OVERHEAD,
+                cover::Appearance::TlsLike => cover::TLS_OVERHEAD,
             }
     }
     fn empty(cover: cover::Config, settings: Settings, end: Instant, now: Instant) -> Self {

@@ -741,7 +741,8 @@ async fn tail_output_preflight_preserves_attempt_and_expiry_retires_wakes() {
     let mut tail = BootstrapTail {
         core,
         confirmation: None,
-        peer_confirmation: [0; CONFIRM_BYTES],
+        peer_confirmation: [0; MAX_CONFIRM_BYTES],
+        peer_confirmation_len: hs::PLAIN_CONFIRM_BYTES,
         parser: Parser::new(),
         peer: path.server,
     };
@@ -1041,7 +1042,8 @@ async fn authenticated_bad_tail_grammar_retires_but_bad_mac_does_not() {
         let mut tail = BootstrapTail {
             core,
             confirmation: None,
-            peer_confirmation: [0; CONFIRM_BYTES],
+            peer_confirmation: [0; MAX_CONFIRM_BYTES],
+            peer_confirmation_len: hs::PLAIN_CONFIRM_BYTES,
             parser: Parser::new(),
             peer: path.server,
         };
@@ -1149,7 +1151,7 @@ async fn terminal_retry_exhaustion_retires_real_noise_final_custody() {
     assert_eq!(client.binding, server.binding);
     let now = Instant::now();
     let mut frame = [0; FRAME_BYTES];
-    frame[..4].copy_from_slice(&[1, 3, 0, CONFIRM_BYTES as u8]);
+    frame[..4].copy_from_slice(&[1, 3, 0, hs::PLAIN_CONFIRM_BYTES as u8]);
     let flight = client
         .tail
         .confirmation
@@ -1160,7 +1162,7 @@ async fn terminal_retry_exhaustion_retires_real_noise_final_custody() {
             &mut frame[4..],
         )
         .expect("copy exact ciphertext without crypto");
-    assert_eq!(flight.bytes, CONFIRM_BYTES);
+    assert_eq!(flight.bytes, hs::PLAIN_CONFIRM_BYTES);
     assert_eq!(
         client
             .tail
@@ -1173,7 +1175,7 @@ async fn terminal_retry_exhaustion_retires_real_noise_final_custody() {
                 elapsed(client.tail.core.origin, now).expect("control time"),
             )
             .expect("retain exact final flight"),
-        4 + CONFIRM_BYTES,
+        4 + hs::PLAIN_CONFIRM_BYTES,
     );
     let mut output = vec![0; client.tail.max_packet_bytes()];
     let mut attempts = 0;
@@ -1211,3 +1213,6 @@ async fn terminal_retry_exhaustion_retires_real_noise_final_custody() {
         None,
     );
 }
+
+#[path = "establish_tuning_tests.rs"]
+mod tuning;

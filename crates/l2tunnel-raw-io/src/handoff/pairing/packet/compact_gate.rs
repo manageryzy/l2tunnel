@@ -11,6 +11,30 @@ fn candidate_class(kind: FinalKind) -> u8 {
 }
 
 impl GateState {
+    pub(in crate::handoff::pairing::packet) const fn tls_record_overhead(&self) -> usize {
+        if self.tls_record_cover {
+            super::super::compact::TLS_RECORD_HEADER_BYTES
+        } else {
+            0
+        }
+    }
+    pub(in crate::handoff::pairing::packet) fn unwrap_final_payload<'a>(
+        &self,
+        payload: &'a [u8],
+    ) -> Option<&'a [u8]> {
+        if !self.tls_record_cover {
+            return Some(payload);
+        }
+        if payload.len() < super::super::compact::TLS_RECORD_HEADER_BYTES + 5 {
+            return None;
+        }
+        if payload[..3] != super::super::compact::TLS_APP_DATA_PREFIX {
+            return None;
+        }
+        let declared = usize::from(u16::from_be_bytes([payload[3], payload[4]]));
+        let body = &payload[super::super::compact::TLS_RECORD_HEADER_BYTES..];
+        (declared == body.len()).then_some(body)
+    }
     pub(in crate::handoff::pairing::packet) fn final_candidate_diagnostics(
         &self,
         now: Instant,
@@ -131,13 +155,16 @@ impl GateState {
             Ok(packet) if packet.phase_shape() => packet,
             _ => return self.reject(),
         };
-        let Some(kind) = FinalKind::inspect(packet.payload) else {
+        let Some(record_bytes) = self.unwrap_final_payload(packet.payload) else {
             return self.reject();
         };
-        if packet.payload.len() < 5 || bytes.len() > usize::from(self.policy.mtu) {
+        let Some(kind) = FinalKind::inspect(record_bytes) else {
+            return self.reject();
+        };
+        if record_bytes.len() < 5 || bytes.len() > usize::from(self.policy.mtu) {
             self.candidate_counters[usize::from(candidate_class(kind))]
                 .preflight_rejected
-                .record(packet.payload.len());
+                .record(record_bytes.len());
             return self.reject();
         }
         let control = kind == FinalKind::CarrierControl;
@@ -191,12 +218,12 @@ impl GateState {
             sequence: packet.sequence,
             acknowledgment: packet.acknowledgment,
             window: packet.window,
-            payload_bytes: u16::try_from(packet.payload.len()).map_err(|_| Error::Capacity)?,
+            payload_bytes: u16::try_from(record_bytes.len()).map_err(|_| Error::Capacity)?,
         };
         if self.validate_final(metadata).is_err() {
             self.candidate_counters[usize::from(candidate_class(kind))]
                 .preflight_rejected
-                .record(packet.payload.len());
+                .record(record_bytes.len());
             return self.reject();
         }
         let fence = self.fence.as_ref().ok_or(Error::Proof)?;
@@ -216,7 +243,7 @@ impl GateState {
         self.incoming.push_back(Cell {
             received_at: Instant::now(),
             final_metadata: Some(metadata),
-            body: packet.payload.to_vec(),
+            body: record_bytes.to_vec(),
             header: wire::Header {
                 kind: if control {
                     wire::Kind::Window
@@ -232,7 +259,7 @@ impl GateState {
                 body: metadata.payload_bytes,
             },
         });
-        self.observe_final_admission(kind, packet.payload.len());
+        self.observe_final_admission(kind, record_bytes.len());
         Ok(())
     }
     /// Read-only raw geometry/replay preflight before the sole verifier commits.
@@ -240,11 +267,14 @@ impl GateState {
         &self,
         metadata: FinalMetadata,
     ) -> Result<(), Error> {
+        let wire_bytes = usize::from(metadata.payload_bytes)
+            .checked_add(self.tls_record_overhead())
+            .ok_or(Error::Exhausted)?;
         if self.final_context != Some(metadata.context)
             || usize::from(metadata.lane) != self.lane
             || metadata.sender != if self.client { 2 } else { 1 }
             || metadata.payload_bytes < 5
-            || usize::from(metadata.payload_bytes) + 40 > usize::from(self.policy.mtu)
+            || wire_bytes + 40 > usize::from(self.policy.mtu)
             || (metadata.kind == FinalKind::Data && self.half && (self.lane == 0) == self.client)
         {
             return Err(Error::Proof);
@@ -263,7 +293,7 @@ impl GateState {
         )
         .ok_or(Error::Proof)?;
         let end = offset
-            .checked_add(u64::from(metadata.payload_bytes))
+            .checked_add(wire_bytes as u64)
             .ok_or(Error::Exhausted)?;
         let right = f
             .retired
@@ -287,6 +317,7 @@ impl GateState {
         metadata: FinalMetadata,
     ) -> Result<u64, Error> {
         self.validate_final(metadata)?;
+        let wire_bytes = u64::from(metadata.payload_bytes) + self.tls_record_overhead() as u64;
         let f = self.fence.as_mut().ok_or(Error::Proof)?;
         let offset = crate::handoff::pairing::packet::sequence::position(
             f.peer,
@@ -294,7 +325,7 @@ impl GateState {
             f.retired,
         )
         .ok_or(Error::Proof)?;
-        let end = offset + u64::from(metadata.payload_bytes);
+        let end = offset + wire_bytes;
         self.ranges
             .commit(offset, end, f.retired.max(end), f.local_horizon)?;
         f.retired = f.retired.max(end);

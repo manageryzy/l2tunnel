@@ -224,6 +224,30 @@ impl Driver {
                 },
             );
         }
+        if let Some(credit) = runtime.credit.as_ref() {
+            let snapshot = credit.snapshot(now);
+            if let Some(sender) = snapshot.sender {
+                let _ = metrics.collector().sample(
+                    Key {
+                        site: Site::CreditWindow,
+                        lane: Lane::Shared,
+                        class: MetricClass::User,
+                    },
+                    now,
+                    Occupancy {
+                        bytes: Some(Extent {
+                            used: sender.inflight_bytes,
+                            capacity: Some(sender.bytes_above),
+                        }),
+                        items: Some(Extent {
+                            used: sender.inflight_datagrams,
+                            capacity: Some(sender.window),
+                        }),
+                    },
+                );
+            }
+            metrics.retain_credit(snapshot);
+        }
     }
     pub(super) fn finish_buffer_metrics(&mut self, now: u64) {
         self.finish_buffer_metrics_at(now, crate::buffer_metrics::SourceBoundary::LoopStop);

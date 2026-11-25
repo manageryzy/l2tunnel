@@ -49,13 +49,15 @@ pub(in crate::secure_udp) async fn initial_parts<T>(
             noise(true),
             gate::Secret::new([7; 32]),
             &mut a_entropy,
-            &mut a_observer
+            &mut a_observer,
+            establish::Tuning::Off
         ),
         b.accept_initial(
             noise(false),
             &mut admission,
             &mut b_entropy,
-            &mut b_observer
+            &mut b_observer,
+            establish::Tuning::Off
         ),
     )?;
     assert_eq!(a.binding(), b.binding());
@@ -149,6 +151,7 @@ async fn actual_initial_only_carrier_keeps_original_noise_member_root_and_socket
                 &mut admission,
                 &mut b_entropy,
                 &mut server_observer,
+                establish::Tuning::Off,
             )
             .await?;
         assert_eq!(admission.config(), config);

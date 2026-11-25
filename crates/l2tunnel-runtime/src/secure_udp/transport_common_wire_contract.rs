@@ -20,6 +20,7 @@ impl CommonTransactionContract {
         selection: record::compact::Selection,
     ) -> io::Result<Self> {
         selection.validate().map_err(invalid)?;
+        require_credit_range(&resources, selection)?;
         if resources[0].security != resources[1].security {
             return Err(invalid(
                 "compact peers require matching security owner limits",
@@ -58,6 +59,7 @@ impl CommonTransactionContract {
             match cover.appearance() {
                 cover::Appearance::QuicLike => 1,
                 cover::Appearance::MediaLike => 2,
+                cover::Appearance::TlsLike => 3,
             },
         ]);
         for value in [
@@ -123,6 +125,7 @@ impl CommonTransactionContract {
         selection: record::compact::Selection,
     ) -> io::Result<Self> {
         require_near8_socket_receipts(&catalog)?;
+        require_credit_range(&resources, selection)?;
         let local = resources[match role {
             security::Role::Initiator => 0,
             security::Role::Responder => 1,
@@ -179,4 +182,28 @@ impl CommonTransactionContract {
             .checked_add(record::compact::AUTHENTICATED_OVERHEAD)
             .ok_or_else(exhausted)
     }
+}
+
+/// The record receiver opens at most `min(packets_per_key, max_forward_packets)`
+/// past its highest accepted number. Credit keeps data within half of that, so
+/// the runtime lowers a credit ceiling above a quarter of it (owner decision
+/// 2026-11-24, docs/modules/receiver-credit.md); only a range too small for
+/// any valid window (below 64) is refused.
+fn require_credit_range(
+    resources: &[Config; 2],
+    selection: record::compact::Selection,
+) -> io::Result<()> {
+    for local in resources {
+        let range = local
+            .security
+            .packets_per_key
+            .min(u64::from(selection.limits.max_forward_packets));
+        let credit = local
+            .credit
+            .ok_or_else(|| invalid("common data requires session receiver credit"))?;
+        credit
+            .fit_range(range)
+            .map_err(|_| invalid("record-receive range below 64 datagrams"))?;
+    }
+    Ok(())
 }

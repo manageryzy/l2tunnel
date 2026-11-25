@@ -100,6 +100,27 @@ impl Driver {
             .common
             .as_deref_mut()
             .ok_or_else(|| protocol("raw Common owner absent"))?;
+        let credit = if runtime.raw_control.is_none() {
+            self.due_credit_body(now)?
+        } else {
+            None
+        };
+        let runtime = self
+            .common
+            .as_deref_mut()
+            .ok_or_else(|| protocol("raw Common owner absent"))?;
+        if let Some((body, charge)) = credit {
+            // Unreliable session credit uses the same single raw control slot.
+            self.buffers.control_wire[..body.len()].copy_from_slice(&body);
+            runtime.raw_control = Some(common::PendingRawControl {
+                bytes: body.len(),
+                wire_bytes: charge,
+                deadline: self
+                    .origin
+                    .checked_add(self.control.expiry())
+                    .ok_or_else(exhausted)?,
+            });
+        }
         if runtime.raw_control.is_none() {
             let Some(emission) = self
                 .control

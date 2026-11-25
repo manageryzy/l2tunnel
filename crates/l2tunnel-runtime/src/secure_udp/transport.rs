@@ -68,6 +68,9 @@ pub use performance::Performance;
 mod carrier;
 #[path = "transport_common_research_order.rs"]
 mod common_research_order;
+#[path = "transport_common_credit.rs"]
+mod credit;
+pub use credit::CreditSnapshot;
 #[path = "transport_maintained_carrier.rs"]
 mod maintained_carrier;
 #[path = "transport_raw_send.rs"]
@@ -103,6 +106,12 @@ mod common_io;
 mod common_native;
 #[path = "transport_common_native_window.rs"]
 mod common_native_window;
+#[path = "transport_device_mtu.rs"]
+mod device_mtu;
+#[path = "transport_meters.rs"]
+mod meters;
+#[path = "transport_tunnel_tests.rs"]
+mod tunnel_tests;
 pub use common::{
     CommonControlHandle, CommonControlRequests, CommonSnapshot, CommonStopped,
     NativeDeliverySnapshot, SameFlowRecovery, common_channel, run_common, run_common_on_carrier,
@@ -110,6 +119,10 @@ pub use common::{
 };
 pub use common_connections::{ConnectionIngressLimits, ConnectionIngressSnapshot};
 pub use common_contract::CommonTransactionContract;
+pub use device_mtu::{DeviceMtu, DeviceMtuSnapshot};
+pub use tunnel_tests::{
+    AddressCheck, TunnelTestPhase, TunnelTestRefusal, TunnelTestReport, TunnelTestRequest,
+};
 // The sole loop returns no snapshot payload, keeping constructor and readiness
 // poll frames independent of the size of Common observations.
 struct LoopCompletion {
@@ -220,10 +233,17 @@ where
         transferred,
     } = &mut execution_owner;
     let driver = &mut **driver;
+    driver.install_tunnel_tests(device.layer(), &requests);
+    driver.install_device_mtu(device.layer(), &requests);
     let mut device =
         NativeReady::with_interest(device, Interest::READABLE.add(Interest::WRITABLE))?;
     let mut inputs = driver.take_inputs()?;
     driver.counters.loop_input_capacity_bytes = inputs.capacity_bytes();
+    // Size the data socket for credit first, so the readback below sees it.
+    if let carrier::IoOwner::Udp(socket) = &socket {
+        driver.credit_observe_udp(socket)?;
+    }
+    let requested_receive = driver.credit_requested_receive_buffer();
     // Readback belongs to this retained original socket, never a requested tuple.
     // Diagnostic allocation or getsockopt failure is retained as unavailable.
     if let carrier::IoOwner::Udp(socket) = &socket
@@ -232,7 +252,7 @@ where
             .as_deref_mut()
             .and_then(|runtime| runtime.buffer_metrics.as_mut())
     {
-        metrics.observe_udp_socket(socket);
+        metrics.observe_udp_socket(socket, requested_receive);
     }
     let ready = sample();
     if ready >= setup_deadline {
@@ -284,6 +304,22 @@ where
                 execution.measure_result(TimingStage::CommonAdmission, || {
                     driver.admit_common(|| clock(origin, sample()).map(duration))
                 })?;
+                // A held switch step waits for its device MTU change, then
+                // runs in the same turn (live tuning decision 9).
+                if let Some((setter, mtu)) = driver.device_mtu_due() {
+                    let result = tokio::time::timeout(device_mtu::SET_WAIT, setter.set(mtu))
+                        .await
+                        .unwrap_or_else(|_| {
+                            Err(io::Error::new(
+                                io::ErrorKind::TimedOut,
+                                "device MTU change timed out",
+                            ))
+                        });
+                    driver.device_mtu_done(mtu, result);
+                    execution.measure_result(TimingStage::CommonAdmission, || {
+                        driver.admit_common(|| clock(origin, sample()).map(duration))
+                    })?;
+                }
             }
             let mut instant = sample();
             let mut now = clock(origin, instant)?;
@@ -354,7 +390,8 @@ where
             }
             execution.measure_result(TimingStage::CommonManagement, || {
                 driver.service_selected_control(now)?;
-                driver.submit_control(now)
+                driver.submit_control(now)?;
+                driver.service_tunnel_tests(now)
             })?;
             execution.measure_result(TimingStage::CommonSend, || {
                 driver.send_and_retry_native_ingress(
@@ -406,6 +443,9 @@ where
                     if native_spent > 0 || (driver.native_deliverable()? && driver.native_room()) {
                         wake.at = wake.at.min(sample());
                     }
+                    if let Some(at) = driver.tunnel_test_wake(now) {
+                        wake.at = wake.at.min(origin + Duration::from_micros(at));
+                    }
                     Ok::<_, io::Error>((read_native, write_native, interest, wake))
                 })?;
             let mixed = matches!(
@@ -440,6 +480,8 @@ where
                         }
                         Some(Request::Common(common::Command::Reuse(request, reply))) => driver
                             .request_connection_reuse(clock(origin, sample())?, request, reply)?,
+                        // The next turn takes the queued test from the shared state.
+                        Some(Request::Common(common::Command::TestWake)) => {}
                         None => requests.close(),
                     }
                 }
@@ -1133,6 +1175,9 @@ pub struct Config {
     /// Complete global selected Rolling fragmentation policy, authenticated at establishment.
     /// None retains unfragmented packet geometry and the base resource digest.
     pub rolling_fragments: Option<l2tunnel::record_engine::FragmentPolicy>,
+    /// Session receiver credit for data datagrams, identical on both peers.
+    /// Common construction requires it and rejects an absent selection.
+    pub credit: Option<l2tunnel_flow_control::session_credit::Config>,
     /// Independent retained native output bounds.
     pub native: NativeBudget,
     /// Explicit active lease and authenticated round-trip timers.
@@ -1723,6 +1768,11 @@ struct Driver {
     lease: u64,
     next_report: Option<u64>,
     terminal: Option<StopReason>,
+    /// Built-in tunnel tests; installed when the loop starts.
+    tunnel_tests: Option<Box<tunnel_tests::Port>>,
+    /// Device MTU ordering for live inner-size switches; installed when the
+    /// loop starts if the service gave a setter.
+    device_mtu: Option<Box<device_mtu::Gate>>,
 }
 
 impl Driver {
@@ -2044,6 +2094,7 @@ impl Driver {
                 Pong(u64),
                 Native(mg::LaneId, u16, u64),
                 Reuse(l2tunnel::connection_records::retirement::command::Command),
+                Test(Option<[u8; control::TUNNEL_TEST_BYTES]>),
             }
             let command = match envelope.body {
                 control::Body::NativeReceipt {
@@ -2060,6 +2111,10 @@ impl Driver {
                     tag: control::ProfileTag::SlotReuseV1,
                     ..
                 } => Command::Reuse(self.admit_connection_reuse(now, envelope)?),
+                control::Body::ProfileControl {
+                    tag: control::ProfileTag::TunnelTestV1,
+                    bytes,
+                } if scope == self.records.control_scope() => Command::Test(bytes.try_into().ok()),
                 _ => {
                     return Err(protocol(
                         "unsupported or mis-scoped authenticated control body",
@@ -2092,6 +2147,9 @@ impl Driver {
                         self.live.last_pong_micros = Some(now);
                         self.next_ping = add(now, self.config.lifetime.ping_interval)?;
                     }
+                }
+                Command::Test(bytes) => {
+                    self.receive_tunnel_test(now, bytes.as_ref().map_or(&[][..], |b| &b[..]))
                 }
                 Command::Native(lane, channel, record) => {
                     self.receive_common_native_delivery(now, scope, lane, channel, record)?
@@ -2358,6 +2416,16 @@ impl Driver {
                         "authenticated Control scope differs from actual Records",
                     ));
                 }
+                let plain = &self.buffers.plain[..opened.bytes];
+                if l2tunnel_flow_control::session_credit::Credit::is_tagged(plain) {
+                    let mut body = [0; l2tunnel_flow_control::session_credit::WIRE_BYTES];
+                    if plain.len() != body.len() {
+                        return Err(protocol("noncanonical session credit length"));
+                    }
+                    body.copy_from_slice(plain);
+                    self.credit_receive(&body, now)?;
+                    return Ok(());
+                }
                 self.control
                     .receive(
                         mg::Ingress::AuthenticatedManagement {
@@ -2372,11 +2440,21 @@ impl Driver {
                 self.delivered_selected_control(now)?;
             }
             Class::User => {
-                return if self.research_physical_output(opened.scope)? {
+                // Credit counts every finished data datagram, whatever the
+                // engine did with it; data feedback is never counted.
+                let data = (!opened.feedback).then_some(opened.number.0);
+                let bytes = packet.len();
+                let result = if self.research_physical_output(opened.scope)? {
                     self.receive_common_user_observed(opened, received, now, original)
                 } else {
                     self.receive_common_user_at(opened, received, now)
                 };
+                if result.is_ok()
+                    && let Some(number) = data
+                {
+                    self.credit_processed(number, bytes, now)?;
+                }
+                return result;
             }
         }
         Ok(())
@@ -2616,6 +2694,7 @@ impl Driver {
         let mut emitted = 0;
         let mut receive_check = instant;
         let mut first_send_poll = now;
+        self.credit_observe_udp(socket)?;
         for _ in 0..self.config.work.send_batch {
             // Whole Common writes advance their actual Engine at completion.
             // The next iteration must use the same injected clock again before
@@ -2717,6 +2796,10 @@ impl Driver {
         Ok(())
     }
     fn prepare_control(&mut self, now: u64) -> io::Result<Option<usize>> {
+        // Unreliable session credit goes first; it never enters a stream.
+        if let Some(bytes) = self.prepare_credit(now)? {
+            return Ok(Some(bytes));
+        }
         let Some(emission) = self
             .control
             .poll(

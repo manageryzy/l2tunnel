@@ -118,11 +118,7 @@ fn class(value: Class) -> MetricClass {
     }
 }
 fn lane(value: usize) -> Lane {
-    if value == 0 {
-        Lane::First
-    } else {
-        Lane::Second
-    }
+    Lane::at(value)
 }
 fn key(site: Site, physical_lane: Lane, value: Class) -> Key {
     Key {

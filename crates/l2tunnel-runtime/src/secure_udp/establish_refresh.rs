@@ -128,6 +128,7 @@ pub async fn connect_observed(
         entropy,
         &mut report,
         Some(selection),
+        super::Tuning::Off,
     ))
     .await;
     if let Err(error) = &result {
@@ -166,6 +167,7 @@ pub async fn accept_observed(
         entropy,
         &mut report,
         Some(admission.selection),
+        super::Tuning::Off,
     ))
     .await;
     report.server(admission.statistics());

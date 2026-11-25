@@ -9,7 +9,7 @@ async fn raw_setup_write_leaves_concurrent_bootstrap_input_for_final_handoff() -
     let selection = record::compact::Selection {
         protection: security::compact::Protection::Aes128Ccm4,
         limits: security::compact::Selection {
-            max_forward_packets: 4096,
+            max_forward_packets: 8192,
             max_failed_checks: 128,
         },
     };
@@ -114,7 +114,7 @@ async fn selected_runtime_pair(
     let selection = record::compact::Selection {
         protection,
         limits: security::compact::Selection {
-            max_forward_packets: 4096,
+            max_forward_packets: 8192,
             max_failed_checks: 128,
         },
     };

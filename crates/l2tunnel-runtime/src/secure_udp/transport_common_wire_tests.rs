@@ -34,7 +34,7 @@ fn selected(
     let selection = Selection {
         protection,
         limits: security::compact::Selection {
-            max_forward_packets: 1024,
+            max_forward_packets: 8192,
             max_failed_checks: 16,
         },
     };

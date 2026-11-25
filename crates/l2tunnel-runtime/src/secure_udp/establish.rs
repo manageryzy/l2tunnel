@@ -5,6 +5,7 @@
 
 use super::diagnostics::{self, Reporter, Stage};
 use super::raw_carrier_io::{NoRaw, RawBacking};
+use l2tunnel::live_tuning;
 use l2tunnel_cover as cover;
 use l2tunnel_handshake as hs;
 use l2tunnel_security as security;
@@ -254,8 +255,34 @@ impl<R: RawBacking> SocketBacking<R> {
 pub const GATE_TAG: u8 = 0x80;
 /// Handshake-cover tag around a complete authenticated bootstrap ARQ packet.
 pub const CONTROL_TAG: u8 = 0x81;
+/// Smallest bootstrap ARQ source, the largest frame without live tuning.
 const FRAME_BYTES: usize = 100;
-const CONFIRM_BYTES: usize = 73;
+/// Largest setup-stream frame: header plus an Initiation with the largest
+/// live-tuning proposal. Frames larger than one ARQ source are split.
+const MAX_FRAME_BYTES: usize = 4 + hs::MAX_INITIATION_BYTES;
+const MAX_CONFIRM_BYTES: usize = hs::CONTEXT_CONFIRM_BYTES;
+
+/// Live-tuning exchange of one setup (docs/modules/live-tuning.md,
+/// decisions 3, 4 and 6).
+pub enum Tuning<'a> {
+    /// No proposal: the handshake is byte-for-byte the original, and a
+    /// responder refuses any carried proposal as not offered.
+    Off,
+    /// Initiator: carry `proposal` in message 1 and bind `context`, the root
+    /// of the catalog this end derived from it, into both confirmations.
+    Propose {
+        /// Encoded choices, at most [`hs::MAX_INITIATION_PAYLOAD`] bytes.
+        proposal: &'a [u8],
+        /// Root of the catalog generated from the base plan and `proposal`.
+        context: [u8; 32],
+    },
+    /// Responder: judge a carried proposal. `Ok(root)` accepts and binds the
+    /// derived catalog root; `Err` refuses, and the initiator receives the
+    /// reason in the authenticated message 2.
+    Judge(&'a mut Judge<'a>),
+}
+/// Responder judgment of one carried proposal.
+pub type Judge<'a> = dyn FnMut(&[u8]) -> Result<[u8; 32], live_tuning::Refusal> + Send + 'a;
 
 /// Caller-verified public context, without a caller-selected session identifier.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -377,6 +404,9 @@ pub enum Error {
     Cover(cover::Error),
     /// Native socket I/O failed; no retry/default migration is inferred.
     Io(io::Error),
+    /// A live-tuning proposal was refused: by this responder, or by the
+    /// server in its authenticated verdict.
+    Tuning(live_tuning::Refusal),
 }
 impl fmt::Display for Error {
     fn fmt(&self, output: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -745,7 +775,8 @@ impl Core {
 pub struct BootstrapTail {
     core: Core,
     confirmation: Option<hs::ConfirmationCache>,
-    peer_confirmation: [u8; CONFIRM_BYTES],
+    peer_confirmation: [u8; MAX_CONFIRM_BYTES],
+    peer_confirmation_len: usize,
     parser: Parser,
     peer: SocketAddr,
 }
@@ -801,7 +832,8 @@ impl BootstrapTail {
                     }
                 };
                 if frame.kind != hs::FlightKind::Confirmation
-                    || frame.bytes[..frame.length] != self.peer_confirmation
+                    || frame.bytes[..frame.length]
+                        != self.peer_confirmation[..self.peer_confirmation_len]
                 {
                     self.retire();
                     return Err(Error::Protocol);
@@ -865,17 +897,19 @@ impl BootstrapTail {
 
 struct Frame {
     kind: hs::FlightKind,
-    bytes: [u8; hs::MAX_FLIGHT_BYTES],
+    bytes: Vec<u8>,
     length: usize,
 }
+// Heap buffers keep the setup and tail futures, which are moved by value,
+// as small as before the larger live-tuning frames.
 struct Parser {
-    bytes: [u8; FRAME_BYTES],
+    bytes: Box<[u8; MAX_FRAME_BYTES]>,
     used: usize,
 }
 impl Parser {
     fn new() -> Self {
         Self {
-            bytes: [0; FRAME_BYTES],
+            bytes: Box::new([0; MAX_FRAME_BYTES]),
             used: 0,
         }
     }
@@ -889,13 +923,14 @@ impl Parser {
                 4
             } else {
                 let length = usize::from(u16::from_be_bytes([self.bytes[2], self.bytes[3]]));
-                let expected = match self.bytes[1] {
-                    1 => 96,
-                    2 => 48,
-                    3 => CONFIRM_BYTES,
+                // The handshake checks the exact length for its state.
+                let allowed = match self.bytes[1] {
+                    1 => (96..=hs::MAX_INITIATION_BYTES).contains(&length),
+                    2 => (48..=hs::MAX_RESPONSE_BYTES).contains(&length),
+                    3 => length == hs::PLAIN_CONFIRM_BYTES || length == hs::CONTEXT_CONFIRM_BYTES,
                     _ => return Err(Error::Protocol),
                 };
-                if self.bytes[0] != 1 || length != expected {
+                if self.bytes[0] != 1 || !allowed {
                     return Err(Error::Protocol);
                 }
                 4 + length
@@ -915,8 +950,7 @@ impl Parser {
                 _ => return Err(Error::Protocol),
             };
             let length = needed - 4;
-            let mut bytes = [0; hs::MAX_FLIGHT_BYTES];
-            bytes[..length].copy_from_slice(&self.bytes[4..needed]);
+            let bytes = self.bytes[4..needed].to_vec();
             self.used = 0;
             return Ok(Some(Frame {
                 kind,
@@ -989,6 +1023,32 @@ pub async fn connect_observed(
     entropy: &mut (impl hs::Entropy + Send),
     observe: &mut diagnostics::Observer<'_>,
 ) -> Result<Established, Error> {
+    connect_tuned(
+        socket,
+        config,
+        identity,
+        admission,
+        deadline,
+        entropy,
+        observe,
+        Tuning::Off,
+    )
+    .await
+}
+
+/// [`connect_observed`] with a live-tuning proposal
+/// (docs/modules/live-tuning.md); `Tuning::Off` is the original exchange.
+#[allow(clippy::too_many_arguments)] // The observed inputs plus the live-tuning hook.
+pub async fn connect_tuned(
+    socket: UdpSocket,
+    config: Config,
+    identity: Identity,
+    admission: gate::Secret,
+    deadline: Instant,
+    entropy: &mut (impl hs::Entropy + Send),
+    observe: &mut diagnostics::Observer<'_>,
+    tuning: Tuning<'_>,
+) -> Result<Established, Error> {
     let mut report = Reporter::new(observe);
     // One setup allocation keeps instrumentation from multiplying caller stack storage.
     let result = Box::pin(connect_inner(
@@ -1000,6 +1060,7 @@ pub async fn connect_observed(
         entropy,
         &mut report,
         None,
+        tuning,
     ))
     .await;
     if let Err(error) = &result {
@@ -1018,6 +1079,7 @@ async fn connect_inner<R: RawBacking>(
     entropy: &mut (impl hs::Entropy + Send),
     report: &mut Reporter<'_, '_>,
     selection: Option<hs::refresh::Selection>,
+    tuning: Tuning<'_>,
 ) -> Result<EstablishedState<R>, Error> {
     let peers = Peers {
         initiator: identity.local.public_key(),
@@ -1079,7 +1141,7 @@ async fn connect_inner<R: RawBacking>(
         next_outer,
         client: Some(client),
     }
-    .run(entropy, None, report, selection)
+    .run(entropy, None, report, selection, tuning)
     .await
 }
 
@@ -1104,6 +1166,29 @@ pub async fn accept_observed(
     entropy: &mut (impl hs::Entropy + Send),
     observe: &mut diagnostics::Observer<'_>,
 ) -> Result<Established, Error> {
+    accept_tuned(
+        socket,
+        identity,
+        admission,
+        deadline,
+        entropy,
+        observe,
+        Tuning::Off,
+    )
+    .await
+}
+
+/// [`accept_observed`] that judges a carried live-tuning proposal
+/// (docs/modules/live-tuning.md); `Tuning::Off` refuses any proposal.
+pub async fn accept_tuned(
+    socket: UdpSocket,
+    identity: Identity,
+    admission: &mut ServerAdmission,
+    deadline: Instant,
+    entropy: &mut (impl hs::Entropy + Send),
+    observe: &mut diagnostics::Observer<'_>,
+    tuning: Tuning<'_>,
+) -> Result<Established, Error> {
     let mut report = Reporter::new(observe);
     report.server(admission.statistics());
     let result = Box::pin(accept_inner(
@@ -1114,6 +1199,7 @@ pub async fn accept_observed(
         entropy,
         &mut report,
         None,
+        tuning,
     ))
     .await;
     report.server(admission.statistics());
@@ -1123,6 +1209,7 @@ pub async fn accept_observed(
     result.and_then(EstablishedState::into_legacy)
 }
 
+#[allow(clippy::too_many_arguments)] // Same bounded setup inputs plus the live-tuning hook.
 async fn accept_inner<R: RawBacking>(
     mut socket: SocketBacking<R>,
     identity: Identity,
@@ -1131,6 +1218,7 @@ async fn accept_inner<R: RawBacking>(
     entropy: &mut (impl hs::Entropy + Send),
     report: &mut Reporter<'_, '_>,
     selection: Option<hs::refresh::Selection>,
+    tuning: Tuning<'_>,
 ) -> Result<EstablishedState<R>, Error> {
     let peers = Peers {
         initiator: identity.peer,
@@ -1212,7 +1300,7 @@ async fn accept_inner<R: RawBacking>(
         next_outer,
         client: None,
     }
-    .run(entropy, Some(admission), report, selection)
+    .run(entropy, Some(admission), report, selection, tuning)
     .await;
     admission
         .gate
@@ -1239,6 +1327,7 @@ impl<R: RawBacking> Exchange<R> {
         mut server: Option<&mut ServerAdmission>,
         report: &mut Reporter<'_, '_>,
         selection: Option<hs::refresh::Selection>,
+        mut tuning: Tuning<'_>,
     ) -> Result<EstablishedState<R>, Error> {
         report.stage(Stage::Noise);
         let role = if self.client.is_some() {
@@ -1285,10 +1374,27 @@ impl<R: RawBacking> Exchange<R> {
                 entropy,
             )?,
         };
+        match tuning {
+            Tuning::Off => {}
+            Tuning::Propose { proposal, context } if role == hs::Role::Initiator => {
+                if proposal.is_empty() {
+                    return Err(Error::Configuration("empty live-tuning proposal"));
+                }
+                handshake.set_initiation_payload(proposal)?;
+                handshake.set_confirmation_context(context)?;
+            }
+            Tuning::Judge(_) if role == hs::Role::Responder => {}
+            _ => return Err(Error::Configuration("live-tuning role")),
+        }
+        // A refused proposal: the responder still delivers its verdict in
+        // message 2 and then ends; the initiator ends on reading it.
+        let mut refused: Option<live_tuning::Refusal> = None;
         let mut parser = Parser::new();
-        let mut pending = [0; FRAME_BYTES];
+        let mut pending = vec![0; MAX_FRAME_BYTES];
         let mut pending_len = 0;
-        let mut peer_confirmation = [0; CONFIRM_BYTES];
+        let mut pending_sent = 0;
+        let mut peer_confirmation = [0; MAX_CONFIRM_BYTES];
+        let mut peer_confirmation_len = 0;
         let mut quota = Quota::new(self.setup.config, Instant::now())?;
         let mut input = vec![
             0;
@@ -1311,38 +1417,44 @@ impl<R: RawBacking> Exchange<R> {
                 report.server(server.statistics());
             }
             let now = Instant::now();
-            before(now, core.end)?;
+            if let Err(error) = before(now, core.end) {
+                return Err(refused.map_or(error, Error::Tuning));
+            }
             loop {
-                if pending_len == 0 {
-                    let Some(_) = handshake.next_flight() else {
+                if pending_sent == pending_len {
+                    let Some(next) = handshake.next_flight() else {
                         break;
                     };
+                    if refused.is_some() && next != hs::FlightKind::Response {
+                        break;
+                    }
                     let flight = handshake.write(hs_time(self.origin, now)?, &mut pending[4..])?;
+                    let length = u16::try_from(flight.bytes)
+                        .map_err(|_| Error::Protocol)?
+                        .to_be_bytes();
                     pending[..4].copy_from_slice(&[
                         1,
                         flight_kind(flight.kind),
-                        0,
-                        flight.bytes as u8,
+                        length[0],
+                        length[1],
                     ]);
                     pending_len = 4 + flight.bytes;
+                    pending_sent = 0;
                     core.statistics.noise_flights = core.statistics.noise_flights.saturating_add(1);
                     report.bootstrap(
                         core.statistics,
                         core.control.as_ref().map(gate::ControlEngine::statistics),
                     );
                 }
-                let written = core
-                    .control
-                    .as_mut()
-                    .ok_or(Error::Protocol)?
-                    .write(&pending[..pending_len], elapsed(self.origin, now)?)?;
+                // A frame larger than one ARQ source continues in the next.
+                let written = core.control.as_mut().ok_or(Error::Protocol)?.write(
+                    &pending[pending_sent..pending_len],
+                    elapsed(self.origin, now)?,
+                )?;
                 if written == 0 {
                     break;
                 }
-                if written != pending_len {
-                    return Err(Error::Protocol);
-                }
-                pending_len = 0;
+                pending_sent += written;
             }
             if let Some(client) = &mut self.client
                 && let Some(frame) = client.poll(elapsed(self.origin, now)?)?
@@ -1368,7 +1480,18 @@ impl<R: RawBacking> Exchange<R> {
                 sent(&mut core.statistics, length, accepted);
                 advance(&mut self.next_outer)?;
             }
-            if handshake.is_complete() && pending_len == 0 {
+            if let Some(refusal) = refused {
+                let delivered = pending_sent == pending_len
+                    && handshake.next_flight() != Some(hs::FlightKind::Response)
+                    && core
+                        .control
+                        .as_ref()
+                        .is_none_or(gate::ControlEngine::drained);
+                if role == hs::Role::Initiator || delivered {
+                    return Err(Error::Tuning(refusal));
+                }
+            }
+            if handshake.is_complete() && pending_sent == pending_len {
                 before(Instant::now(), core.end)?;
                 let now = hs_time(self.origin, Instant::now())?;
                 let (material, confirmation) = if selection.is_some() {
@@ -1395,6 +1518,7 @@ impl<R: RawBacking> Exchange<R> {
                     core,
                     confirmation: Some(confirmation),
                     peer_confirmation,
+                    peer_confirmation_len,
                     parser,
                     peer,
                 };
@@ -1480,7 +1604,13 @@ impl<R: RawBacking> Exchange<R> {
                     while let Some(frame) = parser.read(core.control.as_mut().ok_or(Error::Protocol)?, elapsed(self.origin, now)?)? {
                         report.bootstrap(core.statistics, core.control.as_ref().map(gate::ControlEngine::statistics));
                         let outcome = handshake.read(hs_time(self.origin, now)?, frame.kind, &frame.bytes[..frame.length])?;
-                        if frame.kind == hs::FlightKind::Confirmation { peer_confirmation.copy_from_slice(&frame.bytes[..frame.length]); }
+                        if frame.kind == hs::FlightKind::Confirmation {
+                            peer_confirmation[..frame.length].copy_from_slice(&frame.bytes[..frame.length]);
+                            peer_confirmation_len = frame.length;
+                        }
+                        if outcome == hs::ReadOutcome::Accepted {
+                            refused = refused.or(judge(&mut handshake, &mut tuning, role, frame.kind)?);
+                        }
                         if outcome == hs::ReadOutcome::Duplicate { core.statistics.noise_duplicates = core.statistics.noise_duplicates.saturating_add(1); }
                     }
                 }
@@ -1531,6 +1661,7 @@ fn setup_with_physical_overhead(
     let cover_bytes = match config.cover.appearance() {
         cover::Appearance::QuicLike => 30,
         cover::Appearance::MediaLike => cover::MEDIA_OVERHEAD,
+        cover::Appearance::TlsLike => cover::TLS_OVERHEAD,
     };
     let protected = config
         .gate
@@ -1572,6 +1703,7 @@ fn setup_with_physical_overhead(
         match config.cover.appearance() {
             cover::Appearance::QuicLike => 1,
             cover::Appearance::MediaLike => 2,
+            cover::Appearance::TlsLike => 3,
         },
     ]);
     for field in [
@@ -1663,6 +1795,40 @@ fn before(now: Instant, deadline: Instant) -> Result<(), Error> {
         Err(Error::Deadline)
     } else {
         Ok(())
+    }
+}
+/// Live-tuning step after an accepted flight: the responder judges a carried
+/// proposal and sets its verdict; the initiator reads the verdict. Returns
+/// the refusal, if any.
+fn judge(
+    handshake: &mut hs::Handshake,
+    tuning: &mut Tuning<'_>,
+    role: hs::Role,
+    kind: hs::FlightKind,
+) -> Result<Option<live_tuning::Refusal>, Error> {
+    if handshake.initiation_payload().is_empty() {
+        return Ok(None);
+    }
+    match (role, kind) {
+        (hs::Role::Responder, hs::FlightKind::Initiation) => {
+            let proposal = handshake.initiation_payload().to_vec();
+            let verdict = match tuning {
+                Tuning::Judge(judge) => judge(&proposal),
+                _ => Err(live_tuning::Refusal::NotOffered),
+            };
+            handshake.set_response_payload(&live_tuning::encode_verdict(verdict.map(|_| ())))?;
+            match verdict {
+                Ok(root) => {
+                    handshake.set_confirmation_context(root)?;
+                    Ok(None)
+                }
+                Err(refusal) => Ok(Some(refusal)),
+            }
+        }
+        (hs::Role::Initiator, hs::FlightKind::Response) => {
+            Ok(live_tuning::decode_verdict(handshake.response_payload()).err())
+        }
+        _ => Ok(None),
     }
 }
 fn flight_kind(kind: hs::FlightKind) -> u8 {

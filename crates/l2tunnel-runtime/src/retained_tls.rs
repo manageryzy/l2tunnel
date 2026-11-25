@@ -1043,11 +1043,7 @@ fn submission_key(class: Class) -> Key {
 fn lane_key(site: Site, index: usize, class: MetricClass) -> Key {
     Key {
         site,
-        lane: if index == 0 {
-            MetricLane::First
-        } else {
-            MetricLane::Second
-        },
+        lane: MetricLane::at(index),
         class,
     }
 }

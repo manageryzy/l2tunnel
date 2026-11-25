@@ -807,7 +807,17 @@ impl Driver {
         {
             return Err(protocol("common issuing Bank token differs"));
         }
-        let result = try_native_write(ready, packet.bytes());
+        // Packets for this end's active tunnel-test address go to the test
+        // endpoint and never reach the device (TT-02).
+        let captured = self
+            .tunnel_tests
+            .as_mut()
+            .is_some_and(|port| port.capture(packet.bytes(), Duration::from_micros(before)));
+        let result = if captured {
+            Ok(true)
+        } else {
+            try_native_write(ready, packet.bytes())
+        };
         if matches!(&result, Ok(true)) {
             // Whole device acceptance is irreversible. Commit the actual token,
             // recycle bytes and count it before sampling a possibly failing clock.
@@ -944,6 +954,14 @@ impl Driver {
             } else {
                 self.records.next_number(Class::User)
             };
+            // Session receiver credit gates data only; feedback stays eligible.
+            let has_demand = if allow_data {
+                let owner::DataOwner::Common(state) = &self.owner;
+                !state.engine(epoch)?.drained().map_err(protocol)?
+            } else {
+                false
+            };
+            let allow_data = allow_data && self.credit_gate(number.0, now, has_demand)?;
             let available = self.bucket.allowance().saturating_sub(self.reserve);
             let owner::DataOwner::Common(state) = &mut self.owner;
             // Existing queued originals are serviced after new native ingress has
@@ -1305,6 +1323,7 @@ impl Driver {
         if sealed.number != pending.number || sealed.bytes != capacity.packet_bytes {
             return Err(protocol("common exact security number/wire charge differs"));
         }
+        let credited = (!pending.feedback).then_some((sealed.number.0, sealed.bytes));
         if pending.feedback {
             runtime.compact_feedback_number = Some(sealed.number);
         } else {
@@ -1326,6 +1345,9 @@ impl Driver {
             fragment: pending.fragment,
             proxy_record: pending.proxy_record,
         });
+        if let Some((number, bytes)) = credited {
+            self.credit_sent(number, bytes, now)?;
+        }
         Ok(true)
     }
     pub(super) fn send_common_carrier<R: super::raw_carrier::RawBacking>(
@@ -2096,6 +2118,9 @@ impl Driver {
         let mut wake = self.lease;
         let mut work_ready = false;
         let mut ready_output_at = None;
+        if let Some(at) = self.credit_wake(now) {
+            wake = wake.min(at.max(now));
+        }
         if let Some(state) = self
             .common
             .as_deref()

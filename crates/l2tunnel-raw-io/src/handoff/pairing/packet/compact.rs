@@ -15,6 +15,9 @@ pub(super) type BootstrapFilter =
 
 /// Fixed canonical external AAD. IP addresses, ports and checksums are excluded.
 pub const AAD_BYTES: usize = 49;
+/// Fixed TLS 1.3 Application Data record header (`0x17 0x03 0x03 <u16 len>`).
+pub const TLS_RECORD_HEADER_BYTES: usize = 5;
+pub(super) const TLS_APP_DATA_PREFIX: [u8; 3] = [0x17, 0x03, 0x03];
 
 /// Exact registered Records purpose in the explicitly selected carrier namespace.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -213,12 +216,29 @@ impl PacketPolicy {
     /// Final single-protection geometry. Bootstrap retains `record_geometry()`.
     /// The caller's record includes its one Records header/check and algorithm body.
     pub fn final_record_geometry(self) -> Result<RecordGeometry, Error> {
+        self.final_record_geometry_with_tls_cover(false)
+    }
+    /// Final single-protection geometry with optional 5-byte TLS 1.3 Application Data
+    /// record framing (`0x17 0x03 0x03 <u16 len>`) on every raw TCP segment payload.
+    pub fn final_record_geometry_with_tls_cover(
+        self,
+        tls_record_cover: bool,
+    ) -> Result<RecordGeometry, Error> {
         self.validate()?;
+        let overhead = if tls_record_cover {
+            TLS_RECORD_HEADER_BYTES
+        } else {
+            0
+        };
+        let max_record_bytes = usize::from(self.mtu)
+            .checked_sub(40 + overhead)
+            .filter(|n| *n > 0)
+            .ok_or(Error::Capacity)?;
         Ok(RecordGeometry {
             path_mtu: usize::from(self.mtu),
             ip_tcp_bytes: 40,
-            record_overhead_bytes: 0,
-            max_record_bytes: usize::from(self.mtu) - 40,
+            record_overhead_bytes: overhead,
+            max_record_bytes,
         })
     }
 }

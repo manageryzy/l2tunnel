@@ -352,12 +352,10 @@ impl Bank {
         for sender in [Role::Client, Role::Server] {
             let old = self.current.config.descriptor().direction(sender);
             let new = intent.config.descriptor().direction(sender);
-            if old.common().traffic().layer != new.common().traffic().layer
-                || old.max_native() != new.max_native()
-            {
-                return Err(invalid(
-                    "common preparation changes immutable native format",
-                ));
+            // The inner packet size may change (live-tuning decision 8);
+            // native storage is sized for the largest catalog entry.
+            if old.common().traffic().layer != new.common().traffic().layer {
+                return Err(invalid("common preparation changes immutable native layer"));
             }
         }
         Ok(())

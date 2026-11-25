@@ -132,6 +132,7 @@ pub(in crate::secure_udp) enum NoRaw {}
 pub(in crate::secure_udp) trait RawBacking: Send {
     fn buffer_snapshot(&self, now: Instant) -> BufferSnapshot;
     fn geometry(&self) -> raw::RecordGeometry;
+    fn final_records_enabled(&self) -> bool;
     fn final_input_metadata(&self) -> Option<FinalMetadata>;
     fn commit_final_input(
         &mut self,
@@ -199,6 +200,9 @@ impl RawBacking for NoRaw {
         match *self {}
     }
     fn geometry(&self) -> raw::RecordGeometry {
+        match *self {}
+    }
+    fn final_records_enabled(&self) -> bool {
         match *self {}
     }
     fn addresses(&self) -> (SocketAddr, SocketAddr) {
@@ -404,6 +408,7 @@ impl<I: PacketIo + Send + 'static> RawAdapter<I> {
             .user
             .as_mut()
             .ok_or_else(|| protocol("raw User custody missing"))?;
+        let user_lane = user.pending.lane;
         if user.pending.receipt.is_none() {
             // Retain the exact User identity and original cap while an older
             // Control owns this lane. The Driver now observes waiting custody
@@ -413,7 +418,7 @@ impl<I: PacketIo + Send + 'static> RawAdapter<I> {
                 && self
                     .control
                     .as_ref()
-                    .is_some_and(|control| control.lane == user.pending.lane)
+                    .is_some_and(|control| control.lane == user_lane)
             {
                 return Ok(SendProgress::Pending);
             }
@@ -422,7 +427,7 @@ impl<I: PacketIo + Send + 'static> RawAdapter<I> {
                     .prepared
                     .take()
                     .ok_or_else(|| protocol("raw final User reservation missing"))?;
-                if lane != user.pending.lane {
+                if lane != user_lane {
                     return Err(protocol("raw final User lane changed"));
                 }
                 user.pending.token = Some(
@@ -431,10 +436,37 @@ impl<I: PacketIo + Send + 'static> RawAdapter<I> {
                         .map_err(raw_error)?,
                 );
                 self.custody.commit(custody::Class::User, &user.pending);
-                self.fresh_output = true;
             }
-            self.fail()?;
-            return Ok(SendProgress::Pending);
+            if hold {
+                self.fresh_output = true;
+                self.fail()?;
+                return Ok(SendProgress::Pending);
+            }
+            // Fast-path synchronous send using the current turn's remaining
+            // quota and pacing bucket: avoids a 1-slot stop-and-wait loop bounce
+            // whenever PacketIo accepts the segment immediately.
+            match self.carrier.flush_pending_final(user_lane) {
+                Ok(true) => {
+                    self.collect_receipts()?;
+                }
+                Ok(false) => {
+                    self.fresh_output = true;
+                }
+                Err(error) => {
+                    if self.failure.is_none() {
+                        self.failure = Some(error);
+                    }
+                    self.collect_receipts()?;
+                }
+            }
+            if self
+                .user
+                .as_ref()
+                .is_some_and(|u| u.pending.receipt.is_none())
+            {
+                self.fail()?;
+                return Ok(SendProgress::Pending);
+            }
         }
         if hold {
             return Ok(SendProgress::Pending);
@@ -501,21 +533,26 @@ impl<I: PacketIo + Send + 'static> RawAdapter<I> {
         if self.user.is_some() || self.control.is_some() || self.input.is_some() {
             return Err(protocol("raw upper custody remains at final handoff"));
         }
+        let tls_record_cover = cover.appearance() == l2tunnel::cover::Appearance::TlsLike;
         self.carrier
-            .enable_final_records(binding, move |direction, packet| {
-                let decoded = match direction {
-                    raw::compact::BootstrapDirection::Incoming => cover.decode(packet),
-                    raw::compact::BootstrapDirection::Outgoing => cover.decode_outgoing(packet),
-                };
-                decoded.is_ok_and(|decoded| match decoded.phase {
-                    l2tunnel::cover::Phase::Handshake => {
-                        decoded.protected.first() == Some(&super::establish::CONTROL_TAG)
-                    }
-                    l2tunnel::cover::Phase::Established => {
-                        decoded.protected.first() == Some(&super::member::ROUTE)
-                    }
-                })
-            })
+            .enable_final_records_with_tls_cover(
+                binding,
+                tls_record_cover,
+                move |direction, packet| {
+                    let decoded = match direction {
+                        raw::compact::BootstrapDirection::Incoming => cover.decode(packet),
+                        raw::compact::BootstrapDirection::Outgoing => cover.decode_outgoing(packet),
+                    };
+                    decoded.is_ok_and(|decoded| match decoded.phase {
+                        l2tunnel::cover::Phase::Handshake => {
+                            decoded.protected.first() == Some(&super::establish::CONTROL_TAG)
+                        }
+                        l2tunnel::cover::Phase::Established => {
+                            decoded.protected.first() == Some(&super::member::ROUTE)
+                        }
+                    })
+                },
+            )
             .map_err(raw_error)?;
         self.geometry = self.carrier.final_geometry().map_err(raw_error)?;
         Ok(self.geometry)
@@ -955,6 +992,9 @@ impl<I: PacketIo + Send + 'static> RawBacking for RawAdapter<I> {
     }
     fn geometry(&self) -> raw::RecordGeometry {
         self.geometry
+    }
+    fn final_records_enabled(&self) -> bool {
+        self.carrier.final_records_enabled()
     }
     fn addresses(&self) -> (SocketAddr, SocketAddr) {
         self.addresses

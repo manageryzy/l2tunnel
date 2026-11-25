@@ -16,6 +16,16 @@ impl<I: PacketIo + Send + 'static> PacketCarrier<I> {
         binding: [u8; 32],
         bootstrap_filter: impl Fn(BootstrapDirection, &[u8]) -> bool + Send + Sync + 'static,
     ) -> Result<(), Error> {
+        self.enable_final_records_with_tls_cover(binding, false, bootstrap_filter)
+    }
+    /// Same final Records activation with optional 5-byte TLS 1.3 Application Data
+    /// record framing (`0x17 0x03 0x03 <u16 len>`) on every steady-state raw TCP segment.
+    pub fn enable_final_records_with_tls_cover(
+        &mut self,
+        binding: [u8; 32],
+        tls_record_cover: bool,
+        bootstrap_filter: impl Fn(BootstrapDirection, &[u8]) -> bool + Send + Sync + 'static,
+    ) -> Result<(), Error> {
         self.check_live()?;
         if !self.ready || self.final_context.is_some() || binding == [0; 32] {
             return Err(Error::Configuration);
@@ -46,24 +56,41 @@ impl<I: PacketIo + Send + 'static> PacketCarrier<I> {
                 return Err(Error::Proof);
             }
         }
-        let context = hash_parts(
-            b"l2tunnel/raw-final-record-context/v1\0",
-            &[
-                &binding,
-                &self.transaction,
-                &self.info.transcript_digest,
-                &self.policy_digest,
-                &self.armed,
-                &self.commit_proof.ok_or(Error::Proof)?,
-            ],
-        );
+        let commit_proof = self.commit_proof.ok_or(Error::Proof)?;
+        let context = if tls_record_cover {
+            hash_parts(
+                b"l2tunnel/raw-final-record-context/tls-cover/v1\0",
+                &[
+                    &binding,
+                    &self.transaction,
+                    &self.info.transcript_digest,
+                    &self.policy_digest,
+                    &self.armed,
+                    &commit_proof,
+                ],
+            )
+        } else {
+            hash_parts(
+                b"l2tunnel/raw-final-record-context/v1\0",
+                &[
+                    &binding,
+                    &self.transaction,
+                    &self.info.transcript_digest,
+                    &self.policy_digest,
+                    &self.armed,
+                    &commit_proof,
+                ],
+            )
+        };
         let filter: super::super::compact::BootstrapFilter = Arc::new(bootstrap_filter);
         for lane in self.lanes.iter().flatten() {
             let mut state = lock(&lane.io.state)?;
             state.final_context = Some(context);
+            state.tls_record_cover = tls_record_cover;
             state.bootstrap_filter = Some(filter.clone());
         }
         self.final_context = Some(context);
+        self.tls_record_cover = tls_record_cover;
         Ok(())
     }
     /// True only after explicit installation on this original carrier owner.
@@ -74,7 +101,8 @@ impl<I: PacketIo + Send + 'static> PacketCarrier<I> {
     pub fn final_geometry(&self) -> Result<RecordGeometry, Error> {
         self.check()?;
         self.final_context.ok_or(Error::Configuration)?;
-        self.policy.final_record_geometry()
+        self.policy
+            .final_record_geometry_with_tls_cover(self.tls_record_cover)
     }
     /// Preflight one exact final packet before the sole Records sealer consumes a nonce.
     /// Reserves the existing lane output slot, without allocating sequence space.
@@ -140,7 +168,11 @@ impl<I: PacketIo + Send + 'static> PacketCarrier<I> {
         let index = lane.index();
         if index >= count
             || protected_bytes < 5
-            || protected_bytes > self.policy.final_record_geometry()?.max_record_bytes
+            || protected_bytes
+                > self
+                    .policy
+                    .final_record_geometry_with_tls_cover(self.tls_record_cover)?
+                    .max_record_bytes
             || (kind == FinalKind::Data && count == 2 && (index == 0) != self.info.is_client)
         {
             return Err(Error::Configuration);
@@ -180,9 +212,16 @@ impl<I: PacketIo + Send + 'static> PacketCarrier<I> {
         }
         let state = lock(&owner.io.state)?;
         let f = state.fence.as_ref().ok_or(Error::Proof)?;
+        let wire_bytes = protected_bytes
+            .checked_add(if self.tls_record_cover {
+                compact::TLS_RECORD_HEADER_BYTES
+            } else {
+                0
+            })
+            .ok_or(Error::Exhausted)?;
         let end = f
             .allocated
-            .checked_add(protected_bytes as u64)
+            .checked_add(wire_bytes as u64)
             .ok_or(Error::Exhausted)?;
         let reserve = kind.reserve() * (u64::from(self.policy.mtu) - 40);
         let allowed_end = f
@@ -263,25 +302,54 @@ impl<I: PacketIo + Send + 'static> PacketCarrier<I> {
         }
         let mut state = lock(&owner.io.state)?;
         let f = state.fence.as_ref().ok_or(Error::Proof)?;
+        let wire_len = protected
+            .len()
+            .checked_add(if self.tls_record_cover {
+                compact::TLS_RECORD_HEADER_BYTES
+            } else {
+                0
+            })
+            .ok_or(Error::Exhausted)?;
         if metadata.sequence
             != crate::handoff::pairing::packet::sequence::wire(f.local, f.allocated)
             || token.end
                 != f.allocated
-                    .checked_add(protected.len() as u64)
+                    .checked_add(wire_len as u64)
                     .ok_or(Error::Exhausted)?
         {
             return Err(Error::Proof);
         }
-        let mut bytes = vec![0; protected.len() + 40];
-        packet::encode(
-            state.config,
-            metadata.sequence,
-            metadata.acknowledgment,
-            metadata.window,
-            protected,
-            &mut bytes,
-        )
-        .map_err(|_| Error::Proof)?;
+        let mut bytes = std::mem::take(&mut owner.send_buf);
+        bytes.resize(wire_len + 40, 0);
+        if self.tls_record_cover {
+            let mut wrapped = [0u8; 1500];
+            if wire_len > wrapped.len() {
+                return Err(Error::Capacity);
+            }
+            let record_len = u16::try_from(protected.len()).map_err(|_| Error::Capacity)?;
+            wrapped[..3].copy_from_slice(&compact::TLS_APP_DATA_PREFIX);
+            wrapped[3..5].copy_from_slice(&record_len.to_be_bytes());
+            wrapped[5..wire_len].copy_from_slice(protected);
+            packet::encode(
+                state.config,
+                metadata.sequence,
+                metadata.acknowledgment,
+                metadata.window,
+                &wrapped[..wire_len],
+                &mut bytes,
+            )
+            .map_err(|_| Error::Proof)?;
+        } else {
+            packet::encode(
+                state.config,
+                metadata.sequence,
+                metadata.acknowledgment,
+                metadata.window,
+                protected,
+                &mut bytes,
+            )
+            .map_err(|_| Error::Proof)?;
+        }
         let retired = if metadata.kind == FinalKind::Data {
             owner.retirement_reported
         } else {

@@ -61,10 +61,11 @@ pub(super) struct Snapshot {
     peer: Readback<SocketAddr>,
     receive: Readback<usize>,
     send: Readback<usize>,
+    requested_receive: Option<u64>,
 }
 
 impl Snapshot {
-    pub(super) fn read(socket: &tokio::net::UdpSocket) -> Self {
+    pub(super) fn read(socket: &tokio::net::UdpSocket, requested_receive: Option<u64>) -> Self {
         #[cfg(any(unix, windows))]
         let (receive, send) = {
             let socket = socket2::SockRef::from(socket);
@@ -86,13 +87,17 @@ impl Snapshot {
             peer: socket.peer_addr().into(),
             receive,
             send,
+            requested_receive,
         }
     }
 
     pub(super) fn write(&self, writer: &mut impl Write) -> io::Result<()> {
         write!(
             writer,
-            "{{\"availability\":\"attempted\",\"lane\":\"Shared\",\"sampling\":\"runtime_entry_once\",\"readback_attempted\":true,\"requested_receive_bytes\":null,\"requested_send_bytes\":null,\"socket_options_changed\":false,\"definition\":\"SO_RCVBUF and SO_SNDBUF getsockopt readback; accounting limits, not UDP payload capacity, occupancy, drops or blocked duration\",\"reporting_convention\":\"{}\",\"local\":",
+            "{{\"availability\":\"attempted\",\"lane\":\"Shared\",\"sampling\":\"runtime_entry_once\",\"readback_attempted\":true,\"requested_receive_bytes\":{},\"requested_send_bytes\":null,\"socket_options_changed\":{},\"definition\":\"SO_RCVBUF and SO_SNDBUF getsockopt readback; accounting limits, not UDP payload capacity, occupancy, drops or blocked duration\",\"reporting_convention\":\"{}\",\"local\":",
+            self.requested_receive
+                .map_or_else(|| "null".to_owned(), |bytes| bytes.to_string()),
+            self.requested_receive.is_some(),
             if cfg!(target_os = "linux") {
                 "Linux kernel accounting byte limits include bookkeeping; Linux doubles user-set values; raw readback is preserved without halving or inferring a requested value"
             } else {
@@ -124,7 +129,7 @@ mod tests {
         peer.connect(socket.local_addr()?).await?;
         let actual = socket2::SockRef::from(&socket);
         let before = (actual.recv_buffer_size()?, actual.send_buffer_size()?);
-        let snapshot = Snapshot::read(&socket);
+        let snapshot = Snapshot::read(&socket, None);
         assert_eq!(snapshot.local.0, Ok(socket.local_addr()?));
         assert_eq!(snapshot.peer.0, Ok(peer.local_addr()?));
         assert_eq!(snapshot.receive.0, Ok(before.0));
@@ -161,6 +166,7 @@ mod tests {
             peer: Err(io::Error::new(io::ErrorKind::NotConnected, "not exported")).into(),
             receive: Err(io::Error::from_raw_os_error(22)).into(),
             send: Ok(12345).into(),
+            requested_receive: Some(16 << 20),
         };
         let mut bytes = Vec::new();
         snapshot.write(&mut bytes)?;
@@ -171,6 +177,8 @@ mod tests {
         assert_eq!(report["send"]["availability"], "observed");
         assert_eq!(report["send"]["kernel_reported_bytes"], 12345);
         assert_eq!(report["peer"]["error_kind"], "NotConnected");
+        assert_eq!(report["requested_receive_bytes"], 16 << 20);
+        assert_eq!(report["socket_options_changed"], true);
         assert!(!String::from_utf8(bytes)?.contains("not exported"));
         Ok(())
     }

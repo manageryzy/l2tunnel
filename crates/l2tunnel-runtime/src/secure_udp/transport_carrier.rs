@@ -442,9 +442,7 @@ impl<R: RawBacking> IoOwner<R> {
     }
     pub(super) fn final_raw_mut(&mut self) -> Option<&mut R> {
         match self {
-            Self::Raw(values) if values[0].geometry().record_overhead_bytes == 0 => {
-                Some(&mut values[0])
-            }
+            Self::Raw(values) if values[0].final_records_enabled() => Some(&mut values[0]),
             _ => None,
         }
     }

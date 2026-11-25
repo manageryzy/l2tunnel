@@ -15,4 +15,7 @@ pub enum SwitchError {
     /// The session ended before the change completed; whether the peer
     /// applied it is unknown and irrelevant, since the session is gone.
     Closed,
+    /// The local device MTU could not be lowered for a smaller target
+    /// (live tuning); the current setting stays.
+    DeviceMtu,
 }

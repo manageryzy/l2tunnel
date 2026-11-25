@@ -341,7 +341,8 @@ impl Network {
                             discard = true;
                         }
                     }
-                    l2tunnel_recovery::PacketView::Ack { .. } => {
+                    l2tunnel_recovery::PacketView::Ack { .. }
+                    | l2tunnel_recovery::PacketView::WideAck { .. } => {
                         if self.faults.enabled && side == 1 && !self.faults.recovery_ack_dropped {
                             self.faults.recovery_ack_dropped = true;
                             discard = true;

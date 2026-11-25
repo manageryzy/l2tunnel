@@ -29,6 +29,23 @@ const RESPONSE_BYTES: usize = 48;
 const CONFIRM_DOMAIN: &[u8; 8] = b"L2NCONF\0";
 const CONFIRM_BODY: usize = 8 + 1 + 16 + 32;
 const CONFIRM_BYTES: usize = CONFIRM_BODY + 16;
+/// Largest optional authenticated payload of the initiator's first message
+/// (live-tuning proposal, docs/modules/live-tuning.md decision 4).
+pub const MAX_INITIATION_PAYLOAD: usize = 256;
+/// Largest Initiation flight, with the largest payload.
+pub const MAX_INITIATION_BYTES: usize = INITIATION_BYTES + MAX_INITIATION_PAYLOAD;
+/// Largest authenticated verdict the responder returns in message 2 when
+/// message 1 carried a payload (live-tuning acceptance or refusal reason).
+pub const MAX_RESPONSE_PAYLOAD: usize = 64;
+/// Largest Response flight, with the largest verdict.
+pub const MAX_RESPONSE_BYTES: usize = RESPONSE_BYTES + MAX_RESPONSE_PAYLOAD;
+/// Domain of a confirmation that also binds a derived context digest.
+const CONTEXT_CONFIRM_DOMAIN: &[u8; 8] = b"L2NCONX\0";
+const CONTEXT_CONFIRM_BODY: usize = CONFIRM_BODY + 32;
+/// Confirmation flight that binds a context digest (decision 6).
+pub const CONTEXT_CONFIRM_BYTES: usize = CONTEXT_CONFIRM_BODY + 16;
+/// Confirmation flight without a context digest.
+pub const PLAIN_CONFIRM_BYTES: usize = CONFIRM_BYTES;
 const PROLOGUE_DOMAIN: &[u8] = b"l2tunnel/noise-proof/v1\0";
 
 type Noise = NqHandshakeCore<CheckedX25519, ChaChaPoly, Sha256, UnavailableRandom>;
@@ -159,7 +176,8 @@ pub struct Established {
 /// Bounded final-flight ciphertext custody after the handshake keys are consumed.
 /// This owner has no secret key, encryption operation or automatic response policy.
 pub struct ConfirmationCache {
-    ciphertext: Zeroizing<[u8; CONFIRM_BYTES]>,
+    ciphertext: Zeroizing<[u8; CONTEXT_CONFIRM_BYTES]>,
+    length: usize,
     deadline: Time,
     now: Time,
     retired: bool,
@@ -183,14 +201,12 @@ impl ConfirmationCache {
             self.retired = true;
             return Err(Error::Deadline);
         }
-        let destination = output
-            .get_mut(..CONFIRM_BYTES)
-            .ok_or(Error::OutputTooSmall)?;
-        destination.copy_from_slice(&self.ciphertext[..]);
+        let destination = output.get_mut(..self.length).ok_or(Error::OutputTooSmall)?;
+        destination.copy_from_slice(&self.ciphertext[..self.length]);
         self.now = now;
         Ok(Flight {
             kind: FlightKind::Confirmation,
-            bytes: CONFIRM_BYTES,
+            bytes: self.length,
         })
     }
 }
@@ -257,6 +273,12 @@ pub struct Handshake {
     sent: Vec<Cached>,
     finish_kind: refresh::FinishKind,
     refresh_setup: Option<refresh::InitialSetup>,
+    /// Initiator: payload to send in message 1. Responder: payload received.
+    initiation_payload: Vec<u8>,
+    /// Responder: verdict to send in message 2. Initiator: verdict received.
+    response_payload: Vec<u8>,
+    /// Derived digest both confirmations bind, when a payload was carried.
+    confirmation_context: Option<[u8; 32]>,
 }
 
 impl Handshake {
@@ -391,7 +413,111 @@ impl Handshake {
             sent: Vec::with_capacity(2),
             finish_kind,
             refresh_setup,
+            initiation_payload: Vec::new(),
+            response_payload: Vec::new(),
+            confirmation_context: None,
         })
+    }
+
+    /// Initiator only, before message 1: carry `payload` encrypted and
+    /// authenticated inside it. The responder reads it back with
+    /// [`Self::initiation_payload`] once message 1 is accepted.
+    pub fn set_initiation_payload(&mut self, payload: &[u8]) -> Result<(), Error> {
+        if self.config.role != Role::Initiator
+            || !self.sent.is_empty()
+            || self.retired
+            || payload.len() > MAX_INITIATION_PAYLOAD
+        {
+            return Err(Error::Configuration);
+        }
+        let mut owned = Vec::new();
+        owned
+            .try_reserve_exact(payload.len())
+            .map_err(|_| Error::Protection)?;
+        owned.extend_from_slice(payload);
+        self.initiation_payload = owned;
+        Ok(())
+    }
+
+    /// Payload of message 1: what this initiator sends, or what this
+    /// responder accepted (empty before message 1 or when none was carried).
+    pub fn initiation_payload(&self) -> &[u8] {
+        &self.initiation_payload
+    }
+
+    /// Responder only, after accepting a message 1 that carried a payload and
+    /// before writing message 2: carry a nonempty `payload` (the verdict on
+    /// the initiator's payload) encrypted and authenticated inside message 2.
+    /// Such a message 2 cannot be written without it.
+    pub fn set_response_payload(&mut self, payload: &[u8]) -> Result<(), Error> {
+        if self.config.role != Role::Responder
+            || self.retired
+            || self.initiation_payload.is_empty()
+            || !self.sent.is_empty()
+            || !self.response_payload.is_empty()
+            || payload.is_empty()
+            || payload.len() > MAX_RESPONSE_PAYLOAD
+        {
+            return Err(Error::Configuration);
+        }
+        let mut owned = Vec::new();
+        owned
+            .try_reserve_exact(payload.len())
+            .map_err(|_| Error::Protection)?;
+        owned.extend_from_slice(payload);
+        self.response_payload = owned;
+        Ok(())
+    }
+
+    /// Payload of message 2: what this responder sends, or what this
+    /// initiator accepted (empty before message 2 or when none was carried).
+    pub fn response_payload(&self) -> &[u8] {
+        &self.response_payload
+    }
+
+    /// Bind `context` (a digest both ends derived from the payload) into both
+    /// confirmations, set once before the local confirmation is written or
+    /// the peer's is read. Required exactly when message 1 carried a payload,
+    /// so both ends agree on the confirmation form.
+    pub fn set_confirmation_context(&mut self, context: [u8; 32]) -> Result<(), Error> {
+        if self.retired
+            || self.confirmation_context.is_some()
+            || self.sent_confirmation
+            || self
+                .received
+                .iter()
+                .any(|saved| saved.kind == FlightKind::Confirmation)
+            || self.initiation_payload.is_empty()
+        {
+            return Err(Error::Configuration);
+        }
+        self.confirmation_context = Some(context);
+        Ok(())
+    }
+
+    fn flight_bytes(&self, kind: FlightKind) -> usize {
+        match kind {
+            FlightKind::Initiation => INITIATION_BYTES + self.initiation_payload.len(),
+            FlightKind::Response => RESPONSE_BYTES + self.response_payload.len(),
+            FlightKind::Confirmation if self.confirmation_context.is_some() => {
+                CONTEXT_CONFIRM_BYTES
+            }
+            other => other.size(),
+        }
+    }
+
+    fn confirmation_body(&self, sender: Role) -> Vec<u8> {
+        let plain = self.confirmation(sender);
+        match self.confirmation_context {
+            None => plain.to_vec(),
+            Some(context) => {
+                let mut body = Vec::with_capacity(CONTEXT_CONFIRM_BODY);
+                body.extend_from_slice(CONTEXT_CONFIRM_DOMAIN);
+                body.extend_from_slice(&plain[8..]);
+                body.extend_from_slice(&context);
+                body
+            }
+        }
     }
 
     /// Original absolute deadline; this value is never changed by an input.
@@ -474,10 +600,22 @@ impl Handshake {
             return Err(Error::State);
         }
         let kind = self.next_flight().ok_or(Error::State)?;
-        let bytes = kind.size();
+        let unanswered = kind == FlightKind::Response && self.response_payload.is_empty();
+        let unbound = kind == FlightKind::Confirmation && self.confirmation_context.is_none();
+        if !self.initiation_payload.is_empty() && (unanswered || unbound) {
+            // A carried payload needs a verdict in message 2 and its derived
+            // context in both confirmations.
+            return Err(Error::State);
+        }
+        let bytes = self.flight_bytes(kind);
         let destination = output.get_mut(..bytes).ok_or(Error::OutputTooSmall)?;
+        let payload = match kind {
+            FlightKind::Initiation => self.initiation_payload.clone(),
+            FlightKind::Response => self.response_payload.clone(),
+            FlightKind::Confirmation => Vec::new(),
+        };
         let result = if kind == FlightKind::Confirmation {
-            let body = self.confirmation(self.config.role);
+            let body = self.confirmation_body(self.config.role);
             self.transport
                 .as_mut()
                 .ok_or(Error::State)?
@@ -487,7 +625,7 @@ impl Handshake {
             self.noise
                 .as_mut()
                 .ok_or(Error::State)?
-                .write_message(&[], destination)
+                .write_message(&payload, destination)
                 .map_err(|_| Error::Crypto)
         };
         match result {
@@ -536,7 +674,19 @@ impl Handshake {
         bytes: &[u8],
     ) -> Result<ReadOutcome, Error> {
         self.check(now)?;
-        if bytes.len() != kind.size() {
+        let initiation = kind == FlightKind::Initiation && self.config.role == Role::Responder;
+        // An initiator that carried a payload requires a verdict in message 2.
+        let verdict = kind == FlightKind::Response
+            && self.config.role == Role::Initiator
+            && !self.initiation_payload.is_empty();
+        let length_ok = if initiation {
+            (INITIATION_BYTES..=MAX_INITIATION_BYTES).contains(&bytes.len())
+        } else if verdict {
+            (RESPONSE_BYTES + 1..=MAX_RESPONSE_BYTES).contains(&bytes.len())
+        } else {
+            bytes.len() == self.flight_bytes(kind)
+        };
+        if !length_ok {
             return self.fail(Error::Length);
         }
         if let Some(saved) = self.received.iter().find(|saved| saved.kind == kind) {
@@ -550,13 +700,13 @@ impl Handshake {
             return self.fail(Error::State);
         }
         let result = if kind == FlightKind::Confirmation {
-            let mut body = [0; CONFIRM_BODY];
             let peer_role = if self.config.role == Role::Initiator {
                 Role::Responder
             } else {
                 Role::Initiator
             };
-            let expected = self.confirmation(peer_role);
+            let expected = self.confirmation_body(peer_role);
+            let mut body = vec![0; expected.len()];
             match self.transport.as_mut() {
                 Some(transport) => match transport.receive(bytes, &mut body) {
                     Ok(written) if written == body.len() && body == expected => Ok(()),
@@ -571,10 +721,25 @@ impl Handshake {
                 FlightKind::Initiation
             };
             match self.noise.as_mut() {
-                Some(noise) if kind == expected_kind && !noise.is_write_turn() => noise
-                    .read_message(bytes, &mut [])
-                    .map(|_| ())
-                    .map_err(|_| Error::Authentication),
+                Some(noise) if kind == expected_kind && !noise.is_write_turn() => {
+                    let base = if initiation {
+                        INITIATION_BYTES
+                    } else {
+                        RESPONSE_BYTES
+                    };
+                    let mut payload = vec![0; bytes.len().saturating_sub(base)];
+                    match noise.read_message(bytes, &mut payload) {
+                        Ok(read) if read == payload.len() => {
+                            if initiation {
+                                self.initiation_payload = payload;
+                            } else if verdict {
+                                self.response_payload = payload;
+                            }
+                            Ok(())
+                        }
+                        _ => Err(Error::Authentication),
+                    }
+                }
                 _ => Err(Error::State),
             }
         };
@@ -632,13 +797,15 @@ impl Handshake {
             .iter()
             .find(|saved| saved.kind == FlightKind::Confirmation)
             .ok_or(Error::State)?;
-        let mut ciphertext = Zeroizing::new([0; CONFIRM_BYTES]);
-        if final_flight.bytes.len() != ciphertext.len() {
+        let length = final_flight.bytes.len();
+        if length != self.flight_bytes(FlightKind::Confirmation) {
             return Err(Error::Crypto);
         }
-        ciphertext.copy_from_slice(&final_flight.bytes);
+        let mut ciphertext = Zeroizing::new([0; CONTEXT_CONFIRM_BYTES]);
+        ciphertext[..length].copy_from_slice(&final_flight.bytes);
         let confirmation = ConfirmationCache {
             ciphertext,
+            length,
             deadline: self.config.deadline,
             now: self.now,
             retired: false,

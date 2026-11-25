@@ -1,8 +1,9 @@
 //! Bounded, clock-injected backpressure observations for one runtime owner.
 //!
-//! Construct it only for an opted-in
-//! diagnostic observer. The allocation is diagnostic memory, outside protocol
-//! quotas; failure to construct or update it must not change protocol behavior.
+//! Every runtime owner constructs one (always-on meter CSR,
+//! `docs/modules/meter-csr.md`). The allocation is diagnostic memory, outside
+//! protocol quotas; failure to construct or update it must not change protocol
+//! behavior.
 //!
 //! Occupancy is a sample, not a blockage inference. Call `blocked` only after
 //! actual eligible work is refused or a specifically identified operation waits.
@@ -14,6 +15,7 @@
 
 use std::collections::TryReserveError;
 
+pub(crate) mod csr;
 mod observer;
 mod pipeline_admission;
 pub(crate) mod protocol_buffers;
@@ -53,10 +55,13 @@ pub enum Site {
     TlsSubmission,
     TlsInput,
     TlsReceipt,
+    /// Session receiver credit, send side: in-flight data datagrams and bytes
+    /// against the peer's granted window.
+    CreditWindow,
 }
 
 impl Site {
-    pub const ALL: [Self; 29] = [
+    pub const ALL: [Self; 30] = [
         Self::NativeIngress,
         Self::NativeEgress,
         Self::CodecAdmission,
@@ -86,19 +91,65 @@ impl Site {
         Self::TlsSubmission,
         Self::TlsInput,
         Self::TlsReceipt,
+        Self::CreditWindow,
     ];
 }
 
+/// Carrier lane of an observation: shared by all lanes, or one authenticated
+/// lane by index. Lanes beyond the second are no longer folded together.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[repr(usize)]
 pub enum Lane {
     Shared,
-    First,
-    Second,
+    Index(u16),
 }
 
+#[allow(non_upper_case_globals)]
 impl Lane {
-    pub const ALL: [Self; 3] = [Self::Shared, Self::First, Self::Second];
+    /// Lane 0; kept so existing two-lane hooks read unchanged.
+    pub const First: Self = Self::Index(0);
+    /// Lane 1.
+    pub const Second: Self = Self::Index(1);
+
+    /// The lane at a runtime index; an index beyond u16 is clamped visibly
+    /// to the last representable lane rather than folded into lane 1.
+    pub fn at(index: usize) -> Self {
+        Self::Index(u16::try_from(index).unwrap_or(u16::MAX))
+    }
+
+    /// Label in terminal `.bmetrics` reports: `Shared`, `First`, `Second`,
+    /// then `Lane2`, `Lane3`, ... so existing report readers are unchanged.
+    pub fn label(self) -> LaneLabel {
+        LaneLabel(self)
+    }
+
+    /// Meter CSR segment: `shared` or `laneN`.
+    pub fn segment(self) -> LaneSegment {
+        LaneSegment(self)
+    }
+}
+
+/// Display adapter for [`Lane::label`].
+pub struct LaneLabel(Lane);
+impl std::fmt::Display for LaneLabel {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0 {
+            Lane::Shared => formatter.write_str("Shared"),
+            Lane::Index(0) => formatter.write_str("First"),
+            Lane::Index(1) => formatter.write_str("Second"),
+            Lane::Index(index) => write!(formatter, "Lane{index}"),
+        }
+    }
+}
+
+/// Display adapter for [`Lane::segment`].
+pub struct LaneSegment(Lane);
+impl std::fmt::Display for LaneSegment {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0 {
+            Lane::Shared => formatter.write_str("shared"),
+            Lane::Index(index) => write!(formatter, "lane{index}"),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -171,14 +222,9 @@ pub struct Key {
     pub class: Class,
 }
 
-impl Key {
-    const fn index(self) -> usize {
-        (self.site as usize * Lane::ALL.len() + self.lane as usize) * Class::ALL.len()
-            + self.class as usize
-    }
-}
-
-pub const KEY_COUNT: usize = Site::ALL.len() * Lane::ALL.len() * Class::ALL.len();
+/// Default key slots reserved per owner (decision 16 in
+/// `docs/modules/meter-csr.md`); owners with more lanes reserve more.
+pub const DEFAULT_SLOTS: usize = 64;
 
 /// Unknown capacity must remain `None`; it is not an unbounded or empty queue.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -199,6 +245,8 @@ pub struct Invalid {
     pub occupancy_exceeds_capacity: bool,
     pub update_after_finish: bool,
     pub counter_overflow: bool,
+    /// A key found no free slot; its observations are counted, not kept.
+    pub slots_exhausted: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -206,6 +254,8 @@ pub enum Error {
     ClockRegression,
     OccupancyExceedsCapacity,
     Finished,
+    /// Every reserved key slot is in use by other keys.
+    SlotsExhausted,
 }
 
 /// Capacity and high-water values are samples, not continuous kernel telemetry.
@@ -228,6 +278,8 @@ pub struct DurationSnapshot {
     pub open_us: Option<u64>,
     /// Maximum observed duration, including the current open interval.
     pub maximum_us: u64,
+    /// Completed (never censored) durations by log2 bucket.
+    pub histogram: l2tunnel_meters::Histogram,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -263,6 +315,11 @@ pub struct OwnerSnapshot {
     pub blocked: DurationSnapshot,
     pub diagnostic_heap_bytes: usize,
     pub invalid: Invalid,
+    /// Key slots in use and reserved.
+    pub slots_used: usize,
+    pub slot_capacity: usize,
+    /// Hook calls whose key found no free slot.
+    pub slots_exhausted: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -274,6 +331,7 @@ struct Duration {
     completed_us: u64,
     censored_us: u64,
     maximum_us: u64,
+    histogram: l2tunnel_meters::Histogram,
 }
 
 impl Duration {
@@ -295,6 +353,9 @@ impl Duration {
             } else {
                 add(&mut self.completed_episodes, 1, invalid);
                 add(&mut self.completed_us, elapsed, invalid);
+                if !self.histogram.record(elapsed) {
+                    invalid.counter_overflow = true;
+                }
             }
         }
     }
@@ -309,6 +370,7 @@ impl Duration {
             censored_us: self.censored_us,
             open_us,
             maximum_us: self.maximum_us.max(open_us.unwrap_or(0)),
+            histogram: self.histogram,
         }
     }
 }
@@ -332,36 +394,92 @@ struct Cell {
 
 /// Exactly one bounded allocation on construction; updates and snapshots allocate
 /// nothing. All hooks for this owner must use the same monotonic tick origin.
+///
+/// Keys occupy reserved slots in first-observation order. A key that finds no
+/// free slot is counted in `slots_exhausted` and marks the owner invalid; it
+/// never evicts or merges into another key.
 pub struct Collector {
-    cells: Vec<Cell>,
+    slots: Vec<(Key, Cell)>,
     first: Option<u64>,
     last: Option<u64>,
     finished: Option<u64>,
     active: usize,
     union: Duration,
     invalid: Invalid,
+    slots_exhausted: u64,
 }
 
 impl Collector {
+    /// A collector with [`DEFAULT_SLOTS`] key slots.
     pub fn new() -> Result<Self, TryReserveError> {
-        let mut cells = Vec::new();
-        cells.try_reserve_exact(KEY_COUNT)?;
-        cells.resize(KEY_COUNT, Cell::default());
+        Self::with_slots(DEFAULT_SLOTS)
+    }
+
+    /// A collector with exactly `slots` key slots.
+    pub fn with_slots(slots: usize) -> Result<Self, TryReserveError> {
+        let mut storage = Vec::new();
+        storage.try_reserve_exact(slots)?;
         Ok(Self {
-            cells,
+            slots: storage,
             first: None,
             last: None,
             finished: None,
             active: 0,
             union: Duration::default(),
             invalid: Invalid::default(),
+            slots_exhausted: 0,
         })
     }
 
     /// Actual retained allocation, independent of the observation clock.
     pub fn heap_bytes(&self) -> usize {
         // Vec allocation guarantees capacity * element size fits in isize.
-        self.cells.capacity() * std::mem::size_of::<Cell>()
+        self.slots.capacity() * std::mem::size_of::<(Key, Cell)>()
+    }
+
+    /// Observed (key, reason) pairs; bounds the CSR wait blocks.
+    pub fn observed_reasons(&self) -> usize {
+        self.slots
+            .iter()
+            .map(|(_, cell)| {
+                cell.reasons
+                    .iter()
+                    .filter(|state| state.refusals != 0 || state.progress != 0)
+                    .count()
+            })
+            .sum()
+    }
+
+    /// Keys observed so far, in first-observation order.
+    pub fn keys(&self) -> impl Iterator<Item = Key> + '_ {
+        self.slots.iter().map(|(key, _)| *key)
+    }
+
+    fn position(&self, key: Key) -> Option<usize> {
+        self.slots.iter().position(|(slot, _)| *slot == key)
+    }
+
+    /// The cell of `key`, claiming a free slot on first use. Never allocates:
+    /// the vector never grows beyond its reserved capacity.
+    fn cell_mut(&mut self, key: Key) -> Result<&mut Cell, Error> {
+        let index = match self.position(key) {
+            Some(index) => index,
+            None if self.slots.len() < self.slots.capacity() => {
+                self.slots.push((key, Cell::default()));
+                self.slots.len() - 1
+            }
+            None => {
+                self.invalid.slots_exhausted = true;
+                self.slots_exhausted = self.slots_exhausted.saturating_add(1);
+                return Err(Error::SlotsExhausted);
+            }
+        };
+        Ok(&mut self.slots[index].1)
+    }
+
+    fn cell(&self, key: Key) -> Cell {
+        self.position(key)
+            .map_or_else(Cell::default, |index| self.slots[index].1)
     }
 
     /// Samples actual retained usage. Does not begin or end a blocked interval.
@@ -379,26 +497,33 @@ impl Collector {
             self.invalid.occupancy_exceeds_capacity = true;
             return Err(Error::OccupancyExceedsCapacity);
         }
-        self.observe(key, now);
-        let cell = &mut self.cells[key.index()];
-        sample(&mut cell.bytes, value.bytes, &mut self.invalid);
-        sample(&mut cell.items, value.items, &mut self.invalid);
+        self.observe(key, now)?;
+        let mut invalid = self.invalid;
+        let cell = self.cell_mut(key)?;
+        sample(&mut cell.bytes, value.bytes, &mut invalid);
+        sample(&mut cell.items, value.items, &mut invalid);
+        self.invalid = invalid;
         Ok(())
     }
 
     pub fn blocked(&mut self, key: Key, reason: Reason, now: u64) -> Result<(), Error> {
         self.check_update(now)?;
-        self.observe(key, now);
-        let state = &mut self.cells[key.index()].reasons[reason as usize];
-        add(&mut state.refusals, 1, &mut self.invalid);
-        if state.duration.since.is_none() {
-            state.duration.begin(now, &mut self.invalid);
+        self.observe(key, now)?;
+        let mut invalid = self.invalid;
+        let state = &mut self.cell_mut(key)?.reasons[reason as usize];
+        add(&mut state.refusals, 1, &mut invalid);
+        let began = state.duration.since.is_none();
+        if began {
+            state.duration.begin(now, &mut invalid);
+        }
+        if began {
             if self.active == 0 {
-                self.union.begin(now, &mut self.invalid);
+                self.union.begin(now, &mut invalid);
             }
             // One active bit per fixed slot; the fixed catalog bounds this count.
             self.active += 1;
         }
+        self.invalid = invalid;
         Ok(())
     }
 
@@ -406,33 +531,31 @@ impl Collector {
     /// independent channels or epochs. This deliberately does not start a timer.
     pub fn refused(&mut self, key: Key, reason: Reason, now: u64) -> Result<(), Error> {
         self.check_update(now)?;
-        self.observe(key, now);
-        add(
-            &mut self.cells[key.index()].reasons[reason as usize].refusals,
-            1,
-            &mut self.invalid,
-        );
-        add(
-            &mut self.cells[key.index()].reasons[reason as usize].untimed_refusals,
-            1,
-            &mut self.invalid,
-        );
+        self.observe(key, now)?;
+        let mut invalid = self.invalid;
+        let state = &mut self.cell_mut(key)?.reasons[reason as usize];
+        add(&mut state.refusals, 1, &mut invalid);
+        add(&mut state.untimed_refusals, 1, &mut invalid);
+        self.invalid = invalid;
         Ok(())
     }
 
     /// The caller observes this specific cause clear. Other reasons remain open.
     pub fn progress(&mut self, key: Key, reason: Reason, now: u64) -> Result<(), Error> {
         self.check_update(now)?;
-        self.observe(key, now);
-        let state = &mut self.cells[key.index()].reasons[reason as usize];
-        add(&mut state.progress, 1, &mut self.invalid);
-        if state.duration.since.is_some() {
-            state.duration.end(now, false, &mut self.invalid);
+        self.observe(key, now)?;
+        let mut invalid = self.invalid;
+        let state = &mut self.cell_mut(key)?.reasons[reason as usize];
+        add(&mut state.progress, 1, &mut invalid);
+        let ended = state.duration.since.is_some();
+        if ended {
+            state.duration.end(now, false, &mut invalid);
             self.active -= 1;
             if self.active == 0 {
-                self.union.end(now, false, &mut self.invalid);
+                self.union.end(now, false, &mut invalid);
             }
         }
+        self.invalid = invalid;
         Ok(())
     }
 
@@ -443,7 +566,7 @@ impl Collector {
             return Ok(());
         }
         self.check_update(now)?;
-        for cell in &mut self.cells {
+        for (_, cell) in &mut self.slots {
             for state in &mut cell.reasons {
                 state.duration.end(now, true, &mut self.invalid);
             }
@@ -466,11 +589,14 @@ impl Collector {
             blocked: self.union.snapshot(now),
             diagnostic_heap_bytes: self.heap_bytes(),
             invalid: self.invalid,
+            slots_used: self.slots.len(),
+            slot_capacity: self.slots.capacity(),
+            slots_exhausted: self.slots_exhausted,
         })
     }
 
     pub fn key(&self, key: Key) -> KeySnapshot {
-        let cell = &self.cells[key.index()];
+        let cell = self.cell(key);
         KeySnapshot {
             first_observed_us: cell.first,
             last_observed_us: cell.last,
@@ -481,7 +607,7 @@ impl Collector {
 
     pub fn reason(&self, key: Key, reason: Reason, now: u64) -> Result<ReasonSnapshot, Error> {
         let now = self.query_time(now)?;
-        let state = self.cells[key.index()].reasons[reason as usize];
+        let state = self.cell(key).reasons[reason as usize];
         Ok(ReasonSnapshot {
             observed: state.refusals != 0 || state.progress != 0,
             refusals: state.refusals,
@@ -503,12 +629,13 @@ impl Collector {
         Ok(())
     }
 
-    fn observe(&mut self, key: Key, now: u64) {
-        self.first.get_or_insert(now);
-        self.last = Some(now);
-        let cell = &mut self.cells[key.index()];
+    fn observe(&mut self, key: Key, now: u64) -> Result<(), Error> {
+        let cell = self.cell_mut(key)?;
         cell.first.get_or_insert(now);
         cell.last = Some(now);
+        self.first.get_or_insert(now);
+        self.last = Some(now);
+        Ok(())
     }
 
     fn query_time(&self, now: u64) -> Result<u64, Error> {
@@ -744,8 +871,12 @@ mod tests {
     fn counters_saturate_only_with_visible_overflow_and_fixed_storage()
     -> Result<(), Box<dyn std::error::Error>> {
         let mut collector = Collector::new()?;
-        let capacity = collector.cells.capacity();
-        collector.cells[A.index()].reasons[Reason::IoPending as usize].refusals = u64::MAX;
+        let capacity = collector.slots.capacity();
+        collector
+            .cell_mut(A)
+            .map_err(|error| format!("{error:?}"))?
+            .reasons[Reason::IoPending as usize]
+            .refusals = u64::MAX;
         assert_eq!(collector.blocked(A, Reason::IoPending, 0), Ok(()));
         assert_eq!(collector.progress(A, Reason::IoPending, u64::MAX), Ok(()));
         assert_eq!(
@@ -754,8 +885,74 @@ mod tests {
                 .map(|s| (s.invalid.counter_overflow, s.blocked.completed_us)),
             Ok((true, u64::MAX))
         );
-        assert_eq!(collector.cells.capacity(), capacity);
-        assert_eq!(collector.cells.len(), KEY_COUNT);
+        assert_eq!(collector.slots.capacity(), capacity);
+        assert_eq!(collector.slots.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn exhausted_slots_are_counted_never_merged_or_grown() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let mut collector = Collector::with_slots(2)?;
+        let third = Key {
+            site: Site::QuicSend,
+            lane: Lane::at(2),
+            class: Class::User,
+        };
+        assert_eq!(collector.blocked(A, Reason::IoPending, 1), Ok(()));
+        assert_eq!(collector.blocked(B, Reason::QueueFull, 2), Ok(()));
+        assert_eq!(
+            collector.blocked(third, Reason::QueueFull, 3),
+            Err(Error::SlotsExhausted)
+        );
+        assert_eq!(
+            collector.sample(third, 4, Occupancy::default()),
+            Err(Error::SlotsExhausted)
+        );
+        let owner = collector.owner(5).map_err(|error| format!("{error:?}"))?;
+        assert_eq!(
+            (owner.slots_used, owner.slot_capacity, owner.slots_exhausted),
+            (2, 2, 2)
+        );
+        assert!(owner.invalid.slots_exhausted);
+        assert_eq!(collector.key(third).first_observed_us, None);
+        assert_eq!(collector.keys().collect::<Vec<_>>(), vec![A, B]);
+        assert_eq!(collector.slots.capacity(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn completed_waits_fill_histograms_and_lanes_stay_distinct()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut collector = Collector::new()?;
+        let lane2 = Key {
+            lane: Lane::at(2),
+            ..A
+        };
+        let lane3 = Key {
+            lane: Lane::at(3),
+            ..A
+        };
+        assert_eq!(collector.blocked(lane2, Reason::IoPending, 0), Ok(()));
+        assert_eq!(collector.progress(lane2, Reason::IoPending, 100), Ok(()));
+        assert_eq!(collector.blocked(lane3, Reason::IoPending, 100), Ok(()));
+        assert_eq!(collector.finish(200), Ok(()));
+        let completed = collector
+            .reason(lane2, Reason::IoPending, 200)
+            .map_err(|error| format!("{error:?}"))?;
+        assert_eq!(
+            completed.blocked.histogram.counts()[l2tunnel_meters::Histogram::bucket(100)],
+            1
+        );
+        let censored = collector
+            .reason(lane3, Reason::IoPending, 200)
+            .map_err(|error| format!("{error:?}"))?;
+        assert_eq!(censored.blocked.censored_us, 100);
+        assert_eq!(censored.blocked.histogram.counts().iter().sum::<u64>(), 0);
+        assert_eq!(Lane::at(2).label().to_string(), "Lane2");
+        assert_eq!(Lane::First.label().to_string(), "First");
+        assert_eq!(Lane::Shared.segment().to_string(), "shared");
+        assert_eq!(Lane::at(7).segment().to_string(), "lane7");
         Ok(())
     }
 }

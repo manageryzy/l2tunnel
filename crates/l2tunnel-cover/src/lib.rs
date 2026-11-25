@@ -15,12 +15,18 @@ pub const MAX_PACKET_BYTES: usize = 65_507;
 pub const QUIC_ESTABLISHED_OVERHEAD: usize = 13;
 /// RTP header plus the two-byte private protected-body length.
 pub const MEDIA_OVERHEAD: usize = 14;
+/// TLS 1.3 record header (5 bytes), eight-byte connection identifier and four-byte packet number.
+pub const TLS_OVERHEAD: usize = 17;
 
 const QUIC_VERSION: u32 = 1;
 const QUIC_INITIAL: u8 = 0xc3;
 const QUIC_SHORT: u8 = 0x43;
 const QUIC_INITIAL_FIXED: usize = 28;
 const RTP_VERSION: u8 = 0x80;
+const TLS_HANDSHAKE_TYPE: u8 = 0x16;
+const TLS_APP_DATA_TYPE: u8 = 0x17;
+const TLS_LEGACY_HANDSHAKE_VERSION: [u8; 2] = [0x03, 0x01];
+const TLS_LEGACY_APP_VERSION: [u8; 2] = [0x03, 0x03];
 
 /// Explicit appearance choice, independent of the inner data/recovery algorithm.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -29,6 +35,8 @@ pub enum Appearance {
     QuicLike,
     /// Minimal extension-free RTP layout carrying a private, length-delimited payload.
     MediaLike,
+    /// TLS 1.3 record framing (`0x16 0x03 0x01` handshake / `0x17 0x03 0x03` data), without TLS crypto.
+    TlsLike,
 }
 
 /// Outer framing phase; this marker never proves handshake completion.
@@ -103,6 +111,8 @@ pub enum OuterSequence {
     Quic(PacketNumber),
     /// RTP's sixteen-bit wrapping sequence field, without inferred high bits.
     Media(u16),
+    /// Complete four-byte unprotected TLS-like packet number.
+    Tls(PacketNumber),
 }
 
 /// Borrowed result of structural validation, without cryptographic acceptance.
@@ -177,6 +187,12 @@ impl Config {
                 .ok_or(Error::PacketTooLarge),
             (Appearance::QuicLike, Phase::Established) => Ok(QUIC_ESTABLISHED_OVERHEAD),
             (Appearance::MediaLike, _) => Ok(MEDIA_OVERHEAD),
+            (Appearance::TlsLike, _) => {
+                if protected_bytes > usize::from(u16::MAX) - 12 {
+                    return Err(Error::PacketTooLarge);
+                }
+                Ok(TLS_OVERHEAD)
+            }
         }
     }
 
@@ -228,6 +244,25 @@ impl Config {
                 output[12..14].copy_from_slice(&length.to_be_bytes());
                 MEDIA_OVERHEAD
             }
+            (Appearance::TlsLike, phase) => {
+                let record_len = u16::try_from(
+                    protected
+                        .len()
+                        .checked_add(12)
+                        .ok_or(Error::PacketTooLarge)?,
+                )
+                .map_err(|_| Error::PacketTooLarge)?;
+                let (content_type, version) = match phase {
+                    Phase::Handshake => (TLS_HANDSHAKE_TYPE, TLS_LEGACY_HANDSHAKE_VERSION),
+                    Phase::Established => (TLS_APP_DATA_TYPE, TLS_LEGACY_APP_VERSION),
+                };
+                output[0] = content_type;
+                output[1..3].copy_from_slice(&version);
+                output[3..5].copy_from_slice(&record_len.to_be_bytes());
+                output[5..13].copy_from_slice(&self.ids.peer.0);
+                output[13..17].copy_from_slice(&meta.packet_number.0.to_be_bytes());
+                TLS_OVERHEAD
+            }
         };
         output[offset..total].copy_from_slice(protected);
         Ok(total)
@@ -244,6 +279,7 @@ impl Config {
         match self.appearance {
             Appearance::QuicLike => self.decode_quic(packet),
             Appearance::MediaLike => self.decode_media(packet),
+            Appearance::TlsLike => self.decode_tls(packet),
         }
     }
 
@@ -343,6 +379,30 @@ impl Config {
             },
             sequence: OuterSequence::Media(u16::from_be_bytes([fixed[2], fixed[3]])),
             media_timestamp: Some(MediaTimestamp(read_u32(fixed, 4)?)),
+            protected,
+        })
+    }
+
+    fn decode_tls(self, packet: &[u8]) -> Result<Decoded<'_>, Error> {
+        let fixed = packet.get(..TLS_OVERHEAD).ok_or(Error::Truncated)?;
+        let phase = match (fixed[0], [fixed[1], fixed[2]]) {
+            (TLS_HANDSHAKE_TYPE, TLS_LEGACY_HANDSHAKE_VERSION) => Phase::Handshake,
+            (TLS_APP_DATA_TYPE, TLS_LEGACY_APP_VERSION) => Phase::Established,
+            _ => return Err(Error::Malformed),
+        };
+        let record_len = usize::from(u16::from_be_bytes([fixed[3], fixed[4]]));
+        if record_len < 12 || record_len != packet.len() - 5 {
+            return Err(Error::Malformed);
+        }
+        if fixed[5..13] != self.ids.local.0 {
+            return Err(Error::IdentifierMismatch);
+        }
+        let protected = packet.get(TLS_OVERHEAD..).ok_or(Error::Truncated)?;
+        self.validate_body(protected.len())?;
+        Ok(Decoded {
+            phase,
+            sequence: OuterSequence::Tls(PacketNumber(read_u32(fixed, 13)?)),
+            media_timestamp: None,
             protected,
         })
     }

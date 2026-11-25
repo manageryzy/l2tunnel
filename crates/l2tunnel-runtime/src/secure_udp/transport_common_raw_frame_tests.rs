@@ -139,7 +139,7 @@ async fn current_raw_frame_none_lz4_direct_arq_cauchy_native_delivery_full_half_
                     security::compact::Protection::ChaCha20Poly1305
                 },
                 limits: security::compact::Selection {
-                    max_forward_packets: 4096,
+                    max_forward_packets: 8192,
                     max_failed_checks: 128,
                 },
             };

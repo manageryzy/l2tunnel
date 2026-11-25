@@ -1,5 +1,7 @@
-//! Opt-in terminal export for bounded buffer observations, never protocol authority.
-use super::{Class, Collector, DurationSnapshot, Gauge, Key, Lane, Reason, Site};
+//! Always-on bounded buffer observations, never protocol authority. They feed
+//! the live meter CSR; the terminal `.bmetrics` file is written only when
+//! `L2TUNNEL_BUFFER_METRICS` or `L2TUNNEL_WIRE_METRICS` selects a prefix.
+use super::{Collector, DurationSnapshot, Gauge, Key, Reason};
 use std::{
     fs::OpenOptions,
     io::{self, BufWriter, Write},
@@ -33,9 +35,13 @@ struct SourceTerminal {
     unavailable: bool,
 }
 
+/// A published meter CSR and its build tick.
+type Published = (u64, std::sync::Arc<l2tunnel_meters::Table>);
+
 pub(crate) struct Observer {
     collector: Collector,
-    path: PathBuf,
+    /// Terminal `.bmetrics` destination, present only when selected.
+    path: Option<PathBuf>,
     label: &'static str,
     origin: Instant,
     finished: Option<u64>,
@@ -51,6 +57,11 @@ pub(crate) struct Observer {
     raw: Vec<crate::secure_udp::raw_buffer_metrics::Snapshot>,
     proxy: Vec<crate::proxy::timing::Snapshot>,
     quic: Vec<crate::secure_udp::maintained_io::quic_metrics::Snapshot>,
+    /// Newest session receiver credit snapshot (Common runtimes only).
+    credit: Option<crate::secure_udp::transport::CreditSnapshot>,
+    /// Newest published meter CSR and its build tick (meter-csr decision 17).
+    /// Boxed: keeps the observer, held inline in runtime futures, small.
+    published: Box<std::sync::Mutex<Option<Published>>>,
 }
 
 impl Observer {
@@ -99,7 +110,7 @@ impl Observer {
     pub(crate) fn for_test(origin: Instant, path: PathBuf) -> io::Result<Self> {
         Ok(Self {
             collector: Collector::new().map_err(io::Error::other)?,
-            path,
+            path: Some(path),
             label: "test",
             quic: Self::quic_storage("test")?,
             origin,
@@ -113,6 +124,8 @@ impl Observer {
             udp_socket_allocation_failed: false,
             raw: Self::raw_storage()?,
             proxy: Self::proxy_storage("test")?,
+            credit: None,
+            published: Box::new(std::sync::Mutex::new(None)),
         })
     }
 
@@ -124,35 +137,43 @@ impl Observer {
         label: &'static str,
         origin: Instant,
     ) -> io::Result<Option<Self>> {
-        let Some(mut prefix) = std::env::var_os("L2TUNNEL_BUFFER_METRICS")
-            .or_else(|| std::env::var_os("L2TUNNEL_WIRE_METRICS"))
-        else {
-            return Ok(None);
-        };
-        if prefix.is_empty()
-            || prefix.as_encoded_bytes().len() > 4096
-            || label.is_empty()
+        if label.is_empty()
             || !label
                 .bytes()
                 .all(|b| b.is_ascii_alphanumeric() || b == b'_')
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "buffer metrics path or owner label",
+                "buffer metrics owner label",
             ));
         }
-        let id = NEXT_OWNER
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
-            .map_err(|_| io::Error::other("buffer metrics owner exhausted"))?;
-        // A distinct extension prevents the record-histogram reader from silently
-        // treating a buffer report as another wire-metric population.
-        prefix.push(format!(
-            ".buffers.{label}.{}.{id}.bmetrics",
-            std::process::id()
-        ));
+        let path = match std::env::var_os("L2TUNNEL_BUFFER_METRICS")
+            .or_else(|| std::env::var_os("L2TUNNEL_WIRE_METRICS"))
+        {
+            None => None,
+            Some(mut prefix) => {
+                if prefix.is_empty() || prefix.as_encoded_bytes().len() > 4096 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "buffer metrics path",
+                    ));
+                }
+                let id = NEXT_OWNER
+                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+                    .map_err(|_| io::Error::other("buffer metrics owner exhausted"))?;
+                // A distinct extension prevents the record-histogram reader from silently
+                // treating a buffer report as another wire-metric population.
+                prefix.push(format!(
+                    ".buffers.{label}.{}.{id}.bmetrics",
+                    std::process::id()
+                ));
+                Some(PathBuf::from(prefix))
+            }
+        };
+        // Always present: the meter CSR is always on (meter-csr decision 3).
         Ok(Some(Self {
             collector: Collector::new().map_err(io::Error::other)?,
-            path: PathBuf::from(prefix),
+            path,
             label,
             quic: Self::quic_storage(label)?,
             origin,
@@ -166,12 +187,19 @@ impl Observer {
             udp_socket_allocation_failed: false,
             raw: Self::raw_storage()?,
             proxy: Self::proxy_storage(label)?,
+            credit: None,
+            published: Box::new(std::sync::Mutex::new(None)),
         }))
     }
 
     /// Read the actual retained original UDP socket once, only with opt-in diagnostics.
-    /// No option is set, and an unavailable diagnostic never changes forwarding.
-    pub(crate) fn observe_udp_socket(&mut self, socket: &tokio::net::UdpSocket) {
+    /// No option is set here; `requested_receive` is what the runtime asked
+    /// for before this readback. An unavailable diagnostic never changes forwarding.
+    pub(crate) fn observe_udp_socket(
+        &mut self,
+        socket: &tokio::net::UdpSocket,
+        requested_receive: Option<u64>,
+    ) {
         if self.is_finished() || !self.udp_socket.is_empty() || self.udp_socket_allocation_failed {
             return;
         }
@@ -180,7 +208,7 @@ impl Observer {
             return;
         }
         self.udp_socket
-            .push(super::udp_socket::Snapshot::read(socket));
+            .push(super::udp_socket::Snapshot::read(socket, requested_receive));
     }
 
     pub(crate) fn configure_management_buffers(&mut self) -> io::Result<()> {
@@ -277,6 +305,11 @@ impl Observer {
             }
         }
     }
+    pub(crate) fn retain_credit(&mut self, snapshot: crate::secure_udp::transport::CreditSnapshot) {
+        if !self.is_finished() {
+            self.credit = Some(snapshot);
+        }
+    }
     pub(crate) fn quic_transport_due(&self, lane: usize, now: u64) -> bool {
         !self.is_finished()
             && self
@@ -349,7 +382,7 @@ impl Observer {
                     .first()
                     .map_or(0, |snapshot| snapshot.owner_heap_bytes),
             )
-            .saturating_add(self.path.capacity())
+            .saturating_add(self.path.as_ref().map_or(0, PathBuf::capacity))
             .saturating_add(
                 self.pipeline_admission.capacity()
                     * std::mem::size_of::<super::pipeline_admission::PipelineAdmission>(),
@@ -419,6 +452,51 @@ impl Observer {
         }
     }
 
+    /// Write this owner's live registers into the meter CSR at `now`.
+    pub(crate) fn write_csr(
+        &self,
+        table: &mut l2tunnel_meters::Table,
+        now: u64,
+    ) -> Result<(), l2tunnel_meters::TableError> {
+        let now = self.finished.unwrap_or(now);
+        self.collector.write_csr(table, self.label, now)
+    }
+
+    /// Collector keys and observed (key, reason) pairs; bound the CSR size.
+    pub(crate) fn csr_extent(&self) -> (usize, usize) {
+        (
+            self.collector.keys().count(),
+            self.collector.observed_reasons(),
+        )
+    }
+
+    /// The table published at or after `since`, if any.
+    pub(crate) fn published_since(
+        &self,
+        since: u64,
+    ) -> Option<std::sync::Arc<l2tunnel_meters::Table>> {
+        let published = self
+            .published
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        published
+            .as_ref()
+            .filter(|(built, _)| *built >= since)
+            .map(|(_, table)| table.clone())
+    }
+
+    /// Retain the newest published table.
+    pub(crate) fn retain_published(
+        &self,
+        built: u64,
+        table: std::sync::Arc<l2tunnel_meters::Table>,
+    ) {
+        *self
+            .published
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((built, table));
+    }
+
     fn write_report(&self, writer: &mut impl Write, now: u64) -> io::Result<()> {
         let owner = self
             .collector
@@ -454,10 +532,11 @@ impl Observer {
         duration(writer, owner.blocked)?;
         write!(writer, ",\"sites\":[")?;
         let mut first = true;
-        for site in Site::ALL {
-            for lane in Lane::ALL {
-                for class in Class::ALL {
-                    let key = Key { site, lane, class };
+        for key in self.collector.keys() {
+            {
+                {
+                    let Key { site, lane, class } = key;
+                    let lane = lane.label();
                     let value = self.collector.key(key);
                     if value.first_observed_us.is_none() {
                         continue;
@@ -468,7 +547,7 @@ impl Observer {
                     first = false;
                     write!(
                         writer,
-                        "{{\"site\":\"{site:?}\",\"lane\":\"{lane:?}\",\"class\":\"{class:?}\",\"bytes\":"
+                        "{{\"site\":\"{site:?}\",\"lane\":\"{lane}\",\"class\":\"{class:?}\",\"bytes\":"
                     )?;
                     gauge(writer, value.bytes)?;
                     write!(writer, ",\"first_observed_us\":")?;
@@ -508,6 +587,11 @@ impl Observer {
             snapshot.write(writer)?;
         } else {
             write!(writer, "null")?;
+        }
+        write!(writer, ",\"credit\":")?;
+        match &self.credit {
+            Some(snapshot) => write_credit(writer, snapshot)?,
+            None => write!(writer, "null")?,
         }
         write!(writer, ",\"quic\":")?;
         if let Some(snapshot) = self.quic.first() {
@@ -596,7 +680,10 @@ impl Observer {
     }
 
     fn persist(&self, now: u64) -> io::Result<()> {
-        let mut name = self.path.as_os_str().to_owned();
+        let Some(path) = &self.path else {
+            return Ok(());
+        };
+        let mut name = path.as_os_str().to_owned();
         name.push(".tmp");
         let temporary = PathBuf::from(name);
         let file = OpenOptions::new()
@@ -608,7 +695,7 @@ impl Observer {
             self.write_report(&mut writer, now)?;
             writer.flush()?;
             writer.get_ref().sync_all()?;
-            std::fs::rename(&temporary, &self.path)
+            std::fs::rename(&temporary, path)
         })();
         if result.is_err() {
             let _ = std::fs::remove_file(temporary);
@@ -662,7 +749,84 @@ fn duration(writer: &mut impl Write, value: DurationSnapshot) -> io::Result<()> 
         value.censored_us
     )?;
     optional(writer, value.open_us)?;
-    write!(writer, ",\"maximum_us\":{}}}", value.maximum_us)
+    write!(
+        writer,
+        ",\"maximum_us\":{},\"histogram\":[",
+        value.maximum_us
+    )?;
+    for (index, count) in value.histogram.counts().iter().enumerate() {
+        if index != 0 {
+            write!(writer, ",")?;
+        }
+        write!(writer, "{count}")?;
+    }
+    write!(writer, "]}}")
+}
+fn write_credit(
+    writer: &mut impl Write,
+    value: &crate::secure_udp::transport::CreditSnapshot,
+) -> io::Result<()> {
+    let c = value.configured;
+    let r = value.receiver;
+    write!(
+        writer,
+        "{{\"requested\":{{\"floor_datagrams\":{},\"ceiling_datagrams\":{},\"floor_bytes\":{},\"ceiling_bytes\":{},\"period_us\":{},\"idle_period_us\":{}}}",
+        c.floor_datagrams,
+        c.ceiling_datagrams,
+        c.floor_bytes,
+        c.ceiling_bytes,
+        c.period.as_micros(),
+        c.idle_period.as_micros()
+    )?;
+    write!(
+        writer,
+        ",\"receiver\":{{\"processed\":{},\"limit\":{},\"bytes_above\":{},\"drain_bytes\":{},\"drain_datagrams\":{},\"allowance_bytes\":{},\"allowance_readback\":{},\"issued\":{},\"frozen\":{}}}",
+        r.processed,
+        r.limit,
+        r.bytes_above,
+        r.drain_bytes,
+        r.drain_datagrams,
+        r.allowance_bytes,
+        value.allowance_readback,
+        r.issued,
+        r.frozen
+    )?;
+    write!(writer, ",\"sender\":")?;
+    match value.sender {
+        Some(s) => {
+            write!(
+                writer,
+                "{{\"limit\":{},\"window\":{},\"bytes_above\":{},\"peer_processed\":{},\"inflight_bytes\":{},\"inflight_datagrams\":{},\"peer_drain_bytes\":{},\"pacing_rate\":{},\"accepted\":{},\"stale\":{},\"credit_blocked\":{},\"pacing_blocked\":{},\"declared_lost\":{},\"range\":{},\"range_blocked\":{},\"min_rtt_us\":",
+                s.limit,
+                s.window,
+                s.bytes_above,
+                s.peer_processed,
+                s.inflight_bytes,
+                s.inflight_datagrams,
+                s.peer_drain_bytes,
+                s.pacing_rate,
+                s.accepted,
+                s.stale,
+                s.credit_blocked,
+                s.pacing_blocked,
+                s.declared_lost,
+                s.range,
+                s.range_blocked
+            )?;
+            optional(
+                writer,
+                s.min_rtt
+                    .map(|rtt| u64::try_from(rtt.as_micros()).unwrap_or(u64::MAX)),
+            )?;
+            write!(writer, "}}")?;
+        }
+        None => write!(writer, "null")?,
+    }
+    write!(
+        writer,
+        ",\"rejected\":{},\"sender_restarts\":{},\"unrecorded\":{}}}",
+        value.rejected, value.sender_restarts, value.unrecorded
+    )
 }
 fn gauge(writer: &mut impl Write, value: Gauge) -> io::Result<()> {
     write!(writer, "{{\"samples\":{},\"used\":", value.samples)?;
@@ -681,6 +845,7 @@ fn gauge(writer: &mut impl Write, value: Gauge) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::buffer_metrics::{Class, Lane, Site};
     #[tokio::test(start_paused = true)]
     async fn moved_execution_censors_cancelled_work_at_original_stop_and_survives_render_failure()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -765,16 +930,16 @@ mod tests {
         socket.connect(other.local_addr()?).await?;
         let before = observer.heap_bytes();
         assert_eq!(observer.udp_socket.capacity(), 0);
-        observer.observe_udp_socket(&socket);
+        observer.observe_udp_socket(&socket, None);
         assert_eq!(observer.udp_socket.len(), 1);
         assert_eq!(
             observer.heap_bytes() - before,
             observer.udp_socket.capacity()
                 * std::mem::size_of::<super::super::udp_socket::Snapshot>()
         );
-        observer.observe_udp_socket(&other);
+        observer.observe_udp_socket(&other, None);
         observer.finish_at(0);
-        observer.observe_udp_socket(&other);
+        observer.observe_udp_socket(&other, None);
         let mut bytes = Vec::new();
         observer.write_report(&mut bytes, 0)?;
         let report: serde_json::Value = serde_json::from_slice(&bytes)?;
@@ -795,7 +960,7 @@ mod tests {
         // without relying on nondeterministic allocator exhaustion.
         let mut unavailable = Observer::for_test(Instant::now(), path.clone())?;
         unavailable.udp_socket_allocation_failed = true;
-        unavailable.observe_udp_socket(&socket);
+        unavailable.observe_udp_socket(&socket, None);
         assert_eq!(unavailable.udp_socket.capacity(), 0);
         let mut bytes = Vec::new();
         unavailable.write_report(&mut bytes, 0)?;

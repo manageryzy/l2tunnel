@@ -216,6 +216,17 @@ impl Driver {
                 if let Some(request) = runtime.request.take() {
                     let _ = request.reply.send(Err(SwitchError::Rejected));
                 }
+            } else if let Some(gate) = self.device_mtu.as_deref_mut()
+                && let readiness = gate.ready_for(&request.configuration)
+                && readiness != super::device_mtu::Readiness::Ready
+            {
+                // Lower the device MTU before proposing a smaller size; a
+                // failed lowering refuses the switch.
+                if readiness == super::device_mtu::Readiness::Failed
+                    && let Some(request) = runtime.request.take()
+                {
+                    let _ = request.reply.send(Err(SwitchError::DeviceMtu));
+                }
             } else if !runtime.path.unavailable {
                 let mut sampled = first;
                 let mut first = Some(first);
@@ -251,12 +262,21 @@ impl Driver {
                 }
             }
         }
+        let device_mtu = &mut self.device_mtu;
         state.dispatch_preparations(
             &mut self.control,
             runtime.contract.proxy_binding().is_none()
                 && !runtime
                     .reuse_controller()
                     .is_some_and(super::common_reuse::Controller::active),
+            // The follower lowers its device MTU before acknowledging a
+            // smaller target; a failed lowering proceeds (decision 8 drops
+            // and counts leftover oversized packets).
+            |target| {
+                device_mtu
+                    .as_deref_mut()
+                    .is_none_or(|gate| gate.ready_for(target) != super::device_mtu::Readiness::Wait)
+            },
             &mut sample,
         )?;
         Ok(())

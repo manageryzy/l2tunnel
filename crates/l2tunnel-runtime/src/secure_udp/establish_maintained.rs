@@ -134,6 +134,7 @@ impl Outer {
         admission: gate::Secret,
         entropy: &mut (impl hs::Entropy + Send),
         observe: &mut diagnostics::Observer<'_>,
+        tuning: Tuning<'_>,
     ) -> Result<InitialEstablished, Error> {
         self.validate(config, hs::Role::Initiator)?;
         validate_requested(
@@ -154,6 +155,7 @@ impl Outer {
             entropy,
             &mut report,
             None,
+            tuning,
         ))
         .await;
         if let Err(error) = &result {
@@ -171,6 +173,7 @@ impl Outer {
         admission: &mut InitialServerAdmission,
         entropy: &mut (impl hs::Entropy + Send),
         observe: &mut diagnostics::Observer<'_>,
+        tuning: Tuning<'_>,
     ) -> Result<InitialEstablished, Error> {
         self.validate(admission.inner.config(), hs::Role::Responder)?;
         if admission.outer != self.proof.binding() {
@@ -188,6 +191,7 @@ impl Outer {
             entropy,
             &mut report,
             None,
+            tuning,
         ))
         .await;
         report.server(admission.inner.statistics());

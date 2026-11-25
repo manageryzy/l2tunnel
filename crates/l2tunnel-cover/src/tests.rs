@@ -63,7 +63,11 @@ fn encoded(config: Config, phase: Phase, body: &[u8]) -> Result<Vec<u8>, Error> 
 
 #[test]
 fn retained_outgoing_validation_keeps_direction_and_exact_grammar() -> Result<(), Error> {
-    for appearance in [Appearance::QuicLike, Appearance::MediaLike] {
+    for appearance in [
+        Appearance::QuicLike,
+        Appearance::MediaLike,
+        Appearance::TlsLike,
+    ] {
         let (a, b) = fixture(appearance)?;
         for phase in [Phase::Handshake, Phase::Established] {
             for (sender, peer) in [(a, b), (b, a)] {
@@ -78,6 +82,7 @@ fn retained_outgoing_validation_keeps_direction_and_exact_grammar() -> Result<()
                     (Appearance::QuicLike, Phase::Handshake) => 6,
                     (Appearance::QuicLike, Phase::Established) => 1,
                     (Appearance::MediaLike, _) => 8,
+                    (Appearance::TlsLike, _) => 5,
                 };
                 packet[identifier] ^= 1;
                 assert_eq!(
@@ -87,6 +92,46 @@ fn retained_outgoing_validation_keeps_direction_and_exact_grammar() -> Result<()
             }
         }
     }
+    Ok(())
+}
+
+#[test]
+fn exact_tls_like_handshake_and_established_wire_and_rejections() -> Result<(), Error> {
+    let (a, b) = fixture(Appearance::TlsLike)?;
+    let body = [0xde, 0xad, 0xbe, 0xef];
+    // Handshake: 0x16 0x03 0x01 <u16 len=16> <peer_cid=0x22*8> <seq=0x12345678> <body>
+    let hs = encoded(a, Phase::Handshake, &body)?;
+    assert_eq!(hs.len(), TLS_OVERHEAD + body.len());
+    assert_eq!(&hs[..5], &[0x16, 0x03, 0x01, 0x00, 16]);
+    assert_eq!(&hs[5..13], &[0x22; 8]);
+    assert_eq!(&hs[13..17], &[0x12, 0x34, 0x56, 0x78]);
+    let decoded = b.decode(&hs)?;
+    assert_eq!(decoded.phase, Phase::Handshake);
+    assert_eq!(
+        decoded.sequence,
+        OuterSequence::Tls(meta(Phase::Handshake).packet_number)
+    );
+    assert_eq!(decoded.media_timestamp, None);
+    assert_eq!(decoded.protected, body);
+
+    // Established: 0x17 0x03 0x03 <u16 len=16> <peer_cid=0x22*8> <seq=0x12345678> <body>
+    let est = encoded(a, Phase::Established, &body)?;
+    assert_eq!(&est[..5], &[0x17, 0x03, 0x03, 0x00, 16]);
+    let decoded = b.decode(&est)?;
+    assert_eq!(decoded.phase, Phase::Established);
+    assert_eq!(decoded.protected, body);
+
+    // Rejections: wrong version, wrong content type, wrong length, truncated
+    let mut bad_ver = est.clone();
+    bad_ver[2] = 0x02;
+    assert_eq!(b.decode(&bad_ver), Err(Error::Malformed));
+    let mut bad_type = est.clone();
+    bad_type[0] = 0x15;
+    assert_eq!(b.decode(&bad_type), Err(Error::Malformed));
+    let mut bad_len = est.clone();
+    bad_len[4] += 1;
+    assert_eq!(b.decode(&bad_len), Err(Error::Malformed));
+    assert_eq!(b.decode(&est[..TLS_OVERHEAD - 1]), Err(Error::Truncated));
     Ok(())
 }
 
@@ -259,6 +304,7 @@ fn smallest_configured_packet_and_outer_number_extremes_round_trip() -> Result<(
                 let expected = match appearance {
                     Appearance::QuicLike => OuterSequence::Quic(PacketNumber(number)),
                     Appearance::MediaLike => OuterSequence::Media(number as u16),
+                    Appearance::TlsLike => OuterSequence::Tls(PacketNumber(number)),
                 };
                 assert_eq!(decoded.sequence, expected);
             }
@@ -273,6 +319,8 @@ fn every_length_delimited_packet_prefix_and_trailing_byte_is_rejected() -> Resul
         (Appearance::QuicLike, Phase::Handshake),
         (Appearance::MediaLike, Phase::Handshake),
         (Appearance::MediaLike, Phase::Established),
+        (Appearance::TlsLike, Phase::Handshake),
+        (Appearance::TlsLike, Phase::Established),
     ] {
         let (a, b) = fixture(appearance)?;
         for body in [&[0_u8][..], &[1, 0, 2, 0][..], &[0_u8; 1200][..]] {

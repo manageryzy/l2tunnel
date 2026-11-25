@@ -37,13 +37,15 @@ l2tunnel-core = { path = "../l2tunnel-core" }
 l2tunnel-device = { path = "../l2tunnel-device" }
 l2tunnel-wire = { path = "../l2tunnel-wire" }
 l2tunnel-management = { path = "../l2tunnel-management" }
+l2tunnel-meters = { path = "../l2tunnel-meters" }
+l2tunnel-tunnel-test = { path = "../l2tunnel-tunnel-test" }
 ring = "=0.17.14"
 socket2 = "=0.6.5"
 zeroize = "=1.9.0"
 tokio = { version = "=1.53.1", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-rustix = { version = "=1.1.4", features = ["time"] }
+rustix = { version = "=1.1.4", features = ["net", "time"] }
 
 [dev-dependencies]
 serde_json = "=1.0.151"
