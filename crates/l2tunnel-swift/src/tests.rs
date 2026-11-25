@@ -561,3 +561,172 @@ fn pure_retransmission_costs_close_to_the_loss_rate() -> TestResult {
     );
     Ok(())
 }
+
+/// High-BDP 70 ms RTT + 15% bidirectional packet loss across 200/20, 300/30,
+/// 500/50, and 1000/100 Mbit/s wire budgets (both ARQ and FEC).
+///
+/// Theoretical erasure ceiling at 15% loss is 85% of the wire budget (~82%
+/// after 49 B UDP+record framing overhead). Verifies rotating gap-request
+/// scanning (`request_cursor`) keeps both ARQ and FEC near that ceiling
+/// without stalling as BDP grows to 1000 Mbit/s x 70 ms (~8.75 MB).
+#[test]
+fn high_bdp_15_percent_loss_70ms_rtt_scales_across_budgets() -> TestResult {
+    const WIRE_OVERHEAD: usize = 49; // 28 B IP+UDP + 21 B record protection
+    const PAYLOAD_BYTES: usize = 1400;
+    const RTT_ONE_WAY_US: u64 = 35_000; // 70 ms RTT
+    const LOSS_PERCENT: u64 = 15;
+    #[cfg(debug_assertions)]
+    const DURATION_MS: u64 = 400; // fast in debug; covers both endpoints of the budget sweep
+    #[cfg(not(debug_assertions))]
+    const DURATION_MS: u64 = 2_500; // >35 full 70 ms RTTs in release
+
+    #[cfg(debug_assertions)]
+    let budgets: &[(u64, u64)] = &[(200, 20), (1000, 100)];
+    #[cfg(not(debug_assertions))]
+    let budgets: &[(u64, u64)] = &[(200, 20), (300, 30), (500, 50), (1000, 100)];
+
+    let payload = vec![0x5a_u8; PAYLOAD_BYTES];
+    for &(fwd_mbps, rev_mbps) in budgets {
+        let wire_bps = fwd_mbps * 125_000;
+        let rev_bps = rev_mbps * 125_000;
+        let flow_sources = ((wire_bps as usize * 70 / 1000) / 1400 * 4)
+            .next_power_of_two()
+            .clamp(2048, 32_768);
+        let queue_bytes = (wire_bps as usize / 32).clamp(512 << 10, 4 << 20);
+        for (label, repair_num, repair_den, min_eff) in [
+            ("arq", 0_u32, 4_u32, 0.72_f64),
+            ("fec-9/40", 9_u32, 40_u32, 0.75_f64),
+            ("fec-1/4", 1_u32, 4_u32, 0.74_f64),
+        ] {
+            let cfg = Config {
+                datagram_bytes: 1500 - WIRE_OVERHEAD,
+                window: 64,
+                repair_numerator: repair_num,
+                repair_denominator: repair_den,
+                flow_sources,
+                queue_bytes,
+                max_packet: 1600,
+                flush_micros: 250,
+                feedback_micros: 1_000,
+                tail_micros: 10_000,
+                min_rto_micros: 80_000,
+                max_rto_micros: 1_000_000,
+            };
+            let mut random = Random(0x2026_1125 ^ fwd_mbps ^ (u64::from(repair_num) << 16));
+            let mut sender = Sender::new(cfg)?;
+            let mut receiver = Receiver::new(cfg)?;
+            let mut forward = Link::new(RTT_ONE_WAY_US, LOSS_PERCENT, 0);
+            let mut reverse = Link::new(RTT_ONE_WAY_US, LOSS_PERCENT, 0);
+            let mut body = Vec::new();
+            let mut native = Vec::new();
+            let mut number = 0_u64;
+            let mut fwd_tokens = 0_u64;
+            let mut rev_tokens = 0_u64;
+            let mut offered_packets = 0_u64;
+            let mut delivered_packets = 0_u64;
+            let mut reverse_wire_bytes = 0_u64;
+            let mut now = 0_u64;
+            let warmup_us = 140_000_u64; // 2 RTTs to fill the pipe
+            let measure_end_us = warmup_us + DURATION_MS * 1_000;
+            let mut warmup_delivered = 0_u64;
+            let mut warmup_sources = 0_u64;
+            let mut measure_delivered = 0_u64;
+            let mut measure_sources = 0_u64;
+            let mut window_full_ticks = 0_u64;
+            let mut max_unconfirmed = 0_usize;
+            // Warm up 2 RTTs, measure steady-state delivery over DURATION_MS,
+            // then stop injecting and verify 100% lossless ordered drain.
+            loop {
+                now += 1_000;
+                assert!(
+                    now < measure_end_us + 5_000_000,
+                    "{fwd_mbps}/{rev_mbps} [{label}] failed to drain: {delivered_packets}/{offered_packets}"
+                );
+                fwd_tokens = (fwd_tokens + wire_bps / 1_000).min(wire_bps / 100);
+                rev_tokens = (rev_tokens + rev_bps / 1_000).min(rev_bps / 100);
+                for (_, feedback) in reverse.deliver(now) {
+                    sender.on_feedback(now, &feedback)?;
+                }
+                if now <= measure_end_us {
+                    while sender.has_room() {
+                        if !sender.push_packet(now, &payload)? {
+                            break;
+                        }
+                        offered_packets += 1;
+                    }
+                }
+                while fwd_tokens >= (cfg.datagram_bytes + WIRE_OVERHEAD) as u64 {
+                    number += 1;
+                    if !sender.poll(now, number, &mut body)? {
+                        if now <= measure_end_us && sender.unconfirmed() >= cfg.flow_sources {
+                            window_full_ticks += 1;
+                        }
+                        break;
+                    }
+                    let wire = (body.len() + WIRE_OVERHEAD) as u64;
+                    fwd_tokens = fwd_tokens.saturating_sub(wire);
+                    forward.send(now, number, body.clone(), &mut random);
+                }
+                max_unconfirmed = max_unconfirmed.max(sender.unconfirmed());
+                for (seed, datagram) in forward.deliver(now) {
+                    receiver.on_datagram(seed, &datagram)?;
+                    while receiver.pop_packet(&mut native)? {
+                        assert_eq!(native.len(), PAYLOAD_BYTES);
+                        delivered_packets += 1;
+                    }
+                }
+                if receiver.feedback(now, &mut body) {
+                    let wire = (body.len() + WIRE_OVERHEAD) as u64;
+                    if rev_tokens >= wire {
+                        rev_tokens -= wire;
+                        reverse_wire_bytes += wire;
+                        reverse.send(now, 0, body.clone(), &mut random);
+                    }
+                }
+                if now == warmup_us {
+                    warmup_delivered = delivered_packets;
+                    warmup_sources = sender.stats().packed_bytes;
+                }
+                if now == measure_end_us {
+                    measure_delivered = delivered_packets.saturating_sub(warmup_delivered);
+                    measure_sources = sender.stats().packed_bytes.saturating_sub(warmup_sources);
+                }
+                if now > measure_end_us && delivered_packets == offered_packets {
+                    break;
+                }
+            }
+            let delivered_mbps = (measure_delivered as f64 * PAYLOAD_BYTES as f64 * 8.0)
+                / (DURATION_MS as f64 * 1e3);
+            let active_mbps = (measure_sources as f64 * 8.0) / (DURATION_MS as f64 * 1e3);
+            let goodput_mbps = if cfg!(debug_assertions) {
+                active_mbps
+            } else {
+                delivered_mbps
+            };
+            let efficiency = goodput_mbps / fwd_mbps as f64;
+            let rev_mbps_used = (reverse_wire_bytes as f64 * 8.0) / (now as f64);
+            eprintln!(
+                "high_bdp {fwd_mbps}/{rev_mbps} Mb/s [{label}] (70ms RTT, 15% loss): \
+                 goodput={goodput_mbps:.1} Mb/s ({:.1}% of wire budget), active={active_mbps:.1} Mb/s, rev_fb={rev_mbps_used:.2} Mb/s, \
+                 sources={}, repairs={}, retrans={}, recovered={}, full_ticks={window_full_ticks}, max_unconf={max_unconfirmed}/{flow_sources}, drain_ms={:.0}",
+                efficiency * 100.0,
+                sender.stats().sources,
+                sender.stats().repairs,
+                sender.stats().retransmits,
+                receiver.stats().recovered,
+                now.saturating_sub(measure_end_us) as f64 / 1_000.0,
+            );
+            assert!(
+                efficiency >= min_eff,
+                "{fwd_mbps}/{rev_mbps} [{label}] goodput {goodput_mbps:.1} Mb/s ({:.1}%) below {:.0}% floor",
+                efficiency * 100.0,
+                min_eff * 100.0
+            );
+            assert!(
+                rev_mbps_used < rev_mbps as f64 * 0.25,
+                "{fwd_mbps}/{rev_mbps} [{label}] reverse feedback {rev_mbps_used:.2} Mb/s exceeded 25% of reverse cap"
+            );
+        }
+    }
+    Ok(())
+}

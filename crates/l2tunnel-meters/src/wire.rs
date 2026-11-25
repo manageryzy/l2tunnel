@@ -399,12 +399,29 @@ pub fn answer(
     request: &Request<'_>,
     out: &mut Vec<u8>,
 ) -> Result<(), Error> {
+    answer_bounded(table, generation, request, MAX_REPLY_BYTES, out)
+}
+
+/// Answer `request` from a sealed `table` into `out`, capping the encoded body
+/// at `max_bytes.min(MAX_REPLY_BYTES)` so streams with a smaller message bound
+/// page cleanly without overflowing.
+pub fn answer_bounded(
+    table: &Table,
+    generation: u64,
+    request: &Request<'_>,
+    max_bytes: usize,
+    out: &mut Vec<u8>,
+) -> Result<(), Error> {
     request.validate()?;
     if !table.is_sealed() {
         return Err(Error::Order);
     }
+    let cap = max_bytes.min(MAX_REPLY_BYTES);
+    if cap < REPLY_FIXED {
+        return Err(Error::Limits);
+    }
     let mut body = Vec::new();
-    body.try_reserve_exact(MAX_REPLY_BYTES)?;
+    body.try_reserve_exact(cap)?;
     header(&mut body, KIND_REPLY, request.id);
     body.extend_from_slice(&[0, 0, 0, 0]);
     body.extend_from_slice(&generation.to_be_bytes());
@@ -418,7 +435,7 @@ pub fn answer(
             .take_while(|(left, right)| left == right)
             .count();
         let suffix = &current[shared..];
-        if count == request.limit || body.len() + ENTRY_FIXED + suffix.len() > MAX_REPLY_BYTES {
+        if count == request.limit || body.len() + ENTRY_FIXED + suffix.len() > cap {
             more = true;
             break;
         }
@@ -675,6 +692,47 @@ mod tests {
         assert!(!gate.admit(1_249));
         assert!(gate.admit(1_250));
         assert!(!gate.admit(1_000));
+        Ok(())
+    }
+
+    #[test]
+    fn answer_bounded_pages_within_custom_byte_cap() -> Outcome {
+        let mut table = Table::new(Limits::for_entries(16, 48))?;
+        for i in 0_u32..8 {
+            table.put(format_args!("runtime.meter.k{i:02}"), u64::from(i) + 1)?;
+        }
+        table.seal()?;
+        let cap = 96;
+        let mut collected = Vec::new();
+        let mut cursor: Option<String> = None;
+        let mut pages = 0usize;
+        let mut out = Vec::new();
+        loop {
+            let req = Request {
+                id: pages as u32 + 1,
+                limit: 256,
+                prefix: "runtime.meter",
+                cursor: cursor.as_deref(),
+            };
+            answer_bounded(&table, 7, &req, cap, &mut out)?;
+            assert!(out.len() <= cap, "encoded {} > {cap}", out.len());
+            let Message::Reply(reply) = Message::decode(&out)? else {
+                return Err("expected reply".into());
+            };
+            reply.check(&req)?;
+            assert_eq!(reply.generation, 7);
+            assert!(!reply.entries.is_empty());
+            collected.extend(reply.entries.iter().cloned());
+            pages += 1;
+            if !reply.more {
+                break;
+            }
+            cursor = reply.entries.last().map(|(path, _)| path.clone());
+        }
+        assert!(pages >= 2, "expected multiple pages under {cap}-byte cap");
+        assert_eq!(collected.len(), 8);
+        assert_eq!(collected[0], ("runtime.meter.k00".into(), 1));
+        assert_eq!(collected[7], ("runtime.meter.k07".into(), 8));
         Ok(())
     }
 }

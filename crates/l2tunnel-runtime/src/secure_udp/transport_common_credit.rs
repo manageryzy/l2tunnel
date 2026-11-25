@@ -162,6 +162,38 @@ impl State {
             .as_ref()
             .and_then(|sender| sender.min_rtt(at(now)))
     }
+    /// Update the configured send rate cap (bytes per second) live.
+    pub(crate) fn set_send_rate(&mut self, send_rate: u64) {
+        if send_rate == 0 {
+            return;
+        }
+        self.send_rate = send_rate;
+        self.burst = self.burst.max(send_rate / 100).min(4 << 20);
+        if let Some(sender) = &mut self.sender {
+            sender.set_configured_rate(send_rate);
+        }
+    }
+    /// Raise the credit datagram and byte ceilings live when the negotiated
+    /// speed budget exceeds the 100 Mbit/s baseline so high-BDP (200-1000 Mb/s
+    /// at 70 ms RTT + 15% loss) sessions never stall on the initial plan cap.
+    pub(crate) fn raise_ceiling_for_rates(&mut self, send_rate: u64, receive_rate: u64) {
+        let peak = send_rate.max(receive_rate);
+        if peak <= 12_500_000 {
+            return;
+        }
+        // ~300 ms of packets at 1200 B/datagram (~3x BDP at 70 ms RTT + loss),
+        // bounded to [8192, 32768] and fitted to `range / 4`.
+        let target_datagrams = (peak / 4_000).clamp(8_192, 32_768).min(self.range / 4);
+        let target_bytes = (peak / 2).clamp(16 << 20, 64 << 20);
+        let next_datagrams = target_datagrams.max(self.config.ceiling_datagrams);
+        let next_bytes = target_bytes.max(self.config.ceiling_bytes);
+        self.config.ceiling_datagrams = next_datagrams;
+        self.config.ceiling_bytes = next_bytes;
+        self.receiver.raise_ceiling(next_datagrams, next_bytes);
+        if let Some(sender) = &mut self.sender {
+            sender.raise_ceiling(next_datagrams);
+        }
+    }
     /// Observation only.
     pub(crate) fn snapshot(&self, now: u64) -> CreditSnapshot {
         CreditSnapshot {
@@ -238,6 +270,9 @@ impl Driver {
                 state.counters.requested_receive_buffer = u64::try_from(target).ok();
                 // Failures leave the kernel default; the read-back shows it.
                 let _ = sock.set_recv_buffer_size(target);
+                // Also raise SO_SNDBUF (up to 4 MiB) so high-rate UDP bursts
+                // do not stall on Linux's default 212 KiB send buffer.
+                let _ = sock.set_send_buffer_size(target.min(4 << 20));
                 #[cfg(target_os = "linux")]
                 if sock
                     .recv_buffer_size()

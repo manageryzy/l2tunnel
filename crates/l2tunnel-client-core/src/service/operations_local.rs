@@ -278,7 +278,7 @@ impl Handle {
                         self.meters_local(&prefix, cursor.as_deref(), limit)
                     }
                     crate::local::MeterSide::Remote => {
-                        self.meters_remote(&prefix, cursor.as_deref(), limit)
+                        self.meters_remote(&prefix, cursor.as_deref(), limit).await
                     }
                 };
                 match result {
@@ -464,6 +464,42 @@ impl Handle {
             OperationAction::TestStart { test } => self.test_start(&test),
             OperationAction::TestGet { id, timeout_ms } => self.test_get(id, timeout_ms).await,
             OperationAction::TestCancel { id } => self.test_cancel(id),
+            OperationAction::RateBudgetSet {
+                send_rate,
+                receive_rate,
+            } => {
+                use l2tunnel_runtime::secure_udp::transport::RateBudgetError;
+                let switcher = {
+                    let state = self.0.lock();
+                    match &state.backend {
+                        Some(ObservedBackend::SecureUdpCommon(backend)) => {
+                            Ok(backend.switcher.clone())
+                        }
+                        Some(ObservedBackend::Proxy(_)) => Err("unsupported"),
+                        None => Err("not_running"),
+                    }
+                };
+                match switcher {
+                    Err(code) => self.reply(false, code),
+                    Ok(switcher) => match switcher.set_rate_budget(send_rate, receive_rate).await {
+                        Ok(_) => OperationReply {
+                            status: Some(self.service_status()),
+                            ..self.reply(true, "ok")
+                        },
+                        Err(error) => {
+                            let code = match error {
+                                RateBudgetError::InvalidRate => "invalid_rate",
+                                RateBudgetError::Busy => "busy",
+                                RateBudgetError::Timeout => "peer_timeout",
+                                RateBudgetError::PeerRefused => "peer_refused",
+                                RateBudgetError::Malformed => "peer_malformed",
+                                RateBudgetError::Closed => "not_running",
+                            };
+                            self.reply(false, code)
+                        }
+                    },
+                }
+            }
             OperationAction::ServiceInfo {} => OperationReply {
                 info: Some(self.service_info()),
                 ..self.reply(true, "ok")

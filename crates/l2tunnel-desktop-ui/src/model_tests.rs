@@ -609,3 +609,241 @@ fn a_refresh_asked_during_the_same_read_is_sent_when_it_answers() {
     });
     assert!(is_devices(&retry));
 }
+
+#[test]
+fn historical_backlog_completions_do_not_burst_operation_get_or_hijack_notice() {
+    let mut model = Model::default();
+    model.attach("/run/x/api.sock");
+    let commands = model.handle(Message::Status {
+        attach: 1,
+        start_follower: true,
+        result: Ok(status_reply("connected", None, 20, 7)),
+    });
+    assert_eq!(follow_of(&commands), Some((1, 0)));
+    // Second Status refresh for same ServiceId does not re-query Info once Info is loaded.
+    model.handle(Message::Query {
+        attach: 1,
+        query: Query::Info,
+        result: Ok(info(&[Feature::Metrics, Feature::Meters])),
+    });
+    let mut backlog = reply("ok", 7);
+    backlog.events = Some(EventBatch {
+        events: vec![
+            event(
+                10,
+                EventBody::OperationCompleted {
+                    operation: 4,
+                    outcome: "failed".into(),
+                },
+            ),
+            event(
+                20,
+                EventBody::OperationCompleted {
+                    operation: 9,
+                    outcome: "connected".into(),
+                },
+            ),
+        ],
+        next: 20,
+        gap: false,
+    });
+    let commands = model.handle(Message::Events {
+        attach: 1,
+        follower: 1,
+        reply: Box::new(backlog),
+    });
+    assert!(
+        !commands
+            .iter()
+            .any(|command| matches!(command, Command::Show { .. })),
+        "historical completions should not burst OperationGet: {commands:?}"
+    );
+    assert!(model.notice.is_empty());
+    // Subsequent live completion DOES emit Command::Show.
+    let mut live = reply("ok", 7);
+    live.events = Some(EventBatch {
+        events: vec![event(
+            21,
+            EventBody::OperationCompleted {
+                operation: 10,
+                outcome: "committed".into(),
+            },
+        )],
+        next: 21,
+        gap: false,
+    });
+    let commands = model.handle(Message::Events {
+        attach: 1,
+        follower: 1,
+        reply: Box::new(live),
+    });
+    assert!(
+        commands
+            .iter()
+            .any(|command| matches!(command, Command::Show { operation: 10, .. }))
+    );
+    // Refresh Status for same ServiceId, phase, and generation with Info already loaded skips Query::Info.
+    let status_follow = model.handle(Message::Status {
+        attach: 1,
+        start_follower: false,
+        result: Ok(status_reply("connected", None, 21, 7)),
+    });
+    assert!(
+        !status_follow.iter().any(|command| matches!(
+            command,
+            Command::Query {
+                query: Query::Info,
+                ..
+            }
+        )),
+        "static Info should not be re-queried when phase and generation are unchanged"
+    );
+    // Transitioning phase (e.g., disconnected -> connected) MUST refresh Info so
+    // dynamic capabilities like Feature::Tests update immediately.
+    let phase_changed = model.handle(Message::Status {
+        attach: 1,
+        start_follower: false,
+        result: Ok(status_reply("disconnected", None, 22, 7)),
+    });
+    assert!(
+        phase_changed.iter().any(|command| matches!(
+            command,
+            Command::Query {
+                query: Query::Info,
+                ..
+            }
+        )),
+        "phase transitions must refresh dynamic capabilities in ServiceInfo"
+    );
+}
+
+#[test]
+fn tuning_and_catalog_errors_stop_loading_spin_and_support_retry() {
+    let mut model = Model::default();
+    model.attach("/run/x/api.sock");
+    let mut st = status("connected", None, 1);
+    let snapshot = crate::fixture::snapshot(5, [9; 32], Some(1));
+    assert!(snapshot.is_ok(), "fixture snapshot must build");
+    let Ok(snapshot) = snapshot else { return };
+    st.observation = Some(snapshot);
+    let mut status_msg = reply("ok", 7);
+    status_msg.status = Some(st);
+    model.handle(Message::Status {
+        attach: 1,
+        start_follower: true,
+        result: Ok(Box::new(status_msg)),
+    });
+
+    // Tuning EOF produces a helpful error instead of staying stuck on Loading.
+    assert_eq!(model.refresh_tuning().len(), 1);
+    assert!(model.tuning_loading());
+    model.handle(Message::Query {
+        attach: 1,
+        query: Query::Tuning,
+        result: Err("unexpected end of file".into()),
+    });
+    assert!(!model.tuning_loading());
+    assert!(
+        model
+            .tuning_error()
+            .is_some_and(|text| text.contains("not supported by this service version"))
+    );
+    assert!(model.refresh_tuning().is_empty(), "no auto retry storm");
+    assert_eq!(model.retry_tuning().len(), 1, "manual retry works");
+
+    // Catalog error stops catalog_stale() from spin-retrying every frame.
+    assert!(model.catalog_stale());
+    assert_eq!(model.catalog_page(0).len(), 1);
+    model.handle(Message::Query {
+        attach: 1,
+        query: Query::Catalog {
+            generation: 5,
+            catalog: [9; 32],
+            offset: 0,
+        },
+        result: Err("broken pipe".into()),
+    });
+    assert!(
+        !model.catalog_stale(),
+        "error must stop frame-by-frame retry"
+    );
+    assert_eq!(model.catalog_error(), Some("broken pipe"));
+    assert_eq!(model.retry_catalog().len(), 1);
+}
+
+#[test]
+fn meters_paging_rates_and_action_results_work() {
+    use l2tunnel_client_core::local::{MeterEntry, MeterPage, MeterSide};
+
+    let mut model = Model::default();
+    model.attach("/run/x/api.sock");
+    let cmds = model.refresh_meters(MeterSide::Local, "flow_control".into(), None);
+    assert_eq!(cmds.len(), 1);
+    assert!(model.meters_loading());
+    let mut first = reply("ok", 7);
+    first.meters = Some(Box::new(MeterPage {
+        side: MeterSide::Local,
+        generation: 3,
+        sampled_ms: 1_000,
+        age_ms: Some(12),
+        entries: vec![MeterEntry {
+            path: "flow_control.tx.accepted".into(),
+            value: 100,
+        }],
+        next: Some("flow_control.tx.accepted".into()),
+    }));
+    model.handle(Message::Query {
+        attach: 1,
+        query: Query::Meters {
+            side: MeterSide::Local,
+            prefix: "flow_control".into(),
+            cursor: None,
+        },
+        result: Ok(Box::new(first)),
+    });
+    assert_eq!(model.meters().map(|page| page.entries.len()), Some(1));
+    assert_eq!(model.meter_rate("flow_control.tx.accepted", 100), None);
+
+    // Second read 2 seconds later yields per-second rate.
+    let _ = model.refresh_meters(MeterSide::Local, "flow_control".into(), None);
+    let mut second = reply("ok", 7);
+    second.meters = Some(Box::new(MeterPage {
+        side: MeterSide::Local,
+        generation: 3,
+        sampled_ms: 3_000,
+        age_ms: Some(5),
+        entries: vec![MeterEntry {
+            path: "flow_control.tx.accepted".into(),
+            value: 150,
+        }],
+        next: None,
+    }));
+    model.handle(Message::Query {
+        attach: 1,
+        query: Query::Meters {
+            side: MeterSide::Local,
+            prefix: "flow_control".into(),
+            cursor: None,
+        },
+        result: Ok(Box::new(second)),
+    });
+    assert_eq!(
+        model.meter_rate("flow_control.tx.accepted", 150),
+        Some(25.0)
+    );
+
+    // Action refusal is exposed for modals to stay open and display inline.
+    let mut refused = OperationReply::code(false, "invalid_profile", Some(ServiceId(7)));
+    refused.version = OPERATIONS_VERSION;
+    model.handle(Message::Action {
+        attach: 1,
+        action: Action::Profile,
+        outcome: ActionOutcome::Reply(Box::new(refused)),
+    });
+    assert!(
+        model
+            .take_action_result(Action::Profile)
+            .is_some_and(|res| res.is_err())
+    );
+    assert!(model.take_action_result(Action::Profile).is_none());
+}

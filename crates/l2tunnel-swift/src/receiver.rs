@@ -191,6 +191,9 @@ pub struct Receiver {
     prepared_feedback: Option<PreparedFeedback>,
     /// Highest sequence known when feedback was last produced.
     reported_end: u64,
+    /// Rotating scan cursor across `base..request_to` when more than
+    /// `MAX_REQUESTS` gaps are simultaneously open on high-BDP lossy paths.
+    request_cursor: u64,
     /// Unprompted repeats of the latest feedback still owed, so one lost
     /// acknowledgement does not leave an idle sender waiting for its probe.
     repeats: u8,
@@ -204,6 +207,7 @@ struct PreparedFeedback {
     end: u64,
     dirty: bool,
     changed: bool,
+    next_cursor: u64,
 }
 
 impl Receiver {
@@ -225,6 +229,7 @@ impl Receiver {
             dirty: false,
             prepared_feedback: None,
             reported_end: 0,
+            request_cursor: 0,
             repeats: 0,
             last_feedback: 0,
             spare: Vec::new(),
@@ -290,6 +295,7 @@ impl Receiver {
             dirty: false,
             prepared_feedback: None,
             reported_end: 0,
+            request_cursor: 0,
             repeats: 0,
             last_feedback: 0,
             spare,
@@ -794,7 +800,7 @@ impl Receiver {
                 .saturating_add(self.config.feedback_micros)
         })
     }
-    fn feedback_shape(&self) -> Feedback {
+    fn feedback_shape(&self) -> (Feedback, u64) {
         let coded_from = self
             .end
             .saturating_sub(self.config.window as u64)
@@ -823,60 +829,88 @@ impl Receiver {
         };
         let mut offsets = [0; MAX_REQUESTS];
         let mut requests = 0;
-        for sequence in self.base..request_to {
-            if requests == MAX_REQUESTS {
-                break;
-            }
-            let offset = sequence - self.base;
-            if offset > u64::from(u16::MAX) {
-                break;
-            }
+        let max_seq = self
+            .base
+            .saturating_add(u64::from(u16::MAX))
+            .saturating_add(1)
+            .min(request_to);
+        let is_missing_gap = |sequence: u64| {
             // A row's pivot is determined once that row's other unknowns
             // arrive, so asking for it as well would only buy a duplicate.
-            if self.slot(sequence).is_none()
+            self.slot(sequence).is_none()
                 && !self
                     .rows
                     .iter()
                     .any(|row| row.terms.first().is_some_and(|term| term.0 == sequence))
-            {
-                offsets[requests] = offset as u16;
-                requests += 1;
+        };
+        // Always prioritize the head-of-line blocker (`self.base`) in slot 0 so
+        // it never waits for the rotating scan to wrap around on high-BDP paths.
+        if self.base < max_seq && is_missing_gap(self.base) {
+            offsets[0] = 0;
+            requests = 1;
+        }
+        let scan_base = self.base.saturating_add(1).min(max_seq);
+        let start = self.request_cursor.clamp(scan_base, max_seq);
+        let mut next_cursor = scan_base;
+        let mut scan = |from: u64, to: u64| {
+            for sequence in from..to {
+                if requests == MAX_REQUESTS {
+                    next_cursor = sequence;
+                    return true;
+                }
+                if is_missing_gap(sequence) {
+                    offsets[requests] = (sequence - self.base) as u16;
+                    requests += 1;
+                }
             }
+            false
+        };
+        let filled = scan(start, max_seq);
+        if !filled && start > scan_base {
+            let _ = scan(scan_base, start);
         }
+        // Keep offsets in strictly increasing order if the scan wrapped around.
+        offsets[..requests].sort_unstable();
 
-        Feedback {
-            base: self.base as u32,
-            end: self.end as u32,
-            recent,
-            offsets,
-            requests,
-        }
+        (
+            Feedback {
+                base: self.base as u32,
+                end: self.end as u32,
+                recent,
+                offsets,
+                requests,
+            },
+            next_cursor,
+        )
     }
     /// Earliest genuine feedback opportunity and its complete canonical length.
     pub(crate) fn feedback_opportunity(&self) -> Option<(u64, usize)> {
         self.deadline()
-            .map(|at| (at, self.feedback_shape().bytes()))
+            .map(|at| (at, self.feedback_shape().0.bytes()))
     }
     /// Render without consuming any feedback debt, time or repeat state.
     pub(crate) fn preview_feedback(&self, now: u64, output: &mut Vec<u8>) -> bool {
         if self.deadline().is_none_or(|at| now < at) {
             return false;
         }
-        self.feedback_shape().write(output);
+        self.feedback_shape().0.write(output);
         true
     }
     /// Freeze metadata matching bytes already rendered by preview_feedback.
     pub(crate) fn prepare_feedback(&mut self) {
+        let (_, next_cursor) = self.feedback_shape();
         self.prepared_feedback = Some(PreparedFeedback {
             end: self.end,
             dirty: self.dirty,
             changed: false,
+            next_cursor,
         });
     }
     /// Commit the frozen report, preserving any later authenticated receive event.
     pub(crate) fn confirm_feedback(&mut self, accepted: u64) {
         if let Some(prepared) = self.prepared_feedback.take() {
             self.reported_end = prepared.end;
+            self.request_cursor = prepared.next_cursor;
             self.repeats = if prepared.dirty {
                 FEEDBACK_REPEATS
             } else {
@@ -889,7 +923,9 @@ impl Receiver {
     }
     /// Commit only after the sole packer accepted the complete rendered block.
     pub(crate) fn commit_feedback(&mut self, now: u64) {
+        let (_, next_cursor) = self.feedback_shape();
         self.reported_end = self.end;
+        self.request_cursor = next_cursor;
         self.repeats = if self.dirty {
             FEEDBACK_REPEATS
         } else {

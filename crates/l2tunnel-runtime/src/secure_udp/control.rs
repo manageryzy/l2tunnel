@@ -922,6 +922,19 @@ impl Owner {
 
     /// Reserve one immutable envelope only when the actual source/message owner accepts it.
     /// A refused admission consumes no envelope or submission identity.
+    /// Maximum `ProfileControl` body bytes that fit one `Liveness` stream message.
+    pub(super) fn liveness_max_body_bytes(&self) -> usize {
+        let overhead = sc::HEADER_BYTES + 4;
+        match &self.backend {
+            Backend::Streamed(streamed) => streamed.settings.streams
+                [index(streams::Stream::Liveness)]
+            .max_message_bytes
+            .min(streamed.envelope.len())
+            .saturating_sub(overhead),
+            Backend::Legacy(legacy) => legacy.limits.max_frame_bytes.saturating_sub(overhead),
+        }
+    }
+
     /// Streamed custody receives its own immutable expiry bounded by the caller's
     /// original operation cap; this does not replace that operation's deadline.
     pub(crate) fn submit(
@@ -1828,7 +1841,8 @@ fn outgoing_stream(body: sc::Body<'_>) -> io::Result<streams::Stream> {
         sc::Body::Ping { .. }
         | sc::Body::Pong { .. }
         | sc::Body::ProfileControl {
-            tag: sc::ProfileTag::TunnelTestV1,
+            tag:
+                sc::ProfileTag::TunnelTestV1 | sc::ProfileTag::MetersV1 | sc::ProfileTag::RateBudgetV1,
             ..
         } => Ok(streams::Stream::Liveness),
         sc::Body::NativeReceipt {

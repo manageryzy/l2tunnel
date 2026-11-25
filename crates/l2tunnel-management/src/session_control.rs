@@ -26,9 +26,19 @@ pub enum ProfileTag {
     /// Built-in tunnel speed/ping test address exchange v1, carried on the
     /// Liveness stream in Control scope (docs/modules/tunnel-tests.md).
     TunnelTestV1 = 4,
+    /// In-band remote CSR meter read request/reply/refusal v1, carried on the
+    /// Liveness stream in Control scope (docs/modules/meter-csr.md).
+    MetersV1 = 5,
+    /// Authenticated live speed-budget (upload/download rate cap) update v1,
+    /// carried on the Liveness stream in Control scope.
+    RateBudgetV1 = 6,
 }
 /// Exact body length of a tunnel-test control message.
 pub const TUNNEL_TEST_BYTES: usize = 24;
+/// Largest in-band remote CSR meter body (matches `l2tunnel_meters::wire::MAX_REPLY_BYTES`).
+pub const MAX_METERS_BYTES: usize = 16 * 1024;
+/// Exact body length of a live speed-budget control message.
+pub const RATE_BUDGET_BYTES: usize = 24;
 impl ProfileTag {
     fn decode(value: u16) -> Result<Self, Error> {
         match value {
@@ -36,6 +46,8 @@ impl ProfileTag {
             2 => Ok(Self::SessionRefreshV1),
             3 => Ok(Self::SlotReuseV1),
             4 => Ok(Self::TunnelTestV1),
+            5 => Ok(Self::MetersV1),
+            6 => Ok(Self::RateBudgetV1),
             _ => Err(Error::ProfileTag),
         }
     }
@@ -297,6 +309,7 @@ impl<'a> Envelope<'a> {
                     Some([0, 2]) => MAX_LIFECYCLE_BYTES,
                     Some([0, 3]) => 288,
                     Some([0, 4]) => TUNNEL_TEST_BYTES,
+                    Some([0, 5]) => MAX_METERS_BYTES,
                     _ => MAX_PROFILE_CONTROL_BYTES,
                 };
                 if bytes.len() <= 4 || bytes.len() > 4 + maximum {
@@ -349,6 +362,8 @@ impl<'a> Envelope<'a> {
                             ProfileTag::SessionRefreshV1 => MAX_LIFECYCLE_BYTES,
                             ProfileTag::SlotReuseV1 => 288,
                             ProfileTag::TunnelTestV1 => TUNNEL_TEST_BYTES,
+                            ProfileTag::MetersV1 => MAX_METERS_BYTES,
+                            ProfileTag::RateBudgetV1 => RATE_BUDGET_BYTES,
                         } =>
             {
                 return Err(Error::Length);

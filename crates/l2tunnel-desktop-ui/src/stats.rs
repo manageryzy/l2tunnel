@@ -117,6 +117,15 @@ impl History {
     /// Per-interval rates of the current series over the last `seconds`,
     /// oldest first; `None` marks an unreported or decreasing counter.
     pub fn series(&self, rate: Rate, seconds: u64) -> Vec<Option<f64>> {
+        self.timed_series(rate, seconds)
+            .into_iter()
+            .map(|(_, value)| value)
+            .collect()
+    }
+    /// Per-interval rates with age in seconds from the newest sample
+    /// (`0.0` is the newest interval, `seconds` is the left edge of the
+    /// window), oldest first.
+    pub fn timed_series(&self, rate: Rate, seconds: u64) -> Vec<(f64, Option<f64>)> {
         let Some(last) = self.samples.back() else {
             return Vec::new();
         };
@@ -128,8 +137,31 @@ impl History {
             .collect();
         window
             .windows(2)
-            .map(|pair| Self::between(rate, pair[0], pair[1]))
+            .map(|pair| {
+                let age = last.ms.saturating_sub(pair[1].ms) as f64 / 1000.0;
+                (age, Self::between(rate, pair[0], pair[1]))
+            })
             .collect()
+    }
+}
+
+/// Human byte-size text using IEC binary units (`B`, `KiB`, `MiB`, `GiB`, `TiB`).
+pub fn format_bytes(bytes: u64) -> String {
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = KIB * 1024.0;
+    const GIB: f64 = MIB * 1024.0;
+    const TIB: f64 = GIB * 1024.0;
+    let value = bytes as f64;
+    if value >= TIB {
+        format!("{:.2} TiB", value / TIB)
+    } else if value >= GIB {
+        format!("{:.2} GiB", value / GIB)
+    } else if value >= MIB {
+        format!("{:.1} MiB", value / MIB)
+    } else if value >= KIB {
+        format!("{:.1} KiB", value / KIB)
+    } else {
+        format!("{bytes} B")
     }
 }
 
@@ -200,5 +232,21 @@ mod tests {
         assert!(series.iter().all(|value| *value == Some(8_000.0)));
         history.push(sample(u64::MAX / 2, 9, 0));
         assert_eq!(history.series(Rate::SentBits, 5), Vec::<Option<f64>>::new());
+    }
+
+    #[test]
+    fn timed_series_tracks_age_and_format_bytes_scales() {
+        let mut history = History::default();
+        history.push(sample(1_000, 1, 0));
+        history.push(sample(2_000, 1, 100));
+        history.push(sample(4_000, 1, 300));
+        let timed = history.timed_series(Rate::SentBits, 60);
+        assert_eq!(timed.len(), 2);
+        assert_eq!(timed[0], (2.0, Some(800.0)));
+        assert_eq!(timed[1], (0.0, Some(800.0)));
+        assert_eq!(format_bytes(512), "512 B");
+        assert_eq!(format_bytes(1536), "1.5 KiB");
+        assert_eq!(format_bytes(5 * 1024 * 1024), "5.0 MiB");
+        assert_eq!(format_bytes(2 * 1024 * 1024 * 1024), "2.00 GiB");
     }
 }

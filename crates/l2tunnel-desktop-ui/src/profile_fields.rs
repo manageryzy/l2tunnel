@@ -1,8 +1,9 @@
 //! Labeled fields of the profile editor (usability review 2026-11-24). A
 //! profile stays the validated run options (owner decision 2026-11-23); this
-//! table only gives the common options a label, a group, a kind of input and
-//! help. Options not listed here stay editable as raw rows under "Other".
-//! The service remains the authority: Save is refused for an unrunnable plan.
+//! table gives the common options a label, a group, a kind of input, carrier
+//! visibility, and help. Options not listed here stay editable as raw rows
+//! under "Other". The service remains the authority: Save is refused for an
+//! unrunnable plan.
 
 /// How a field is entered.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -13,7 +14,7 @@ pub enum Kind {
     File,
     /// `IP:PORT`.
     Address,
-    /// A whole number.
+    /// A whole number (`u64`).
     Number,
     /// A network device name (offered from the device list).
     Device,
@@ -32,6 +33,39 @@ pub enum Roles {
     Server,
 }
 
+/// Which `--carrier` selections show the field.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Carriers {
+    /// Every carrier.
+    All,
+    /// UDP-endpoint carriers (`quic-like`, `media-like`, `openvpn-like`).
+    UdpEndpoints,
+    /// Carriers with `--remote`/`--listen` endpoints (`raw-packet`, `tcp`, `quic`).
+    RemoteListen,
+    /// Carriers with outer TLS + explicit `--udp-cover` (`openvpn-like`, `raw-packet`, `tcp`, `quic`).
+    OuterTls,
+    /// `raw-packet` only (`--raw-policy`, `--raw-mark`).
+    RawPacket,
+    /// Maintained `tcp` or `quic` (`--maintained-policy`).
+    Maintained,
+}
+impl Carriers {
+    /// Whether `carrier` (trimmed) matches this group.
+    pub fn matches(self, carrier: &str) -> bool {
+        let carrier = carrier.trim();
+        match self {
+            Self::All => true,
+            Self::UdpEndpoints => {
+                matches!(carrier, "" | "quic-like" | "media-like" | "openvpn-like")
+            }
+            Self::RemoteListen => matches!(carrier, "raw-packet" | "tcp" | "quic"),
+            Self::OuterTls => matches!(carrier, "openvpn-like" | "raw-packet" | "tcp" | "quic"),
+            Self::RawPacket => carrier == "raw-packet",
+            Self::Maintained => matches!(carrier, "tcp" | "quic"),
+        }
+    }
+}
+
 /// One labeled option.
 #[derive(Clone, Copy, Debug)]
 pub struct Field {
@@ -47,7 +81,9 @@ pub struct Field {
     pub kind: Kind,
     /// Roles showing it.
     pub roles: Roles,
-    /// Needed for a runnable profile of this role.
+    /// Carriers showing it.
+    pub carriers: Carriers,
+    /// Needed for a runnable profile of this role and carrier.
     pub required: bool,
     /// Placeholder.
     pub hint: &'static str,
@@ -62,13 +98,14 @@ impl Field {
             _ => self.label,
         }
     }
-    /// Shown for the role.
-    pub fn shown(&self, serve: bool) -> bool {
-        match self.roles {
+    /// Shown for the role and carrier.
+    pub fn shown(&self, serve: bool, carrier: &str) -> bool {
+        let role_ok = match self.roles {
             Roles::Both => true,
             Roles::Client => !serve,
             Roles::Server => serve,
-        }
+        };
+        role_ok && self.carriers.matches(carrier)
     }
 }
 
@@ -95,6 +132,7 @@ const fn field(
         group,
         kind,
         roles: Roles::Both,
+        carriers: Carriers::All,
         required: true,
         hint: "",
         help,
@@ -103,28 +141,6 @@ const fn field(
 
 /// The labeled options, in display order within each group.
 pub const FIELDS: &[Field] = &[
-    Field {
-        server_label: Some("Expected client address"),
-        hint: "203.0.113.7:4433",
-        ..field(
-            "--udp-peer",
-            "Server address",
-            "Connection",
-            Kind::Address,
-            "IP:port of the other side.",
-        )
-    },
-    Field {
-        server_label: Some("Listen address"),
-        hint: "0.0.0.0:4433",
-        ..field(
-            "--udp-bind",
-            "Local address",
-            "Connection",
-            Kind::Address,
-            "IP:port this side uses (a server listens here).",
-        )
-    },
     field(
         "--carrier",
         "Carrier",
@@ -139,6 +155,95 @@ pub const FIELDS: &[Field] = &[
         ]),
         "How the tunnel travels: quic-like and media-like are UDP that looks like QUIC or media.",
     ),
+    Field {
+        server_label: Some("Expected client address"),
+        carriers: Carriers::UdpEndpoints,
+        hint: "203.0.113.7:4433",
+        ..field(
+            "--udp-peer",
+            "Server address",
+            "Connection",
+            Kind::Address,
+            "IP:port of the other side.",
+        )
+    },
+    Field {
+        server_label: Some("Listen address"),
+        carriers: Carriers::UdpEndpoints,
+        hint: "0.0.0.0:4433",
+        ..field(
+            "--udp-bind",
+            "Local address",
+            "Connection",
+            Kind::Address,
+            "IP:port this side uses (a server listens here).",
+        )
+    },
+    Field {
+        roles: Roles::Client,
+        carriers: Carriers::RemoteListen,
+        hint: "203.0.113.7:443",
+        ..field(
+            "--remote",
+            "Server address",
+            "Connection",
+            Kind::Address,
+            "IP:port of the server (must match the policy's first tuple).",
+        )
+    },
+    Field {
+        roles: Roles::Server,
+        carriers: Carriers::RemoteListen,
+        hint: "0.0.0.0:443",
+        ..field(
+            "--listen",
+            "Listen address",
+            "Connection",
+            Kind::Address,
+            "IP:port this server listens on (must match the policy's first tuple).",
+        )
+    },
+    Field {
+        carriers: Carriers::OuterTls,
+        ..field(
+            "--udp-cover",
+            "Bootstrap cover",
+            "Connection",
+            Kind::Choice(&["quic-like", "media-like", "tls-like"]),
+            "Explicit bootstrap cover required by OpenVPN, raw-packet, TCP, and QUIC carriers.",
+        )
+    },
+    Field {
+        carriers: Carriers::Maintained,
+        ..field(
+            "--maintained-policy",
+            "Maintained policy file",
+            "Connection",
+            Kind::File,
+            "TCP/QUIC maintained carrier policy JSON.",
+        )
+    },
+    Field {
+        carriers: Carriers::RawPacket,
+        ..field(
+            "--raw-policy",
+            "Raw packet policy file",
+            "Connection",
+            Kind::File,
+            "Explicit raw-packet carrier tuple and policy JSON.",
+        )
+    },
+    Field {
+        carriers: Carriers::RawPacket,
+        hint: "1",
+        ..field(
+            "--raw-mark",
+            "Raw socket mark",
+            "Connection",
+            Kind::Number,
+            "Nonzero Linux fwmark (u32) isolating raw carrier packets.",
+        )
+    },
     field(
         "--common-transaction-plan",
         "Transaction plan file",
@@ -196,7 +301,6 @@ pub const FIELDS: &[Field] = &[
     ),
     Field {
         roles: Roles::Server,
-        required: false,
         ..field(
             "--session-cookie-key-file",
             "Cookie secret",
@@ -213,6 +317,64 @@ pub const FIELDS: &[Field] = &[
             "Security and keys",
             Kind::File,
             "Only with the ikpsk2 handshake.",
+        )
+    },
+    Field {
+        roles: Roles::Client,
+        carriers: Carriers::OuterTls,
+        ..field(
+            "--ca",
+            "Outer TLS CA certificate",
+            "Security and keys",
+            Kind::File,
+            "Pinned CA certificate verifying the server's outer TLS identity.",
+        )
+    },
+    Field {
+        roles: Roles::Client,
+        carriers: Carriers::OuterTls,
+        hint: "tunnel.example.test",
+        ..field(
+            "--server-name",
+            "Outer TLS server name",
+            "Security and keys",
+            Kind::Text,
+            "Expected DNS/host name verified against the server certificate.",
+        )
+    },
+    Field {
+        roles: Roles::Client,
+        carriers: Carriers::OuterTls,
+        required: false,
+        hint: "optional",
+        ..field(
+            "--sni",
+            "Outer TLS SNI",
+            "Security and keys",
+            Kind::Text,
+            "Optional SNI override when different from server name.",
+        )
+    },
+    Field {
+        roles: Roles::Server,
+        carriers: Carriers::OuterTls,
+        ..field(
+            "--cert",
+            "Outer TLS server certificate",
+            "Security and keys",
+            Kind::File,
+            "PEM certificate chain presented on the outer TLS carrier.",
+        )
+    },
+    Field {
+        roles: Roles::Server,
+        carriers: Carriers::OuterTls,
+        ..field(
+            "--key",
+            "Outer TLS server key",
+            "Security and keys",
+            Kind::File,
+            "Private key matching the outer TLS server certificate.",
         )
     },
     Field {
@@ -381,40 +543,70 @@ pub const FIELDS: &[Field] = &[
     },
 ];
 
+/// Validation result split into hard errors (block Save) and non-blocking
+/// warnings (such as files unreadable by the unprivileged GUI process).
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct Validation {
+    /// Problems that must be fixed before saving.
+    pub errors: Vec<String>,
+    /// Advisory checks that do not prevent saving (the service verifies them).
+    pub warnings: Vec<String>,
+}
+
 /// The labeled field for `option`.
 pub fn find(option: &str) -> Option<&'static Field> {
     FIELDS.iter().find(|field| field.option == option)
 }
 
-/// Problems a person can fix before saving: missing required values, values
-/// outside a choice, malformed addresses or numbers, and missing files.
-pub fn problems(
+/// Validate fields for `serve` and the currently selected `--carrier`.
+///
+/// Missing files on the unprivileged GUI side are reported as `warnings`
+/// rather than hard `errors`, because key files may live in a directory
+/// readable only by the service.
+pub fn validate(
     serve: bool,
     value: impl Fn(&str) -> Option<String>,
     exists: impl Fn(&str) -> bool,
-) -> Vec<String> {
-    let mut problems = Vec::new();
-    for field in FIELDS.iter().filter(|field| field.shown(serve)) {
+) -> Validation {
+    let carrier = value("--carrier").unwrap_or_default();
+    let mut out = Validation::default();
+    for field in FIELDS.iter().filter(|field| field.shown(serve, &carrier)) {
         let label = field.label(serve);
         let Some(text) = value(field.option).filter(|text| !text.trim().is_empty()) else {
             if field.required {
-                problems.push(format!("{label} is required"));
+                out.errors.push(format!("{label} is required"));
             }
             continue;
         };
         let text = text.trim();
         match field.kind {
             Kind::Choice(values) if !values.contains(&text) => {
-                problems.push(format!("{label} must be one of {}", values.join(", ")));
+                out.errors
+                    .push(format!("{label} must be one of {}", values.join(", ")));
             }
             Kind::Address if text.parse::<std::net::SocketAddr>().is_err() => {
-                problems.push(format!("{label} must be IP:port, e.g. {}", field.hint));
+                out.errors
+                    .push(format!("{label} must be IP:port, e.g. {}", field.hint));
             }
-            Kind::Number if text.parse::<u32>().is_err() => {
-                problems.push(format!("{label} must be a whole number"));
+            Kind::Number => {
+                if field.option == "--raw-mark" {
+                    if text
+                        .parse::<u32>()
+                        .ok()
+                        .filter(|value| *value > 0)
+                        .is_none()
+                    {
+                        out.errors
+                            .push(format!("{label} must be a nonzero whole number"));
+                    }
+                } else if text.parse::<u64>().is_err() {
+                    out.errors.push(format!("{label} must be a whole number"));
+                }
             }
             Kind::File if !exists(text) => {
-                problems.push(format!("{label}: {text} does not exist"));
+                out.warnings.push(format!(
+                    "{label}: {text} is not readable by this window (the service will verify it on save)"
+                ));
             }
             _ => {}
         }
@@ -422,12 +614,24 @@ pub fn problems(
     let psk = value("--noise-psk-file").is_some_and(|text| !text.trim().is_empty());
     match value("--noise-profile").as_deref().map(str::trim) {
         Some("ikpsk2") if !psk => {
-            problems.push("The ikpsk2 handshake needs a pre-shared key".into())
+            out.errors
+                .push("The ikpsk2 handshake needs a pre-shared key".into());
         }
-        Some("ik") if psk => problems.push("A pre-shared key needs the ikpsk2 handshake".into()),
+        Some("ik") if psk => out
+            .errors
+            .push("A pre-shared key needs the ikpsk2 handshake".into()),
         _ => {}
     }
-    problems
+    out
+}
+
+/// Hard problems a person can fix before saving (compatibility wrapper).
+pub fn problems(
+    serve: bool,
+    value: impl Fn(&str) -> Option<String>,
+    exists: impl Fn(&str) -> bool,
+) -> Vec<String> {
+    validate(serve, value, exists).errors
 }
 
 #[cfg(test)]
@@ -436,7 +640,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     #[test]
-    fn fields_are_unique_grouped_and_role_aware() {
+    fn fields_are_unique_grouped_and_role_and_carrier_aware() {
         let mut seen = std::collections::BTreeSet::new();
         for field in FIELDS {
             assert!(seen.insert(field.option), "{} twice", field.option);
@@ -445,23 +649,46 @@ mod tests {
         }
         let peer = find("--udp-peer").map(|field| (field.label(false), field.label(true)));
         assert_eq!(peer, Some(("Server address", "Expected client address")));
-        assert!(find("--identity").is_some_and(|field| field.shown(false) && !field.shown(true)));
-        assert!(find("--allow-key").is_some_and(|field| field.shown(true) && !field.shown(false)));
+        assert!(find("--identity").is_some_and(|field| {
+            field.shown(false, "quic-like") && !field.shown(true, "quic-like")
+        }));
+        assert!(find("--allow-key").is_some_and(|field| {
+            field.shown(true, "quic-like") && !field.shown(false, "quic-like")
+        }));
+        assert!(find("--udp-peer").is_some_and(|field| {
+            field.shown(false, "quic-like") && !field.shown(false, "tcp")
+        }));
+        assert!(find("--remote").is_some_and(|field| {
+            field.shown(false, "tcp") && !field.shown(false, "quic-like")
+        }));
+        assert!(find("--maintained-policy").is_some_and(|field| {
+            field.shown(false, "quic") && !field.shown(false, "raw-packet")
+        }));
+        assert!(find("--raw-policy").is_some_and(|field| {
+            field.shown(false, "raw-packet") && !field.shown(false, "tcp")
+        }));
     }
 
     #[test]
-    fn problems_name_what_to_fix() {
+    fn validate_handles_udp_tcp_raw_and_non_blocking_file_warnings() {
         let mut values: BTreeMap<&str, &str> = BTreeMap::new();
-        let check = |values: &BTreeMap<&str, &str>| {
-            problems(
-                false,
+        let check = |serve: bool, values: &BTreeMap<&str, &str>| {
+            validate(
+                serve,
                 |option| values.get(option).map(|value| (*value).to_owned()),
                 |path| path.starts_with("/ok"),
             )
         };
-        let all = check(&values);
-        assert!(all.contains(&"Server address is required".to_owned()));
-        assert!(!all.iter().any(|problem| problem.contains("Trusted member")));
+        let all = check(false, &values);
+        assert!(
+            all.errors
+                .contains(&"Server address is required".to_owned())
+        );
+        assert!(
+            !all.errors
+                .iter()
+                .any(|problem| problem.contains("Trusted member"))
+        );
         for (option, value) in [
             ("--udp-peer", "127.0.0.1:24441"),
             ("--udp-bind", "127.0.0.1:24440"),
@@ -478,22 +705,49 @@ mod tests {
         ] {
             values.insert(option, value);
         }
-        assert_eq!(check(&values), Vec::<String>::new());
-        values.insert("--udp-peer", "example.org");
-        values.insert("--carrier", "pigeon");
-        values.insert("--identity", "/missing/member.der");
-        values.insert("--noise-profile", "ikpsk2");
-        let found = check(&values);
-        assert_eq!(found.len(), 4, "{found:?}");
+        assert_eq!(check(false, &values), Validation::default());
+
+        // Unreadable file in the GUI produces a warning, not a blocking error.
+        values.insert("--identity", "/etc/l2tunnel/root-only.der");
+        let with_warning = check(false, &values);
+        assert!(with_warning.errors.is_empty(), "{with_warning:?}");
+        assert_eq!(with_warning.warnings.len(), 1);
+
+        // Switching to TCP hides UDP fields and validates TCP/TLS fields instead.
+        let mut tcp = BTreeMap::new();
+        for (option, value) in [
+            ("--carrier", "tcp"),
+            ("--remote", "127.0.0.1:443"),
+            ("--udp-cover", "tls-like"),
+            ("--maintained-policy", "/ok/maintained.json"),
+            ("--common-transaction-plan", "/ok/plan.json"),
+            ("--noise-profile", "ik"),
+            ("--noise-private-key-file", "/ok/a.key"),
+            ("--noise-peer-key-file", "/ok/b.pub"),
+            ("--identity", "/ok/member.der"),
+            ("--session-admission-key-file", "/ok/admission.key"),
+            ("--ca", "/ok/ca.pem"),
+            ("--server-name", "tunnel.example.test"),
+            ("--device", "l2t0"),
+            ("--layer", "tun"),
+            ("--record-profile", "common"),
+        ] {
+            tcp.insert(option, value);
+        }
+        assert_eq!(check(false, &tcp), Validation::default());
+
+        // Raw-packet requires nonzero u32 raw-mark.
+        let mut raw = tcp.clone();
+        raw.insert("--carrier", "raw-packet");
+        raw.insert("--raw-policy", "/ok/raw.json");
+        raw.insert("--raw-mark", "0");
         assert!(
-            found
+            check(false, &raw)
+                .errors
                 .iter()
-                .any(|problem| problem.starts_with("Server address must be IP:port"))
+                .any(|error| error.contains("Raw socket mark"))
         );
-        assert!(
-            found
-                .iter()
-                .any(|problem| problem.contains("pre-shared key"))
-        );
+        raw.insert("--raw-mark", "7");
+        assert_eq!(check(false, &raw), Validation::default());
     }
 }

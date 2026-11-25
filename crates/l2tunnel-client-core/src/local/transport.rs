@@ -170,9 +170,41 @@ impl Server {
                         Incoming::Legacy(request) => response_limit(request.version),
                         Incoming::Operations(_) => COMMON_RESPONSE_LIMIT,
                     };
+                    // Read-only long-poll waits can be cancelled when the client
+                    // closes its connection so closed GUI/CLI followers free
+                    // their concurrency slot immediately. Mutating submissions
+                    // always run to completion regardless of client disconnect.
+                    let cancel_on_eof = matches!(
+                        &incoming,
+                        Incoming::Operations(request)
+                            if matches!(
+                                request.action,
+                                OperationAction::Events { .. }
+                                    | OperationAction::OperationWait { .. }
+                                    | OperationAction::TestGet { .. }
+                            )
+                    );
                     let future = handler(incoming);
                     tasks.push(Box::pin(async move {
-                        let outgoing = future.await;
+                        let outgoing = if cancel_on_eof {
+                            let mut byte = [0u8; 1];
+                            tokio::select! {
+                                outgoing = future => Some(outgoing),
+                                _ = tokio::io::AsyncReadExt::read(&mut stream, &mut byte) => None,
+                            }
+                        } else {
+                            Some(future.await)
+                        };
+                        let Some(outgoing) = outgoing else {
+                            let now = Instant::now();
+                            return Step::Done {
+                                accepted_at,
+                                read_at,
+                                handled_at: now,
+                                replied_at: now,
+                                success: false,
+                            };
+                        };
                         let handled_at = Instant::now();
                         // A disconnected or non-reading client cannot block the API.
                         let reply = tokio::time::timeout(Duration::from_secs(5), async {

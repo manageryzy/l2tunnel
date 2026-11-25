@@ -34,12 +34,27 @@ const RTT_BINS: usize = 10;
 const PACING_GAIN: (u64, u64) = (5, 4);
 /// Pacing over the peer's drain rate before any RTT sample.
 const PACING_GAIN_UNTIMED: u64 = 2;
-/// Pacing burst in maximum data datagrams.
+/// Pacing burst in maximum data datagrams (minimum floor).
 const PACING_BURST_DATAGRAMS: u64 = 16;
+/// Maximum pacing burst (2 MiB) so high-rate 200-1000 Mbit/s links never drop
+/// tokens across 1-2 ms event-loop wakeups.
+const MAX_PACING_BURST_BYTES: u64 = 2 << 20;
+
+fn pacing_burst(configured_rate: u64, max_datagram_bytes: u64, burst_bytes: u64) -> u64 {
+    let floor = max_datagram_bytes.saturating_mul(PACING_BURST_DATAGRAMS);
+    // 5 ms of wire budget at high bitrates (capped at 2 MiB).
+    let scaled = (configured_rate / 200).clamp(floor, MAX_PACING_BURST_BYTES);
+    burst_bytes.min(scaled).max(max_datagram_bytes)
+}
 /// Configuration bounds.
 const MAX_CEILING_DATAGRAMS: u64 = 65_536;
 const MAX_CEILING_BYTES: u64 = 64 << 20;
 const MIN_FLOOR_DATAGRAMS: u64 = 16;
+/// Upper bound for quiescent idle credit heartbeats after traffic stops.
+/// Fast tail-loss recovery still fires at `1× idle_period`, then quiet
+/// repeats back off exponentially up to this ceiling to keep idle wire
+/// traffic minimal; any arriving data packet resets immediately.
+const MAX_QUIET_IDLE_PERIOD: Duration = Duration::from_secs(10);
 
 /// Session credit failures. None is caused by ordinary packet loss.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -270,6 +285,7 @@ pub struct Receiver {
     frozen: bool,
     last: Option<Duration>,
     issued_count: u64,
+    idle_heartbeats: u32,
 }
 impl Receiver {
     /// `allowance_bytes` is the payload the data socket can queue without drops
@@ -292,6 +308,7 @@ impl Receiver {
             frozen: false,
             last: None,
             issued_count: 0,
+            idle_heartbeats: 0,
         })
     }
     fn advance(&mut self, now: Duration) -> Result<(), Error> {
@@ -315,6 +332,7 @@ impl Receiver {
         };
         self.processed = self.processed.max(next);
         self.data_since_issue = true;
+        self.idle_heartbeats = 0;
         let index = Self::bin_index(now);
         self.first_bin.get_or_insert(index);
         let bin = &mut self.bins[(index % BINS as u64) as usize];
@@ -334,6 +352,16 @@ impl Receiver {
     /// Freeze or release grant growth while the native queue is full.
     pub fn set_frozen(&mut self, frozen: bool) {
         self.frozen = frozen;
+    }
+    /// Raise the receiver's datagram and byte grant ceilings live while staying
+    /// within documented bounds (never lowers existing ceilings).
+    pub fn raise_ceiling(&mut self, ceiling_datagrams: u64, ceiling_bytes: u64) {
+        self.config.ceiling_datagrams = ceiling_datagrams
+            .max(self.config.ceiling_datagrams)
+            .min(MAX_CEILING_DATAGRAMS);
+        self.config.ceiling_bytes = ceiling_bytes
+            .max(self.config.ceiling_bytes)
+            .min(MAX_CEILING_BYTES);
     }
     /// Drain estimate over the completed bins since the first processed
     /// datagram, at most 175 ms: (bytes/s, datagrams/s). Datagrams follow the
@@ -493,7 +521,13 @@ impl Receiver {
                 Some(empty_at.map_or(idle, |at| at.min(idle)))
             }
         } else {
-            Some(idle)
+            let factor = 1_u32 << self.idle_heartbeats.min(6);
+            let quiet = self
+                .config
+                .idle_period
+                .saturating_mul(factor)
+                .min(MAX_QUIET_IDLE_PERIOD);
+            Some(issued.at.saturating_add(quiet))
         }
     }
     /// Issue the next Credit and record it as sent.
@@ -511,6 +545,11 @@ impl Receiver {
             drain_datagrams,
         };
         credit.check()?;
+        let was_quiet = !self.data_since_issue
+            && drain_datagrams == 0
+            && self
+                .issued
+                .is_some_and(|previous| previous.drain_datagrams == 0);
         self.serial = serial;
         self.issued = Some(Issued {
             at: now,
@@ -519,6 +558,11 @@ impl Receiver {
             drain_datagrams,
         });
         self.data_since_issue = false;
+        self.idle_heartbeats = if was_quiet {
+            self.idle_heartbeats.saturating_add(1)
+        } else {
+            0
+        };
         self.issued_count = self.issued_count.saturating_add(1);
         Ok(credit)
     }
@@ -665,9 +709,7 @@ impl Sender {
         }
         let capacity =
             usize::try_from(config.ceiling_datagrams).map_err(|_| Error::Configuration)?;
-        let burst = burst_bytes
-            .min(max_datagram_bytes.saturating_mul(PACING_BURST_DATAGRAMS))
-            .max(max_datagram_bytes);
+        let burst = pacing_burst(configured_rate, max_datagram_bytes, burst_bytes);
         Ok(Self {
             max_datagram_bytes,
             range,
@@ -694,6 +736,41 @@ impl Sender {
             last: None,
             status: SenderStatus::default(),
         })
+    }
+    /// Update the configured send rate cap (bytes per second) live.
+    pub fn set_configured_rate(&mut self, configured_rate: u64) {
+        if configured_rate == 0 {
+            return;
+        }
+        self.configured_rate = configured_rate;
+        self.burst = pacing_burst(
+            configured_rate,
+            self.max_datagram_bytes,
+            self.burst.max(configured_rate / 200),
+        );
+        self.tokens = self.tokens.min(self.burst);
+        self.rate = if self.peer_drain_bytes == 0 {
+            configured_rate
+        } else {
+            let paced = u128::from(self.peer_drain_bytes) * u128::from(PACING_GAIN.0)
+                / u128::from(PACING_GAIN.1);
+            u64::try_from(paced).unwrap_or(u64::MAX)
+        }
+        .min(configured_rate)
+        .max(self.max_datagram_bytes);
+    }
+    /// Raise the sender's in-flight ring capacity live, clamped to `range / 4`
+    /// and `MAX_CEILING_DATAGRAMS`. Never lowers capacity or panics on OOM.
+    pub fn raise_ceiling(&mut self, ceiling_datagrams: u64) {
+        let max_for_range = (self.range / 4).min(MAX_CEILING_DATAGRAMS);
+        let target = usize::try_from(ceiling_datagrams.min(max_for_range)).unwrap_or(usize::MAX);
+        if target <= self.capacity {
+            return;
+        }
+        let additional = target.saturating_sub(self.ring.len());
+        if self.ring.try_reserve(additional).is_ok() {
+            self.capacity = target;
+        }
     }
     fn advance(&mut self, now: Duration) -> Result<(), Error> {
         if self.last.is_some_and(|last| now < last) {

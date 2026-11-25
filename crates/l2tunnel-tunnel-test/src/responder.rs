@@ -21,7 +21,11 @@ enum Work {
     /// Writing the 8-byte count, then closing.
     Confirm { count: [u8; 8], written: usize },
     /// Sending zeros until `until`.
-    Download { until: Duration },
+    Download {
+        started: Duration,
+        until: Duration,
+        queued: u64,
+    },
     /// Closing; listen again once closed.
     Closing,
 }
@@ -92,6 +96,10 @@ impl Responder {
             }
         }
         self.stack.advance(now)
+    }
+    /// Return an already-admitted outbound buffer to the bounded pool.
+    pub fn recycle_outbound(&mut self, buf: Vec<u8>) {
+        self.stack.queues.recycle(buf);
     }
     /// Next packet to send to the peer, flagged.
     pub fn next_outbound(&mut self) -> Option<Vec<u8>> {
@@ -177,7 +185,9 @@ fn serve(
             connection.work = match parse_header(bytes) {
                 Some((Direction::Upload, _)) => Work::Upload { count: 0 },
                 Some((Direction::Download, duration)) => Work::Download {
+                    started: now,
                     until: now + duration,
+                    queued: 0,
                 },
                 None => {
                     socket.abort();
@@ -213,7 +223,11 @@ fn serve(
             }
             false
         }
-        Work::Download { until } => {
+        Work::Download {
+            started,
+            until,
+            queued,
+        } => {
             // Discard anything the tester sends after its header.
             while let Ok(read) = socket.recv(|buffer| (buffer.len(), buffer.len())) {
                 if read == 0 {
@@ -225,17 +239,10 @@ fn serve(
                 connection.work = Work::Closing;
                 return false;
             }
-            while socket.can_send() {
-                let sent = socket
-                    .send(|buffer| {
-                        buffer.fill(0);
-                        (buffer.len(), buffer.len())
-                    })
-                    .unwrap_or(0);
-                if sent == 0 {
-                    break;
-                }
-            }
+            let drained = queued.saturating_sub(socket.send_queue() as u64);
+            let max_queue = crate::adaptive_send_queue(*started, now, drained);
+            let sent = crate::fill_zeros_capped(socket, max_queue);
+            *queued = queued.saturating_add(sent);
             false
         }
         Work::Closing => {

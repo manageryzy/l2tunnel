@@ -290,6 +290,13 @@ pub enum OperationAction {
         /// Test number.
         id: u64,
     },
+    /// Negotiate a live wire speed-budget update (bytes/s) with the authenticated peer.
+    RateBudgetSet {
+        /// Local upload wire budget in bytes/s (`125_000..=1_250_000_000`).
+        send_rate: u64,
+        /// Peer send (local download) wire budget in bytes/s (`125_000..=1_250_000_000`).
+        receive_rate: u64,
+    },
 }
 impl OperationAction {
     /// Whether the action submits a keyed service operation.

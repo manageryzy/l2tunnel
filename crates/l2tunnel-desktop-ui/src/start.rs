@@ -8,7 +8,177 @@
 use crate::model::{Command, Model};
 use eframe::egui;
 use l2tunnel_client_core::local::elevate::StartRequest;
+use l2tunnel_client_core::local::{OPERATIONS_VERSION, ServiceInfo};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
+
+/// Reminder shown when the attached service is older than this GUI build.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ServiceUpdate {
+    /// Plain-language explanation of why the service is older.
+    pub reason: String,
+    /// When `Some`, clicking the install button runs this elevated reinstall/restart.
+    pub install_request: Option<StartRequest>,
+}
+
+/// Parse `MAJOR.MINOR.PATCH` (ignoring any `-prerelease` or `+build` suffix).
+pub fn parse_semver(text: &str) -> Option<(u64, u64, u64)> {
+    let core = text.trim().split(['-', '+']).next()?;
+    let mut parts = core.split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    let patch = parts.next()?.parse().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    Some((major, minor, patch))
+}
+
+/// Compare the local build binary against the installed system binary and the
+/// running daemon's approximate start time. Pure helper for unit testing.
+pub fn binary_outdated(
+    local_mtime: SystemTime,
+    local_len: u64,
+    installed: Option<(SystemTime, u64)>,
+    service_uptime_ms: u64,
+    now: SystemTime,
+) -> Option<&'static str> {
+    let Some((installed_mtime, installed_len)) = installed else {
+        return Some("The service binary is not installed in the system path yet.");
+    };
+    let skew = Duration::from_secs(2);
+    if local_mtime
+        .duration_since(installed_mtime)
+        .is_ok_and(|delta| delta > skew)
+        || (local_len != installed_len && local_mtime >= installed_mtime)
+    {
+        return Some(
+            "The installed service binary is older than this build; reinstall to enable newer features.",
+        );
+    }
+    if let Some(started_at) = now.checked_sub(Duration::from_millis(service_uptime_ms))
+        && installed_mtime
+            .duration_since(started_at)
+            .is_ok_and(|delta| delta > skew)
+    {
+        return Some(
+            "The running service started before the installed binary was updated; restart it to use the new version.",
+        );
+    }
+    None
+}
+
+/// Check at startup (once `ServiceInfo` arrives) whether the attached service
+/// is older than this GUI build.
+pub fn check_service_version(info: &ServiceInfo, attached: Option<&Path>) -> Option<ServiceUpdate> {
+    let gui_version = env!("CARGO_PKG_VERSION");
+    let mut reason: Option<String> = None;
+
+    if let (Some(service_ver), Some(gui_ver)) =
+        (parse_semver(&info.version), parse_semver(gui_version))
+        && service_ver < gui_ver
+    {
+        reason = Some(format!(
+            "The running service is v{} while this window is v{gui_version}.",
+            info.version
+        ));
+    } else if info.api < OPERATIONS_VERSION {
+        reason = Some(format!(
+            "The running service uses local API v{} while this window expects v{OPERATIONS_VERSION}.",
+            info.api
+        ));
+    }
+
+    let defaults = StartRequest::defaults().ok();
+    let is_managed_local = defaults
+        .as_ref()
+        .is_some_and(|req| attached.is_some_and(|socket| socket == req.socket.as_path()));
+
+    #[cfg(target_os = "linux")]
+    if reason.is_none()
+        && is_managed_local
+        && let Some(defaults) = &defaults
+        && let Ok(local_meta) = std::fs::metadata(&defaults.program)
+        && let Ok(local_mtime) = local_meta.modified()
+    {
+        let installed = std::fs::metadata(l2tunnel_client_core::local::elevate::LINUX_PROGRAM)
+            .ok()
+            .and_then(|meta| meta.modified().ok().map(|mtime| (mtime, meta.len())));
+        if let Some(text) = binary_outdated(
+            local_mtime,
+            local_meta.len(),
+            installed,
+            info.uptime_ms,
+            SystemTime::now(),
+        ) {
+            reason = Some(text.to_owned());
+        }
+    }
+
+    let reason = reason?;
+    let install_request = if is_managed_local {
+        #[cfg(not(windows))]
+        {
+            defaults.map(|mut req| {
+                req.install = Some(Vec::new());
+                req
+            })
+        }
+        #[cfg(windows)]
+        {
+            None
+        }
+    } else {
+        None
+    };
+    Some(ServiceUpdate {
+        reason,
+        install_request,
+    })
+}
+
+/// Draw the older-service reminder banner with a one-click install button.
+/// Returns `(commands, dismissed)`.
+pub fn update_banner(
+    ui: &mut egui::Ui,
+    model: &mut Model,
+    update: &ServiceUpdate,
+    dismissible: bool,
+) -> (Vec<Command>, bool) {
+    let mut commands = Vec::new();
+    let mut dismissed = false;
+    egui::Frame::group(ui.style()).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        ui.horizontal_wrapped(|ui| {
+            ui.colored_label(ui.visuals().warn_fg_color, format!("⚠ {}", update.reason));
+            if let Some(req) = &update.install_request {
+                if ui
+                    .add_enabled(
+                        !model.starting(),
+                        egui::Button::new("Install & restart service…"),
+                    )
+                    .on_hover_text(
+                        "Installs this build as the system service (administrator prompt) and \
+                         restarts it; active tunnels will briefly disconnect.",
+                    )
+                    .clicked()
+                {
+                    commands.extend(model.start_service(req.clone()));
+                }
+                if model.starting() {
+                    ui.spinner();
+                    ui.weak("Installing and restarting…");
+                }
+            } else {
+                ui.weak("Update and restart that service to match this window.");
+            }
+            if dismissible && ui.small_button("Dismiss").clicked() {
+                dismissed = true;
+            }
+        });
+    });
+    (commands, dismissed)
+}
 
 /// Start form state.
 #[derive(Debug, Default)]
@@ -233,5 +403,46 @@ mod tests {
             result: Err("the administrator prompt was dismissed".into()),
         });
         assert!(model.notice.starts_with("Service not started"));
+    }
+
+    #[test]
+    fn semver_and_binary_freshness_detect_older_service() {
+        assert_eq!(parse_semver("0.1.0"), Some((0, 1, 0)));
+        assert_eq!(parse_semver("1.2.3-rc1+build"), Some((1, 2, 3)));
+        assert_eq!(parse_semver("bad"), None);
+
+        let base = SystemTime::UNIX_EPOCH + Duration::from_secs(10_000);
+        let newer = base + Duration::from_secs(60);
+        // Local build newer than installed binary -> outdated.
+        assert!(binary_outdated(newer, 200, Some((base, 200)), 5_000, newer).is_some());
+        // Missing installed binary -> outdated.
+        assert!(binary_outdated(newer, 200, None, 5_000, newer).is_some());
+        // Running daemon started before installed binary was replaced -> outdated.
+        assert!(binary_outdated(newer, 200, Some((newer, 200)), 120_000, newer).is_some());
+        // Up-to-date binary and freshly started daemon -> None.
+        assert_eq!(
+            binary_outdated(
+                newer,
+                200,
+                Some((newer, 200)),
+                1_000,
+                newer + Duration::from_secs(5)
+            ),
+            None
+        );
+
+        let info = ServiceInfo {
+            version: "0.0.1".into(),
+            role: l2tunnel_client_core::local::Role::Client,
+            api: OPERATIONS_VERSION,
+            uptime_ms: 100,
+            capabilities: Vec::new(),
+        };
+        let detected = check_service_version(&info, None);
+        assert!(
+            detected
+                .as_ref()
+                .is_some_and(|update| update.reason.contains("v0.0.1"))
+        );
     }
 }

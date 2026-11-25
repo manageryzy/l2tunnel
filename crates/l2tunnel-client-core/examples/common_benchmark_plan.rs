@@ -21,7 +21,50 @@ const UNITS: u8 = 8;
 const NATIVE_STALL_US: u64 = 10_000_000;
 const ROW_MEMORY: usize = 512 << 20;
 const DEFAULT_BURST_BYTES: usize = 64 << 10;
+const BASELINE_FORWARD_RATE: u64 = 12_500_000;
 const REVERSE_PACED_ID: &str = "packed-c48-near8-reverse-paced";
+
+fn wire_burst(rate: u64, high_bdp: bool) -> usize {
+    if !high_bdp {
+        return DEFAULT_BURST_BYTES;
+    }
+    usize::try_from(rate / 100)
+        .unwrap_or(4 << 20)
+        .clamp(DEFAULT_BURST_BYTES, 4 << 20)
+}
+
+fn swift_flow_sources(peak_rate: u64) -> usize {
+    if peak_rate <= BASELINE_FORWARD_RATE {
+        return 1024;
+    }
+    let bdp_symbols = usize::try_from(peak_rate)
+        .unwrap_or(usize::MAX)
+        .saturating_mul(70)
+        / 1_000
+        / 1_400;
+    (bdp_symbols.saturating_mul(3) / 2)
+        .next_power_of_two()
+        .clamp(2048, 4096)
+}
+
+fn parse_budget_mbps(value: &str) -> Result<(u64, u64)> {
+    let parse_one = |part: &str| -> Result<u64> {
+        let mbps = part
+            .trim()
+            .parse::<u64>()
+            .map_err(|_| "--budget-mbps expects FWD/REV integer Mbit/s values")?;
+        if !(1..=10_000).contains(&mbps) {
+            return Err("--budget-mbps values must be within 1..=10000 Mbit/s".into());
+        }
+        Ok(mbps * 125_000)
+    };
+    if let Some((fwd, rev)) = value.split_once('/') {
+        Ok((parse_one(fwd)?, parse_one(rev)?))
+    } else {
+        let rate = parse_one(value)?;
+        Ok((rate, rate))
+    }
+}
 
 #[derive(Clone, Copy)]
 enum Carrier {
@@ -322,20 +365,26 @@ fn source_max(symbol: usize, packed: bool) -> Result<usize> {
 /// times the nominal RTT in full sources, tripled so loss repair and RTO
 /// recovery do not stall the sender, rounded to a power of two and kept within
 /// the wide-ACK range (more than 64 selects the wide ACK).
-fn bdp_window(original: usize) -> usize {
-    const FORWARD_BYTES_PER_SECOND: usize = 12_500_000;
+fn bdp_window(original: usize, peak_rate: u64) -> usize {
     const NOMINAL_RTT_MS: usize = 70;
-    let bdp = FORWARD_BYTES_PER_SECOND * NOMINAL_RTT_MS / 1000;
+    let rate = usize::try_from(peak_rate.max(BASELINE_FORWARD_RATE)).unwrap_or(usize::MAX);
+    let bdp = rate.saturating_mul(NOMINAL_RTT_MS) / 1000;
     (3 * bdp.div_ceil(original)).next_power_of_two().clamp(
         l2tunnel_recovery::LEGACY_ACK_WINDOW,
         l2tunnel_recovery::MAX_ARQ_WINDOW,
     )
 }
-fn aligned_config(carrier: Carrier, packed: bool, with_fec: bool) -> Result<aligned::Config> {
+fn aligned_config(
+    carrier: Carrier,
+    packed: bool,
+    with_fec: bool,
+    peak_rate: u64,
+) -> Result<aligned::Config> {
+    let high_bdp = peak_rate > BASELINE_FORWARD_RATE;
     let symbol = carrier.symbol();
     let original = source_max(symbol, packed)?;
     let wrapped = original + l2tunnel_recovery::DATA_HEADER_BYTES;
-    let window = bdp_window(original);
+    let window = bdp_window(original, peak_rate);
     let count = if with_fec { 8 } else { 1 };
     let repairs = if with_fec { 2 } else { 0 };
     let fec_packet = fec::HEADER_BYTES + count + 2 + wrapped;
@@ -359,11 +408,11 @@ fn aligned_config(carrier: Carrier, packed: bool, with_fec: bool) -> Result<alig
                 max_packet_bytes: fec_packet,
                 max_work_per_symbol: 1_000_000,
             },
-            max_generations: 16,
+            max_generations: if high_bdp { 64 } else { 16 },
             max_symbols_per_generation: count + repairs,
-            max_reserved_bytes: 16 << 20,
+            max_reserved_bytes: if high_bdp { 64 << 20 } else { 16 << 20 },
             max_lifetime_ticks: 10_000,
-            generation_window: 256,
+            generation_window: if high_bdp { 1024 } else { 256 },
         },
         repair_symbols: repairs,
         flush_after: Duration::from_millis(1),
@@ -376,9 +425,16 @@ fn aligned_config(carrier: Carrier, packed: bool, with_fec: bool) -> Result<alig
     let source_window = (window + recovery.max_restored_packets)
         .next_power_of_two()
         .max(8192);
+    let mut recv_limits = receiver(symbol, CHANNELS, source_window);
+    if high_bdp {
+        recv_limits.record_window = 16_384;
+        recv_limits.lookahead_records = 4096;
+        recv_limits.lookahead_bytes = 16 << 20;
+        recv_limits.lookahead_fragments = 16_384;
+    }
     Ok(aligned::Config {
         native_policy: aligned::NativePolicy::IpHeaders,
-        receiver: receiver(symbol, CHANNELS, source_window),
+        receiver: recv_limits,
         max_recovery_packet_bytes: recovery.maximum_packet_bytes()?,
         recovery,
     })
@@ -588,7 +644,8 @@ fn rolling_direction(carrier: Carrier) -> Result<rolling_records::DirectionConfi
         },
     })
 }
-fn profile(algorithm: Algorithm, carrier: Carrier) -> Result<c::Profile> {
+fn profile(algorithm: Algorithm, carrier: Carrier, peak_rate: u64) -> Result<c::Profile> {
+    let high_bdp = peak_rate > BASELINE_FORWARD_RATE;
     Ok(match algorithm {
         Algorithm::KcpLikeL2(native, delivery) => {
             let selected = kcp_like_direction(carrier, native, delivery)?;
@@ -598,22 +655,30 @@ fn profile(algorithm: Algorithm, carrier: Carrier) -> Result<c::Profile> {
             }
         }
         Algorithm::Swift { fec } => {
+            let flow_sources = swift_flow_sources(peak_rate);
+            let queue_bytes = if high_bdp {
+                usize::try_from(peak_rate / 64)
+                    .unwrap_or(2 << 20)
+                    .clamp(512 << 10, 2 << 20)
+            } else {
+                256 << 10
+            };
             let selected = l2tunnel_swift::records::Config {
                 channels: usize::from(CHANNELS),
                 layer: l2tunnel_swift::records::Layer::Ip,
                 max_native: MTU,
                 codec: l2tunnel_swift::Config {
                     datagram_bytes: MTU - carrier.overhead(),
-                    window: 128,
+                    window: if high_bdp { 64 } else { 128 },
                     repair_numerator: u32::from(fec),
                     repair_denominator: 4,
-                    flow_sources: 1024,
-                    queue_bytes: 256 << 10,
+                    flow_sources,
+                    queue_bytes,
                     max_packet: MTU + l2tunnel_swift::header::MAX_EXPANSION,
-                    flush_micros: 500,
+                    flush_micros: if high_bdp { 250 } else { 500 },
                     feedback_micros: 1000,
                     tail_micros: 10_000,
-                    min_rto_micros: 140_000,
+                    min_rto_micros: if high_bdp { 80_000 } else { 140_000 },
                     max_rto_micros: 1_000_000,
                 },
             };
@@ -626,7 +691,7 @@ fn profile(algorithm: Algorithm, carrier: Carrier) -> Result<c::Profile> {
             packed: is_packed,
             fec,
         } => {
-            let base = aligned_config(carrier, is_packed, fec)?;
+            let base = aligned_config(carrier, is_packed, fec, peak_rate)?;
             if is_packed {
                 let selected = packed(base);
                 c::Profile::Packed {
@@ -820,7 +885,22 @@ fn geometry(carrier: Carrier) -> engine::Geometry {
         reverse_overhead_bytes: carrier.overhead(),
     }
 }
-fn direction(rate: u64, burst: usize) -> Result<c::CommonDirection> {
+fn direction(rate: u64, burst: usize, peak_rate: u64) -> Result<c::CommonDirection> {
+    let high_bdp = peak_rate > BASELINE_FORWARD_RATE;
+    let per_flow_bytes = if high_bdp {
+        usize::try_from(rate / 16)
+            .unwrap_or(8 << 20)
+            .clamp(2 << 20, 8 << 20)
+    } else {
+        1 << 20
+    };
+    let queue_bytes = if high_bdp {
+        usize::try_from(rate / 4)
+            .unwrap_or(32 << 20)
+            .clamp(16 << 20, 32 << 20)
+    } else {
+        8 << 20
+    };
     Ok(c::CommonDirection::new(
         traffic::TrafficPolicy {
             layer: traffic::NetworkLayer::Tun,
@@ -832,8 +912,8 @@ fn direction(rate: u64, burst: usize) -> Result<c::CommonDirection> {
                 base_quantum_bytes: 1500,
                 max_weight: 1,
                 per_flow: pipeline::QueueLimits {
-                    bytes: 1 << 20,
-                    packets: 1024,
+                    bytes: per_flow_bytes,
+                    packets: if high_bdp { 4096 } else { 1024 },
                 },
             }),
             flows: pipeline::FlowTableConfig {
@@ -847,8 +927,8 @@ fn direction(rate: u64, burst: usize) -> Result<c::CommonDirection> {
                 ..pipeline::ParseLimits::default()
             },
             queue: pipeline::QueueLimits {
-                bytes: 8 << 20,
-                packets: 8192,
+                bytes: queue_bytes,
+                packets: if high_bdp { 32_768 } else { 8192 },
             },
         },
         rate,
@@ -857,8 +937,13 @@ fn direction(rate: u64, burst: usize) -> Result<c::CommonDirection> {
     )?)
 }
 
-fn mode_direction(algorithm: Algorithm, rate: u64, burst: usize) -> Result<c::CommonDirection> {
-    let original = direction(rate, burst)?;
+fn mode_direction(
+    algorithm: Algorithm,
+    rate: u64,
+    burst: usize,
+    peak_rate: u64,
+) -> Result<c::CommonDirection> {
+    let original = direction(rate, burst, peak_rate)?;
     if !matches!(algorithm, Algorithm::KcpLikeL2(..)) {
         return Ok(original);
     }
@@ -890,8 +975,27 @@ fn write_json(path: &Path, value: &Value) -> Result<()> {
     Ok(())
 }
 
-fn runtime_document(retained_bytes: usize, descriptor: &c::Descriptor, lease_micros: u64) -> Value {
+fn runtime_document(
+    retained_bytes: usize,
+    descriptor: &c::Descriptor,
+    lease_micros: u64,
+    peak_rate: u64,
+) -> Value {
+    let high_bdp = peak_rate > BASELINE_FORWARD_RATE;
     let message = json!({"max_message_bytes":4096,"max_outbound_messages":16,"max_outbound_bytes":131072,"max_fragments":32,"max_reassembly_bytes":65536,"max_incomplete_messages":8,"message_lifetime_micros":5_000_000,"work_per_call":32});
+    let work = if high_bdp {
+        json!({"receive_interval_micros":1000,"receive_packets":1024,"send_batch":256,"native_read_batch":256,"native_write_batch":256})
+    } else {
+        json!({"receive_interval_micros":1000,"receive_packets":256,"send_batch":64,"native_read_batch":64,"native_write_batch":64})
+    };
+    let pending_bytes: usize = if high_bdp { 8 << 20 } else { 1536000 };
+    let credit = if high_bdp {
+        let ceiling_datagrams = (peak_rate / 4_000).clamp(8_192, 32_768);
+        let ceiling_bytes = (peak_rate / 2).clamp(16 << 20, 64 << 20);
+        json!({"floor_datagrams":128,"ceiling_datagrams":ceiling_datagrams,"floor_bytes":204800,"ceiling_bytes":ceiling_bytes,"period_micros":5000,"idle_period_micros":250000})
+    } else {
+        json!({"floor_datagrams":64,"ceiling_datagrams":8192,"floor_bytes":102400,"ceiling_bytes":16777216,"period_micros":10000,"idle_period_micros":250000})
+    };
     json!({
         "version":1,"backend":"common_records_v2","initial_index":0,
         "compact_wire":{"version":3,"data_protection":"chacha20-poly1305","max_forward_packets":2147483647u32,"max_failed_checks":4294967295u32},
@@ -902,10 +1006,10 @@ fn runtime_document(retained_bytes: usize, descriptor: &c::Descriptor, lease_mic
             "control":{"recovery":{"max_source_bytes":256,"send_bytes":16384,"receive_bytes":16384,"send_records":64,"receive_records":64,"initial_rto_micros":120000,"maximum_rto_micros":500000,"ack_delay_micros":5000,"max_retries":8},"interval_micros":10000,"packets_per_interval":16,"bytes_per_interval":16384},
             "streams":{"transaction":message.clone(),"liveness":message.clone(),"data_feedback":message},
             "wire":{"initiator_burst_bytes":descriptor.local(Role::Client).send().common().burst_bytes(),"responder_burst_bytes":descriptor.local(Role::Server).send().common().burst_bytes()},
-            "work":{"receive_interval_micros":1000,"receive_packets":256,"send_batch":64,"native_read_batch":64,"native_write_batch":64},
-            "native":{"pending_packets":1024,"pending_bytes":1536000,"stall_timeout_micros":NATIVE_STALL_US},
+            "work":work,
+            "native":{"pending_packets":1024,"pending_bytes":pending_bytes,"stall_timeout_micros":NATIVE_STALL_US},
             "lifetime":{"lease_micros":lease_micros,"ping_interval_micros":1_000_000,"pong_timeout_micros":5_000_000},
-            "credit":{"floor_datagrams":64,"ceiling_datagrams":8192,"floor_bytes":102400,"ceiling_bytes":16777216,"period_micros":10000,"idle_period_micros":250000},
+            "credit":credit,
             "report_interval_micros":1_000_000
         },"rolling_work":null
     })
@@ -991,6 +1095,8 @@ fn export_row(
     carrier: Carrier,
     reverse_burst: Option<usize>,
     lease_micros: u64,
+    forward_rate: u64,
+    reverse_rate: u64,
 ) -> Result<Value> {
     if matches!(row.algorithm, Algorithm::PackedC48 { source_wire, .. } if source_wire.is_near8())
         && !matches!(carrier, Carrier::Udp)
@@ -998,15 +1104,23 @@ fn export_row(
         return Err("near8 needs an all-traffic complete-IP socket receipt".into());
     }
     let id = format!("{}-{}", row.id, carrier.id());
-    let selected = profile(row.algorithm, carrier)?;
+    let peak_rate = forward_rate.max(reverse_rate);
+    let high_bdp = peak_rate > BASELINE_FORWARD_RATE;
+    let selected = profile(row.algorithm, carrier, peak_rate)?;
     let descriptor = c::Descriptor::new(
         MTU,
         Duplex::Full,
-        mode_direction(row.algorithm, 12_500_000, DEFAULT_BURST_BYTES)?,
         mode_direction(
             row.algorithm,
-            1_250_000,
-            reverse_burst.unwrap_or(DEFAULT_BURST_BYTES),
+            forward_rate,
+            wire_burst(forward_rate, high_bdp),
+            peak_rate,
+        )?,
+        mode_direction(
+            row.algorithm,
+            reverse_rate,
+            reverse_burst.unwrap_or_else(|| wire_burst(reverse_rate, high_bdp)),
+            peak_rate,
         )?,
         selected,
     )?;
@@ -1058,7 +1172,7 @@ fn export_row(
         .checked_mul(2)
         .and_then(|bytes| bytes.checked_add(64 << 20))
         .ok_or("runtime reserve overflow")?;
-    let mut document = runtime_document(retained, &descriptor, lease_micros);
+    let mut document = runtime_document(retained, &descriptor, lease_micros, peak_rate);
     document["catalog"] = json!([encoded]);
     if let Some(ack) = ack {
         let role = json!({"selection":"benchmark","interval_micros":ack.interval.as_micros(),
@@ -1106,7 +1220,7 @@ fn export_row(
         "descriptor_digest_definition":"SHA256 of exact unanchored descriptor bytes; not the session H0",
         "catalog_digest_hex":hex(catalog.root().as_bytes()),"record_profile_debug":format!("{selected:?}"),
         "validation":"both selected compact Engine storage plans accepted; daemon inspection and real carrier/native execution remain required",
-        "parameters":{"path_mtu":MTU,"maximum_native_bytes":MTU,"channels":CHANNELS,"symbol_capacity":carrier.symbol(),"max_packed_units":UNITS,"inner_payload_compression":"off","header_policy":"IpHeaders except Swift's own header codec","data_protection":"chacha20-poly1305","record_protection_overhead":21,"carrier_admission_allowance":carrier.physical_allowance(),"allowance_is_measured_wire_cost":false,"engine_capacity_bytes_by_role":plans,"runtime_retained_bytes":retained,"source_window":if ordinary {64} else if matches!(row.algorithm,Algorithm::Swift{..}) {1024} else if matches!(row.algorithm,Algorithm::Connections{..}) {512} else {8192},"source_window_domain":if matches!(row.algorithm,Algorithm::Swift{..}) {"per Swift channel"} else if matches!(row.algorithm,Algorithm::Connections{..} | Algorithm::PythonCompact) {"per independent owner,16owners"} else {"shared recovery direction"}},
+        "parameters":{"path_mtu":MTU,"maximum_native_bytes":MTU,"channels":CHANNELS,"symbol_capacity":carrier.symbol(),"max_packed_units":UNITS,"inner_payload_compression":"off","header_policy":"IpHeaders except Swift's own header codec","data_protection":"chacha20-poly1305","record_protection_overhead":21,"carrier_admission_allowance":carrier.physical_allowance(),"allowance_is_measured_wire_cost":false,"engine_capacity_bytes_by_role":plans,"runtime_retained_bytes":retained,"source_window":if ordinary {64} else if matches!(row.algorithm,Algorithm::Swift{..}) {swift_flow_sources(peak_rate)} else if matches!(row.algorithm,Algorithm::Connections{..}) {512} else {8192},"source_window_domain":if matches!(row.algorithm,Algorithm::Swift{..}) {"per Swift channel"} else if matches!(row.algorithm,Algorithm::Connections{..} | Algorithm::PythonCompact) {"per independent owner,16owners"} else {"shared recovery direction"}},
         "limitations":if ordinary {json!(["Ordinary selective-repeat has a production hard64-source window shared across channels; it may be BDP-limited well below100Mbit/s."])} else {json!([])},
         "evidence_scope":"canonical plan preflight only; not throughput, loss-recovery or native qualification"
     });
@@ -1250,6 +1364,8 @@ fn run() -> Result<()> {
     let raw_arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
     let mut arguments = Vec::with_capacity(raw_arguments.len());
     let mut lease_seconds: u64 = 120;
+    let mut forward_rate: u64 = 12_500_000;
+    let mut reverse_rate: u64 = 1_250_000;
     let mut idx = 0;
     while idx < raw_arguments.len() {
         if raw_arguments[idx] == "--lease-seconds" {
@@ -1264,6 +1380,33 @@ fn run() -> Result<()> {
                 return Err("--lease-seconds must be within 30..=3600".into());
             }
             lease_seconds = parsed;
+            idx += 2;
+            continue;
+        }
+        if raw_arguments[idx] == "--symmetric-rate" {
+            let value = raw_arguments
+                .get(idx + 1)
+                .and_then(|arg| arg.to_str())
+                .ok_or("--symmetric-rate requires a bytes/second value")?;
+            let parsed = value
+                .parse::<u64>()
+                .map_err(|_| "--symmetric-rate must be an integer bytes/second value")?;
+            if !(1_250_000..=1_250_000_000).contains(&parsed) {
+                return Err("--symmetric-rate must be between 1250000 and 1250000000 B/s".into());
+            }
+            forward_rate = parsed;
+            reverse_rate = parsed;
+            idx += 2;
+            continue;
+        }
+        if raw_arguments[idx] == "--budget-mbps" {
+            let value = raw_arguments
+                .get(idx + 1)
+                .and_then(|arg| arg.to_str())
+                .ok_or("--budget-mbps requires FWD/REV (e.g. 200/20, 500/50, 1000/100)")?;
+            let (fwd, rev) = parse_budget_mbps(value)?;
+            forward_rate = fwd;
+            reverse_rate = rev;
             idx += 2;
             continue;
         }
@@ -1454,7 +1597,15 @@ fn run() -> Result<()> {
             DEFAULT_BURST_BYTES
         });
         for &carrier in carriers {
-            match export_row(directory, &row, carrier, reverse_burst, lease_micros) {
+            match export_row(
+                directory,
+                &row,
+                carrier,
+                reverse_burst,
+                lease_micros,
+                forward_rate,
+                reverse_rate,
+            ) {
                 Ok(value) => exported.push(value),
                 Err(error) if error.is::<std::io::Error>() || error.is::<serde_json::Error>() => {
                     return Err(error);
@@ -1463,7 +1614,7 @@ fn run() -> Result<()> {
                     let mut refusal = json!({"id":format!("{}-{}",row.id,carrier.id()),"status":"plan_refused","reason":error.to_string(),"algorithm":row.family,"variant":row.variant,"carrier":carrier.id(),"validation":"generated configuration refused; requires diagnosis and does not establish an unsupported algorithm"});
                     if matches!(row.algorithm, Algorithm::Striped { .. })
                         && let Ok(c::Profile::Striped { forward, reverse }) =
-                            profile(row.algorithm, carrier)
+                            profile(row.algorithm, carrier, forward_rate.max(reverse_rate))
                     {
                         refusal["requested_directions"] = json!({
                             "forward": striped_resources(forward)?,
@@ -1480,7 +1631,7 @@ fn run() -> Result<()> {
         .iter()
         .filter(|value| value["status"] == "ready")
         .count();
-    let manifest = json!({"version":1,"kind":"current-common-native-matrix","baseline":{"ip_family":4,"duplex":"full","layer":"tun","tcp_flows":16,"forward_mbit_s":100,"reverse_mbit_s":10,"nominal_rtt_ms":70,"one_way_delay_ms":35,"loss_percent_each_way":15,"warmup_seconds":2,"sample_seconds":10,"directions":["forward","reverse","simultaneous"],"mtu":1500},"rows":exported,"ready_rows":ready,"all_rows":all_rows,"not_covered":["Unimplemented Python catalog modes remain parity gaps; these rows enumerate current connected owners, not all47 acceptance gates.","Windows, Android, public ISP classification and middlebox passage are not measured by this Linux namespace matrix.","Half duplex, compression-policy alternatives and proxy are separate functional selections; this manifest is the explicitly chosen Full native TUN baseline."],"metric_boundary":"Actual captured IP bytes and receiver application bytes; configured allowances are never substituted for physical wire bytes."});
+    let manifest = json!({"version":1,"kind":"current-common-native-matrix","baseline":{"ip_family":4,"duplex":"full","layer":"tun","tcp_flows":16,"forward_mbit_s":forward_rate / 125_000,"reverse_mbit_s":reverse_rate / 125_000,"nominal_rtt_ms":70,"one_way_delay_ms":35,"loss_percent_each_way":15,"warmup_seconds":2,"sample_seconds":10,"directions":["forward","reverse","simultaneous"],"mtu":1500},"rows":exported,"ready_rows":ready,"all_rows":all_rows,"not_covered":["Unimplemented Python catalog modes remain parity gaps; these rows enumerate current connected owners, not all47 acceptance gates.","Windows, Android, public ISP classification and middlebox passage are not measured by this Linux namespace matrix.","Half duplex, compression-policy alternatives and proxy are separate functional selections; this manifest is the explicitly chosen Full native TUN baseline."],"metric_boundary":"Actual captured IP bytes and receiver application bytes; configured allowances are never substituted for physical wire bytes."});
     let mut manifest = manifest;
     if kcp_l2 {
         manifest["baseline"]["layer"] = json!("tap");
@@ -1513,10 +1664,57 @@ mod tests {
         Ok(c::Descriptor::new(
             MTU,
             Duplex::Full,
-            mode_direction(algorithm, 12_500_000, DEFAULT_BURST_BYTES)?,
-            mode_direction(algorithm, 1_250_000, DEFAULT_BURST_BYTES)?,
-            profile(algorithm, carrier)?,
+            mode_direction(
+                algorithm,
+                BASELINE_FORWARD_RATE,
+                DEFAULT_BURST_BYTES,
+                BASELINE_FORWARD_RATE,
+            )?,
+            mode_direction(
+                algorithm,
+                1_250_000,
+                DEFAULT_BURST_BYTES,
+                BASELINE_FORWARD_RATE,
+            )?,
+            profile(algorithm, carrier, BASELINE_FORWARD_RATE)?,
         )?)
+    }
+
+    #[test]
+    fn high_bdp_budgets_scale_swift_aligned_and_runtime_windows() -> Result<()> {
+        for spec in ["200/20", "300/30", "500/50", "1000/100"] {
+            let (fwd, rev) = parse_budget_mbps(spec)?;
+            let peak = fwd.max(rev);
+            for algorithm in [
+                Algorithm::Swift { fec: false },
+                Algorithm::Swift { fec: true },
+                Algorithm::Aligned {
+                    packed: false,
+                    fec: true,
+                },
+                Algorithm::Aligned {
+                    packed: true,
+                    fec: true,
+                },
+            ] {
+                let selected = profile(algorithm, Carrier::Udp, peak)?;
+                let desc = c::Descriptor::new(
+                    MTU,
+                    Duplex::Full,
+                    mode_direction(algorithm, fwd, wire_burst(fwd, true), peak)?,
+                    mode_direction(algorithm, rev, wire_burst(rev, true), peak)?,
+                    selected,
+                )?;
+                let mut bytes = [0; c::DESCRIPTOR_BYTES];
+                desc.encode_into(&mut bytes)?;
+                assert_eq!(c::Descriptor::decode(&bytes)?, desc);
+                let doc = runtime_document(256 << 20, &desc, 120_000_000, peak);
+                assert!(doc["runtime"]["work"]["receive_packets"].as_u64() >= Some(1024));
+                assert!(doc["runtime"]["work"]["send_batch"].as_u64() >= Some(256));
+                assert!(doc["runtime"]["credit"]["ceiling_datagrams"].as_u64() >= Some(8192));
+            }
+        }
+        Ok(())
     }
 
     #[test]

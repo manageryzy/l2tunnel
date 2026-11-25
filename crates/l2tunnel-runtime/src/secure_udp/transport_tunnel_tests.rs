@@ -31,7 +31,9 @@ const LINGER: Duration = Duration::from_secs(10);
 /// Ended test addresses remembered for [`LINGER`].
 const ENDED: usize = 4;
 /// Test packets injected per loop turn.
-pub(super) const INJECT_PER_TURN: usize = 64;
+pub(super) const INJECT_PER_TURN: usize = 256;
+/// Minimum spacing between shared progress snapshots while a test runs.
+const REPORT_INTERVAL: Duration = Duration::from_millis(50);
 
 /// One requested test.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -221,6 +223,7 @@ pub(super) struct Port {
     turn: bool,
     seed: u64,
     malformed: u64,
+    last_report: Option<Duration>,
 }
 impl Port {
     /// A port for a session whose device has `layer`; `seed` comes from the
@@ -238,6 +241,7 @@ impl Port {
             turn: false,
             seed,
             malformed: 0,
+            last_report: None,
         }
     }
     /// Connect the service's handle.
@@ -432,6 +436,10 @@ impl Port {
             );
         }
         let mut ended = None;
+        let report_due = self
+            .last_report
+            .is_none_or(|at| now.saturating_sub(at) >= REPORT_INTERVAL);
+        let mut publish = None;
         if let Some(TesterRun {
             state: TesterState::Running { tester, .. },
             ..
@@ -442,15 +450,22 @@ impl Port {
                 let _ = error;
             }
             if let Some(progress) = tester.progress(now) {
-                if progress.phase != Phase::Running {
+                let finished = progress.phase != Phase::Running;
+                if finished {
                     ended = Some(match progress.phase {
                         Phase::Completed => TunnelTestPhase::Completed,
                         Phase::Cancelled => TunnelTestPhase::Cancelled,
                         _ => TunnelTestPhase::Failed,
                     });
                 }
-                self.report(|report| report.progress = Some(progress));
+                if finished || report_due {
+                    publish = Some(progress);
+                }
             }
+        }
+        if let Some(progress) = publish {
+            self.last_report = Some(now);
+            self.report(|report| report.progress = Some(progress));
         }
         if let Some(phase) = ended {
             let error = self
@@ -688,6 +703,20 @@ impl Port {
     pub(super) fn hold(&mut self, packet: Vec<u8>) {
         self.held = Some(packet);
     }
+    /// Return a consumed packet buffer to whichever endpoint owns the pool.
+    pub(super) fn recycle(&mut self, packet: Vec<u8>) {
+        if self.turn {
+            if let Some(TesterRun {
+                state: TesterState::Running { tester, .. },
+                ..
+            }) = &mut self.tester
+            {
+                tester.recycle_outbound(packet);
+            }
+        } else if let Some(run) = &mut self.responder {
+            run.responder.recycle_outbound(packet);
+        }
+    }
     /// Next time the port needs a turn.
     pub(super) fn poll_at(&mut self, now: Duration) -> Option<Duration> {
         if self.held.is_some() || !self.outgoing.is_empty() {
@@ -854,6 +883,7 @@ impl super::Driver {
                 port.hold(packet);
                 break;
             }
+            port.recycle(packet);
         }
         Ok(())
     }

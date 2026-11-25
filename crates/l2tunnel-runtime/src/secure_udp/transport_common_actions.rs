@@ -607,11 +607,23 @@ impl Driver {
                     let local = value
                         .descriptor()
                         .local(common_contract::mg_role(self.info.role));
-                    self.bucket.rate = local.send().common().bytes_per_second();
+                    self.bucket.rate = runtime
+                        .rate_override
+                        .map_or(local.send().common().bytes_per_second(), |(s, _)| s);
                     if let Some(serializer) = runtime.serializer.as_mut() {
                         serializer.observe(now, self.bucket.rate)?;
                     }
-                    self.bucket.burst = local.send().common().burst_bytes();
+                    if let Some(credit) = runtime.credit.as_mut() {
+                        credit.set_send_rate(self.bucket.rate);
+                    }
+                    let plan_burst = local.send().common().burst_bytes();
+                    self.bucket.burst = if runtime.rate_override.is_some() {
+                        usize::try_from(self.bucket.rate / 100)
+                            .unwrap_or(4 << 20)
+                            .clamp(plan_burst, 4 << 20)
+                    } else {
+                        plan_burst
+                    };
                     self.bucket.tokens = self.bucket.tokens.min(self.bucket.burst as u128 * SCALE);
                     self.config.path_mtu = value.descriptor().path_mtu();
                     work.applied = true;

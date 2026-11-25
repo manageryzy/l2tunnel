@@ -172,3 +172,39 @@ async fn connections_beyond_the_bound_are_closed_without_reply() -> io::Result<(
     let _cancelled = task.await;
     Ok(())
 }
+
+#[tokio::test]
+async fn disconnected_events_waiters_release_connection_slots_immediately() -> io::Result<()> {
+    let directory = Directory::new()?;
+    let path = directory.socket();
+    let server = Server::bind(&path)?;
+    let (handle, run) = crate::service::channel();
+    let task = tokio::spawn(async move { server.serve_service(handle).await });
+    // Fill every server slot with 30 s Events long-poll clients.
+    let mut waiters = Vec::new();
+    for _ in 0..CONCURRENT_CONNECTIONS {
+        let mut stream = UnixStream::connect(&path).await?;
+        let req = OperationRequest::new(OperationAction::Events {
+            after: 0,
+            limit: EVENTS_LIMIT,
+            timeout_ms: WAIT_LIMIT_MS,
+            service: None,
+        });
+        write_json(&mut stream, &req, REQUEST_LIMIT).await?;
+        waiters.push(stream);
+    }
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    // Closing every waiting client must free the slots immediately (well under 30 s).
+    drop(waiters);
+    let reply = tokio::time::timeout(
+        Duration::from_secs(2),
+        request_operation(&path, &OperationRequest::new(OperationAction::Status {})),
+    )
+    .await
+    .map_err(|_| io::Error::other("slots were not released after client disconnect"))??;
+    assert!(reply.ok);
+    task.abort();
+    let _cancelled = task.await;
+    drop(run);
+    Ok(())
+}

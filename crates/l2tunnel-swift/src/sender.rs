@@ -15,8 +15,14 @@ pub(crate) enum DataKind {
 /// Exact branch retained until the enclosing record receives carrier custody.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PreparedData {
-    Source { sequence: u64, first: bool },
-    Repair { tail_interval: Option<u64> },
+    Source {
+        sequence: u64,
+        first: bool,
+        keep_queued: bool,
+    },
+    Repair {
+        tail_interval: Option<u64>,
+    },
 }
 impl PreparedData {
     pub(crate) const fn kind(self) -> DataKind {
@@ -34,6 +40,9 @@ struct Source {
     last_sent: u64,
     retransmitted: bool,
     queued: bool,
+    /// Additional redundant copies to emit for this queued retransmission
+    /// (used under window pressure to eliminate multi-RTT HoL tail-loss stalls).
+    extra_copies: u8,
 }
 
 /// Read-only current sender occupancy and recovery observations.
@@ -280,8 +289,8 @@ impl Sender {
             self.config.max_rto_micros.min(200_000)
         } else {
             smoothed_rtt
-                .saturating_add(smoothed_rtt / 4)
-                .saturating_add(10_000)
+                .saturating_add(smoothed_rtt / 8)
+                .saturating_add(5_000)
         };
         estimate.clamp(self.config.min_rto_micros, self.config.max_rto_micros)
     }
@@ -388,17 +397,27 @@ impl Sender {
                 .retransmits
                 .checked_add(1)
                 .ok_or(Error::Exhausted)?;
-            let _ = self.retransmit.pop_front();
-            let source = self.source(sequence).ok_or(Error::Storage)?;
-            // Keep the requested attempt guarded until actual carrier custody.
-            source.queued = true;
-            output.push(KIND_SOURCE);
-            output.extend_from_slice(&(sequence as u32).to_be_bytes());
-            output.extend_from_slice(&source.payload);
+            let keep_queued = {
+                let source = self.source(sequence).ok_or(Error::Storage)?;
+                let keep = source.extra_copies > 0;
+                if keep {
+                    source.extra_copies -= 1;
+                }
+                // Keep the requested attempt guarded until actual carrier custody.
+                source.queued = true;
+                output.push(KIND_SOURCE);
+                output.extend_from_slice(&(sequence as u32).to_be_bytes());
+                output.extend_from_slice(&source.payload);
+                keep
+            };
+            if !keep_queued {
+                let _ = self.retransmit.pop_front();
+            }
             self.stats.retransmits = retransmits;
             return Ok(Some(PreparedData::Source {
                 sequence,
                 first: false,
+                keep_queued,
             }));
         }
         if self.repairs_due > 0 {
@@ -464,6 +483,7 @@ impl Sender {
                 last_sent: 0,
                 retransmitted: false,
                 queued: true,
+                extra_copies: 0,
             });
             self.stats.sources = sources;
             self.stats.packed_bytes = packed_bytes;
@@ -473,6 +493,7 @@ impl Sender {
             return Ok(Some(PreparedData::Source {
                 sequence,
                 first: true,
+                keep_queued: false,
             }));
         }
         if self.sources.is_empty() {
@@ -518,7 +539,11 @@ impl Sender {
     /// an older copy. Newer feedback, including equal-tick observations, wins.
     pub(crate) fn confirm_prepared(&mut self, accepted: u64, prepared: PreparedData) {
         let mut first_retained = false;
-        if let PreparedData::Source { sequence, first } = prepared
+        if let PreparedData::Source {
+            sequence,
+            first,
+            keep_queued,
+        } = prepared
             && let Some(source) = self.source(sequence)
         {
             if first {
@@ -529,7 +554,7 @@ impl Sender {
                 source.retransmitted = true;
             }
             source.last_sent = accepted;
-            source.queued = false;
+            source.queued = keep_queued;
         }
         if self.sources.is_empty() || self.last_probe_feedback.is_some_and(|at| at >= accepted) {
             return;
@@ -708,10 +733,25 @@ impl Sender {
             self.probe_burst = 0;
             self.repairs_due = 0;
         }
+        let unconfirmed = self.sources.len();
+        let high_pressure = unconfirmed >= self.config.flow_sources / 2;
+        let critical_pressure = unconfirmed >= (self.config.flow_sources * 3) / 4;
         for sequence in enqueue[..enqueue_count].iter().copied() {
             // First requests are immediate; repeats use the prospective RTT
             // above, exactly as the original post-sample scheduling did.
-            self.source(sequence).ok_or(Error::Storage)?.queued = true;
+            // Under window pressure, protect head-of-line retries with one
+            // extra copy so 15% loss cannot pin `acked` for 3-5 RTTs.
+            let offset = sequence.saturating_sub(self.acked);
+            let source = self.source(sequence).ok_or(Error::Storage)?;
+            source.extra_copies = if (source.retransmitted
+                && (high_pressure || (offset < 64 && unconfirmed >= 256)))
+                || (critical_pressure && offset < 16)
+            {
+                1
+            } else {
+                0
+            };
+            source.queued = true;
             self.retransmit.push_back(sequence);
         }
         Ok(())

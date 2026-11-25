@@ -51,8 +51,8 @@ pub(super) fn main(args: &[String]) -> ExitCode {
         return fail("must run as root (through pkexec)");
     }
     let result = match verb {
-        "install" => install(uid).and_then(|()| start(uid)),
-        "start" => start(uid),
+        "install" => install(uid).and_then(|()| start(uid, true)),
+        "start" => start(uid, false),
         _ => uninstall(uid),
     };
     match result {
@@ -136,7 +136,7 @@ fn install(uid: u32) -> io::Result<()> {
     systemctl(&["daemon-reload"])
 }
 
-fn start(uid: u32) -> io::Result<()> {
+fn start(uid: u32, restart: bool) -> io::Result<()> {
     let unit = linux_unit_name(uid);
     if !Path::new(LINUX_UNIT_DIRECTORY).join(&unit).is_file() {
         return Err(io::Error::new(
@@ -144,7 +144,7 @@ fn start(uid: u32) -> io::Result<()> {
             format!("{unit} is not installed"),
         ));
     }
-    systemctl(&["start", &unit])?;
+    systemctl(&[if restart { "restart" } else { "start" }, &unit])?;
     let socket = linux_socket(uid);
     let deadline = Instant::now() + READY;
     loop {

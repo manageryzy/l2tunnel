@@ -9,10 +9,25 @@ use l2tunnel_client_core::local::{
 use std::io;
 use std::path::Path;
 use std::sync::{Arc, mpsc};
-use tokio::sync::mpsc as async_mpsc;
+use std::time::Duration;
+use tokio::sync::{Semaphore, mpsc as async_mpsc};
 
 /// Pending commands beyond this are refused instead of queued without bound.
 const COMMAND_QUEUE: usize = 256;
+/// Concurrent non-follower local API exchanges allowed at once. Kept well
+/// below the service's `CONCURRENT_CONNECTIONS` (8) so startup bursts and
+/// simultaneous CLI/GUI windows never trigger connection resets.
+const MAX_IN_FLIGHT: usize = 3;
+/// Short pause before retrying a transient connection reset.
+const RESET_RETRY_DELAY: Duration = Duration::from_millis(100);
+/// Attempts for read-only/idempotent exchanges on transient connection reset.
+const RESET_RETRY_ATTEMPTS: usize = 3;
+/// Transient retries for the long-lived follower before reporting loss.
+const FOLLOW_RESET_RETRIES: usize = 3;
+/// Long-poll wait duration for the GUI event follower. Kept short enough that
+/// closing a window never pins a daemon slot for 30 s against older daemons,
+/// while still waking immediately whenever an event arrives.
+const FOLLOW_TIMEOUT_MS: u32 = 3_000;
 
 type Wake = Arc<dyn Fn() + Send + Sync>;
 
@@ -78,6 +93,7 @@ impl Post {
 async fn serve(mut commands: async_mpsc::Receiver<Command>, post: Post) {
     let mut tasks = tokio::task::JoinSet::new();
     let mut follower: Option<tokio::task::AbortHandle> = None;
+    let permits = Arc::new(Semaphore::new(MAX_IN_FLIGHT));
     loop {
         let command = tokio::select! {
             command = commands.recv() => command,
@@ -88,6 +104,7 @@ async fn serve(mut commands: async_mpsc::Receiver<Command>, post: Post) {
             break;
         };
         let post = post.clone();
+        let permits = Arc::clone(&permits);
         match command {
             Command::Status {
                 attach,
@@ -95,7 +112,8 @@ async fn serve(mut commands: async_mpsc::Receiver<Command>, post: Post) {
                 start_follower,
             } => {
                 tasks.spawn(async move {
-                    let result = exchange(&path, OperationAction::Status {}).await;
+                    let result =
+                        exchange_with_retry(&path, OperationAction::Status {}, &permits).await;
                     post.send(Message::Status {
                         attach,
                         start_follower,
@@ -112,6 +130,7 @@ async fn serve(mut commands: async_mpsc::Receiver<Command>, post: Post) {
                 payload,
             } => {
                 tasks.spawn(async move {
+                    let _permit = permits.acquire().await;
                     let outcome = act(&path, action, operation, service, payload).await;
                     post.send(Message::Action {
                         attach,
@@ -134,6 +153,7 @@ async fn serve(mut commands: async_mpsc::Receiver<Command>, post: Post) {
                 allow_key,
             } => {
                 tasks.spawn(async move {
+                    let _permit = permits.acquire().await;
                     let result = match client::revoke_member(&path, &allow_key, 120).await {
                         Ok(revoked) if !revoked.saved.succeeded() => Err(format!(
                             "profile {} not saved: {:?}",
@@ -160,6 +180,7 @@ async fn serve(mut commands: async_mpsc::Receiver<Command>, post: Post) {
                 include_addresses,
             } => {
                 tasks.spawn(async move {
+                    let _permit = permits.acquire().await;
                     let result = match local::diagnostics::collect(&path, include_addresses).await {
                         Ok(report) => match local::diagnostics::write_new(&destination, &report) {
                             Ok(()) => Ok(destination),
@@ -205,8 +226,33 @@ async fn serve(mut commands: async_mpsc::Receiver<Command>, post: Post) {
                         },
                         Query::TestCancel(id) => OperationAction::TestCancel { id: *id },
                         Query::Tuning => OperationAction::TuningGet {},
+                        Query::Meters {
+                            side,
+                            prefix,
+                            cursor,
+                        } => OperationAction::MetersRead {
+                            side: *side,
+                            prefix: prefix.clone(),
+                            cursor: cursor.clone(),
+                            limit: local::METER_PAGE_LIMIT,
+                        },
+                        Query::RateBudgetSet {
+                            send_rate,
+                            receive_rate,
+                        } => OperationAction::RateBudgetSet {
+                            send_rate: *send_rate,
+                            receive_rate: *receive_rate,
+                        },
                     };
-                    let result = exchange(&path, action).await;
+                    let result = if matches!(
+                        query,
+                        Query::TestStart(_) | Query::TestCancel(_) | Query::RateBudgetSet { .. }
+                    ) {
+                        let _permit = permits.acquire().await;
+                        exchange(&path, action).await
+                    } else {
+                        exchange_with_retry(&path, action, &permits).await
+                    };
                     post.send(Message::Query {
                         attach,
                         query,
@@ -221,8 +267,12 @@ async fn serve(mut commands: async_mpsc::Receiver<Command>, post: Post) {
                 service,
             } => {
                 tasks.spawn(async move {
-                    let result =
-                        exchange(&path, OperationAction::OperationGet { operation, service }).await;
+                    let result = exchange_with_retry(
+                        &path,
+                        OperationAction::OperationGet { operation, service },
+                        &permits,
+                    )
+                    .await;
                     post.send(Message::Show { attach, result });
                 });
             }
@@ -248,6 +298,16 @@ async fn serve(mut commands: async_mpsc::Receiver<Command>, post: Post) {
     tasks.abort_all();
 }
 
+fn is_transient_reset(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::ConnectionReset
+            | io::ErrorKind::BrokenPipe
+            | io::ErrorKind::Interrupted
+            | io::ErrorKind::WouldBlock
+    )
+}
+
 async fn exchange(
     path: &Path,
     action: OperationAction,
@@ -256,6 +316,26 @@ async fn exchange(
         .await
         .map(Box::new)
         .map_err(|error| error.to_string())
+}
+
+async fn exchange_with_retry(
+    path: &Path,
+    action: OperationAction,
+    permits: &Semaphore,
+) -> Result<Box<local::OperationReply>, String> {
+    let request = OperationRequest::new(action);
+    for attempt in 0..RESET_RETRY_ATTEMPTS {
+        let _permit = permits.acquire().await;
+        match local::request_operation(path, &request).await {
+            Ok(reply) => return Ok(Box::new(reply)),
+            Err(error) if attempt + 1 < RESET_RETRY_ATTEMPTS && is_transient_reset(&error) => {
+                drop(_permit);
+                tokio::time::sleep(RESET_RETRY_DELAY * (attempt as u32 + 1)).await;
+            }
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+    Err("transient connection reset".into())
 }
 
 async fn act(
@@ -383,15 +463,17 @@ async fn follow(
     mut after: u64,
     mut service: Option<local::ServiceId>,
 ) {
+    let mut resets = 0usize;
     loop {
         let action = OperationAction::Events {
             after,
             limit: local::EVENTS_LIMIT,
-            timeout_ms: local::WAIT_LIMIT_MS,
+            timeout_ms: FOLLOW_TIMEOUT_MS,
             service,
         };
-        let reason = match exchange(&path, action).await {
+        let reason = match local::request_operation(&path, &OperationRequest::new(action)).await {
             Ok(reply) if reply.ok => {
+                resets = 0;
                 if let Some(batch) = &reply.events {
                     after = batch.next;
                 }
@@ -399,12 +481,17 @@ async fn follow(
                 post.send(Message::Events {
                     attach,
                     follower,
-                    reply,
+                    reply: Box::new(reply),
                 });
                 continue;
             }
             Ok(reply) => reply.code,
-            Err(error) => error,
+            Err(error) if is_transient_reset(&error) && resets < FOLLOW_RESET_RETRIES => {
+                resets += 1;
+                tokio::time::sleep(RESET_RETRY_DELAY * resets as u32).await;
+                continue;
+            }
+            Err(error) => error.to_string(),
         };
         post.send(Message::FollowerEnded {
             attach,

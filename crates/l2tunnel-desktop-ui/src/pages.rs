@@ -3,9 +3,11 @@
 //! service's reason and the equivalent CLI command instead of hiding.
 use crate::model::{Action, Command, Model};
 use crate::present::{self, Tone};
-use crate::stats::{Rate, rate_text};
+use crate::stats::{Rate, format_bytes, rate_text};
 use eframe::egui;
-use l2tunnel_client_core::local::{self, DeviceChange, DeviceLayer, Feature, Role, RouteChange};
+use l2tunnel_client_core::local::{
+    self, DeviceChange, DeviceLayer, Feature, MeterSide, Role, RouteChange,
+};
 
 /// Placeholder of the service field.
 #[cfg(windows)]
@@ -109,15 +111,27 @@ pub struct UiState {
     pub export: String,
     /// Elevated service start form.
     pub start: crate::start::StartForm,
+    /// Detected older-service warning and install action (from startup check).
+    pub service_update: Option<crate::start::ServiceUpdate>,
     /// Keep IP addresses in the export.
     pub include_addresses: bool,
-    /// Page the window should switch to (a page asked to navigate).
-    /// Carrier chosen on the Connection page.
-    pub carrier: String,
     /// Tunnel test form.
     pub tests: crate::test_panel::TestForm,
     /// Live-tuning controls being edited.
     pub tune: crate::tuning_panel::TuneForm,
+    /// Elapsed milliseconds since `ServiceInfo` was fetched (for live uptime).
+    pub info_elapsed_ms: u64,
+    /// Elapsed milliseconds since `ServiceStatus` was fetched (for live connected time).
+    pub status_elapsed_ms: u64,
+    /// CSR meters side (`Local` or `Remote`).
+    pub meters_side: MeterSide,
+    /// CSR meters prefix filter (dot-separated segments).
+    pub meters_prefix: String,
+    /// CSR meters client-side substring filter.
+    pub meters_filter: String,
+    /// Auto-refresh CSR meters while on Statistics.
+    pub meters_auto: bool,
+    /// Page the window should switch to (a page asked to navigate).
     pub goto: Option<Page>,
 }
 impl Default for UiState {
@@ -133,10 +147,16 @@ impl Default for UiState {
             revoke: String::new(),
             export: String::new(),
             start: crate::start::StartForm::default(),
+            service_update: None,
             include_addresses: false,
-            carrier: String::new(),
             tune: crate::tuning_panel::TuneForm::default(),
             tests: crate::test_panel::TestForm::default(),
+            info_elapsed_ms: 0,
+            status_elapsed_ms: 0,
+            meters_side: MeterSide::Local,
+            meters_prefix: String::new(),
+            meters_filter: String::new(),
+            meters_auto: false,
             goto: None,
         }
     }
@@ -180,6 +200,10 @@ pub struct EditForm {
     pub remove: String,
     /// Up state: unchanged, up or down.
     pub up: Option<bool>,
+    /// Configure request in flight; keep the form open until accepted.
+    pub saving: bool,
+    /// Last refusal or error from applying this configure form.
+    pub save_error: Option<String>,
 }
 /// New-route form fields.
 #[derive(Debug, Default)]
@@ -271,6 +295,25 @@ pub fn carrier_text(model: &Model) -> Option<String> {
     })
 }
 
+/// Concise active protocol summary for the top bar (e.g. `swift · ARQ`).
+pub fn active_protocol_short(model: &Model) -> Option<String> {
+    let current = model
+        .status()?
+        .observation
+        .as_ref()?
+        .common
+        .as_ref()?
+        .current
+        .as_ref()?;
+    let full = local::configuration_summary(current);
+    let mut parts = full.split(" · ");
+    match (parts.next(), parts.next()) {
+        (Some(alg), Some(rec)) => Some(format!("{alg} · {rec}")),
+        (Some(alg), None) => Some(alg.to_owned()),
+        _ => None,
+    }
+}
+
 /// Why `page` cannot be used now, if it cannot.
 pub fn unavailable(model: &Model, page: Page) -> Option<String> {
     model.path()?;
@@ -280,29 +323,50 @@ pub fn unavailable(model: &Model, page: Page) -> Option<String> {
 
 /// Exchanges to run when a page is opened.
 pub fn opened(model: &mut Model, page: Page) -> Vec<Command> {
+    let mut commands = Vec::new();
     match page {
-        Page::Connection | Page::Management if model.capability(Feature::Profiles).is_ok() => {
-            let mut commands = model.refresh_profiles();
-            if page == Page::Connection && model.catalog().is_none() {
+        Page::Connection => {
+            if model.capability(Feature::Profiles).is_ok() {
+                commands.extend(model.refresh_profiles());
+            }
+            if model.catalog().is_none() && model.catalog_error().is_none() {
                 commands.extend(model.catalog_page(0));
             }
-            commands
         }
-        Page::Connection if model.catalog().is_none() => model.catalog_page(0),
-        Page::Devices => model.refresh_devices(),
+        Page::Management => {
+            commands.extend(model.refresh_info());
+            if model.capability(Feature::Profiles).is_ok() {
+                commands.extend(model.refresh_profiles());
+            }
+            if model.capability(Feature::Sessions).is_ok() {
+                commands.extend(model.refresh_sessions());
+            }
+        }
+        Page::Devices => {
+            commands.extend(model.refresh_devices());
+            if model.capability(Feature::Profiles).is_ok() {
+                commands.extend(model.refresh_profiles());
+            }
+        }
         // The connect card warns when the profile's device cannot carry traffic.
-        Page::Overview if model.capability(Feature::Devices).is_ok() => {
-            let mut commands = model.refresh_devices();
-            commands.extend(model.refresh_profiles());
-            commands
+        Page::Overview => {
+            if model.capability(Feature::Devices).is_ok() {
+                commands.extend(model.refresh_devices());
+            }
+            if model.capability(Feature::Profiles).is_ok() {
+                commands.extend(model.refresh_profiles());
+            }
         }
         Page::Routes => {
-            let mut commands = model.refresh_routes();
+            commands.extend(model.refresh_routes());
             commands.extend(model.refresh_devices());
-            commands
+            if model.capability(Feature::Profiles).is_ok() {
+                commands.extend(model.refresh_profiles());
+            }
         }
-        _ => Vec::new(),
+        _ => {}
     }
+    commands
 }
 
 fn unavailable_panel(ui: &mut egui::Ui, page: Page, reason: &str) {
@@ -345,10 +409,11 @@ pub fn show(ui: &mut egui::Ui, model: &mut Model, state: &mut UiState, page: Pag
             let mut commands = connect_card(ui, model, state);
             ui.add_space(10.0);
             commands.extend(connection(ui, model, state));
+            ui.add_space(10.0);
             commands.extend(crate::test_panel::panel(ui, model, &mut state.tests));
             return commands;
         }
-        Page::Statistics => statistics(ui, model, state),
+        Page::Statistics => return statistics(ui, model, state),
         Page::Management => return management(ui, model, state),
         Page::Events => return events(ui, model, state),
         Page::Devices => return devices(ui, model, state),
@@ -416,42 +481,88 @@ fn connect_card(ui: &mut egui::Ui, model: &mut Model, state: &mut UiState) -> Ve
     let headline = present::headline(model);
     let busy = model.busy();
     let server = model.info().is_some_and(|info| info.role == Role::Server);
+    let common = status
+        .observation
+        .as_ref()
+        .and_then(|observation| observation.common.as_ref())
+        .cloned();
+    let view = model.view();
     egui::Frame::group(ui.style()).show(ui, |ui| {
         ui.set_width(ui.available_width());
         ui.horizontal(|ui| {
             dot(ui, headline.tone);
             ui.heading(headline.text.as_str());
             if let Some(profile) = present::running_profile(model) {
-                ui.label(format!("· profile {profile}"));
+                ui.label(format!("· {profile}"));
             }
             if let Some(ms) = status.connected_ms {
-                ui.label(format!("· up {}", uptime(ms)));
+                ui.weak(format!(
+                    "· up {}",
+                    uptime(ms.saturating_add(state.status_elapsed_ms))
+                ));
+            }
+            if let Some(epoch) = common.as_ref().and_then(|c| c.epoch) {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.weak(format!("epoch {epoch}"));
+                });
             }
         });
+        if connected && let Some(common) = &common {
+            ui.add_space(4.0);
+            let carrier_label = {
+                let carrier = common.carrier.as_str();
+                if !carrier.is_empty() && carrier != "—" {
+                    format!(
+                        "{} ({carrier})",
+                        present::carrier_words(&view.rows[2], &view.rows[3])
+                    )
+                } else {
+                    present::carrier_words(&view.rows[2], &view.rows[3])
+                }
+            };
+            let protocol_label = common
+                .current
+                .as_ref()
+                .map(local::configuration_summary)
+                .unwrap_or_else(|| view.rows[5].clone());
+            let mut summary_rows = vec![
+                ("Peer", view.rows[4].clone()),
+                ("Carrier", carrier_label),
+                ("Protocol", protocol_label),
+            ];
+            if let (Some(send), Some(recv)) = (common.send_rate, common.receive_rate) {
+                let up = rate_text(Rate::SentBits, Some(send as f64 * 8.0));
+                let down = rate_text(Rate::SentBits, Some(recv as f64 * 8.0));
+                let note = if recv.saturating_mul(2) < send || send.saturating_mul(2) < recv {
+                    " (asymmetric plan cap)"
+                } else {
+                    ""
+                };
+                summary_rows.push(("Plan budget", format!("Up {up} · Down {down}{note}")));
+            }
+            rows(ui, "connect-card-summary", &summary_rows);
+        }
         if let Some(detail) = &headline.detail {
             ui.label(detail.as_str());
         }
         if let Some(warning) = present::device_warning(model) {
             ui.colored_label(ui.visuals().warn_fg_color, format!("⚠ {warning}"));
         }
-        ui.add_space(4.0);
         let pending = status.operation.is_some();
+        // Top bar always provides global Disconnect/Reconnect/Cancel; avoid a
+        // duplicate Disconnect button inside the card when there are no other
+        // profiles to switch to.
+        let show_controls = pending || !connected || !names.is_empty();
+        if !show_controls {
+            return;
+        }
+        ui.add_space(4.0);
         ui.horizontal_wrapped(|ui| {
             if pending {
                 ui.spinner();
                 if ui.add_enabled(!busy, egui::Button::new("Cancel")).clicked() {
                     commands.extend(model.act(Action::Cancel));
                 }
-                return;
-            }
-            if connected
-                && ui
-                    .add_enabled(!busy, egui::Button::new("⏹ Disconnect"))
-                    .clicked()
-            {
-                commands.extend(model.act(Action::Disconnect));
-            }
-            if names.is_empty() && connected {
                 return;
             }
             if names.is_empty() {
@@ -468,7 +579,6 @@ fn connect_card(ui: &mut egui::Ui, model: &mut Model, state: &mut UiState) -> Ve
                 return;
             }
             if connected {
-                ui.separator();
                 ui.label("Switch to");
             }
             egui::ComboBox::from_id_salt("connect-profile")
@@ -527,36 +637,137 @@ fn rows(ui: &mut egui::Ui, id: &str, rows: &[(&str, String)]) {
         });
 }
 
-/// Line chart of one rate series; gaps are left blank.
-pub(crate) fn chart(ui: &mut egui::Ui, title: &str, rate: Rate, values: &[Option<f64>]) {
-    ui.label(title);
-    let width = ui.available_width().min(640.0);
-    let (response, painter) = ui.allocate_painter(egui::vec2(width, 90.0), egui::Sense::hover());
+fn window_label(seconds: u64) -> String {
+    if seconds > 60 && seconds.is_multiple_of(60) {
+        format!("-{} min", seconds / 60)
+    } else {
+        format!("-{seconds} s")
+    }
+}
+
+/// Horizontal time axis for [`chart`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum ChartAxis {
+    /// Rolling window ending at `now`: points are `(age_secs_before_now, value)`.
+    Rolling { window_secs: u64 },
+    /// Fixed-duration elapsed series from left (`0 s`) to right (`total_secs s`):
+    /// points are `(completed_second_1_based, value)`.
+    Elapsed {
+        total_secs: u64,
+        elapsed_secs: f64,
+        running: bool,
+    },
+}
+
+/// Line chart of one rate series with Y-axis labels, subtle area fill, and
+/// hover crosshair. Gaps are left blank; draws as soon as one point arrives.
+pub(crate) fn chart(
+    ui: &mut egui::Ui,
+    title: &str,
+    rate: Rate,
+    axis: ChartAxis,
+    points: &[(f64, Option<f64>)],
+) {
+    let width = ui.available_width();
+    let peak = points
+        .iter()
+        .filter_map(|(_, value)| *value)
+        .fold(0.0_f64, f64::max);
+    let latest = points.iter().rev().find_map(|(_, value)| *value);
+    let reported = points.iter().filter(|(_, value)| value.is_some()).count();
+
+    let (latest_label, left_axis, right_axis) = match axis {
+        ChartAxis::Rolling { window_secs } => ("now", window_label(window_secs), "now".to_owned()),
+        ChartAxis::Elapsed {
+            total_secs,
+            running,
+            ..
+        } => (
+            if running { "last 1 s" } else { "final 1 s" },
+            "0 s".to_owned(),
+            format!("{} s", total_secs.max(1)),
+        ),
+    };
+
+    ui.allocate_ui_with_layout(
+        egui::vec2(width, 18.0),
+        egui::Layout::left_to_right(egui::Align::Center),
+        |ui| {
+            ui.label(title);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if reported > 0 {
+                    ui.weak(format!(
+                        "{latest_label} {} · peak {}",
+                        rate_text(rate, latest),
+                        rate_text(rate, Some(peak))
+                    ));
+                }
+            });
+        },
+    );
+
+    let (response, painter) = ui.allocate_painter(egui::vec2(width, 108.0), egui::Sense::hover());
     let rect = response.rect;
     let visuals = ui.visuals();
     painter.rect_filled(rect, 4.0, visuals.extreme_bg_color);
-    let peak = values.iter().flatten().copied().fold(0.0_f64, f64::max);
-    // Headroom so a steady rate is not drawn on the top edge.
-    let scale = peak * 1.25;
-    let reported = values.iter().flatten().count();
-    if reported < 2 || peak <= 0.0 {
-        let text = if values.iter().all(Option::is_none) && !values.is_empty() {
+    let pad_top = 10.0;
+    let pad_bottom = 18.0;
+    let plot_left = rect.left() + 58.0;
+    let plot_right = rect.right() - 8.0;
+    let plot_w = (plot_right - plot_left).max(1.0);
+    let plot_h = (rect.height() - pad_top - pad_bottom).max(12.0);
+    let plot_top = rect.top() + pad_top;
+    let plot_bottom = rect.bottom() - pad_bottom;
+    let axis_color = visuals.weak_text_color().linear_multiply(0.30);
+    let font_small = egui::FontId::proportional(10.0);
+
+    // Top, midline and baseline guides.
+    for frac in [0.0_f32, 0.5, 1.0] {
+        let y = plot_bottom - plot_h * frac;
+        painter.line_segment(
+            [egui::pos2(plot_left, y), egui::pos2(plot_right, y)],
+            egui::Stroke::new(0.75, axis_color),
+        );
+    }
+    painter.text(
+        egui::pos2(plot_left, rect.bottom() - 3.0),
+        egui::Align2::LEFT_BOTTOM,
+        left_axis,
+        font_small.clone(),
+        visuals.weak_text_color(),
+    );
+    painter.text(
+        egui::pos2(plot_right, rect.bottom() - 3.0),
+        egui::Align2::RIGHT_BOTTOM,
+        right_axis,
+        font_small.clone(),
+        visuals.weak_text_color(),
+    );
+
+    if reported == 0 || peak <= 0.0 {
+        painter.text(
+            egui::pos2(plot_left - 6.0, plot_bottom),
+            egui::Align2::RIGHT_CENTER,
+            "0",
+            font_small.clone(),
+            visuals.weak_text_color(),
+        );
+        let text = if points.iter().all(|(_, value)| value.is_none()) && !points.is_empty() {
             "not reported"
-        } else if reported < 2 {
+        } else if reported == 0 {
             "collecting samples…"
         } else {
-            // Samples arrive but are all zero: idle, not missing.
             painter.line_segment(
                 [
-                    egui::pos2(rect.left(), rect.bottom() - 4.0),
-                    egui::pos2(rect.right(), rect.bottom() - 4.0),
+                    egui::pos2(plot_left, plot_bottom),
+                    egui::pos2(plot_right, plot_bottom),
                 ],
                 egui::Stroke::new(1.5, visuals.selection.bg_fill),
             );
             "idle (0)"
         };
         painter.text(
-            rect.center(),
+            egui::pos2(plot_left + plot_w * 0.5, plot_top + plot_h * 0.5),
             egui::Align2::CENTER_CENTER,
             text,
             egui::FontId::proportional(12.0),
@@ -564,46 +775,144 @@ pub(crate) fn chart(ui: &mut egui::Ui, title: &str, rate: Rate, values: &[Option
         );
         return;
     }
-    let step = rect.width() / (values.len() - 1).max(1) as f32;
-    let stroke = egui::Stroke::new(1.5, visuals.selection.bg_fill);
-    let mut segment: Vec<egui::Pos2> = Vec::new();
-    for (index, value) in values.iter().enumerate() {
-        match value {
-            Some(value) => segment.push(egui::pos2(
-                rect.left() + step * index as f32,
-                rect.bottom() - (value / scale) as f32 * (rect.height() - 8.0) - 4.0,
-            )),
-            None if segment.len() > 1 => {
-                painter.line(std::mem::take(&mut segment), stroke);
-            }
-            None => segment.clear(),
-        }
-    }
-    if segment.len() > 1 {
-        painter.line(segment, stroke);
-    }
+
+    // Headroom so a steady rate stays below the top border, with readable Y-axis ticks.
+    let scale = peak * 1.2;
     painter.text(
-        rect.left_top() + egui::vec2(6.0, 4.0),
-        egui::Align2::LEFT_TOP,
-        format!("peak {}", rate_text(rate, Some(peak))),
-        egui::FontId::proportional(11.0),
+        egui::pos2(plot_left - 6.0, plot_top),
+        egui::Align2::RIGHT_CENTER,
+        rate_text(rate, Some(scale)),
+        font_small.clone(),
         visuals.weak_text_color(),
     );
+    painter.text(
+        egui::pos2(plot_left - 6.0, plot_bottom - plot_h * 0.5),
+        egui::Align2::RIGHT_CENTER,
+        rate_text(rate, Some(scale * 0.5)),
+        font_small.clone(),
+        visuals.weak_text_color(),
+    );
+    painter.text(
+        egui::pos2(plot_left - 6.0, plot_bottom),
+        egui::Align2::RIGHT_CENTER,
+        "0",
+        font_small,
+        visuals.weak_text_color(),
+    );
+
+    let accent = visuals.selection.bg_fill;
+    let fill = egui::Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 36);
+    let stroke = egui::Stroke::new(2.0, accent);
+    let mut segment: Vec<egui::Pos2> = Vec::new();
+    let mut plotted: Vec<(egui::Pos2, f64, f64)> = Vec::new();
+
+    let flush_segment = |painter: &egui::Painter, seg: &mut Vec<egui::Pos2>| {
+        if seg.len() > 1 {
+            for pair in seg.windows(2) {
+                let quad = vec![
+                    pair[0],
+                    pair[1],
+                    egui::pos2(pair[1].x, plot_bottom),
+                    egui::pos2(pair[0].x, plot_bottom),
+                ];
+                painter.add(egui::Shape::convex_polygon(quad, fill, egui::Stroke::NONE));
+            }
+            painter.line(std::mem::take(seg), stroke);
+        } else {
+            seg.clear();
+        }
+    };
+
+    // For Elapsed charts, anchor 0 s at the first completed second's height so
+    // the curve begins cleanly at the left edge and aligns with the progress bar.
+    if let ChartAxis::Elapsed { .. } = axis
+        && let Some((_, Some(first_val))) = points.first()
+    {
+        let y0 = plot_bottom - ((first_val / scale).clamp(0.0, 1.0) as f32) * plot_h;
+        segment.push(egui::pos2(plot_left, y0));
+    }
+
+    for &(coord, value) in points {
+        let frac = match axis {
+            ChartAxis::Rolling { window_secs } => {
+                let window = window_secs.max(1) as f64;
+                (1.0 - (coord / window).clamp(0.0, 1.0)) as f32
+            }
+            ChartAxis::Elapsed { total_secs, .. } => {
+                let span = total_secs.max(1) as f64;
+                (coord / span).clamp(0.0, 1.0) as f32
+            }
+        };
+        let x = plot_left + frac * plot_w;
+        match value {
+            Some(value) => {
+                let y = plot_bottom - ((value / scale).clamp(0.0, 1.0) as f32) * plot_h;
+                let pos = egui::pos2(x, y);
+                segment.push(pos);
+                plotted.push((pos, coord, value));
+            }
+            None => flush_segment(&painter, &mut segment),
+        }
+    }
+    flush_segment(&painter, &mut segment);
+
+    // Live elapsed cursor while a speed test is actively running.
+    if let ChartAxis::Elapsed {
+        total_secs,
+        elapsed_secs,
+        running: true,
+    } = axis
+    {
+        let cursor_frac = (elapsed_secs / total_secs.max(1) as f64).clamp(0.0, 1.0) as f32;
+        let cursor_x = plot_left + cursor_frac * plot_w;
+        if let Some(&(last_pos, _, _)) = plotted.last()
+            && cursor_x > last_pos.x + 1.0
+        {
+            painter.line_segment(
+                [last_pos, egui::pos2(cursor_x, last_pos.y)],
+                egui::Stroke::new(1.5, accent.linear_multiply(0.55)),
+            );
+        }
+        painter.line_segment(
+            [
+                egui::pos2(cursor_x, plot_top),
+                egui::pos2(cursor_x, plot_bottom),
+            ],
+            egui::Stroke::new(1.0, visuals.weak_text_color().linear_multiply(0.5)),
+        );
+    }
+
+    if let Some(&(pos, _, _)) = plotted.last() {
+        painter.circle_filled(pos, 3.0, accent);
+    }
+
+    if let Some(pointer) = response.hover_pos()
+        && let Some(&(pos, coord, value)) = plotted.iter().min_by(|a, b| {
+            (a.0.x - pointer.x)
+                .abs()
+                .total_cmp(&(b.0.x - pointer.x).abs())
+        })
+    {
+        painter.line_segment(
+            [egui::pos2(pos.x, plot_top), egui::pos2(pos.x, plot_bottom)],
+            egui::Stroke::new(1.0, visuals.text_color().linear_multiply(0.35)),
+        );
+        painter.circle_filled(pos, 4.0, visuals.text_color());
+        let hover = match axis {
+            ChartAxis::Rolling { .. } => {
+                format!("{} ({:.0} s ago)", rate_text(rate, Some(value)), coord)
+            }
+            ChartAxis::Elapsed { .. } => {
+                format!("second {:.0}: {}", coord, rate_text(rate, Some(value)))
+            }
+        };
+        response.on_hover_text(hover);
+    }
 }
 
 fn overview(ui: &mut egui::Ui, model: &Model) {
     let view = model.view();
-    let connected = model
-        .status()
-        .is_some_and(|status| status.phase == "connected");
     let mut list: Vec<(&str, String)> = Vec::new();
-    if connected {
-        list.push(("Peer", view.rows[4].clone()));
-        list.push((
-            "Carrier",
-            present::carrier_words(&view.rows[2], &view.rows[3]),
-        ));
-    }
     if let Some(device) = present::profile_device(model) {
         let state = model
             .devices()
@@ -641,7 +950,8 @@ fn overview(ui: &mut egui::Ui, model: &Model) {
             ui,
             "Sent, last 60 s",
             Rate::SentBits,
-            &history.series(Rate::SentBits, 60),
+            ChartAxis::Rolling { window_secs: 60 },
+            &history.timed_series(Rate::SentBits, 60),
         );
     }
     ui.add_space(8.0);
@@ -666,10 +976,6 @@ fn overview(ui: &mut egui::Ui, model: &Model) {
     }
 }
 
-/// Carriers a live carrier switch could offer: the UDP covers and the
-/// TLS-like raw carrier (owner 2026-11-23: TLS-like and QUIC-like only).
-pub const SWITCH_CARRIERS: [&str; 4] = ["quic-like", "media-like", "openvpn-like", "raw-packet"];
-
 fn connection(ui: &mut egui::Ui, model: &mut Model, state: &mut UiState) -> Vec<Command> {
     let mut commands = Vec::new();
     let common = model
@@ -680,183 +986,194 @@ fn connection(ui: &mut egui::Ui, model: &mut Model, state: &mut UiState) -> Vec<
     let connected = model
         .status()
         .is_some_and(|status| status.phase == "connected");
-    let view = model.view();
+    let switching = model
+        .status()
+        .is_some_and(|status| status.phase == "applying");
 
-    // Carrier: how the tunnel travels.
-    ui.add_space(8.0);
-    ui.heading("Carrier");
-    let in_use = common
-        .as_ref()
-        .map(|common| common.carrier.clone())
-        .filter(|carrier| !carrier.is_empty() && carrier != "—");
-    rows(
-        ui,
-        "carrier",
-        &[(
-            "In use",
-            match &in_use {
-                Some(carrier) => format!(
-                    "{} ({carrier})",
-                    present::carrier_words(&view.rows[2], &view.rows[3])
-                ),
-                None => present::carrier_words(&view.rows[2], &view.rows[3]),
-            },
-        )],
-    );
-    if state.carrier.is_empty()
-        && let Some(carrier) = &in_use
-    {
-        state.carrier = carrier.clone();
-    }
-    ui.horizontal_wrapped(|ui| {
-        ui.label("Switch to");
-        egui::ComboBox::from_id_salt("carrier-switch")
-            .selected_text(if state.carrier.is_empty() {
-                "choose"
-            } else {
-                state.carrier.as_str()
-            })
-            .show_ui(ui, |ui| {
-                for carrier in SWITCH_CARRIERS {
-                    ui.selectable_value(&mut state.carrier, carrier.to_owned(), carrier);
+    egui::Frame::group(ui.style()).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        ui.horizontal(|ui| {
+            ui.heading("Protocol & Live tuning");
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if switching {
+                    ui.weak("Switching…");
+                    ui.spinner();
+                } else if connected {
+                    ui.weak("Hot switching keeps the session connected");
                 }
             });
-        // No service offers a live carrier switch yet (protocol work in
-        // design with the protocol-core session); never fake it with a
-        // reconnect.
-        ui.add_enabled(false, egui::Button::new("Switch carrier"))
-            .on_disabled_hover_text(CARRIER_SWITCH_PENDING);
-    });
-    ui.weak(CARRIER_SWITCH_PENDING);
+        });
 
-    // Live tuning: FEC, repair rate and packet sizes by setting.
-    if model.capability(Feature::Catalog).is_ok() {
-        commands.extend(crate::tuning_panel::show(
-            ui,
-            model,
-            &mut state.tune,
-            connected,
-        ));
-    }
+        // Quick live tuning (FEC, repair rate, MTU) synchronized with the protocol list below.
+        if model.capability(Feature::Catalog).is_ok() {
+            commands.extend(crate::tuning_panel::show(
+                ui,
+                model,
+                &mut state.tune,
+                connected,
+            ));
+        }
 
-    // Protocol: hot switch between the plan's configurations.
-    ui.add_space(12.0);
-    ui.heading("Protocol");
-    ui.weak("Switching keeps the session up: both sides prepare, drain and commit together.");
-    if let Err(reason) = model.capability(Feature::Catalog) {
-        ui.weak(format!("Unavailable: {reason}"));
-        return commands;
-    }
-    let Some(common) = common else {
-        ui.weak("Connect first; the choices come from the running session's plan.");
-        return commands;
-    };
-    if model.catalog_stale() {
-        commands.extend(model.catalog_page(0));
-    }
-    let Some(catalog) = model.catalog().filter(|_| !model.catalog_stale()).cloned() else {
-        ui.weak("Loading the protocol choices…");
-        return commands;
-    };
-    if usize::from(catalog.total) <= crate::model::CATALOG_ALL
-        && let Some(next) = catalog.next
-    {
-        commands.extend(model.catalog_page(next));
-    }
-    let current = common.current.clone();
-    if catalog.total <= 1 {
-        ui.weak(
-            "This profile's plan allows only the protocol in use, so there is nothing to \
-             switch to. Use a plan with several catalog members to switch live.",
-        );
-    }
-    let mut target = model.target().cloned();
-    egui::Frame::group(ui.style()).show(ui, |ui| {
-        ui.set_width(ui.available_width().min(760.0));
+        ui.add_space(6.0);
+        ui.separator();
+        ui.add_space(4.0);
+        ui.strong("Protocol catalog");
+        if let Err(reason) = model.capability(Feature::Catalog) {
+            ui.weak(format!("Unavailable: {reason}"));
+            return;
+        }
+        let Some(common) = common else {
+            ui.weak("Connect first; the choices come from the running session's plan.");
+            return;
+        };
+        if let Some(error) = model.catalog_error().map(str::to_owned) {
+            ui.horizontal_wrapped(|ui| {
+                ui.colored_label(
+                    ui.visuals().warn_fg_color,
+                    format!("Protocol choices unavailable: {error}"),
+                );
+                if ui.button("Retry").clicked() {
+                    commands.extend(model.retry_catalog());
+                }
+            });
+            return;
+        }
+        if model.catalog_stale() {
+            commands.extend(model.catalog_page(0));
+        }
+        let Some(catalog) = model.catalog().filter(|_| !model.catalog_stale()).cloned() else {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.weak("Loading the protocol choices…");
+            });
+            return;
+        };
+        if usize::from(catalog.total) <= crate::model::CATALOG_ALL
+            && let Some(next) = catalog.next
+        {
+            commands.extend(model.catalog_page(next));
+        }
+        let current = common.current.clone();
+        if catalog.total <= 1 {
+            ui.weak(
+                "This profile's plan allows only the protocol in use. Use a multi-protocol plan to \
+                 switch live.",
+            );
+        }
+        let mut target = model.target().cloned();
         for (index, entry) in catalog.entries.iter().enumerate() {
             let number = u32::from(catalog.offset) + index as u32 + 1;
             let is_current = current.as_ref() == Some(entry);
             let is_requested = common.requested.as_ref() == Some(entry) && !is_current;
             ui.horizontal(|ui| {
                 let label = format!("{number}. {}", local::configuration_summary(entry));
-                let selected = target.as_ref() == Some(entry) || (target.is_none() && is_current);
-                if ui.radio(selected, label).clicked() {
-                    target = (!is_current).then(|| entry.clone());
+                if catalog.total <= 1 {
+                    ui.label(label);
+                } else {
+                    let selected =
+                        target.as_ref() == Some(entry) || (target.is_none() && is_current);
+                    if ui.radio(selected, label).clicked() {
+                        target = (!is_current).then(|| entry.clone());
+                        // Picking a catalog member clears any unsaved live-tuning draft so the
+                        // two controls never disagree.
+                        state.tune.chosen = None;
+                    }
                 }
                 if is_current {
                     dot(ui, Tone::Good);
                     ui.colored_label(egui::Color32::from_rgb(90, 190, 110), "in use");
                 } else if is_requested {
-                    ui.weak("switching to this…");
+                    ui.spinner();
+                    ui.weak("switching…");
                 }
             });
         }
-    });
-    if target.as_ref() != model.target() {
-        model.select_target(target.clone());
-    }
-    if usize::from(catalog.total) > crate::model::CATALOG_ALL {
-        ui.horizontal(|ui| {
-            let first = u32::from(catalog.offset) + 1;
-            let last = u32::from(catalog.offset) + catalog.entries.len() as u32;
-            ui.weak(format!("{first}–{last} of {}", catalog.total));
-            if ui
-                .add_enabled(catalog.offset > 0, egui::Button::new("< Previous"))
-                .clicked()
-            {
-                let offset = catalog.offset.saturating_sub(local::CATALOG_LIMIT);
-                commands.extend(model.catalog_page(offset));
-            }
-            if let Some(next) = catalog.next
-                && ui.button("Next >").clicked()
-            {
-                commands.extend(model.catalog_page(next));
-            }
-        });
-    }
-    ui.add_space(4.0);
-    let ready =
-        connected && !model.busy() && target.is_some() && target.as_ref() != current.as_ref();
-    ui.horizontal_wrapped(|ui| {
-        let button = ui.add_enabled(ready, egui::Button::new("Switch protocol"));
-        if button.clicked() {
-            commands.extend(model.act(Action::Switch));
+        if target.as_ref() != model.target() {
+            model.select_target(target.clone());
         }
-        if !connected {
-            ui.weak("Connect to switch.");
-        } else if model.busy() {
-            ui.weak("Switching… progress shows in the top bar and Events.");
-        } else if target.is_none() {
-            ui.weak("Pick another protocol above.");
+        if usize::from(catalog.total) > crate::model::CATALOG_ALL {
+            ui.horizontal(|ui| {
+                let first = u32::from(catalog.offset) + 1;
+                let last = u32::from(catalog.offset) + catalog.entries.len() as u32;
+                ui.weak(format!("{first}–{last} of {}", catalog.total));
+                if ui
+                    .add_enabled(catalog.offset > 0, egui::Button::new("< Previous"))
+                    .clicked()
+                {
+                    let offset = catalog.offset.saturating_sub(local::CATALOG_LIMIT);
+                    commands.extend(model.catalog_page(offset));
+                }
+                if let Some(next) = catalog.next
+                    && ui.button("Next >").clicked()
+                {
+                    commands.extend(model.catalog_page(next));
+                }
+            });
         }
-    });
+        if catalog.total > 1 {
+            ui.add_space(4.0);
+            let ready = connected
+                && !model.busy()
+                && target.is_some()
+                && target.as_ref() != current.as_ref();
+            ui.horizontal_wrapped(|ui| {
+                let button = ui.add_enabled(ready, egui::Button::new("Switch protocol"));
+                if button.clicked() {
+                    commands.extend(model.act(Action::Switch));
+                }
+                if target.is_some() && ui.button("Reset").clicked() {
+                    model.select_target(None);
+                }
+                if !connected {
+                    ui.weak("Connect to switch.");
+                } else if model.busy() {
+                    ui.weak("Switching… progress shows in the top bar and Events.");
+                } else if target.is_none() {
+                    ui.weak("Select another protocol above to switch live.");
+                }
+            });
+        }
 
-    egui::CollapsingHeader::new("Details")
-        .id_salt("connection-details")
-        .show(ui, |ui| {
-            let mut list = vec![("Requested carrier", common.carrier.clone())];
-            if let Some(current) = &current {
+        ui.add_space(6.0);
+        egui::CollapsingHeader::new("Session details")
+            .id_salt("connection-details")
+            .show(ui, |ui| {
+                let mut list = vec![("Requested carrier", common.carrier.clone())];
+                if let Some(current) = &current {
+                    list.push((
+                        "Current configuration",
+                        local::configuration_summary(current),
+                    ));
+                }
+                if let Some(requested) = &common.requested
+                    && Some(requested) != current.as_ref()
+                {
+                    list.push((
+                        "Requested configuration",
+                        local::configuration_summary(requested),
+                    ));
+                }
                 list.push((
-                    "Current configuration",
-                    local::configuration_summary(current),
+                    "Epoch",
+                    common.epoch.map_or("—".into(), |epoch| epoch.to_string()),
                 ));
-            }
-            if let Some(requested) = &common.requested
-                && Some(requested) != current.as_ref()
-            {
-                list.push((
-                    "Requested configuration",
-                    local::configuration_summary(requested),
-                ));
-            }
-            list.push((
-                "Epoch",
-                common.epoch.map_or("—".into(), |epoch| epoch.to_string()),
-            ));
-            list.push(("Generation", common.generation.to_string()));
-            list.push(("Catalog members", catalog.total.to_string()));
-            rows(ui, "connection-details-rows", &list);
-        });
+                list.push(("Generation", common.generation.to_string()));
+                list.push(("Catalog members", catalog.total.to_string()));
+                if let (Some(send), Some(recv)) = (common.send_rate, common.receive_rate) {
+                    list.push((
+                        "Configured rate cap",
+                        format!(
+                            "Up {} · Down {}",
+                            rate_text(Rate::SentBits, Some(send as f64 * 8.0)),
+                            rate_text(Rate::SentBits, Some(recv as f64 * 8.0)),
+                        ),
+                    ));
+                }
+                rows(ui, "connection-details-rows", &list);
+                ui.add_space(4.0);
+                ui.weak(CARRIER_SWITCH_PENDING);
+            });
+    });
     commands
 }
 
@@ -875,8 +1192,26 @@ fn layer_text(layer: Option<DeviceLayer>) -> &'static str {
 fn devices(ui: &mut egui::Ui, model: &mut Model, state: &mut UiState) -> Vec<Command> {
     let mut commands = Vec::new();
     let busy = model.busy();
+    if model.profiles().is_none() && model.capability(Feature::Profiles).is_ok() {
+        commands.extend(model.refresh_profiles());
+    }
+    if let Some(edit) = &mut state.editing
+        && edit.saving
+        && let Some(result) = model.take_action_result(Action::Device)
+    {
+        match result {
+            Ok(_) => state.editing = None,
+            Err(reason) => {
+                edit.saving = false;
+                edit.save_error = Some(reason);
+            }
+        }
+    }
     if ui.button("Refresh").clicked() {
         commands.extend(model.refresh_devices());
+        if model.capability(Feature::Profiles).is_ok() {
+            commands.extend(model.refresh_profiles());
+        }
     }
     let all = model.devices().map(<[_]>::to_vec).unwrap_or_default();
     if let Some(warning) = present::device_warning(model) {
@@ -887,80 +1222,82 @@ fn devices(ui: &mut egui::Ui, model: &mut Model, state: &mut UiState) -> Vec<Com
         .partition(|device| present::is_tunnel(model, device));
     ui.strong("Tunnel devices");
     ui.weak("Devices the service created, or that a profile uses.");
-    egui::Grid::new("devices")
-        .striped(true)
-        .num_columns(8)
-        .spacing([14.0, 6.0])
-        .show(ui, |ui| {
-            for title in [
-                "name",
-                "used by",
-                "layer",
-                "MTU",
-                "up",
-                "addresses",
-                "owner",
-                "",
-            ] {
-                ui.strong(title);
-            }
-            ui.end_row();
-            for device in &list {
-                ui.label(device.name.as_str());
-                let users = present::profiles_using(model, &device.name);
-                ui.label(if users.is_empty() {
-                    "—".to_owned()
-                } else {
-                    users.join(", ")
-                });
-                ui.label(layer_text(device.layer));
-                ui.label(device.mtu.map_or("—".into(), |mtu| mtu.to_string()));
-                ui.label(if device.up { "yes" } else { "no" });
-                ui.label(if device.addresses.is_empty() {
-                    "—".to_owned()
-                } else {
-                    device.addresses.join(", ")
-                });
-                ui.label(if device.owned { "l2tunnel" } else { "system" })
-                    .on_hover_text(if device.owned {
-                        "created by the service; it can change or delete it"
-                    } else {
-                        "created outside l2tunnel; the service uses it but never changes it"
-                    });
-                ui.horizontal(|ui| {
-                    if !device.owned {
-                        return;
-                    }
-                    if ui
-                        .add_enabled(!busy, egui::Button::new("Configure"))
-                        .clicked()
-                    {
-                        state.editing = Some(EditForm {
-                            name: device.name.clone(),
-                            ..EditForm::default()
-                        });
-                    }
-                    let key = format!("device:{}", device.name);
-                    let confirming = state.confirm.as_deref() == Some(key.as_str());
-                    let label = if confirming {
-                        "Confirm delete"
-                    } else {
-                        "Delete"
-                    };
-                    if ui.add_enabled(!busy, egui::Button::new(label)).clicked() {
-                        if confirming {
-                            state.confirm = None;
-                            commands.extend(model.change_device(DeviceChange::Delete {
-                                name: device.name.clone(),
-                            }));
-                        } else {
-                            state.confirm = Some(key);
-                        }
-                    }
-                });
+    if !list.is_empty() {
+        egui::Grid::new("devices")
+            .striped(true)
+            .num_columns(8)
+            .spacing([14.0, 6.0])
+            .show(ui, |ui| {
+                for title in [
+                    "name",
+                    "used by",
+                    "layer",
+                    "MTU",
+                    "up",
+                    "addresses",
+                    "owner",
+                    "",
+                ] {
+                    ui.strong(title);
+                }
                 ui.end_row();
-            }
-        });
+                for device in &list {
+                    ui.label(device.name.as_str());
+                    let users = present::profiles_using(model, &device.name);
+                    ui.label(if users.is_empty() {
+                        "—".to_owned()
+                    } else {
+                        users.join(", ")
+                    });
+                    ui.label(layer_text(device.layer));
+                    ui.label(device.mtu.map_or("—".into(), |mtu| mtu.to_string()));
+                    ui.label(if device.up { "yes" } else { "no" });
+                    ui.label(if device.addresses.is_empty() {
+                        "—".to_owned()
+                    } else {
+                        device.addresses.join(", ")
+                    });
+                    ui.label(if device.owned { "l2tunnel" } else { "system" })
+                        .on_hover_text(if device.owned {
+                            "created by the service; it can change or delete it"
+                        } else {
+                            "created outside l2tunnel; the service uses it but never changes it"
+                        });
+                    ui.horizontal(|ui| {
+                        if !device.owned {
+                            return;
+                        }
+                        if ui
+                            .add_enabled(!busy, egui::Button::new("Configure"))
+                            .clicked()
+                        {
+                            state.editing = Some(EditForm {
+                                name: device.name.clone(),
+                                ..EditForm::default()
+                            });
+                        }
+                        let key = format!("device:{}", device.name);
+                        let confirming = state.confirm.as_deref() == Some(key.as_str());
+                        let label = if confirming {
+                            "Confirm delete"
+                        } else {
+                            "Delete"
+                        };
+                        if ui.add_enabled(!busy, egui::Button::new(label)).clicked() {
+                            if confirming {
+                                state.confirm = None;
+                                commands.extend(model.change_device(DeviceChange::Delete {
+                                    name: device.name.clone(),
+                                }));
+                            } else {
+                                state.confirm = Some(key);
+                            }
+                        }
+                    });
+                    ui.end_row();
+                }
+            });
+    }
     if model.devices().is_none() {
         ui.weak("Loading…");
     } else if list.is_empty() {
@@ -1015,20 +1352,37 @@ fn devices(ui: &mut egui::Ui, model: &mut Model, state: &mut UiState) -> Vec<Com
             ui.end_row();
         });
         let change = configure_change(edit);
+        if let Some(error) = &edit.save_error {
+            ui.colored_label(
+                ui.visuals().error_fg_color,
+                format!("Apply failed: {error}"),
+            );
+        }
         if let Err(reason) = &change {
             ui.weak(reason.as_str());
         }
         let mut close = false;
         ui.horizontal(|ui| {
             if ui
-                .add_enabled(change.is_ok() && !busy, egui::Button::new("Apply"))
+                .add_enabled(
+                    change.is_ok() && !busy && !edit.saving,
+                    egui::Button::new("Apply"),
+                )
                 .clicked()
                 && let Ok(change) = change
             {
+                edit.saving = true;
+                edit.save_error = None;
                 commands.extend(model.change_device(change));
-                close = true;
             }
-            if ui.button("Close").clicked() {
+            if edit.saving {
+                ui.spinner();
+                ui.weak("Applying…");
+            }
+            if ui
+                .add_enabled(!edit.saving, egui::Button::new("Close"))
+                .clicked()
+            {
                 close = true;
             }
         });
@@ -1086,9 +1440,15 @@ fn routes(ui: &mut egui::Ui, model: &mut Model, state: &mut UiState) -> Vec<Comm
     let connected = model
         .status()
         .is_some_and(|status| status.phase == "connected");
+    if model.profiles().is_none() && model.capability(Feature::Profiles).is_ok() {
+        commands.extend(model.refresh_profiles());
+    }
     if ui.button("Refresh").clicked() {
         commands.extend(model.refresh_routes());
         commands.extend(model.refresh_devices());
+        if model.capability(Feature::Profiles).is_ok() {
+            commands.extend(model.refresh_profiles());
+        }
     }
     let (list, others): (Vec<_>, Vec<_>) = model
         .routes()
@@ -1097,53 +1457,55 @@ fn routes(ui: &mut egui::Ui, model: &mut Model, state: &mut UiState) -> Vec<Comm
         .into_iter()
         .partition(|route| route.owned);
     ui.strong("Routes added by l2tunnel");
-    egui::Grid::new("routes")
-        .striped(true)
-        .num_columns(6)
-        .spacing([14.0, 6.0])
-        .show(ui, |ui| {
-            for title in ["destination", "gateway", "device", "metric", "purpose", ""] {
-                ui.strong(title);
-            }
-            ui.end_row();
-            for route in &list {
-                ui.label(route.destination.as_str());
-                ui.label(route.gateway.as_deref().unwrap_or("—"));
-                ui.label(route.device.as_deref().unwrap_or("—"));
-                ui.label(route.metric.map_or("—".into(), |metric| metric.to_string()));
-                ui.label(match route.purpose.as_deref() {
-                    Some("default") => "all traffic",
-                    Some("peer_exception") => "keeps the peer reachable",
-                    _ => "route",
-                });
-                if route.owned
-                    && route.purpose.as_deref() == Some("route")
-                    && let Some(device) = &route.device
-                {
-                    let key = format!("route:{}:{device}", route.destination);
-                    let confirming = state.confirm.as_deref() == Some(key.as_str());
-                    let label = if confirming {
-                        "Confirm remove"
-                    } else {
-                        "Remove"
-                    };
-                    if ui.add_enabled(!busy, egui::Button::new(label)).clicked() {
-                        if confirming {
-                            state.confirm = None;
-                            commands.extend(model.change_route(RouteChange::Remove {
-                                destination: route.destination.clone(),
-                                device: device.clone(),
-                            }));
-                        } else {
-                            state.confirm = Some(key);
-                        }
-                    }
-                } else {
-                    ui.label("");
+    if !list.is_empty() {
+        egui::Grid::new("routes")
+            .striped(true)
+            .num_columns(6)
+            .spacing([14.0, 6.0])
+            .show(ui, |ui| {
+                for title in ["destination", "gateway", "device", "metric", "purpose", ""] {
+                    ui.strong(title);
                 }
                 ui.end_row();
-            }
-        });
+                for route in &list {
+                    ui.label(route.destination.as_str());
+                    ui.label(route.gateway.as_deref().unwrap_or("—"));
+                    ui.label(route.device.as_deref().unwrap_or("—"));
+                    ui.label(route.metric.map_or("—".into(), |metric| metric.to_string()));
+                    ui.label(match route.purpose.as_deref() {
+                        Some("default") => "all traffic",
+                        Some("peer_exception") => "keeps the peer reachable",
+                        _ => "route",
+                    });
+                    if route.owned
+                        && route.purpose.as_deref() == Some("route")
+                        && let Some(device) = &route.device
+                    {
+                        let key = format!("route:{}:{device}", route.destination);
+                        let confirming = state.confirm.as_deref() == Some(key.as_str());
+                        let label = if confirming {
+                            "Confirm remove"
+                        } else {
+                            "Remove"
+                        };
+                        if ui.add_enabled(!busy, egui::Button::new(label)).clicked() {
+                            if confirming {
+                                state.confirm = None;
+                                commands.extend(model.change_route(RouteChange::Remove {
+                                    destination: route.destination.clone(),
+                                    device: device.clone(),
+                                }));
+                            } else {
+                                state.confirm = Some(key);
+                            }
+                        }
+                    } else {
+                        ui.label("");
+                    }
+                    ui.end_row();
+                }
+            });
+    }
     if model.routes().is_none() {
         ui.weak("Loading…");
     } else if list.is_empty() {
@@ -1262,10 +1624,14 @@ fn device_choice(ui: &mut egui::Ui, id: &str, selected: &mut String, choices: &[
         });
 }
 
-fn statistics(ui: &mut egui::Ui, model: &Model, state: &mut UiState) {
-    let Some(metrics) = model.metrics() else {
-        ui.label("Waiting for the first sample…");
-        return;
+fn statistics(ui: &mut egui::Ui, model: &mut Model, state: &mut UiState) -> Vec<Command> {
+    let mut commands = Vec::new();
+    let Some(metrics) = model.metrics().cloned() else {
+        ui.horizontal(|ui| {
+            ui.spinner();
+            ui.label("Waiting for the first sample…");
+        });
+        return commands;
     };
     ui.horizontal(|ui| {
         ui.label("Window");
@@ -1285,7 +1651,15 @@ fn statistics(ui: &mut egui::Ui, model: &Model, state: &mut UiState) {
             Rate::DeviceWritten,
         ),
     ] {
-        chart(ui, title, rate, &history.series(rate, state.window));
+        chart(
+            ui,
+            title,
+            rate,
+            ChartAxis::Rolling {
+                window_secs: state.window,
+            },
+            &history.timed_series(rate, state.window),
+        );
         ui.add_space(4.0);
     }
     let count = |value: Option<u64>| value.map_or("—".into(), |value| value.to_string());
@@ -1336,13 +1710,13 @@ fn statistics(ui: &mut egui::Ui, model: &Model, state: &mut UiState) {
             .striped(true)
             .num_columns(4)
             .show(ui, |ui| {
-                for title in ["channel", "queued bytes", "admitted", "dropped"] {
+                for title in ["channel", "queued", "admitted", "dropped"] {
                     ui.strong(title);
                 }
                 ui.end_row();
                 for channel in &metrics.channels {
                     ui.label(channel.channel.to_string());
-                    ui.label(channel.queued_bytes.to_string());
+                    ui.label(format_bytes(channel.queued_bytes));
                     ui.label(channel.admitted.to_string());
                     ui.label(channel.dropped.to_string());
                     ui.end_row();
@@ -1365,8 +1739,8 @@ fn statistics(ui: &mut egui::Ui, model: &Model, state: &mut UiState) {
                 for flow in &metrics.flows {
                     ui.label(flow.flow.to_string());
                     ui.label(flow.label.as_str());
-                    ui.label(flow.sent_bytes.to_string());
-                    ui.label(flow.received_bytes.to_string());
+                    ui.label(format_bytes(flow.sent_bytes));
+                    ui.label(format_bytes(flow.received_bytes));
                     ui.label(flow.state.as_str());
                     ui.end_row();
                 }
@@ -1376,12 +1750,16 @@ fn statistics(ui: &mut egui::Ui, model: &Model, state: &mut UiState) {
         ui.add_space(8.0);
         ui.strong("Device");
         ui.label(format!(
-            "pending {} packets / {} bytes · oversize {} · backpressure drops {}",
+            "pending {} packets / {} · oversize {} · backpressure drops {}",
             device.pending_packets,
-            device.pending_bytes,
+            format_bytes(device.pending_bytes),
             device.oversize,
             device.backpressure_drops
         ));
+    }
+    if model.capability(Feature::Meters).is_ok() {
+        ui.add_space(10.0);
+        commands.extend(meters_section(ui, model, state));
     }
     ui.add_space(8.0);
     egui::CollapsingHeader::new("Details")
@@ -1399,6 +1777,144 @@ fn statistics(ui: &mut egui::Ui, model: &Model, state: &mut UiState) {
                 ));
             }
         });
+    commands
+}
+
+fn meters_section(ui: &mut egui::Ui, model: &mut Model, state: &mut UiState) -> Vec<Command> {
+    let mut commands = Vec::new();
+    egui::CollapsingHeader::new("CSR meters (flow control, runtime, MUX)")
+        .id_salt("statistics-csr-meters")
+        .show(ui, |ui| {
+            ui.weak("Live control/status registers from the running session (same data as `l2tunnelctl meters read`).");
+            let mut changed = false;
+            ui.horizontal_wrapped(|ui| {
+                if ui
+                    .radio_value(&mut state.meters_side, MeterSide::Local, "Local")
+                    .changed()
+                {
+                    changed = true;
+                }
+                if ui
+                    .radio_value(&mut state.meters_side, MeterSide::Remote, "Remote peer")
+                    .changed()
+                {
+                    changed = true;
+                }
+                ui.separator();
+                ui.label("Prefix");
+                let prefix_edit = ui.add(
+                    egui::TextEdit::singleline(&mut state.meters_prefix)
+                        .hint_text("e.g. flow_control, runtime, mux")
+                        .desired_width(210.0),
+                );
+                let submitted = prefix_edit.lost_focus()
+                    && ui.input(|input| input.key_pressed(egui::Key::Enter));
+                if ui
+                    .add_enabled(!model.meters_loading(), egui::Button::new("Read"))
+                    .clicked()
+                    || submitted
+                    || changed
+                {
+                    let prefix = state.meters_prefix.trim().to_owned();
+                    commands.extend(model.refresh_meters(state.meters_side, prefix, None));
+                }
+                ui.checkbox(&mut state.meters_auto, "Auto (2 s)");
+                if model.meters_loading() {
+                    ui.spinner();
+                }
+            });
+            if model.meters().is_none()
+                && model.meters_error().is_none()
+                && !model.meters_loading()
+            {
+                let prefix = state.meters_prefix.trim().to_owned();
+                commands.extend(model.refresh_meters(state.meters_side, prefix, None));
+            }
+            if let Some(error) = model.meters_error() {
+                ui.colored_label(ui.visuals().warn_fg_color, format!("Meters unavailable: {error}"));
+            }
+            if let Some(page) = model.meters().cloned() {
+                ui.horizontal_wrapped(|ui| {
+                    let side = match page.side {
+                        MeterSide::Local => "local",
+                        MeterSide::Remote => "remote",
+                    };
+                    let age = page
+                        .age_ms
+                        .map(|ms| format!(" · table age {ms} ms"))
+                        .unwrap_or_default();
+                    ui.weak(format!(
+                        "{side} · generation {} · {} registers{age}",
+                        page.generation,
+                        page.entries.len()
+                    ));
+                    ui.separator();
+                    ui.label("Filter");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut state.meters_filter)
+                            .hint_text("substring")
+                            .desired_width(180.0),
+                    );
+                    if let Some(next) = page.next.clone()
+                        && ui
+                            .add_enabled(!model.meters_loading(), egui::Button::new("Load more"))
+                            .clicked()
+                    {
+                        let prefix = state.meters_prefix.trim().to_owned();
+                        commands.extend(model.refresh_meters(
+                            state.meters_side,
+                            prefix,
+                            Some(next),
+                        ));
+                    }
+                });
+                let filter = state.meters_filter.trim().to_lowercase();
+                let visible: Vec<_> = page
+                    .entries
+                    .iter()
+                    .filter(|entry| {
+                        filter.is_empty() || entry.path.to_lowercase().contains(&filter)
+                    })
+                    .collect();
+                if visible.is_empty() {
+                    ui.weak("No matching registers.");
+                } else {
+                    egui::ScrollArea::vertical()
+                        .id_salt("csr-meters-scroll")
+                        .min_scrolled_height(240.0)
+                        .max_height(320.0)
+                        .show(ui, |ui| {
+                            egui::Grid::new("csr-meters-grid")
+                                .striped(true)
+                                .num_columns(3)
+                                .spacing([14.0, 4.0])
+                                .show(ui, |ui| {
+                                    for title in ["register", "value", "rate"] {
+                                        ui.strong(title);
+                                    }
+                                    ui.end_row();
+                                    for entry in &visible {
+                                        ui.monospace(entry.path.as_str());
+                                        ui.monospace(entry.value.to_string());
+                                        match model.meter_rate(&entry.path, entry.value) {
+                                            Some(rate) if rate > 0.0 => {
+                                                ui.monospace(format!("{rate:.1}/s"));
+                                            }
+                                            Some(_) => {
+                                                ui.weak("0/s");
+                                            }
+                                            None => {
+                                                ui.weak("—");
+                                            }
+                                        }
+                                        ui.end_row();
+                                    }
+                                });
+                        });
+                }
+            }
+        });
+    commands
 }
 
 fn management(ui: &mut egui::Ui, model: &mut Model, state: &mut UiState) -> Vec<Command> {
@@ -1414,7 +1930,10 @@ fn management(ui: &mut egui::Ui, model: &mut Model, state: &mut UiState) -> Vec<
                     ("Version", info.version.clone()),
                     ("Role", role_text(info.role).into()),
                     ("Local API", info.api.to_string()),
-                    ("Uptime", uptime(info.uptime_ms)),
+                    (
+                        "Uptime",
+                        uptime(info.uptime_ms.saturating_add(state.info_elapsed_ms)),
+                    ),
                     (
                         "Instance",
                         model
@@ -1465,6 +1984,11 @@ fn management(ui: &mut egui::Ui, model: &mut Model, state: &mut UiState) -> Vec<
     if stop {
         commands.extend(model.act(Action::Stop));
     }
+    if let Some(update) = state.service_update.clone() {
+        ui.add_space(6.0);
+        let (update_commands, _) = crate::start::update_banner(ui, model, &update, false);
+        commands.extend(update_commands);
+    }
     ui.add_space(10.0);
     ui.heading("Profiles");
     commands.extend(crate::profiles::section(ui, model, &mut state.profiles));
@@ -1510,12 +2034,20 @@ fn sessions(ui: &mut egui::Ui, model: &mut Model, state: &mut UiState) -> Vec<Co
                 ),
                 (
                     "Trusted member",
-                    session.member.clone().unwrap_or_else(|| "—".into()),
+                    session.member.clone().unwrap_or_else(|| {
+                        if session.profile.is_none() {
+                            "— (not from a stored profile)".into()
+                        } else {
+                            "—".into()
+                        }
+                    }),
                 ),
                 (
                     "Sent / received",
                     match (session.sent_bytes, session.received_bytes) {
-                        (Some(sent), Some(received)) => format!("{sent} B / {received} B"),
+                        (Some(sent), Some(received)) => {
+                            format!("{} / {}", format_bytes(sent), format_bytes(received))
+                        }
                         _ => "not reported".into(),
                     },
                 ),
@@ -1547,37 +2079,41 @@ fn sessions(ui: &mut egui::Ui, model: &mut Model, state: &mut UiState) -> Vec<Co
     ui.weak(
         "Kicking ends the session; the server listens again and the same member may reconnect.",
     );
-    let from_profile = list.iter().any(|session| session.profile.is_some());
-    ui.add_space(6.0);
-    ui.horizontal(|ui| {
-        ui.label("New member public key");
-        ui.add(
-            egui::TextEdit::singleline(&mut state.revoke)
-                .hint_text("/etc/l2tunnel/member-new.pub")
-                .desired_width(300.0),
-        );
-        let path = std::path::PathBuf::from(state.revoke.trim());
-        let ready = from_profile && !busy && path.is_absolute();
-        let confirming = state.confirm.as_deref() == Some("member:revoke");
-        let label = if confirming {
-            "Confirm: revoke the current member"
-        } else {
-            "Revoke member"
-        };
-        if ui.add_enabled(ready, egui::Button::new(label)).clicked() {
-            if confirming {
-                state.confirm = None;
-                commands.extend(model.revoke(path));
+    if model.capability(Feature::Profiles).is_ok() {
+        let from_profile = list.iter().any(|session| session.profile.is_some());
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            ui.label("New member public key");
+            ui.add(
+                egui::TextEdit::singleline(&mut state.revoke)
+                    .hint_text("/etc/l2tunnel/member-new.pub")
+                    .desired_width(300.0),
+            );
+            let path = std::path::PathBuf::from(state.revoke.trim());
+            let ready = from_profile && !busy && path.is_absolute();
+            let confirming = state.confirm.as_deref() == Some("member:revoke");
+            let label = if confirming {
+                "Confirm: revoke the current member"
             } else {
-                state.confirm = Some("member:revoke".into());
+                "Revoke member"
+            };
+            if ui.add_enabled(ready, egui::Button::new(label)).clicked() {
+                if confirming {
+                    state.confirm = None;
+                    commands.extend(model.revoke(path));
+                } else {
+                    state.confirm = Some("member:revoke".into());
+                }
             }
-        }
-    });
-    ui.weak(
-        "Revoking saves the running profile with this key as its only trusted member and \
-         replaces the session, so the old member cannot reconnect. Needs a session started \
-         from a stored profile and an absolute path the service can read.",
-    );
+        });
+        ui.weak(
+            "Revoking saves the running profile with this key as its only trusted member and \
+             replaces the session, so the old member cannot reconnect. Needs a session started \
+             from a stored profile and an absolute path the service can read.",
+        );
+    } else {
+        ui.weak("Member revocation requires running the server as a daemon with stored profiles.");
+    }
     commands
 }
 
@@ -1593,6 +2129,9 @@ fn uptime(ms: u64) -> String {
 
 fn events(ui: &mut egui::Ui, model: &mut Model, state: &mut UiState) -> Vec<Command> {
     let mut commands = Vec::new();
+    if let Some(Ok(_)) = model.take_exported() {
+        state.export = default_export_path();
+    }
     ui.strong("Diagnostic export");
     if state.export.is_empty() {
         state.export = default_export_path();
@@ -1607,7 +2146,6 @@ fn events(ui: &mut egui::Ui, model: &mut Model, state: &mut UiState) -> Vec<Comm
                 std::path::PathBuf::from(state.export.trim()),
                 state.include_addresses,
             ));
-            state.export.clear();
         }
     });
     ui.weak(

@@ -208,7 +208,7 @@ impl Gate {
                 Body::Ping { .. }
                 | Body::Pong { .. }
                 | Body::ProfileControl {
-                    tag: ProfileTag::TunnelTestV1,
+                    tag: ProfileTag::TunnelTestV1 | ProfileTag::MetersV1 | ProfileTag::RateBudgetV1,
                     ..
                 },
             ) => {

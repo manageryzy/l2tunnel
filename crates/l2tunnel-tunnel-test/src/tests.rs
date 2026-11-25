@@ -136,6 +136,44 @@ fn speed_survives_loss() -> Result<(), Error> {
     Ok(())
 }
 
+/// Slow links (~1.5 Mbit/s) must drain their upload queue and receive the
+/// responder's confirmation well within `GRACE`.
+#[test]
+fn slow_upload_confirms_within_grace() -> Result<(), Error> {
+    let mut pair = Pair::new(1, 20, 0)?;
+    pair.tester
+        .start_speed(Direction::Upload, 1, Duration::from_secs(3), Duration::ZERO)?;
+    // Pace to ~1.5 Mbit/s (1 packet every 8 ms).
+    let mut step = 0_u64;
+    while pair.now < Duration::from_secs(12) {
+        pair.now += Duration::from_millis(1);
+        let now = pair.now;
+        pair.up.arrive(now, &mut |pkt| pair.responder.deliver(pkt));
+        pair.down.arrive(now, &mut |pkt| pair.tester.deliver(pkt));
+        pair.tester.poll(now)?;
+        pair.responder.poll(now)?;
+        if step.is_multiple_of(8) {
+            pair.up.send(now, &mut || pair.tester.next_outbound());
+        }
+        pair.down.send(now, &mut || pair.responder.next_outbound());
+        step += 1;
+        if pair
+            .tester
+            .progress(now)
+            .is_some_and(|p| p.phase != Phase::Running)
+        {
+            break;
+        }
+    }
+    let progress = pair
+        .tester
+        .progress(pair.now)
+        .ok_or(Error::Invalid("none"))?;
+    assert_eq!(progress.phase, Phase::Completed, "{progress:?}");
+    assert!(progress.elapsed < Duration::from_secs(5), "{progress:?}");
+    Ok(())
+}
+
 #[test]
 fn ping_measures_round_trips_and_loss() -> Result<(), Error> {
     let mut pair = Pair::new(10, 10, 0)?;

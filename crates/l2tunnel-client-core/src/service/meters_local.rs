@@ -83,20 +83,51 @@ impl Handle {
         })
     }
 
-    /// One page of the peer's registers over the in-band `Meters` stream.
-    ///
-    /// Not implemented yet (MCSR-09): the stream is not negotiated by any
-    /// runtime, so the read is refused as `remote_unavailable` rather than
-    /// reported as an empty or unsupported peer.
-    pub fn meters_remote(
+    /// One page of the peer's registers over the in-band `Meters` control stream
+    /// (`ProfileTag::MetersV1`, MCSR-09/MCSR-10).
+    pub async fn meters_remote(
         &self,
         prefix: &str,
         cursor: Option<&str>,
         limit: u16,
     ) -> Result<MeterPage, &'static str> {
         crate::local::check_request(prefix, cursor, limit)?;
-        self.live_meters().ok_or("not_running")?;
-        Err("remote_unavailable")
+        let switcher = {
+            let state = self.0.lock();
+            match &state.backend {
+                Some(ObservedBackend::SecureUdpCommon(backend)) => backend.switcher.clone(),
+                Some(ObservedBackend::Proxy(_)) => return Err("remote_unavailable"),
+                None => return Err("not_running"),
+            }
+        };
+        let reply = switcher
+            .meters_remote_read(prefix.to_owned(), cursor.map(str::to_owned), limit)
+            .await
+            .map_err(|error| match error {
+                l2tunnel_runtime::secure_udp::transport::RemoteMeterError::Busy => "busy",
+                l2tunnel_runtime::secure_udp::transport::RemoteMeterError::Timeout => {
+                    "peer_timeout"
+                }
+                l2tunnel_runtime::secure_udp::transport::RemoteMeterError::PeerRefused(code) => {
+                    code.as_str()
+                }
+                l2tunnel_runtime::secure_udp::transport::RemoteMeterError::Malformed => {
+                    "peer_malformed"
+                }
+                l2tunnel_runtime::secure_udp::transport::RemoteMeterError::Closed => "not_running",
+            })?;
+        Ok(MeterPage {
+            side: MeterSide::Remote,
+            generation: reply.generation,
+            sampled_ms: self.sampled_ms(),
+            age_ms: None,
+            entries: reply
+                .entries
+                .into_iter()
+                .map(|(path, value)| MeterEntry { path, value })
+                .collect(),
+            next: reply.next,
+        })
     }
 
     /// One page of the static catalog.

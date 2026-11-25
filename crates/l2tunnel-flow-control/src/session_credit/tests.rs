@@ -616,3 +616,80 @@ fn small_datagram_allowance_scales_with_measured_datagram_size() -> TestResult {
     assert!(bytes >= allowance);
     Ok(())
 }
+
+/// Quiescent idle heartbeats fire once at `idle_period` (for prompt tail-loss
+/// recovery), then back off exponentially up to 10 s, and reset immediately
+/// when new data arrives.
+#[test]
+fn quiet_idle_heartbeats_back_off_and_reset_on_new_data() -> TestResult {
+    let mut receiver = Receiver::new(config(), DATAGRAM, 106_496)?;
+    receiver.processed(0, DATAGRAM, ms(0))?;
+    let _ = receiver.issue(ms(0), None)?;
+    // Once drain drops to zero, the first idle heartbeat is due at idle_period (250 ms).
+    let d0 = receiver.due(ms(200), None).ok_or(Error::Configuration)?;
+    assert_eq!(d0, ms(250));
+    let _ = receiver.issue(d0, None)?;
+    // Subsequent quiet heartbeats back off exponentially: 500 ms, 1000 ms, ..., capped at 10 s.
+    let d1 = receiver.due(d0, None).ok_or(Error::Configuration)?;
+    assert_eq!(d1, d0 + ms(500));
+    let _ = receiver.issue(d1, None)?;
+    let d2 = receiver.due(d1, None).ok_or(Error::Configuration)?;
+    assert_eq!(d2, d1 + ms(1_000));
+    let mut now = d2;
+    for _ in 0..8 {
+        let _ = receiver.issue(now, None)?;
+        now = receiver.due(now, None).ok_or(Error::Configuration)?;
+    }
+    let _ = receiver.issue(now, None)?;
+    assert_eq!(
+        receiver.due(now, None),
+        Some(now + Duration::from_secs(10)),
+        "capped at 10 s"
+    );
+    // Any new data datagram resets immediately back to active period.
+    receiver.processed(1, DATAGRAM, now + ms(1))?;
+    assert_eq!(receiver.due(now + ms(1), None), Some(now + ms(10)));
+    Ok(())
+}
+
+/// High-BDP live budget increases scale pacing burst and grant/ring ceilings
+/// without dropping tokens on 1 ms event-loop wakeups.
+#[test]
+fn high_bdp_live_rate_and_ceiling_scaling_unlocks_gigabit_bursts() -> TestResult {
+    let cfg = config();
+    let range = 1 << 20;
+    let mut receiver = Receiver::new(cfg, DATAGRAM, 106_496)?;
+    let mut sender = Sender::new(cfg, DATAGRAM, 0, 12_500_000, 64 << 10, range)?;
+    // Upgrade live to 1 Gbit/s (125 MB/s) and high-BDP credit ceiling.
+    sender.set_configured_rate(125_000_000);
+    sender.raise_ceiling(32_768);
+    receiver.raise_ceiling(32_768, 64 << 20);
+    // Grant a large window from the receiver after high drain.
+    for i in 0..10_000_u64 {
+        receiver.processed(i, DATAGRAM, ms(i / 200))?;
+    }
+    let grant = receiver.issue(ms(60), Some(ms(70)))?;
+    assert!(
+        grant.limit - grant.processed > cfg.ceiling_datagrams,
+        "raised receiver ceiling should exceed initial {}",
+        cfg.ceiling_datagrams
+    );
+    assert!(grant.bytes_above > cfg.ceiling_bytes);
+    // Sender accepts the larger grant and can burst >80 datagrams (~1 ms at 1 Gb/s)
+    // immediately after a 1 ms refill without hitting the old 16-datagram burst cap.
+    let _ = sender.apply(grant, ms(60))?;
+    let mut sent = 0_u64;
+    for n in 0..90_u64 {
+        if sender.gate(n, ms(61))? == Gate::Open {
+            sender.sent(n, DATAGRAM, ms(61))?;
+            sent += 1;
+        } else {
+            break;
+        }
+    }
+    assert!(
+        sent >= 80,
+        "expected >=80 datagrams in a 1 ms 1 Gbit/s burst, got {sent}"
+    );
+    Ok(())
+}

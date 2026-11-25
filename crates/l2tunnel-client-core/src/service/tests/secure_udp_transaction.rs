@@ -694,6 +694,137 @@ async fn tunnel_tests_cross_the_real_session_and_never_reach_a_device() -> Resul
     Ok(())
 }
 
+/// MCSR-09 / MCSR-10 without privileges: two real services joined by loopback
+/// UDP read each other's live CSR registers over the authenticated Liveness
+/// control stream (`ProfileTag::MetersV1`), with prefix filtering, cursor
+/// paging, and rate-gate enforcement.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn remote_meters_cross_the_real_session_with_paging_and_rate_gate() -> Result {
+    use crate::local::{MeterSide, OperationAction, OperationRequest};
+    let hosts = [Arc::new(Host::default()), Arc::new(Host::default())];
+    let TransactionPlans {
+        plans: [client_plan, server_plan],
+        ..
+    } = transaction_plans(l2tunnel_cover::Appearance::QuicLike, &hosts)?;
+    let (client, client_run) = channel();
+    let (server, server_run) = channel();
+    let client_task = tokio::spawn(client_run);
+    let server_task = tokio::spawn(server_run);
+    let a = client
+        .connect(client_plan, client.next_key().map_err(submit)?)
+        .map_err(submit)?;
+    let b = server
+        .connect(server_plan, server.next_key().map_err(submit)?)
+        .map_err(submit)?;
+    tokio::try_join!(connected(&client, a), connected(&server, b))?;
+
+    let first = client
+        .operations_request(OperationRequest::new(OperationAction::MetersRead {
+            side: MeterSide::Remote,
+            prefix: "runtime".into(),
+            cursor: None,
+            limit: 4,
+        }))
+        .await;
+    assert!(first.ok, "{first:?}");
+    let page1 = first.meters.ok_or("first remote meter page")?;
+    assert_eq!(page1.side, MeterSide::Remote);
+    assert_eq!(page1.entries.len(), 4, "{page1:?}");
+    assert!(page1.entries.iter().all(|e| e.path.starts_with("runtime.")));
+    let cursor = page1.next.clone().ok_or("expected next cursor")?;
+
+    let rapid = client
+        .operations_request(OperationRequest::new(OperationAction::MetersRead {
+            side: MeterSide::Remote,
+            prefix: "runtime".into(),
+            cursor: Some(cursor.clone()),
+            limit: 4,
+        }))
+        .await;
+    assert!(!rapid.ok, "{rapid:?}");
+    assert_eq!(rapid.code, "busy", "{rapid:?}");
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let second = client
+        .operations_request(OperationRequest::new(OperationAction::MetersRead {
+            side: MeterSide::Remote,
+            prefix: "runtime".into(),
+            cursor: Some(cursor.clone()),
+            limit: 64,
+        }))
+        .await;
+    assert!(second.ok, "{second:?}");
+    let page2 = second.meters.ok_or("second remote meter page")?;
+    assert_eq!(page2.side, MeterSide::Remote);
+    assert!(!page2.entries.is_empty(), "{page2:?}");
+    assert!(page2.entries[0].path > cursor, "{page2:?}");
+
+    let from_server = server
+        .operations_request(OperationRequest::new(OperationAction::MetersRead {
+            side: MeterSide::Remote,
+            prefix: "meta".into(),
+            cursor: None,
+            limit: 16,
+        }))
+        .await;
+    assert!(from_server.ok, "{from_server:?}");
+    let server_page = from_server.meters.ok_or("server->client meter page")?;
+    assert!(
+        server_page
+            .entries
+            .iter()
+            .any(|e| e.path == "meta.version" && e.value == l2tunnel_meters::catalog::VERSION),
+        "{server_page:?}"
+    );
+
+    // Live authenticated speed-budget update applies symmetrically on both peers.
+    let target_up = 62_500_000_u64; // 500 Mbit/s
+    let target_down = 125_000_000_u64; // 1 Gbit/s
+    let applied = client
+        .operations_request(OperationRequest::new(OperationAction::RateBudgetSet {
+            send_rate: target_up,
+            receive_rate: target_down,
+        }))
+        .await;
+    assert!(applied.ok, "{applied:?}");
+    let wait_rates = |handle: &Handle, expected_send: u64, expected_recv: u64| {
+        let handle = handle.clone();
+        async move {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+            loop {
+                let status = handle
+                    .operations_request(OperationRequest::new(OperationAction::Status {}))
+                    .await;
+                if let Some(common) = status
+                    .status
+                    .and_then(|s| s.observation)
+                    .and_then(|o| o.common)
+                    && common.send_rate == Some(expected_send)
+                    && common.receive_rate == Some(expected_recv)
+                {
+                    return Ok::<(), Box<dyn std::error::Error + Send + Sync>>(());
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(format!(
+                        "rates did not converge to ({expected_send}, {expected_recv})"
+                    )
+                    .into());
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        }
+    };
+    tokio::try_join!(
+        wait_rates(&client, target_up, target_down),
+        wait_rates(&server, target_down, target_up),
+    )?;
+
+    client_task.abort();
+    server_task.abort();
+    let _ = tokio::join!(client_task, server_task);
+    Ok(())
+}
+
 #[tokio::test]
 async fn tuned_client_proposes_at_connect_and_switches_fec_off_live() -> Result {
     use crate::local::{OperationAction, OperationRequest};

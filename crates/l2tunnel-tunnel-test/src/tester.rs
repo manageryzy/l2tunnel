@@ -226,6 +226,10 @@ impl Tester {
     pub fn deliver(&mut self, packet: &[u8]) {
         self.stack.queues.deliver(packet);
     }
+    /// Return an already-admitted outbound buffer to the bounded pool.
+    pub fn recycle_outbound(&mut self, buf: Vec<u8>) {
+        self.stack.queues.recycle(buf);
+    }
     /// Next packet to send to the peer, flagged.
     pub fn next_outbound(&mut self) -> Option<Vec<u8>> {
         self.stack.queues.outgoing.pop_front()
@@ -393,18 +397,9 @@ fn drive_stream(
                     if !socket.may_send() {
                         return Err("the responder closed the upload early");
                     }
-                    while socket.can_send() {
-                        let sent = socket
-                            .send(|buffer| {
-                                buffer.fill(0);
-                                (buffer.len(), buffer.len())
-                            })
-                            .unwrap_or(0);
-                        if sent == 0 {
-                            break;
-                        }
-                        stream.queued = stream.queued.saturating_add(sent as u64);
-                    }
+                    let max_queue = crate::adaptive_send_queue(start, now, stream.counted);
+                    let sent = crate::fill_zeros_capped(socket, max_queue);
+                    stream.queued = stream.queued.saturating_add(sent);
                     return Ok(());
                 }
                 Direction::Download => {

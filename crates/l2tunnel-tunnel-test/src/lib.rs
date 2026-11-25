@@ -47,10 +47,13 @@ pub const MIN_PING_INTERVAL: Duration = Duration::from_millis(100);
 pub const MAX_PING_INTERVAL: Duration = Duration::from_millis(1_000);
 /// Time a ping reply may take.
 pub const PING_TIMEOUT: Duration = Duration::from_secs(1);
-/// TCP buffer per direction and socket.
-pub const SOCKET_BYTES: usize = 256 * 1024;
+/// TCP buffer per direction and socket (4 MiB unlocks 450+ Mb/s per stream at
+/// 70 ms RTT while `fill_zeros_capped` keeps slow links bounded to 64 KiB).
+pub const SOCKET_BYTES: usize = 4 * 1024 * 1024;
 /// Queued packets per direction and endpoint.
-pub const PACKET_SLOTS: usize = 256;
+pub const PACKET_SLOTS: usize = 1024;
+/// Static zero block for fast, allocation-free bulk sends.
+pub(crate) static ZERO_CHUNK: [u8; 65_536] = [0; 65_536];
 /// Smallest test MTU (IPv4 minimum datagram).
 pub const MIN_MTU: usize = 576;
 /// Largest test MTU.
@@ -181,6 +184,7 @@ pub fn rate(bytes: u64, elapsed: Duration) -> u64 {
 pub(crate) struct Queues {
     pub(crate) incoming: VecDeque<Vec<u8>>,
     pub(crate) outgoing: VecDeque<Vec<u8>>,
+    pub(crate) free: Vec<Vec<u8>>,
     pub(crate) mtu: usize,
     /// Peer packets dropped because the incoming queue was full or the
     /// packet was oversized.
@@ -195,17 +199,20 @@ impl RxToken for Rx {
         f(&self.0)
     }
 }
-pub(crate) struct Tx<'a>(&'a mut VecDeque<Vec<u8>>);
+pub(crate) struct Tx<'a> {
+    outgoing: &'a mut VecDeque<Vec<u8>>,
+    free: &'a mut Vec<Vec<u8>>,
+}
 impl TxToken for Tx<'_> {
     fn consume<R, F>(self, len: usize, f: F) -> R
     where
         F: FnOnce(&mut [u8]) -> R,
     {
-        // The IP-medium stack writes one complete packet within its MTU;
-        // acquiring this token already checked for a free slot.
-        let mut packet = vec![0; len];
+        // Reuse a pooled packet buffer when available to avoid per-packet heap churn.
+        let mut packet = self.free.pop().unwrap_or_default();
+        packet.resize(len, 0);
         let result = f(&mut packet);
-        self.0.push_back(packet);
+        self.outgoing.push_back(packet);
         result
     }
 }
@@ -217,13 +224,22 @@ impl Device for Queues {
             return None;
         }
         let packet = self.incoming.pop_front()?;
-        Some((Rx(packet), Tx(&mut self.outgoing)))
+        Some((
+            Rx(packet),
+            Tx {
+                outgoing: &mut self.outgoing,
+                free: &mut self.free,
+            },
+        ))
     }
     fn transmit(&mut self, _: Instant) -> Option<Tx<'_>> {
         if self.outgoing.len() >= PACKET_SLOTS {
             return None;
         }
-        Some(Tx(&mut self.outgoing))
+        Some(Tx {
+            outgoing: &mut self.outgoing,
+            free: &mut self.free,
+        })
     }
     fn capabilities(&self) -> DeviceCapabilities {
         let mut caps = DeviceCapabilities::default();
@@ -239,8 +255,9 @@ impl Queues {
             return Err(Error::Mtu);
         }
         Ok(Self {
-            incoming: VecDeque::new(),
-            outgoing: VecDeque::new(),
+            incoming: VecDeque::with_capacity(PACKET_SLOTS),
+            outgoing: VecDeque::with_capacity(PACKET_SLOTS),
+            free: Vec::with_capacity(PACKET_SLOTS),
             mtu,
             dropped: 0,
         })
@@ -252,7 +269,17 @@ impl Queues {
             self.dropped = self.dropped.saturating_add(1);
             return;
         }
-        self.incoming.push_back(packet.to_vec());
+        let mut buf = self.free.pop().unwrap_or_default();
+        buf.clear();
+        buf.extend_from_slice(packet);
+        self.incoming.push_back(buf);
+    }
+    /// Return a consumed buffer to the bounded pool.
+    pub(crate) fn recycle(&mut self, mut buf: Vec<u8>) {
+        if self.free.len() < PACKET_SLOTS * 2 && buf.capacity() <= self.mtu.saturating_mul(2) {
+            buf.clear();
+            self.free.push(buf);
+        }
     }
 }
 
@@ -303,9 +330,48 @@ pub(crate) fn tcp_socket() -> tcp::Socket<'static> {
         tcp::SocketBuffer::new(vec![0; SOCKET_BYTES]),
     );
     socket.set_nagle_enabled(false);
+    // Avoid 10 ms delayed-ACK pauses slowing Reno slow-start and throughput.
+    socket.set_ack_delay(None);
     socket.set_congestion_control(tcp::CongestionControl::Reno);
     socket.set_timeout(Some(smoltcp::time::Duration::from_secs(10)));
     socket
+}
+
+/// Adaptive TCP send-queue cap (~250 ms of actual drained rate, bounded to
+/// `[64 KiB, SOCKET_BYTES]`) so high-BDP gigabit links get the full 4 MiB
+/// window while slow 1-5 Mbit/s links drain TCP FIN well inside `GRACE`.
+pub(crate) fn adaptive_send_queue(started: Duration, now: Duration, drained: u64) -> usize {
+    let elapsed_us = now.saturating_sub(started).as_micros();
+    if elapsed_us >= 250_000 {
+        let bytes_per_sec = u128::from(drained).saturating_mul(1_000_000) / elapsed_us;
+        usize::try_from(bytes_per_sec / 4)
+            .unwrap_or(SOCKET_BYTES)
+            .clamp(64 * 1024, SOCKET_BYTES)
+    } else {
+        128 * 1024
+    }
+}
+
+/// Fill a TCP socket's send buffer up to `max_queue` queued bytes so slow links
+/// do not trap a large backlog behind TCP FIN when a stream ends.
+pub(crate) fn fill_zeros_capped(socket: &mut tcp::Socket<'static>, max_queue: usize) -> u64 {
+    let mut total = 0_u64;
+    while socket.can_send() {
+        let queued = socket.send_queue();
+        let room = max_queue.saturating_sub(queued);
+        if room == 0 {
+            break;
+        }
+        let chunk = &ZERO_CHUNK[..room.min(ZERO_CHUNK.len())];
+        let Ok(sent) = socket.send_slice(chunk) else {
+            break;
+        };
+        if sent == 0 {
+            break;
+        }
+        total = total.saturating_add(sent as u64);
+    }
+    total
 }
 
 /// The 16-byte request header.
@@ -435,16 +501,18 @@ impl Stack {
         }
         self.last = now;
         let at = instant(now)?;
-        // Each poll handles a bounded burst; a few rounds drain what the
-        // queues allow without spinning.
-        for _ in 0..4 {
-            let _ = self.interface.poll(at, &mut self.queues, &mut self.sockets);
+        // Drain bounded bursts while sockets make progress; stop at once when idle.
+        for _ in 0..16 {
+            let result = self.interface.poll(at, &mut self.queues, &mut self.sockets);
+            if matches!(result, smoltcp::iface::PollResult::None) {
+                break;
+            }
         }
         Ok(())
     }
     /// Next time the stack needs a poll.
     pub(crate) fn poll_at(&mut self, now: Duration) -> Option<Duration> {
-        if !self.queues.incoming.is_empty() {
+        if !self.queues.incoming.is_empty() || !self.queues.outgoing.is_empty() {
             return Some(now);
         }
         let at = instant(now).ok()?;

@@ -6,13 +6,13 @@ use l2tunnel_client_core::local::elevate::{StartRequest, Started};
 use l2tunnel_client_core::local::keys::KeyReference;
 use l2tunnel_client_core::local::tunnel_test::{TestRequest, TestState};
 use l2tunnel_client_core::local::{
-    DeviceChange, DeviceState, EventBody, EventState, Feature, Metrics, OperationReply,
-    OperationResult, OperationState, ProfileChange, ProfileEntry, ProfileSummary, RouteChange,
-    RouteState, ServiceId, ServiceInfo, ServiceStatus, SessionState, TerminalState, TuningSetting,
-    TuningView,
+    DeviceChange, DeviceState, EventBody, EventState, Feature, MeterPage, MeterSide, Metrics,
+    OperationReply, OperationResult, OperationState, ProfileChange, ProfileEntry, ProfileSummary,
+    RouteChange, RouteState, ServiceId, ServiceInfo, ServiceStatus, SessionState, TerminalState,
+    TuningSetting, TuningView,
 };
 use l2tunnel_client_core::secure_udp::common_status::CanonicalConfiguration;
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::path::PathBuf;
 
 /// Most retained log lines.
@@ -134,6 +134,22 @@ pub enum Query {
     TestCancel(u64),
     /// `tuning_get`.
     Tuning,
+    /// `meters_read`.
+    Meters {
+        /// Local or remote peer CSR.
+        side: MeterSide,
+        /// Whole-segment prefix (empty for all).
+        prefix: String,
+        /// Optional pagination cursor (last path of previous page).
+        cursor: Option<String>,
+    },
+    /// `rate_budget_set`.
+    RateBudgetSet {
+        /// Local upload wire budget in bytes/s.
+        send_rate: u64,
+        /// Peer send (local download) wire budget in bytes/s.
+        receive_rate: u64,
+    },
 }
 
 /// Catalogs up to this size are shown as one list.
@@ -393,10 +409,28 @@ pub struct Model {
     metrics: Option<Metrics>,
     history: History,
     catalog: Option<CatalogView>,
+    catalog_for: Option<(u64, [u8; 32])>,
+    catalog_error: Option<String>,
     target: Option<CanonicalConfiguration>,
     /// Live-tuning controls and the (generation, epoch) they were read for.
     tuning: Option<TuningView>,
     tuning_for: Option<(u64, Option<u64>)>,
+    tuning_error: Option<String>,
+    /// Live speed-budget update in flight and last error.
+    rate_budget_busy: bool,
+    rate_budget_error: Option<String>,
+    /// Latest CSR meter page, previous snapshot for rates, and error state.
+    meters: Option<MeterPage>,
+    meters_prev: Option<(MeterSide, u64, u64, BTreeMap<String, u64>)>,
+    meters_request: Option<(MeterSide, String)>,
+    meters_error: Option<String>,
+    /// Last action completion result so modal forms know whether to close or show an error.
+    action_result: Option<(Action, Result<String, String>)>,
+    /// Last diagnostic export completion result.
+    exported: Option<Result<PathBuf, String>>,
+    /// Sequence boundary of the initial event backlog; historical completions
+    /// at or below this sequence are not fetched via `OperationGet`.
+    backlog_end: Option<u64>,
     in_flight: Vec<Query>,
     /// Reads asked for while the same read was in flight; sent again when
     /// it answers, so a reply from before a change never stays on screen.
@@ -404,6 +438,14 @@ pub struct Model {
     /// Last logged event sequence per service instance, so a restarted
     /// follower continues instead of logging events twice.
     seen: Option<(ServiceId, u64)>,
+}
+
+fn friendly_query_error(error: &str) -> String {
+    if error.contains("unexpected end of file") {
+        "not supported by this service version (update or restart the service)".into()
+    } else {
+        bounded(error)
+    }
 }
 
 fn dash<T: ToString>(value: Option<T>) -> String {
@@ -556,9 +598,19 @@ impl Model {
         self.metrics = None;
         self.history.clear();
         self.catalog = None;
+        self.catalog_for = None;
+        self.catalog_error = None;
         self.target = None;
         self.tuning = None;
         self.tuning_for = None;
+        self.tuning_error = None;
+        self.meters = None;
+        self.meters_prev = None;
+        self.meters_request = None;
+        self.meters_error = None;
+        self.action_result = None;
+        self.exported = None;
+        self.backlog_end = None;
         self.in_flight.clear();
         self.again.clear();
         self.seen = None;
@@ -621,13 +673,21 @@ impl Model {
         let Some(key) = self.session_key() else {
             self.tuning = None;
             self.tuning_for = None;
+            self.tuning_error = None;
             return Vec::new();
         };
         if self.tuning_for == Some(key) {
             return Vec::new();
         }
         self.tuning_for = Some(key);
+        self.tuning_error = None;
         self.query(Query::Tuning)
+    }
+    /// Manually retry loading live-tuning controls for the current session.
+    pub fn retry_tuning(&mut self) -> Vec<Command> {
+        self.tuning_for = None;
+        self.tuning_error = None;
+        self.refresh_tuning()
     }
     /// Latest live-tuning controls of the live session.
     pub fn tuning(&self) -> Option<&TuningView> {
@@ -635,6 +695,91 @@ impl Model {
             self.session_key()
                 .is_some_and(|key| self.tuning_for == Some(key))
         })
+    }
+    /// Why live-tuning controls could not be read for the live session.
+    pub fn tuning_error(&self) -> Option<&str> {
+        self.tuning_error.as_deref().filter(|_| {
+            self.session_key()
+                .is_some_and(|key| self.tuning_for == Some(key))
+        })
+    }
+    /// Whether a live-tuning query is currently in flight.
+    pub fn tuning_loading(&self) -> bool {
+        self.in_flight
+            .iter()
+            .any(|pending| matches!(pending, Query::Tuning))
+    }
+    /// Refresh service metadata (version, uptime, capabilities).
+    pub fn refresh_info(&mut self) -> Vec<Command> {
+        self.query(Query::Info)
+    }
+    /// Read one page of CSR meter registers.
+    pub fn refresh_meters(
+        &mut self,
+        side: MeterSide,
+        prefix: String,
+        cursor: Option<String>,
+    ) -> Vec<Command> {
+        if cursor.is_none() {
+            self.meters_error = None;
+        }
+        if self.meters_request.as_ref() != Some(&(side, prefix.clone())) {
+            self.meters = None;
+            self.meters_prev = None;
+            self.meters_error = None;
+        }
+        self.meters_request = Some((side, prefix.clone()));
+        self.query(Query::Meters {
+            side,
+            prefix,
+            cursor,
+        })
+    }
+    /// Latest CSR meter page.
+    pub fn meters(&self) -> Option<&MeterPage> {
+        self.meters.as_ref()
+    }
+    /// Why CSR meters could not be read.
+    pub fn meters_error(&self) -> Option<&str> {
+        self.meters_error.as_deref()
+    }
+    /// Whether a CSR meter read is in flight.
+    pub fn meters_loading(&self) -> bool {
+        self.in_flight
+            .iter()
+            .any(|pending| matches!(pending, Query::Meters { .. }))
+    }
+    /// Per-second rate of register `path` against the previous snapshot of the
+    /// same side and session generation, when monotonically advancing.
+    pub fn meter_rate(&self, path: &str, value: u64) -> Option<f64> {
+        let current = self.meters.as_ref()?;
+        let (side, generation, prev_ms, prev_map) = self.meters_prev.as_ref()?;
+        if *side != current.side
+            || *generation != current.generation
+            || current.sampled_ms <= *prev_ms
+        {
+            return None;
+        }
+        let before = prev_map.get(path)?;
+        let delta = value.checked_sub(*before)?;
+        let seconds = (current.sampled_ms - *prev_ms) as f64 / 1000.0;
+        (seconds > 0.0).then_some(delta as f64 / seconds)
+    }
+    /// Consume the latest completion result for `action`, if it matches.
+    pub fn take_action_result(&mut self, action: Action) -> Option<Result<String, String>> {
+        if self
+            .action_result
+            .as_ref()
+            .is_some_and(|(kind, _)| *kind == action)
+        {
+            self.action_result.take().map(|(_, result)| result)
+        } else {
+            None
+        }
+    }
+    /// Consume the latest diagnostic export completion result.
+    pub fn take_exported(&mut self) -> Option<Result<PathBuf, String>> {
+        self.exported.take()
     }
     /// Submit a device change.
     pub fn change_device(&mut self, change: DeviceChange) -> Vec<Command> {
@@ -931,7 +1076,8 @@ impl Model {
         self.catalog.as_ref()
     }
     /// Whether the displayed catalog page is missing or belongs to another
-    /// generation or catalog than the live session's.
+    /// generation or catalog than the live session's. Returns `false` when the
+    /// current session's catalog already failed so the UI does not spin-retry.
     pub fn catalog_stale(&self) -> bool {
         let live = self
             .status
@@ -939,16 +1085,58 @@ impl Model {
             .and_then(|status| status.observation.as_ref())
             .and_then(|observation| observation.common.as_ref())
             .map(|common| (common.generation, common.catalog));
-        live.is_some()
-            && self
-                .catalog
-                .as_ref()
-                .map(|view| (view.generation, view.root))
-                != live
+        let Some(live) = live else {
+            return false;
+        };
+        if self.catalog_error.is_some() && self.catalog_for == Some(live) {
+            return false;
+        }
+        self.catalog
+            .as_ref()
+            .map(|view| (view.generation, view.root))
+            != Some(live)
+    }
+    /// Why the current session's catalog could not be read.
+    pub fn catalog_error(&self) -> Option<&str> {
+        let live = self
+            .status
+            .as_ref()
+            .and_then(|status| status.observation.as_ref())
+            .and_then(|observation| observation.common.as_ref())
+            .map(|common| (common.generation, common.catalog));
+        self.catalog_error
+            .as_deref()
+            .filter(|_| live.is_some() && self.catalog_for == live)
+    }
+    /// Clear the catalog error and fetch page 0 again.
+    pub fn retry_catalog(&mut self) -> Vec<Command> {
+        self.catalog_error = None;
+        self.catalog_for = None;
+        self.catalog_page(0)
     }
     /// Whether an action is in flight.
     pub fn busy(&self) -> bool {
         self.busy.is_some()
+    }
+    /// Negotiate a live wire speed-budget update (bytes/s) with the peer.
+    pub fn set_rate_budget(&mut self, send_rate: u64, receive_rate: u64) -> Vec<Command> {
+        if self.rate_budget_busy {
+            return Vec::new();
+        }
+        self.rate_budget_busy = true;
+        self.rate_budget_error = None;
+        self.query(Query::RateBudgetSet {
+            send_rate,
+            receive_rate,
+        })
+    }
+    /// Whether a live speed-budget update is in flight.
+    pub fn rate_budget_busy(&self) -> bool {
+        self.rate_budget_busy
+    }
+    /// Last speed-budget error, if any.
+    pub fn rate_budget_error(&self) -> Option<&str> {
+        self.rate_budget_error.as_deref()
     }
     /// Identity of the attached service instance.
     pub fn service(&self) -> Option<ServiceId> {
@@ -989,9 +1177,21 @@ impl Model {
             } if current(attach) => {
                 self.refreshing = false;
                 let mut commands = Vec::new();
+                let mut need_info = self.info.is_none();
                 match result {
                     Ok(reply) if reply.ok && reply.status.is_some() => {
                         let restarted = reply.service.is_some() && reply.service != self.service;
+                        let previous_state = self
+                            .status
+                            .as_ref()
+                            .map(|status| (status.phase.clone(), status.generation));
+                        let next_state = reply
+                            .status
+                            .as_ref()
+                            .map(|status| (status.phase.clone(), status.generation));
+                        if restarted || previous_state != next_state {
+                            need_info = true;
+                        }
                         self.service = reply.service.or(self.service);
                         self.status = reply.status;
                         if self.notice.starts_with("Service") {
@@ -1000,13 +1200,19 @@ impl Model {
                         if (start_follower || restarted || self.follower.is_none())
                             && let Some(path) = self.path.clone()
                         {
+                            let after = self.follow_after();
+                            let cursor =
+                                self.status.as_ref().map_or(0, |status| status.event_cursor);
+                            // Suppress `OperationGet` hydration for historical backlog
+                            // events that already happened before this window attached.
+                            self.backlog_end = (after < cursor).then_some(cursor);
                             self.next_follower += 1;
                             self.follower = Some(self.next_follower);
                             commands.push(Command::Follow {
                                 attach,
                                 follower: self.next_follower,
                                 path,
-                                after: self.follow_after(),
+                                after,
                                 service: self.service,
                             });
                         }
@@ -1022,7 +1228,9 @@ impl Model {
                             .lost_service(format!("Service unavailable: {}", bounded(&error)));
                     }
                 }
-                commands.extend(self.query(Query::Info));
+                if need_info {
+                    commands.extend(self.query(Query::Info));
+                }
                 if self.dirty {
                     self.dirty = false;
                     commands.extend(self.refresh(false));
@@ -1042,8 +1250,48 @@ impl Model {
                     .iter()
                     .position(|waiting| std::mem::discriminant(waiting) == kind)
                     .map(|index| self.again.remove(index));
-                let Ok(reply) = result else {
-                    return again.map(|query| self.query(query)).unwrap_or_default();
+                let reply = match result {
+                    Ok(reply) => reply,
+                    Err(error) => {
+                        let text = friendly_query_error(&error);
+                        match query {
+                            Query::Tuning => {
+                                self.tuning = None;
+                                self.tuning_error = Some(text);
+                            }
+                            Query::Catalog {
+                                generation,
+                                catalog,
+                                ..
+                            } => {
+                                self.catalog_for = Some((generation, catalog));
+                                self.catalog_error = Some(text);
+                            }
+                            Query::Meters { side, prefix, .. } => {
+                                if self.meters_request.as_ref() == Some(&(side, prefix)) {
+                                    self.meters_error = Some(text);
+                                }
+                            }
+                            Query::RateBudgetSet { .. } => {
+                                self.rate_budget_busy = false;
+                                self.rate_budget_error = Some(text);
+                            }
+                            Query::Profiles if self.profiles.is_none() => {
+                                self.profiles = Some(Vec::new());
+                                self.notice = format!("profile list failed: {text}");
+                            }
+                            Query::Sessions if self.sessions.is_none() => {
+                                self.sessions = Some(Vec::new());
+                                self.notice = format!("session list failed: {text}");
+                            }
+                            Query::Keys(name) if self.keys.is_none() => {
+                                self.keys = Some((name, Vec::new()));
+                                self.notice = format!("profile keys failed: {text}");
+                            }
+                            _ => {}
+                        }
+                        return again.map(|query| self.query(query)).unwrap_or_default();
+                    }
                 };
                 match query {
                     Query::Info => self.info = reply.info,
@@ -1081,10 +1329,79 @@ impl Model {
                     Query::Tuning => {
                         if reply.ok {
                             self.tuning = reply.tuning.map(|view| *view);
+                            self.tuning_error = None;
                         } else {
                             self.tuning = None;
                             if reply.code != "closed" {
-                                self.notice = format!("tuning refused: {}", bounded(&reply.code));
+                                let reason = format!("refused ({})", bounded(&reply.code));
+                                self.notice = format!("tuning {reason}");
+                                self.tuning_error = Some(reason);
+                            } else {
+                                self.tuning_error = Some("service is closed".into());
+                            }
+                        }
+                    }
+                    Query::Meters {
+                        side,
+                        prefix,
+                        cursor,
+                    } => {
+                        if self.meters_request.as_ref() == Some(&(side, prefix)) {
+                            if reply.ok
+                                && let Some(page) = reply.meters
+                            {
+                                let page = *page;
+                                self.meters_error = None;
+                                if cursor.is_some()
+                                    && let Some(existing) = &mut self.meters
+                                    && existing.side == page.side
+                                    && existing.generation == page.generation
+                                {
+                                    existing.entries.extend(page.entries);
+                                    existing.next = page.next;
+                                    existing.sampled_ms = page.sampled_ms;
+                                    existing.age_ms = page.age_ms;
+                                } else {
+                                    if let Some(previous) = &self.meters
+                                        && previous.side == page.side
+                                        && previous.generation == page.generation
+                                        && page.sampled_ms > previous.sampled_ms
+                                    {
+                                        let snapshot = previous
+                                            .entries
+                                            .iter()
+                                            .map(|entry| (entry.path.clone(), entry.value))
+                                            .collect();
+                                        self.meters_prev = Some((
+                                            previous.side,
+                                            previous.generation,
+                                            previous.sampled_ms,
+                                            snapshot,
+                                        ));
+                                    }
+                                    self.meters = Some(page);
+                                }
+                            } else if !reply.ok {
+                                self.meters_error = Some(match reply.code.as_str() {
+                                    "peer_timeout" => {
+                                        "peer did not answer (the remote server may be on an older build)".into()
+                                    }
+                                    "remote_unavailable" => {
+                                        "remote meters are not available on this carrier or service version".into()
+                                    }
+                                    "peer_unsupported" => {
+                                        "the remote peer does not support in-band meters".into()
+                                    }
+                                    "busy" => {
+                                        "another meter read is in flight (rate limited to 4/s)".into()
+                                    }
+                                    "not_running" => {
+                                        "no active session to read meters from".into()
+                                    }
+                                    _ => format!("refused ({})", bounded(&reply.code)),
+                                });
+                            } else {
+                                self.meters_error = Some("service replied without meters".into());
                             }
                         }
                     }
@@ -1126,11 +1443,58 @@ impl Model {
                             self.history.push(Sample::of(service.0, metrics));
                         }
                     }
+                    Query::RateBudgetSet {
+                        send_rate,
+                        receive_rate,
+                    } => {
+                        self.rate_budget_busy = false;
+                        if reply.ok {
+                            self.rate_budget_error = None;
+                            if reply.status.is_some() {
+                                self.status = reply.status;
+                            }
+                            let up = crate::stats::rate_text(
+                                crate::stats::Rate::SentBits,
+                                Some(send_rate as f64 * 8.0),
+                            );
+                            let down = crate::stats::rate_text(
+                                crate::stats::Rate::SentBits,
+                                Some(receive_rate as f64 * 8.0),
+                            );
+                            let msg = format!("Speed budget updated: Up {up} · Down {down}");
+                            self.notice = msg.clone();
+                            self.append(msg);
+                            let mut next = self.refresh(false);
+                            if let Some(q) = again {
+                                next.extend(self.query(q));
+                            }
+                            return next;
+                        } else {
+                            let reason = match reply.code.as_str() {
+                                "peer_timeout" => {
+                                    "peer did not confirm (restart the server on the latest build)"
+                                        .into()
+                                }
+                                "invalid_rate" => {
+                                    "rate must be between 1 Mb/s and 10 Gb/s".into()
+                                }
+                                "busy" => "another speed-budget update is in flight".into(),
+                                "unsupported" => {
+                                    "speed-budget tuning is not supported by this service or backend"
+                                        .into()
+                                }
+                                "not_running" => "connect first to tune the speed budget".into(),
+                                _ => format!("refused ({})", bounded(&reply.code)),
+                            };
+                            self.rate_budget_error = Some(reason);
+                        }
+                    }
                     Query::Catalog {
                         generation,
                         catalog,
                         ..
                     } => {
+                        self.catalog_for = Some((generation, catalog));
                         if let Some(page) = reply
                             .observation
                             .and_then(|observation| observation.common)
@@ -1145,8 +1509,14 @@ impl Model {
                                 entries: page.configurations,
                             };
                             self.catalog = Some(merge_catalog(self.catalog.take(), page));
+                            self.catalog_error = None;
                         } else if !reply.ok {
-                            self.notice = format!("catalog refused: {}", bounded(&reply.code));
+                            let reason = format!("refused ({})", bounded(&reply.code));
+                            self.notice = format!("catalog {reason}");
+                            self.catalog_error = Some(reason);
+                        } else {
+                            self.catalog_error =
+                                Some("service replied without catalog page".into());
                         }
                     }
                 }
@@ -1158,19 +1528,20 @@ impl Model {
                 outcome,
             } if current(attach) => {
                 self.busy = None;
-                self.notice = match outcome {
+                let result = match outcome {
                     ActionOutcome::Reply(reply) if reply.ok => {
                         let id = dash(reply.operation.as_ref().map(|state| state.id));
-                        if action == Action::Cancel {
+                        let message = if action == Action::Cancel {
                             format!("Cancellation requested for operation {id}")
                         } else if action == Action::Switch {
                             self.target = None;
                             format!("Operation {id} accepted (switch)")
                         } else {
                             format!("Operation {id} accepted ({})", action.name())
-                        }
+                        };
+                        Ok(message)
                     }
-                    ActionOutcome::Reply(reply) => match &reply.check {
+                    ActionOutcome::Reply(reply) => Err(match &reply.check {
                         Some(check) => format!(
                             "{} refused: {} ({})",
                             action.name(),
@@ -1178,9 +1549,15 @@ impl Model {
                             bounded(check.reason.as_deref().unwrap_or(""))
                         ),
                         None => format!("{} refused: {}", action.name(), bounded(&reply.code)),
-                    },
-                    ActionOutcome::Failed(text) => format!("{} failed: {}", action.name(), text),
+                    }),
+                    ActionOutcome::Failed(text) => {
+                        Err(format!("{} failed: {}", action.name(), text))
+                    }
                 };
+                self.notice = match &result {
+                    Ok(message) | Err(message) => message.clone(),
+                };
+                self.action_result = Some((action, result));
                 self.append(self.notice.clone());
                 self.refresh(false)
             }
@@ -1213,6 +1590,7 @@ impl Model {
                 }
                 for event in &batch.events {
                     self.append(event_text(event));
+                    let historical = self.backlog_end.is_some_and(|end| event.sequence <= end);
                     match &event.event {
                         EventBody::OperationProgress { stage, .. } => {
                             self.stage = Some(stage.clone());
@@ -1221,7 +1599,8 @@ impl Model {
                         | EventBody::OperationCompleted { .. } => self.stage = None,
                         _ => {}
                     }
-                    if let EventBody::OperationCompleted { operation, .. } = &event.event
+                    if !historical
+                        && let EventBody::OperationCompleted { operation, .. } = &event.event
                         && let Some(path) = self.path.clone()
                     {
                         commands.push(Command::Show {
@@ -1231,6 +1610,9 @@ impl Model {
                             service: self.service,
                         });
                     }
+                }
+                if self.backlog_end.is_some_and(|end| batch.next >= end) {
+                    self.backlog_end = None;
                 }
                 if batch.gap || !batch.events.is_empty() {
                     commands.extend(self.refresh(false));
@@ -1286,10 +1668,11 @@ impl Model {
             }
             Message::Exported { result } => {
                 self.exporting = false;
-                self.notice = match result {
+                self.notice = match &result {
                     Ok(file) => format!("Diagnostics written to {}", file.display()),
-                    Err(error) => format!("Diagnostics export failed: {}", bounded(&error)),
+                    Err(error) => format!("Diagnostics export failed: {}", bounded(error)),
                 };
+                self.exported = Some(result);
                 Vec::new()
             }
             Message::FollowerEnded {

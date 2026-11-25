@@ -5,8 +5,8 @@
 //! review 2026-11-24); other options stay raw rows. The service refuses
 //! unrunnable saves.
 use crate::browse::{self, Browser};
-use crate::model::{Command, Model};
-use crate::profile_fields::{self, FIELDS, GROUPS, Kind};
+use crate::model::{Action, Command, Model};
+use crate::profile_fields::{self, FIELDS, GROUPS, Kind, Validation};
 use eframe::egui;
 use l2tunnel_client_core::local::{
     self, Feature, PROFILE_VERSION, ProfileChange, ProfileDocument, ProfileRole,
@@ -35,6 +35,13 @@ pub struct Editor {
     pub extra: Vec<(String, String)>,
     /// Waiting for this profile to load (`duplicate` makes a new one).
     pub waiting: Option<(String, bool)>,
+    /// A `ProfileChange::Save` is currently in flight; keep the editor open
+    /// until the service confirms acceptance.
+    pub saving: bool,
+    /// Last refusal or transport error from saving this profile.
+    pub save_error: Option<String>,
+    /// Destination path for exporting this profile directly from the editor.
+    pub export_path: String,
 }
 impl Editor {
     /// A new client profile with the usual fixed choices filled in.
@@ -69,6 +76,9 @@ impl Editor {
         }
         editor
     }
+    fn carrier(&self) -> String {
+        self.value("--carrier").unwrap_or_default()
+    }
     fn value(&self, option: &str) -> Option<String> {
         self.values.get(option).cloned().or_else(|| {
             self.extra
@@ -80,10 +90,12 @@ impl Editor {
     /// The document the editor describes, checked like the service does.
     pub fn document(&self) -> Result<ProfileDocument, String> {
         validate_profile_name(self.name.trim()).map_err(str::to_owned)?;
+        let carrier = self.carrier();
         let mut options = BTreeMap::new();
         for (key, value) in &self.values {
-            // Fields of the other role are kept out of the document.
-            let shown = profile_fields::find(key).is_none_or(|field| field.shown(self.serve));
+            // Fields of another role or carrier are kept out of the document.
+            let shown =
+                profile_fields::find(key).is_none_or(|field| field.shown(self.serve, &carrier));
             if shown && !value.trim().is_empty() {
                 options.insert(key.clone(), value.trim().to_owned());
             }
@@ -112,23 +124,25 @@ impl Editor {
         document.validate().map_err(str::to_owned)?;
         Ok(document)
     }
-    /// What to fix before saving (the service still checks the plan).
-    pub fn problems(&self) -> Vec<String> {
-        let mut problems = Vec::new();
+    /// Hard errors (block Save) and advisory warnings (do not block Save).
+    pub fn validation(&self) -> Validation {
+        let mut out = Validation::default();
         if let Err(reason) = validate_profile_name(self.name.trim()) {
-            problems.push(format!("Name: {reason}"));
+            out.errors.push(format!("Name: {reason}"));
         }
-        problems.extend(profile_fields::problems(
+        let field_check = profile_fields::validate(
             self.serve,
             |option| self.value(option),
             |path| Path::new(path).is_file(),
-        ));
-        if problems.is_empty()
+        );
+        out.errors.extend(field_check.errors);
+        out.warnings.extend(field_check.warnings);
+        if out.errors.is_empty()
             && let Err(reason) = self.document()
         {
-            problems.push(reason);
+            out.errors.push(reason);
         }
-        problems
+        out
     }
 }
 
@@ -336,6 +350,10 @@ pub fn windows(ctx: &egui::Context, model: &mut Model, state: &mut ProfileState)
         if target == "import" {
             state.file = text;
             import(model, state);
+        } else if target == "export" {
+            if let Some(editor) = &mut state.editor {
+                editor.export_path = text;
+            }
         } else if let Some(editor) = &mut state.editor {
             editor.values.insert(target, text);
         }
@@ -352,6 +370,24 @@ pub fn windows(ctx: &egui::Context, model: &mut Model, state: &mut ProfileState)
             filled.original = Some((entry.name.clone(), entry.revision));
         }
         *editor = filled;
+    }
+    // Close the editor only after the service confirms the save; on refusal,
+    // keep the user's edits and display the reason inline.
+    if let Some(editor) = &mut state.editor
+        && editor.saving
+        && let Some(result) = model.take_action_result(Action::Profile)
+    {
+        match result {
+            Ok(_) => {
+                state.editor = None;
+                state.browser = None;
+                return commands;
+            }
+            Err(reason) => {
+                editor.saving = false;
+                editor.save_error = Some(reason);
+            }
+        }
     }
     let Some(editor) = &mut state.editor else {
         return commands;
@@ -371,19 +407,19 @@ pub fn windows(ctx: &egui::Context, model: &mut Model, state: &mut ProfileState)
         .open(&mut open)
         .collapsible(false)
         .resizable(true)
-        .default_size([900.0, 640.0])
+        .default_size([920.0, 660.0])
         .show(ctx, |ui| {
             if editor.waiting.is_some() {
                 ui.spinner();
                 return;
             }
             egui::ScrollArea::vertical()
-                .max_height(ctx.content_rect().height() - 180.0)
+                .max_height((ctx.content_rect().height() - 220.0).max(200.0))
                 .show(ui, |ui| {
                     form(ui, model, editor, &mut state.browser);
                 });
             ui.separator();
-            close = footer(ui, model, editor, &state.file, &mut commands);
+            close = footer(ui, model, editor, &mut state.browser, &mut commands);
         });
     if !open || close {
         state.editor = None;
@@ -412,6 +448,7 @@ fn form(ui: &mut egui::Ui, model: &Model, editor: &mut Editor, browser: &mut Opt
             });
             ui.end_row();
         });
+    let carrier = editor.carrier();
     let devices: Vec<String> = model
         .devices()
         .unwrap_or_default()
@@ -420,6 +457,13 @@ fn form(ui: &mut egui::Ui, model: &Model, editor: &mut Editor, browser: &mut Opt
         .map(|device| device.name.clone())
         .collect();
     for group in GROUPS {
+        let visible: Vec<_> = FIELDS
+            .iter()
+            .filter(|field| field.group == group && field.shown(editor.serve, &carrier))
+            .collect();
+        if visible.is_empty() {
+            continue;
+        }
         ui.add_space(10.0);
         ui.strong(group);
         egui::Grid::new(("profile-group", group))
@@ -427,10 +471,7 @@ fn form(ui: &mut egui::Ui, model: &Model, editor: &mut Editor, browser: &mut Opt
             .spacing([12.0, 6.0])
             .min_col_width(170.0)
             .show(ui, |ui| {
-                for field in FIELDS
-                    .iter()
-                    .filter(|field| field.group == group && field.shown(editor.serve))
-                {
+                for field in visible {
                     let label = field.label(editor.serve);
                     let text = if field.required {
                         format!("{label} *")
@@ -517,10 +558,12 @@ fn input(
                 if !path.is_empty() {
                     if Path::new(path).is_file() {
                         ui.colored_label(egui::Color32::from_rgb(60, 180, 90), "✔")
-                            .on_hover_text("file found");
+                            .on_hover_text("file readable by this window");
                     } else {
-                        ui.colored_label(ui.visuals().error_fg_color, "✘")
-                            .on_hover_text("no such file");
+                        ui.colored_label(ui.visuals().warn_fg_color, "⚠")
+                            .on_hover_text(
+                                "not readable by this window (the service will verify it on save)",
+                            );
                     }
                 }
             });
@@ -553,54 +596,103 @@ fn input(
     }
 }
 
+fn default_profile_export_path(name: &str) -> String {
+    let stem = if name.trim().is_empty() {
+        "profile"
+    } else {
+        name.trim()
+    };
+    let home = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
+        .map(PathBuf::from)
+        .unwrap_or_default();
+    home.join(format!("{stem}.json")).display().to_string()
+}
+
 fn footer(
     ui: &mut egui::Ui,
     model: &mut Model,
-    editor: &Editor,
-    file: &str,
+    editor: &mut Editor,
+    browser: &mut Option<Browser>,
     commands: &mut Vec<Command>,
 ) -> bool {
     let mut close = false;
-    let problems = editor.problems();
-    if problems.is_empty() {
+    if let Some(error) = &editor.save_error {
+        ui.colored_label(ui.visuals().error_fg_color, format!("Save failed: {error}"));
+    }
+    let validation = editor.validation();
+    if validation.errors.is_empty() {
         ui.colored_label(
             egui::Color32::from_rgb(60, 180, 90),
             "✔ Ready to save. The service checks the complete plan when you save.",
         );
     } else {
         ui.colored_label(ui.visuals().warn_fg_color, "Fix before saving:");
-        for problem in problems.iter().take(6) {
+        for problem in validation.errors.iter().take(6) {
             ui.label(format!("• {problem}"));
         }
-        if problems.len() > 6 {
-            ui.weak(format!("… and {} more", problems.len() - 6));
+        if validation.errors.len() > 6 {
+            ui.weak(format!("… and {} more", validation.errors.len() - 6));
         }
     }
+    for warning in validation.warnings.iter().take(3) {
+        ui.colored_label(ui.visuals().warn_fg_color, format!("⚠ {warning}"));
+    }
+    if validation.warnings.len() > 3 {
+        ui.weak(format!(
+            "… and {} more file warnings",
+            validation.warnings.len() - 3
+        ));
+    }
     let document = editor.document();
-    ui.horizontal(|ui| {
-        let ready = problems.is_empty() && document.is_ok() && !model.busy();
+    if editor.export_path.is_empty() {
+        editor.export_path = default_profile_export_path(&editor.name);
+    }
+    ui.horizontal_wrapped(|ui| {
+        let ready =
+            validation.errors.is_empty() && document.is_ok() && !model.busy() && !editor.saving;
         if ui
             .add_enabled(ready, egui::Button::new("💾 Save"))
             .clicked()
             && let Ok(document) = &document
         {
+            editor.saving = true;
+            editor.save_error = None;
             commands.extend(model.change_profile(ProfileChange::Save {
                 name: editor.name.trim().to_owned(),
                 document: document.clone(),
                 expected_revision: editor.original.as_ref().map(|(_, revision)| *revision),
             }));
+        }
+        if editor.saving {
+            ui.spinner();
+            ui.weak("Saving and checking plan…");
+        }
+        if ui
+            .add_enabled(!editor.saving, egui::Button::new("Cancel"))
+            .clicked()
+        {
             close = true;
+        }
+        ui.separator();
+        ui.label("Export");
+        ui.add(
+            egui::TextEdit::singleline(&mut editor.export_path)
+                .hint_text("/path/to/profile.json")
+                .desired_width(240.0),
+        );
+        if ui.button("Browse…").clicked() {
+            *browser = Some(Browser::open("export", &editor.export_path));
         }
         if ui
             .add_enabled(
-                document.is_ok() && !file.trim().is_empty(),
+                document.is_ok() && !editor.export_path.trim().is_empty(),
                 egui::Button::new("Export to file"),
             )
-            .on_hover_text("Writes the profile to the import/export file (must not exist)")
+            .on_hover_text("Writes this profile JSON to a new file (must not exist)")
             .clicked()
             && let Ok(document) = &document
         {
-            let path = PathBuf::from(file.trim());
+            let path = PathBuf::from(editor.export_path.trim());
             model.notice = match serde_json::to_value(document)
                 .map_err(std::io::Error::other)
                 .and_then(|value| local::diagnostics::write_new(&path, &value))
@@ -608,9 +700,6 @@ fn footer(
                 Ok(()) => format!("Exported to {}", path.display()),
                 Err(error) => format!("Export failed: {}: {error}", path.display()),
             };
-        }
-        if ui.button("Cancel").clicked() {
-            close = true;
         }
     });
     close
@@ -800,7 +889,8 @@ mod tests {
         editor.name = "office".into();
         assert!(
             editor
-                .problems()
+                .validation()
+                .errors
                 .iter()
                 .any(|problem| problem == "Server address is required"),
             "the template names what is missing"

@@ -110,6 +110,10 @@ mod common_native_window;
 mod device_mtu;
 #[path = "transport_meters.rs"]
 mod meters;
+#[path = "transport_rate_budget.rs"]
+mod rate_budget;
+#[path = "transport_remote_meters.rs"]
+mod remote_meters;
 #[path = "transport_tunnel_tests.rs"]
 mod tunnel_tests;
 pub use common::{
@@ -120,6 +124,8 @@ pub use common::{
 pub use common_connections::{ConnectionIngressLimits, ConnectionIngressSnapshot};
 pub use common_contract::CommonTransactionContract;
 pub use device_mtu::{DeviceMtu, DeviceMtuSnapshot};
+pub use rate_budget::{MAX_RATE_BYTES_PER_SEC, MIN_RATE_BYTES_PER_SEC, RateBudgetError};
+pub use remote_meters::{RemoteMeterError, RemoteMeterReply};
 pub use tunnel_tests::{
     AddressCheck, TunnelTestPhase, TunnelTestRefusal, TunnelTestReport, TunnelTestRequest,
 };
@@ -234,6 +240,8 @@ where
     } = &mut execution_owner;
     let driver = &mut **driver;
     driver.install_tunnel_tests(device.layer(), &requests);
+    driver.install_remote_meters(&requests);
+    driver.install_rate_budget(&requests);
     driver.install_device_mtu(device.layer(), &requests);
     let mut device =
         NativeReady::with_interest(device, Interest::READABLE.add(Interest::WRITABLE))?;
@@ -391,7 +399,9 @@ where
             execution.measure_result(TimingStage::CommonManagement, || {
                 driver.service_selected_control(now)?;
                 driver.submit_control(now)?;
-                driver.service_tunnel_tests(now)
+                driver.service_tunnel_tests(now)?;
+                driver.service_remote_meters(now)?;
+                driver.service_rate_budget(now)
             })?;
             execution.measure_result(TimingStage::CommonSend, || {
                 driver.send_and_retry_native_ingress(
@@ -446,6 +456,12 @@ where
                     if let Some(at) = driver.tunnel_test_wake(now) {
                         wake.at = wake.at.min(origin + Duration::from_micros(at));
                     }
+                    if let Some(at) = driver.remote_meters_wake() {
+                        wake.at = wake.at.min(origin + Duration::from_micros(at));
+                    }
+                    if let Some(at) = driver.rate_budget_wake() {
+                        wake.at = wake.at.min(origin + Duration::from_micros(at));
+                    }
                     Ok::<_, io::Error>((read_native, write_native, interest, wake))
                 })?;
             let mixed = matches!(
@@ -480,8 +496,10 @@ where
                         }
                         Some(Request::Common(common::Command::Reuse(request, reply))) => driver
                             .request_connection_reuse(clock(origin, sample())?, request, reply)?,
-                        // The next turn takes the queued test from the shared state.
-                        Some(Request::Common(common::Command::TestWake)) => {}
+                        // The next turn takes the queued test, meter read, or rate update from shared state.
+                        Some(Request::Common(common::Command::TestWake))
+                        | Some(Request::Common(common::Command::MetersWake))
+                        | Some(Request::Common(common::Command::RateBudgetWake)) => {}
                         None => requests.close(),
                     }
                 }
@@ -1770,6 +1788,10 @@ struct Driver {
     terminal: Option<StopReason>,
     /// Built-in tunnel tests; installed when the loop starts.
     tunnel_tests: Option<Box<tunnel_tests::Port>>,
+    /// In-band remote CSR meter reads; installed when the loop starts.
+    remote_meters: Option<Box<remote_meters::Port>>,
+    /// Authenticated live speed-budget updates; installed when the loop starts.
+    rate_budget: Option<Box<rate_budget::Port>>,
     /// Device MTU ordering for live inner-size switches; installed when the
     /// loop starts if the service gave a setter.
     device_mtu: Option<Box<device_mtu::Gate>>,
@@ -2095,6 +2117,8 @@ impl Driver {
                 Native(mg::LaneId, u16, u64),
                 Reuse(l2tunnel::connection_records::retirement::command::Command),
                 Test(Option<[u8; control::TUNNEL_TEST_BYTES]>),
+                Meters(Vec<u8>),
+                RateBudget(Vec<u8>),
             }
             let command = match envelope.body {
                 control::Body::NativeReceipt {
@@ -2115,6 +2139,14 @@ impl Driver {
                     tag: control::ProfileTag::TunnelTestV1,
                     bytes,
                 } if scope == self.records.control_scope() => Command::Test(bytes.try_into().ok()),
+                control::Body::ProfileControl {
+                    tag: control::ProfileTag::MetersV1,
+                    bytes,
+                } if scope == self.records.control_scope() => Command::Meters(bytes.to_vec()),
+                control::Body::ProfileControl {
+                    tag: control::ProfileTag::RateBudgetV1,
+                    bytes,
+                } if scope == self.records.control_scope() => Command::RateBudget(bytes.to_vec()),
                 _ => {
                     return Err(protocol(
                         "unsupported or mis-scoped authenticated control body",
@@ -2151,6 +2183,8 @@ impl Driver {
                 Command::Test(bytes) => {
                     self.receive_tunnel_test(now, bytes.as_ref().map_or(&[][..], |b| &b[..]))
                 }
+                Command::Meters(bytes) => self.receive_remote_meters(now, &bytes),
+                Command::RateBudget(bytes) => self.receive_rate_budget(now, &bytes)?,
                 Command::Native(lane, channel, record) => {
                     self.receive_common_native_delivery(now, scope, lane, channel, record)?
                 }

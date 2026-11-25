@@ -14,6 +14,10 @@ pub struct TuneForm {
     pub chosen: Option<TuningSetting>,
     /// Last repair rate chosen, restored when FEC is turned back on.
     pub rate: Option<String>,
+    /// Staged upload speed budget (Mbit/s); `None` follows the live session.
+    pub upload_mbps: Option<u32>,
+    /// Staged download speed budget (Mbit/s); `None` follows the live session.
+    pub download_mbps: Option<u32>,
 }
 
 /// Repair rates (every choice except `off`).
@@ -55,7 +59,8 @@ fn words(repair: &str) -> String {
     }
 }
 
-/// Draw the panel; returns the exchanges it needs.
+/// Draw the quick live-tuning section inside the Connection page's Protocol &
+/// Live tuning card; returns the exchanges it needs.
 pub fn show(
     ui: &mut egui::Ui,
     model: &mut Model,
@@ -63,143 +68,324 @@ pub fn show(
     connected: bool,
 ) -> Vec<Command> {
     let mut commands = model.refresh_tuning();
-    ui.add_space(12.0);
-    ui.heading("Live tuning");
-    ui.weak(
-        "FEC, repair rate and packet sizes switch live, like any protocol switch. Both \
-         sides lower the device MTU before a switch to smaller packets.",
-    );
+    ui.add_space(4.0);
     let Some(view) = model.tuning().cloned() else {
-        if connected {
-            ui.weak("Loading the tuning choices…");
+        if !connected {
+            ui.weak("Connect first; tuning choices come from the running session.");
+        } else if let Some(error) = model.tuning_error().map(str::to_owned) {
+            ui.horizontal_wrapped(|ui| {
+                ui.colored_label(
+                    ui.visuals().warn_fg_color,
+                    format!("Live tuning is unavailable: {error}"),
+                );
+                if ui.button("Retry").clicked() {
+                    commands.extend(model.retry_tuning());
+                }
+            });
+        } else if model.tuning_loading() {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.weak("Loading live tuning choices…");
+            });
         } else {
-            ui.weak("Connect first; the choices come from the running session.");
+            ui.horizontal_wrapped(|ui| {
+                ui.weak("Live tuning choices not loaded.");
+                if ui.button("Retry").clicked() {
+                    commands.extend(model.retry_tuning());
+                }
+            });
         }
+        commands.extend(speed_budget(ui, model, form, connected));
         return commands;
     };
     let Some(current) = view.current.clone() else {
-        ui.weak("The protocol in use has no tunable FEC or packet sizes.");
+        ui.weak("The active protocol has no tunable FEC or packet-size controls.");
+        commands.extend(speed_budget(ui, model, form, connected));
         return commands;
     };
-    if view.entries.len() <= 1 {
-        ui.weak(
-            "Only the setting in use is available. Add switchable choices to the client \
-             profile (Live tuning group) and connect again to switch live.",
-        );
-    }
     if form.chosen.as_ref() == Some(&current) {
         form.chosen = None;
     }
     let mut chosen = form.chosen.clone().unwrap_or_else(|| current.clone());
     let rates = rates(&view);
-    egui::Frame::group(ui.style()).show(ui, |ui| {
-        ui.set_width(ui.available_width().min(760.0));
-        egui::Grid::new("tuning-controls")
-            .num_columns(2)
-            .spacing([16.0, 6.0])
-            .show(ui, |ui| {
-                ui.label("Forward error correction");
-                let mut fec = chosen.repair != "off";
-                let can_toggle =
-                    view.repair.iter().any(|repair| repair == "off") && !rates.is_empty();
-                let toggle = ui.add_enabled(can_toggle, egui::Checkbox::new(&mut fec, "on"));
-                if toggle.changed() {
-                    chosen.repair = if fec {
-                        fec_rate(&view, form).unwrap_or_else(|| "off".to_owned())
-                    } else {
-                        "off".to_owned()
-                    };
+    let mut edited = false;
+
+    egui::Grid::new("tuning-controls")
+        .num_columns(2)
+        .spacing([16.0, 6.0])
+        .show(ui, |ui| {
+            ui.label("Forward error correction");
+            let mut fec = chosen.repair != "off";
+            let can_toggle = view.repair.iter().any(|repair| repair == "off") && !rates.is_empty();
+            ui.horizontal_wrapped(|ui| {
+                if can_toggle {
+                    let fec_label = if fec { "Enabled" } else { "Off (ARQ only)" };
+                    let toggle = ui.checkbox(&mut fec, fec_label);
+                    if toggle.changed() {
+                        edited = true;
+                        chosen.repair = if fec {
+                            fec_rate(&view, form).unwrap_or_else(|| "off".to_owned())
+                        } else {
+                            "off".to_owned()
+                        };
+                    }
+                    if fec {
+                        if rates.len() > 1 {
+                            egui::ComboBox::from_id_salt("tuning-repair")
+                                .selected_text(words(&chosen.repair))
+                                .show_ui(ui, |ui| {
+                                    for rate in &rates {
+                                        if ui
+                                            .selectable_label(chosen.repair == *rate, words(rate))
+                                            .clicked()
+                                        {
+                                            edited = true;
+                                            chosen.repair = (*rate).to_owned();
+                                            form.rate = Some((*rate).to_owned());
+                                        }
+                                    }
+                                });
+                        } else {
+                            ui.weak(format!("· {}", words(&chosen.repair)));
+                        }
+                    }
+                } else {
+                    ui.label(words(&chosen.repair));
+                    ui.weak("(fixed by plan)");
                 }
-                ui.end_row();
+            });
+            ui.end_row();
 
-                ui.label("Repair rate");
-                ui.add_enabled_ui(chosen.repair != "off" && rates.len() > 1, |ui| {
-                    egui::ComboBox::from_id_salt("tuning-repair")
-                        .selected_text(words(&chosen.repair))
-                        .show_ui(ui, |ui| {
-                            for rate in &rates {
-                                if ui
-                                    .selectable_label(chosen.repair == *rate, words(rate))
-                                    .clicked()
-                                {
-                                    chosen.repair = (*rate).to_owned();
-                                    form.rate = Some((*rate).to_owned());
-                                }
-                            }
-                        });
-                });
-                ui.end_row();
-
-                ui.label("Device MTU (inner packets)");
+            ui.label("Device MTU (inner)");
+            if view.device_mtu.len() > 1 {
                 egui::ComboBox::from_id_salt("tuning-device-mtu")
                     .selected_text(format!("{} bytes", chosen.device_mtu))
                     .show_ui(ui, |ui| {
                         for mtu in &view.device_mtu {
-                            ui.selectable_value(
-                                &mut chosen.device_mtu,
-                                *mtu,
-                                format!("{mtu} bytes"),
-                            );
+                            if ui
+                                .selectable_value(
+                                    &mut chosen.device_mtu,
+                                    *mtu,
+                                    format!("{mtu} bytes"),
+                                )
+                                .changed()
+                            {
+                                edited = true;
+                            }
                         }
                     });
-                ui.end_row();
+            } else {
+                ui.horizontal(|ui| {
+                    ui.label(format!("{} bytes", chosen.device_mtu));
+                    ui.weak("(fixed by plan)");
+                });
+            }
+            ui.end_row();
 
-                ui.label("Path MTU (outer packets)");
+            ui.label("Path MTU (outer)");
+            if view.path_mtu.len() > 1 {
                 egui::ComboBox::from_id_salt("tuning-path-mtu")
                     .selected_text(format!("{} bytes", chosen.path_mtu))
                     .show_ui(ui, |ui| {
                         for mtu in &view.path_mtu {
-                            ui.selectable_value(&mut chosen.path_mtu, *mtu, format!("{mtu} bytes"));
+                            if ui
+                                .selectable_value(
+                                    &mut chosen.path_mtu,
+                                    *mtu,
+                                    format!("{mtu} bytes"),
+                                )
+                                .changed()
+                            {
+                                edited = true;
+                            }
                         }
                     });
-                ui.end_row();
-            });
-        if let Some(device) = &view.device {
-            let value =
-                |mtu: Option<u32>| mtu.map_or_else(|| "—".to_owned(), |mtu| mtu.to_string());
-            let mut line = format!(
-                "Device MTU set by the service: {} (protocol needs {})",
-                value(device.applied),
-                value(device.wanted)
-            );
-            if device.failures > 0 {
-                line.push_str(&format!(
-                    "; {} change(s) failed{}",
-                    device.failures,
-                    device
-                        .last_error
-                        .as_ref()
-                        .map_or_else(String::new, |error| format!(", last: {error}"))
-                ));
-                ui.colored_label(ui.visuals().warn_fg_color, line);
             } else {
-                ui.weak(line);
+                ui.horizontal(|ui| {
+                    ui.label(format!("{} bytes", chosen.path_mtu));
+                    ui.weak("(fixed by plan)");
+                });
             }
+            ui.end_row();
+        });
+
+    if let Some(device) = &view.device {
+        let value = |mtu: Option<u32>| mtu.map_or_else(|| "—".to_owned(), |mtu| mtu.to_string());
+        let mut line = format!(
+            "Device MTU set by service: {} (protocol needs {})",
+            value(device.applied),
+            value(device.wanted)
+        );
+        if device.failures > 0 {
+            line.push_str(&format!(
+                "; {} change(s) failed{}",
+                device.failures,
+                device
+                    .last_error
+                    .as_ref()
+                    .map_or_else(String::new, |error| format!(", last: {error}"))
+            ));
+            ui.colored_label(ui.visuals().warn_fg_color, line);
+        } else {
+            ui.weak(line);
         }
-    });
+    }
+
+    if edited {
+        // Clear any separate protocol-list radio selection so both controls stay consistent.
+        model.select_target(None);
+    }
     let changed = chosen != current;
     form.chosen = changed.then(|| chosen.clone());
     let ok = reachable(&view, &chosen);
+    if view.entries.len() > 1 {
+        ui.add_space(4.0);
+        ui.horizontal_wrapped(|ui| {
+            let ready = connected && !model.busy() && changed && ok;
+            if ui
+                .add_enabled(ready, egui::Button::new("Apply tuning"))
+                .clicked()
+            {
+                commands.extend(model.tune(chosen.clone()));
+            }
+            if changed && ui.button("Reset").clicked() {
+                form.chosen = None;
+            }
+            if !changed {
+                ui.colored_label(egui::Color32::from_rgb(90, 190, 110), "Active");
+            } else if !ok {
+                ui.colored_label(
+                    ui.visuals().warn_fg_color,
+                    "This combination is not in the session's catalog.",
+                );
+            } else if model.busy() {
+                ui.spinner();
+                ui.weak("Applying tuning…");
+            } else {
+                ui.colored_label(ui.visuals().selection.bg_fill, "Pending change");
+            }
+        });
+    }
+    commands.extend(speed_budget(ui, model, form, connected));
+    commands
+}
+
+/// Interactive live speed-budget controls (Upload & Download wire caps in Mbit/s),
+/// applied to both peers over the authenticated control channel.
+fn speed_budget(
+    ui: &mut egui::Ui,
+    model: &mut Model,
+    form: &mut TuneForm,
+    connected: bool,
+) -> Vec<Command> {
+    let mut commands = Vec::new();
+    let Some(common) = model
+        .status()
+        .and_then(|s| s.observation.as_ref())
+        .and_then(|o| o.common.as_ref())
+    else {
+        return commands;
+    };
+    let (Some(cur_send_bps), Some(cur_recv_bps)) = (common.send_rate, common.receive_rate) else {
+        return commands;
+    };
+    let to_mbps = |bytes_per_sec: u64| -> u32 {
+        let mbps = bytes_per_sec.saturating_mul(8).saturating_add(500_000) / 1_000_000;
+        u32::try_from(mbps).unwrap_or(10_000).clamp(1, 10_000)
+    };
+    let cur_up = to_mbps(cur_send_bps);
+    let cur_down = to_mbps(cur_recv_bps);
+    if form.upload_mbps == Some(cur_up) {
+        form.upload_mbps = None;
+    }
+    if form.download_mbps == Some(cur_down) {
+        form.download_mbps = None;
+    }
+    let mut up = form.upload_mbps.unwrap_or(cur_up);
+    let mut down = form.download_mbps.unwrap_or(cur_down);
+
+    ui.add_space(6.0);
+    ui.separator();
+    ui.add_space(4.0);
+    ui.strong("Speed budget");
+    egui::Grid::new("tuning-speed-budget")
+        .num_columns(2)
+        .spacing([16.0, 6.0])
+        .show(ui, |ui| {
+            ui.label("Upload / Download cap");
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Up");
+                ui.add(
+                    egui::DragValue::new(&mut up)
+                        .range(1..=10_000)
+                        .speed(5.0)
+                        .suffix(" Mb/s"),
+                );
+                ui.label("Down");
+                ui.add(
+                    egui::DragValue::new(&mut down)
+                        .range(1..=10_000)
+                        .speed(5.0)
+                        .suffix(" Mb/s"),
+                );
+            });
+            ui.end_row();
+
+            ui.label("Presets");
+            ui.horizontal_wrapped(|ui| {
+                for (label, u, d) in [
+                    ("100/10", 100_u32, 10_u32),
+                    ("200/20", 200, 20),
+                    ("300/30", 300, 30),
+                    ("500/50", 500, 50),
+                    ("1000/100", 1_000, 100),
+                    ("500 sym", 500, 500),
+                    ("1 Gb/s sym", 1_000, 1_000),
+                ] {
+                    if ui.small_button(label).clicked() {
+                        up = u;
+                        down = d;
+                    }
+                }
+            });
+            ui.end_row();
+        });
+
+    form.upload_mbps = (up != cur_up).then_some(up);
+    form.download_mbps = (down != cur_down).then_some(down);
+    let dirty = form.upload_mbps.is_some() || form.download_mbps.is_some();
+    let busy = model.rate_budget_busy();
+
     ui.add_space(4.0);
     ui.horizontal_wrapped(|ui| {
-        let ready = connected && !model.busy() && changed && ok;
-        if ui.add_enabled(ready, egui::Button::new("Apply")).clicked() {
-            commands.extend(model.tune(chosen.clone()));
+        let ready = connected && dirty && !busy;
+        if ui
+            .add_enabled(ready, egui::Button::new("Apply budget"))
+            .clicked()
+        {
+            let send_rate = u64::from(up).saturating_mul(125_000);
+            let receive_rate = u64::from(down).saturating_mul(125_000);
+            commands.extend(model.set_rate_budget(send_rate, receive_rate));
         }
-        if changed && ui.button("Reset").clicked() {
-            form.chosen = None;
+        if dirty && !busy && ui.button("Reset").clicked() {
+            form.upload_mbps = None;
+            form.download_mbps = None;
         }
-        if !changed {
-            ui.weak("In use.");
-        } else if !ok {
-            ui.colored_label(
-                ui.visuals().warn_fg_color,
-                "This combination is not in the session's catalog.",
-            );
-        } else if model.busy() {
-            ui.weak("Switching… progress shows in the top bar and Events.");
+        if busy {
+            ui.spinner();
+            ui.weak("Updating both peers…");
+        } else if !dirty {
+            ui.colored_label(egui::Color32::from_rgb(90, 190, 110), "Active");
+        } else {
+            ui.colored_label(ui.visuals().selection.bg_fill, "Pending change");
         }
     });
+    if let Some(error) = model.rate_budget_error() {
+        ui.colored_label(
+            ui.visuals().warn_fg_color,
+            format!("Speed budget update failed: {error}"),
+        );
+    }
     commands
 }
 

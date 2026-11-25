@@ -200,12 +200,14 @@ pub struct CommonStopped {
 
 pub(super) type TransactionReply = oneshot::Sender<Result<core::Epoch, SwitchError>>;
 
-/// Shared producer of complete supported generic configurations, and the
-/// service's side of the built-in tunnel tests.
+/// Shared producer of complete supported generic configurations, built-in
+/// tunnel tests, in-band remote CSR meter reads, and live speed-budget updates.
 #[derive(Clone)]
 pub struct CommonControlHandle(
     pub(super) mpsc::Sender<Command>,
     pub(super) std::sync::Arc<super::tunnel_tests::Shared>,
+    pub(super) std::sync::Arc<super::remote_meters::Shared>,
+    pub(super) std::sync::Arc<super::rate_budget::Shared>,
 );
 
 /// Unique bounded complete-configuration request receiver.
@@ -213,6 +215,8 @@ pub struct CommonControlRequests(
     pub(super) mpsc::Receiver<Command>,
     pub(super) std::sync::Arc<super::tunnel_tests::Shared>,
     pub(super) Option<std::sync::Arc<dyn super::DeviceMtu>>,
+    pub(super) std::sync::Arc<super::remote_meters::Shared>,
+    pub(super) std::sync::Arc<super::rate_budget::Shared>,
 );
 impl CommonControlRequests {
     /// Let the session set its device MTU around live inner-size switches
@@ -229,15 +233,21 @@ pub(super) enum Command {
     Reuse(super::common_reuse::Request, super::common_reuse::Reply),
     /// A tunnel test was queued in the shared state; wake the loop.
     TestWake,
+    /// A remote CSR meter read was queued in the shared state; wake the loop.
+    MetersWake,
+    /// A live speed-budget update was queued in the shared state; wake the loop.
+    RateBudgetWake,
 }
 
 /// Allocate exactly one queued request; dropping a waiter never cancels custody.
 pub fn common_channel() -> (CommonControlHandle, CommonControlRequests) {
     let (sender, receiver) = mpsc::channel(1);
     let tests = std::sync::Arc::new(super::tunnel_tests::Shared::default());
+    let meters = std::sync::Arc::new(super::remote_meters::Shared::default());
+    let rate_budget = std::sync::Arc::new(super::rate_budget::Shared::default());
     (
-        CommonControlHandle(sender, tests.clone()),
-        CommonControlRequests(receiver, tests, None),
+        CommonControlHandle(sender, tests.clone(), meters.clone(), rate_budget.clone()),
+        CommonControlRequests(receiver, tests, None, meters, rate_budget),
     )
 }
 
@@ -285,6 +295,35 @@ impl CommonControlHandle {
     /// addresses an interface or route on this host uses.
     pub fn tunnel_test_address_check(&self, check: super::tunnel_tests::AddressCheck) {
         self.1.set_check(check);
+    }
+    /// Read one page of the authenticated peer's CSR meters over the in-band
+    /// `Liveness` control stream (`ProfileTag::MetersV1`, MCSR-09).
+    pub async fn meters_remote_read(
+        &self,
+        prefix: String,
+        cursor: Option<String>,
+        limit: u16,
+    ) -> Result<super::remote_meters::RemoteMeterReply, super::remote_meters::RemoteMeterError>
+    {
+        let receiver = self.2.request(prefix, cursor, limit)?;
+        // A full channel already holds a request that wakes the loop.
+        let _ = self.0.try_send(Command::MetersWake);
+        receiver
+            .await
+            .unwrap_or(Err(super::remote_meters::RemoteMeterError::Closed))
+    }
+    /// Negotiate a live wire speed-budget update (bytes/s for local send and
+    /// peer send) with the authenticated peer (`ProfileTag::RateBudgetV1`).
+    pub async fn set_rate_budget(
+        &self,
+        send_rate: u64,
+        receive_rate: u64,
+    ) -> Result<(u64, u64), super::rate_budget::RateBudgetError> {
+        let receiver = self.3.request(send_rate, receive_rate)?;
+        let _ = self.0.try_send(Command::RateBudgetWake);
+        receiver
+            .await
+            .unwrap_or(Err(super::rate_budget::RateBudgetError::Closed))
     }
 }
 
@@ -393,6 +432,8 @@ pub(super) struct Runtime {
     pub(super) fragment_data_drops: u64,
     pub(super) fragment_feedback_drops: u64,
     pub(super) path: SameFlowRecovery,
+    /// Peer-confirmed live wire speed budget override `(send_rate, receive_rate)` in B/s.
+    pub(super) rate_override: Option<(u64, u64)>,
 }
 
 /// Run actual common record generations on the original authenticated UDP socket.
@@ -1069,6 +1110,7 @@ impl Driver {
                 fragment_data_drops: 0,
                 fragment_feedback_drops: 0,
                 path: SameFlowRecovery::default(),
+                rate_override: None,
             })?;
             // Complete ownership here. The carrier moves this same Driver into its
             // existing cell without retaining additional inline Driver return slots
@@ -1120,6 +1162,8 @@ impl Driver {
                     next_report,
                     terminal: None,
                     tunnel_tests: None,
+                    remote_meters: None,
+                    rate_budget: None,
                     device_mtu: None,
                 },
             )
@@ -1220,8 +1264,12 @@ impl Driver {
             storage: state.usage(),
             resource_preallocation_complete: false,
             engine: state.engine(state.epoch())?.statistics(),
-            send_rate: local.send().common().bytes_per_second(),
-            receive_rate: local.receive().common().bytes_per_second(),
+            send_rate: runtime
+                .rate_override
+                .map_or(local.send().common().bytes_per_second(), |(s, _)| s),
+            receive_rate: runtime
+                .rate_override
+                .map_or(local.receive().common().bytes_per_second(), |(_, r)| r),
             send_channels: local.send().channels(),
             receive_channels: local.receive().channels(),
             rolling_work: self.config.rolling_work,
@@ -1277,6 +1325,25 @@ impl Driver {
         };
         snapshot.meters = super::meters::publish(&snapshot, runtime.buffer_metrics.as_ref(), now);
         Ok(snapshot)
+    }
+
+    pub(super) fn current_meters_table(
+        &self,
+        now: u64,
+    ) -> Option<std::sync::Arc<l2tunnel_meters::Table>> {
+        if let Some(table) = self
+            .common
+            .as_deref()
+            .and_then(|runtime| runtime.buffer_metrics.as_ref())
+            .and_then(|observer| {
+                observer.published_since(now.saturating_sub(super::meters::REBUILD_INTERVAL_US))
+            })
+        {
+            return Some(table);
+        }
+        self.snapshot_common(now, true)
+            .ok()
+            .and_then(|snapshot| snapshot.meters)
     }
 }
 

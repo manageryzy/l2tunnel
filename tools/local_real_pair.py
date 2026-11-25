@@ -108,7 +108,15 @@ def in_namespace() -> bool:
 
 
 def target() -> Path:
-    return Path(os.environ.get('CARGO_TARGET_DIR', ROOT / 'target')).resolve() / 'debug'
+    base = Path(os.environ.get('CARGO_TARGET_DIR', ROOT / 'target')).resolve()
+    profile = os.environ.get('L2TUNNEL_PROFILE', '').strip().lower()
+    if profile in {'release', 'debug'}:
+        return base / profile
+    release = base / 'release' / 'l2tunneld'
+    debug = base / 'debug' / 'l2tunneld'
+    if release.exists() and (not debug.exists() or release.stat().st_mtime >= debug.stat().st_mtime):
+        return base / 'release'
+    return base / 'debug'
 
 
 def private_directory(path: Path) -> None:
@@ -139,7 +147,8 @@ def prepare(directory: Path, row_id: str, forwarding: bool = False) -> None:
     plans = directory / 'plans'
     if not plans.exists():
         subprocess.run(['cargo', 'run', '--quiet', '--locked', '-p', 'l2tunnel-client-core', '--example',
-                        'common_benchmark_plan', '--', '--output-dir', str(plans)], cwd=ROOT, check=True)
+                        'common_benchmark_plan', '--', '--output-dir', str(plans),
+                        '--symmetric-rate', '125000000'], cwd=ROOT, check=True)
     manifest = json.loads((plans / 'manifest.json').read_text())
     rows = {row['id']: row for row in manifest['rows']}
     row = rows.get(row_id)
@@ -161,6 +170,8 @@ def prepare(directory: Path, row_id: str, forwarding: bool = False) -> None:
     plan_path = plans / row['common_plan']
     plan = json.loads(plan_path.read_text())
     plan['runtime']['lifetime']['lease_micros'] = INTERACTIVE_LEASE_MICROS
+    # Interactive sessions do not need 1 Hz benchmark liveness pings.
+    plan['runtime']['lifetime']['ping_interval_micros'] = 10_000_000
     plan_path.write_text(json.dumps(plan, indent=1))
     sides = {}
     for side, other in (('a', 'b'), ('b', 'a')):
@@ -188,7 +199,55 @@ def device_ready(name: str) -> str | None:
     return None
 
 
-def run(directory: Path, side: str) -> None:
+def stop_existing_server(socket: Path, directory: Path) -> None:
+    """Stop any l2tunneld (and stale demo_server_ns_loop.sh) holding `socket`."""
+    import signal
+    import time
+
+    sock_str = str(socket)
+    dir_str = str(directory)
+    my_pid = os.getpid()
+    pids: list[int] = []
+    for entry in Path('/proc').iterdir():
+        if not entry.name.isdigit():
+            continue
+        pid = int(entry.name)
+        if pid == my_pid:
+            continue
+        try:
+            cmdline = (entry / 'cmdline').read_bytes().decode('utf-8', 'replace').split('\0')
+        except OSError:
+            continue
+        joined = ' '.join(cmdline)
+        if ('l2tunneld' in joined and sock_str in joined) or (
+            'demo_server_ns_loop.sh' in joined and (dir_str in joined or 'l2tunnel-demo' in joined)
+        ):
+            pids.append(pid)
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            pass
+    deadline = time.monotonic() + 3.0
+    while time.monotonic() < deadline:
+        alive = False
+        for pid in pids:
+            try:
+                os.kill(pid, 0)
+                alive = True
+            except OSError:
+                pass
+        if not alive:
+            break
+        time.sleep(0.1)
+    if socket.is_socket():
+        try:
+            socket.unlink()
+        except OSError:
+            pass
+
+
+def run(directory: Path, side: str, replace: bool = False) -> None:
     pair_file = directory / 'pair.json'
     if not pair_file.exists():
         prepare(directory, DEFAULT_ROW)
@@ -213,12 +272,17 @@ def run(directory: Path, side: str) -> None:
         except OSError:
             socket.unlink()  # stale socket left by an earlier run of this side
         else:
-            raise SystemExit(f'side {side} is already running ({socket} answers)')
+            if replace:
+                probe.close()
+                print(f'Replacing existing side {side} server on {socket}...', flush=True)
+                stop_existing_server(socket, directory)
+            else:
+                raise SystemExit(f'side {side} is already running ({socket} answers)')
         finally:
             probe.close()
     binary = str(target() / 'l2tunneld')
     print(f'REAL l2tunneld {pair["row"]} side {side} ({"client" if side == "a" else "server"}); '
-          f'control socket {socket}', flush=True)
+          f'binary {binary}; control socket {socket}', flush=True)
     os.execv(binary, [binary, *pair['sides'][side]])
 
 
@@ -233,6 +297,8 @@ def main() -> None:
     second = commands.add_parser('run')
     second.add_argument('--dir', type=Path, default=DEFAULT_DIR)
     second.add_argument('--side', choices=('a', 'b'), required=True)
+    second.add_argument('--replace', action='store_true',
+                        help='stop any existing server holding this control socket before starting')
     commands.add_parser('network', help='print the root commands of the forwarding layout')
     args = parser.parse_args()
     if args.command == 'prepare':
@@ -244,7 +310,7 @@ def main() -> None:
         print('# Remove it again:')
         print('\n'.join(teardown))
     else:
-        run(args.dir, args.side)
+        run(args.dir, args.side, replace=args.replace)
 
 
 if __name__ == '__main__':
