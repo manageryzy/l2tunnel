@@ -265,7 +265,8 @@ Three-card layout:
   starts a new series instead of producing a negative rate.
 - Collapsible **CSR meters (flow control, runtime, MUX)** panel with
   Local / Remote peer toggle, prefix filter, manual `Read`, optional
-  `Auto (2 s)` refresh, and rate deltas ([meter CSR](meter-csr.md)).
+  `Auto (2 s)` refresh, rate deltas, and log2 wait-latency p50/p99
+  percentiles ([meter CSR](meter-csr.md)).
 
 ### Management
 
@@ -301,7 +302,7 @@ queries; everything that changes state is a keyed operation.
 | Connect / Reconnect / Disconnect / Cancel | `service connect\|reconnect\|disconnect`, `operation cancel` | existing | implemented |
 | Connection: catalog, hot switch | `config catalog`, `config switch` | `catalog`, `switch_common_configuration` | implemented |
 | Connection: live FEC/MTU tuning | `tune show`, `tune set` | `tuning_get`, `tuning_switch` | implemented (Swift, Aligned, Packed) |
-| Connection: live speed budget | — (v5 action; CLI command pending) | `rate_budget_set` | implemented (Common sessions, 1 Mbit/s..=10 Gbit/s) |
+| Connection: live speed budget | `tune budget --symmetric MBPS \| --upload MBPS --download MBPS` | `rate_budget_set` | implemented (Common sessions, 1 Mbit/s..=10 Gbit/s; warns when kernel clamps `SO_RCVBUF`/`SO_SNDBUF`) |
 | Connection: tunnel speed & ping tests | `test speed\|ping\|status\|cancel` | `test_start`, `test_get`, `test_cancel` | implemented (Common TUN sessions) |
 | Connect with profile | `service connect\|reconnect --profile NAME` | keyed `profile_connect{name, replace}` | implemented (daemon); TCP-proxy profiles refused until the daemon hosts the proxy frontend |
 | Devices | `device list\|create\|configure\|delete` | `device_list`; keyed `device{change}` (`op`: `create`, `configure`, `delete`) | implemented on Linux (`--state-dir`); privileged run pending |

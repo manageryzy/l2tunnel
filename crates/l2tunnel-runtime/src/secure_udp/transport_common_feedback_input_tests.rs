@@ -93,7 +93,7 @@ async fn actual_udp_metrics_require_receipt_identity_and_preserve_late_acceptanc
                 runtime.wire[..pending.sealed.bytes].to_vec(),
             )
         };
-        let mut socket_owner: carrier::IoOwner = carrier::IoOwner::Udp(a.socket);
+        let mut socket_owner: carrier::IoOwner = carrier::IoOwner::from(a.socket);
         let receipt = tokio::time::timeout(Duration::from_secs(1), async {
             loop {
                 let carrier::IoOwner::Udp(socket) = &socket_owner else {
@@ -267,7 +267,7 @@ async fn actual_early_compact_feedback_keeps_original_input_until_delayed_whole_
     let original_usage = a.driver.common_state()?.usage();
     let original_charges = (a.driver.counters.wire_packets, a.driver.counters.wire_bytes);
     let next_user = a.driver.records.next_number(Class::User);
-    let mut socket_owner: carrier::IoOwner = carrier::IoOwner::Udp(a.socket);
+    let mut socket_owner: carrier::IoOwner = carrier::IoOwner::from(a.socket);
     let receipt = tokio::time::timeout(Duration::from_secs(1), async {
         loop {
             let carrier::IoOwner::Udp(socket) = &socket_owner else {
@@ -855,7 +855,7 @@ async fn observed_actual_selection_preserves_shutdown_request_and_alternating_io
     let fixture = Fixture::from_contracts_with_tail(kind, contracts, false).await?;
     let [mut a, b] = fixture.endpoints;
     let current = a.driver.common_state()?.current();
-    let mut socket: carrier::IoOwner = carrier::IoOwner::Udp(a.socket);
+    let mut socket: carrier::IoOwner = carrier::IoOwner::from(a.socket);
     b.socket.send(b"readiness fixture").await?;
     let carrier::IoOwner::Udp(udp) = &socket else {
         return Err("UDP fixture".into());

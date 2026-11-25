@@ -2272,6 +2272,7 @@ dependencies = [
  "l2tunnel",
  "l2tunnel-client-core",
  "l2tunnel-core",
+ "l2tunnel-meters",
  "l2tunnel-swift",
  "serde_json",
  "tokio",

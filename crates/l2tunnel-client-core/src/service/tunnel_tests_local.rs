@@ -272,4 +272,50 @@ mod tests {
         assert_eq!(state.state, TestPhase::Running);
         assert_eq!(state.kind, "ping");
     }
+
+    #[tokio::test]
+    async fn tunnel_test_actions_report_expected_refusals_when_idle() {
+        let (handle, _run) = crate::service::channel();
+        assert!(unavailable(&handle).is_some());
+
+        // Invalid test parameters are rejected before backend lookup.
+        let bad_speed = handle.test_start(&TestRequest::Speed {
+            direction: Direction::Upload,
+            streams: 0,
+            duration_ms: 1_000,
+        });
+        assert!(
+            (!bad_speed.ok) && bad_speed.code == "invalid_test",
+            "{bad_speed:?}"
+        );
+
+        let bad_ping = handle.test_start(&TestRequest::Ping {
+            count: 0,
+            interval_ms: 200,
+        });
+        assert!(
+            (!bad_ping.ok) && bad_ping.code == "invalid_test",
+            "{bad_ping:?}"
+        );
+
+        // Valid start/get/cancel while disconnected all return `not_connected`.
+        let valid_speed = handle.test_start(&TestRequest::Speed {
+            direction: Direction::Upload,
+            streams: 1,
+            duration_ms: 1_000,
+        });
+        assert!(
+            (!valid_speed.ok) && valid_speed.code == "not_connected",
+            "{valid_speed:?}"
+        );
+
+        let got = handle.test_get(None, 0).await;
+        assert!((!got.ok) && got.code == "not_connected", "{got:?}");
+
+        let cancelled = handle.test_cancel(1);
+        assert!(
+            (!cancelled.ok) && cancelled.code == "not_connected",
+            "{cancelled:?}"
+        );
+    }
 }

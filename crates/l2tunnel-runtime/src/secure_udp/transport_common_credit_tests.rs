@@ -613,6 +613,11 @@ async fn small_record_receive_range_clamps_the_credit_ceiling() -> Result {
             snapshot.requested_receive_buffer,
             Some(snapshot.effective.ceiling_bytes)
         );
+        assert_eq!(
+            snapshot.requested_send_buffer,
+            Some(snapshot.effective.ceiling_bytes.min(4 << 20))
+        );
+        assert!(snapshot.send_buffer_readback.is_some());
         assert!(snapshot.allowance_readback);
     }
     let sender = credit(&fixture, 0)?.sender.ok_or("sender credit")?;

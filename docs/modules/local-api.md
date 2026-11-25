@@ -39,7 +39,7 @@ secrets are absent from requests, snapshots and error responses.
 - [x] [MOD-API-03] Test real local requests, malformed inputs, size limits and path collisions. Evidence: [real socket tests](../../crates/l2tunnel-client-core/src/local/tests.rs).
 - [x] [MOD-API-04] Bind local requests to authenticated managed runtime status/switch completion. Evidence: [shared CLI integration](../../crates/l2tunnel-client-core/src/cli.rs).
 - [ ] [MOD-API-05] Add GUI/native Windows adapters, structured events and richer lifecycle operations. Status: Linux GUI (`l2tunnel-desktop-ui`) and structured v5 events/operations are implemented and tested on Unix; native Windows named-pipe verification (WLS-02..WLS-08) remains open.
-- [ ] [MOD-API-06] Add deterministic timeout tests and simultaneous local-client service tests.
+- [x] [MOD-API-06] Add deterministic timeout tests and simultaneous local-client service tests. Evidence: [deterministic read/client timeout and simultaneous 8-client Unix-socket tests](../../crates/l2tunnel-client-core/src/local/transport_operations_tests.rs) (`deterministic_read_timeout_reclaims_slot_without_disrupting_service`, `deterministic_client_timeout_reports_timed_out_for_stalled_handler`, `simultaneous_local_clients_are_all_served_within_concurrency_bound`, `connections_beyond_the_bound_are_closed_without_reply`).
 
 Platform split: `transport.rs` holds the shared loop and client exchange;
 `transport/unix.rs` binds the private socket, checks peer UIDs and cleans up

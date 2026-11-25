@@ -196,4 +196,55 @@ mod tests {
         assert_eq!(next, None);
         Ok(())
     }
+
+    #[tokio::test]
+    async fn meter_service_reports_every_validation_and_idle_refusal_code()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (handle, _run) = crate::service::channel();
+        // Local validation & idle refusals.
+        assert_eq!(handle.meters_local("", None, 0), Err("invalid_limit"));
+        assert_eq!(
+            handle.meters_local("", None, METER_PAGE_LIMIT + 1),
+            Err("invalid_limit")
+        );
+        assert_eq!(
+            handle.meters_local("Bad.Prefix", None, 10),
+            Err("invalid_prefix")
+        );
+        assert_eq!(
+            handle.meters_local("runtime", Some("BadCursor"), 10),
+            Err("invalid_cursor")
+        );
+        assert_eq!(handle.meters_local("runtime", None, 10), Err("not_running"));
+        // Remote validation & idle refusals.
+        assert_eq!(
+            handle.meters_remote("", None, 0).await,
+            Err("invalid_limit")
+        );
+        assert_eq!(
+            handle.meters_remote("Bad", None, 10).await,
+            Err("invalid_prefix")
+        );
+        assert_eq!(
+            handle.meters_remote("runtime", None, 10).await,
+            Err("not_running")
+        );
+        // Catalog validation & paging.
+        assert_eq!(handle.meters_catalog("", None, 0), Err("invalid_limit"));
+        assert_eq!(
+            handle.meters_catalog("Bad", None, 10),
+            Err("invalid_prefix")
+        );
+        let first = handle
+            .meters_catalog("flow_control.session_credit", None, 2)
+            .map_err(io::Error::other)?;
+        assert_eq!(first.entries.len(), 2);
+        let cursor = first.next.ok_or("catalog next cursor")?;
+        let second = handle
+            .meters_catalog("flow_control.session_credit", Some(cursor), 2)
+            .map_err(io::Error::other)?;
+        assert!(!second.entries.is_empty());
+        assert_ne!(first.entries[0].pattern, second.entries[0].pattern);
+        Ok(())
+    }
 }

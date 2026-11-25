@@ -82,16 +82,51 @@ impl Plan {
         self.capacity
     }
 }
+/// Bare UDP socket paired with its cached IP+UDP wire header overhead (`28` IPv4 / `48` IPv6)
+/// so the send hot path never invokes `getsockname()` per datagram.
+pub(super) struct UdpIo {
+    socket: tokio::net::UdpSocket,
+    ip_overhead: Option<usize>,
+}
+impl UdpIo {
+    pub(super) fn new(socket: tokio::net::UdpSocket) -> Self {
+        let ip_overhead = socket
+            .local_addr()
+            .ok()
+            .map(|addr| if addr.is_ipv6() { 48 } else { 28 });
+        Self {
+            socket,
+            ip_overhead,
+        }
+    }
+    pub(super) fn ip_overhead(&self) -> io::Result<usize> {
+        if let Some(overhead) = self.ip_overhead {
+            Ok(overhead)
+        } else {
+            Ok(if self.socket.local_addr()?.is_ipv6() {
+                48
+            } else {
+                28
+            })
+        }
+    }
+}
+impl std::ops::Deref for UdpIo {
+    type Target = tokio::net::UdpSocket;
+    fn deref(&self) -> &Self::Target {
+        &self.socket
+    }
+}
 /// Sole real socket owner. Carrier-only backing does not enlarge bare-UDP frames.
 pub(super) enum IoOwner<R: RawBacking = NoRaw> {
-    Udp(tokio::net::UdpSocket),
+    Udp(UdpIo),
     Carrier(Vec<CarrierIo>),
     Raw(Vec<R>),
     Maintained(Vec<MaintainedIo>),
 }
 impl From<tokio::net::UdpSocket> for IoOwner {
     fn from(socket: tokio::net::UdpSocket) -> Self {
-        Self::Udp(socket)
+        Self::Udp(UdpIo::new(socket))
     }
 }
 impl IoOwner {
@@ -220,11 +255,7 @@ impl<R: RawBacking> IoOwner<R> {
     }
     pub(super) fn ip_wire_bytes(&self) -> io::Result<usize> {
         match self {
-            Self::Udp(socket) => Ok(if socket.local_addr()?.is_ipv6() {
-                48
-            } else {
-                28
-            }),
+            Self::Udp(socket) => socket.ip_overhead(),
             Self::Maintained(values) => Ok(values[0].geometry().charged_overhead_bytes),
             Self::Raw(values) => values[0]
                 .geometry()
@@ -591,7 +622,7 @@ impl<R: RawBacking> IoOwner<R> {
         observed_udp: &mut bool,
     ) -> io::Result<(usize, Option<Instant>, Option<InputFraming>)> {
         if *observed_udp && let Self::Udp(socket) = self {
-            let socket = socket2::SockRef::from(&*socket);
+            let socket = socket2::SockRef::from(&**socket);
             match std::io::Read::read(&mut &*socket, output) {
                 Ok(length) => return Ok((length, None, None)),
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => *observed_udp = false,
@@ -791,11 +822,7 @@ fn complete(result: Result<SendReceipt, SendFailure>) -> io::Result<SendProgress
         Err(SendFailure::Ticket) => Err(protocol("original carrier ticket refused")),
     }
 }
-fn udp_write(
-    socket: &tokio::net::UdpSocket,
-    bytes: &[u8],
-    deadline: Instant,
-) -> io::Result<SendProgress> {
+fn udp_write(socket: &UdpIo, bytes: &[u8], deadline: Instant) -> io::Result<SendProgress> {
     if Instant::now() >= deadline {
         return Err(io::ErrorKind::TimedOut.into());
     }
@@ -807,11 +834,7 @@ fn udp_write(
         ));
     }
     let accepted_at = Instant::now();
-    let overhead = if socket.local_addr()?.is_ipv6() {
-        48
-    } else {
-        28
-    };
+    let overhead = socket.ip_overhead()?;
     Ok(SendProgress::Whole {
         receipt: AcceptedReceipt {
             record_bytes: written,

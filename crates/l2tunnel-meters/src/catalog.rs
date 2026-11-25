@@ -881,6 +881,8 @@ pub const ROOTS: &[Root] = &[
             counter("range_blocked", Unit::Count),
             counter("range_probes", Unit::Packets),
             gauge("min_rtt_us", Unit::Micros),
+            gauge("sndbuf_requested", Unit::Bytes),
+            gauge("sndbuf_readback", Unit::Bytes),
         ])]
     ),
     root!(

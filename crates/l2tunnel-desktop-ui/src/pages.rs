@@ -1876,6 +1876,29 @@ fn meters_section(ui: &mut egui::Ui, model: &mut Model, state: &mut UiState) -> 
                         filter.is_empty() || entry.path.to_lowercase().contains(&filter)
                     })
                     .collect();
+                let waits = wait_percentiles(&page.entries, &filter);
+                if !waits.is_empty() {
+                    ui.add_space(4.0);
+                    ui.strong("Wait latency percentiles (completed episodes)");
+                    egui::Grid::new("csr-wait-percentiles")
+                        .striped(true)
+                        .num_columns(4)
+                        .spacing([14.0, 4.0])
+                        .show(ui, |ui| {
+                            for title in ["wait cause", "episodes", "p50", "p99"] {
+                                ui.strong(title);
+                            }
+                            ui.end_row();
+                            for (cause, episodes, p50, p99) in &waits {
+                                ui.monospace(cause.as_str());
+                                ui.monospace(episodes.to_string());
+                                ui.monospace(format!("≤ {p50} µs"));
+                                ui.monospace(format!("≤ {p99} µs"));
+                                ui.end_row();
+                            }
+                        });
+                    ui.add_space(4.0);
+                }
                 if visible.is_empty() {
                     ui.weak("No matching registers.");
                 } else {
@@ -2204,9 +2227,66 @@ mod tests {
     }
 }
 
+/// Aggregate completed-episode wait histograms (`*.hist.b00..b23`) from CSR
+/// entries into `(wait_cause, total_episodes, p50_us, p99_us)` rows.
+pub fn wait_percentiles(
+    entries: &[l2tunnel_client_core::local::MeterEntry],
+    filter_lower: &str,
+) -> Vec<(String, u64, u64, u64)> {
+    let mut buckets: std::collections::BTreeMap<&str, [u64; l2tunnel_meters::wait::BUCKETS]> =
+        std::collections::BTreeMap::new();
+    for entry in entries {
+        if let Some((base, bucket)) = entry.path.rsplit_once(".hist.b")
+            && let Ok(index) = bucket.parse::<usize>()
+            && index < l2tunnel_meters::wait::BUCKETS
+        {
+            if !filter_lower.is_empty() && !base.to_lowercase().contains(filter_lower) {
+                continue;
+            }
+            buckets.entry(base).or_default()[index] = entry.value;
+        }
+    }
+    let mut rows = Vec::new();
+    for (base, counts) in buckets {
+        let total: u64 = counts.iter().copied().sum();
+        if total == 0 {
+            continue;
+        }
+        let hist = l2tunnel_meters::Histogram::from_counts(counts);
+        if let (Some(p50), Some(p99)) = (hist.quantile(0.5), hist.quantile(0.99)) {
+            rows.push((base.to_owned(), total, p50, p99));
+        }
+    }
+    rows
+}
+
 #[cfg(test)]
 mod form_tests {
     use super::*;
+
+    #[test]
+    fn wait_percentiles_computes_p50_and_p99_from_csr_histograms() {
+        use l2tunnel_client_core::local::MeterEntry;
+        let base = "runtime.native_ingress.lane0.user.wait.queue_full";
+        let entries = vec![
+            MeterEntry {
+                path: format!("{base}.hist.b03"),
+                value: 8,
+            },
+            MeterEntry {
+                path: format!("{base}.hist.b10"),
+                value: 2,
+            },
+            MeterEntry {
+                path: "runtime.wire.shared.sent_packets".into(),
+                value: 42,
+            },
+        ];
+        let rows = wait_percentiles(&entries, "");
+        assert_eq!(rows, vec![(base.to_owned(), 10, 15, 2047)]);
+        assert!(wait_percentiles(&entries, "unrelated").is_empty());
+        assert_eq!(wait_percentiles(&entries, "queue_full").len(), 1);
+    }
 
     #[test]
     fn forms_build_changes_validated_like_the_cli() {

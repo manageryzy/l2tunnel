@@ -70,7 +70,7 @@ async fn actual_swift_receipt_survives_early_ack_and_preserves_late_success() ->
                 emission,
             )
         };
-        let mut socket_owner: carrier::IoOwner = carrier::IoOwner::Udp(a.socket);
+        let mut socket_owner: carrier::IoOwner = carrier::IoOwner::from(a.socket);
         let receipt = tokio::time::timeout(Duration::from_secs(1), async {
             loop {
                 let carrier::IoOwner::Udp(socket) = &socket_owner else {

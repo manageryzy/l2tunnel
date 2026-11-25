@@ -289,6 +289,7 @@ fn speed_budget(
     let (Some(cur_send_bps), Some(cur_recv_bps)) = (common.send_rate, common.receive_rate) else {
         return commands;
     };
+    let credit = common.credit;
     let to_mbps = |bytes_per_sec: u64| -> u32 {
         let mbps = bytes_per_sec.saturating_mul(8).saturating_add(500_000) / 1_000_000;
         u32::try_from(mbps).unwrap_or(10_000).clamp(1, 10_000)
@@ -386,7 +387,57 @@ fn speed_budget(
             format!("Speed budget update failed: {error}"),
         );
     }
+    if let Some(warning) = credit
+        .as_ref()
+        .and_then(|credit| clamped_udp_buffer_warning(cur_send_bps.max(cur_recv_bps), credit))
+    {
+        ui.add_space(4.0);
+        ui.colored_label(ui.visuals().warn_fg_color, warning);
+    }
     commands
+}
+
+/// Detect when Linux (or another OS) clamped `SO_RCVBUF`/`SO_SNDBUF` far below
+/// what a >100 Mbit/s session requested, which can cause silent kernel UDP drops.
+pub fn clamped_udp_buffer_warning(
+    peak_rate_bps: u64,
+    credit: &l2tunnel_client_core::secure_udp::common_status::CreditStatus,
+) -> Option<String> {
+    if peak_rate_bps <= 12_500_000 {
+        return None;
+    }
+    let mut notes = Vec::new();
+    // Linux reports 2x the requested value on getsockopt; divide by 2 for usable bytes.
+    if let (Some(req), Some(raw)) = (
+        credit.requested_receive_buffer,
+        credit.receive_buffer_readback,
+    ) {
+        let usable = raw / 2;
+        if usable < req.min(2 << 20) / 2 {
+            notes.push(format!(
+                "SO_RCVBUF {} KiB (requested {} MiB)",
+                usable / 1024,
+                (req / (1 << 20)).max(1)
+            ));
+        }
+    }
+    if let (Some(req), Some(raw)) = (credit.requested_send_buffer, credit.send_buffer_readback) {
+        let usable = raw / 2;
+        if usable < req.min(2 << 20) / 2 {
+            notes.push(format!(
+                "SO_SNDBUF {} KiB (requested {} MiB)",
+                usable / 1024,
+                (req / (1 << 20)).max(1)
+            ));
+        }
+    }
+    if notes.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "Kernel clamped UDP socket buffer ({}); high-BDP traffic may see kernel drops. Run with CAP_NET_ADMIN or raise net.core.rmem_max / net.core.wmem_max.",
+        notes.join(", ")
+    ))
 }
 
 #[cfg(test)]
@@ -444,5 +495,42 @@ mod tests {
         assert!(reachable(&view, &setting("off", 1400)));
         assert!(reachable(&view, &setting("1/4", 1280)));
         assert!(!reachable(&view, &setting("off", 1280)));
+    }
+
+    #[test]
+    fn clamped_udp_buffer_warning_flags_high_bdp_clamps_only()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use l2tunnel_client_core::secure_udp::common_status::CreditStatus;
+        let mut credit: CreditStatus = serde_json::from_value(serde_json::json!({
+            "configured_datagrams": [64, 16384],
+            "effective_datagrams": [64, 16384],
+            "requested_receive_buffer": 33_554_432,
+            "receive_buffer_readback": 212_992,
+            "requested_send_buffer": 4_194_304,
+            "send_buffer_readback": 212_992,
+            "configured_bytes": [98304, 33_554_432],
+            "configured_period_micros": [10000, 250000],
+            "processed": 0,
+            "granted_limit": 64,
+            "granted_bytes": 98304,
+            "drain": [0, 0],
+            "allowance_bytes": 106496,
+            "allowance_readback": true,
+            "issued": 0,
+            "frozen": false,
+            "anomalies": [0, 0, 0]
+        }))?;
+        // <=100 Mb/s does not warn.
+        assert!(clamped_udp_buffer_warning(12_500_000, &credit).is_none());
+        // >100 Mb/s with 212 KiB kernel readback warns for both RCVBUF and SNDBUF.
+        let warning =
+            clamped_udp_buffer_warning(62_500_000, &credit).ok_or("expected clamp warning")?;
+        assert!(warning.contains("SO_RCVBUF"), "{warning}");
+        assert!(warning.contains("SO_SNDBUF"), "{warning}");
+        // Once kernel grants >= 2 MiB usable (4 MiB raw Linux readback), warning clears.
+        credit.receive_buffer_readback = Some(8 << 20);
+        credit.send_buffer_readback = Some(8 << 20);
+        assert!(clamped_udp_buffer_warning(62_500_000, &credit).is_none());
+        Ok(())
     }
 }

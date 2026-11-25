@@ -469,6 +469,13 @@ pub struct CreditStatus {
     /// granted value); the grant's allowance is half of it, at most 106,496.
     #[serde(default)]
     pub receive_buffer_readback: Option<u64>,
+    /// Send buffer requested from the UDP data socket (up to 4 MiB).
+    #[serde(default)]
+    pub requested_send_buffer: Option<u64>,
+    /// The kernel's raw `SO_SNDBUF` read-back after that request (Linux reports
+    /// twice the granted value).
+    #[serde(default)]
+    pub send_buffer_readback: Option<u64>,
     /// Configured floor and ceiling in bytes.
     pub configured_bytes: [u64; 2],
     /// Configured Credit period and idle heartbeat, microseconds.
@@ -528,6 +535,8 @@ impl From<l2tunnel_runtime::secure_udp::transport::CreditSnapshot> for CreditSta
             ],
             requested_receive_buffer: value.requested_receive_buffer,
             receive_buffer_readback: value.receive_buffer_readback,
+            requested_send_buffer: value.requested_send_buffer,
+            send_buffer_readback: value.send_buffer_readback,
             configured_bytes: [c.floor_bytes, c.ceiling_bytes],
             configured_period_micros: [micros(c.period), micros(c.idle_period)],
             processed: r.processed,

@@ -184,7 +184,7 @@ is the default; `--json` prints each version-5 reply as one JSON line.
 
 Additional groups (see [desktop GUI](desktop-gui.md) for the full parity table):
 `service info|start|stop`, `service connect|reconnect --profile NAME`,
-`tune show|set`, `test speed|ping|status|cancel`, `stats show|watch`,
+`tune show|set|budget`, `test speed|ping|status|cancel`, `stats show|watch`,
 `meters read|catalog|watch`, `device list|create|configure|delete`,
 `route list|add|remove|default`, `profile list|show|validate|export|import|delete|default|keys`,
 `key generate|generate-noise|generate-secret`, `session list|kick`, `member revoke`,
@@ -204,7 +204,7 @@ long-running Linux service that hosts stored profiles.
 - [x] [LOP-03] Dispatch version-5 actions onto the existing `Handle` without blocking on completion; map every `SubmitError` and `Completed` variant. Evidence: [dispatcher and tests](../../crates/l2tunnel-client-core/src/service/operations_local.rs), [retained-plan replay test](../../crates/l2tunnel-client-core/src/service/prepared_transaction_tests.rs).
 - [x] [LOP-04] Serve concurrent bounded connections so status is answered during a running operation; preserve version 1/4 behavior and timing accounting. Evidence: [transport](../../crates/l2tunnel-client-core/src/local/transport.rs), [real-socket tests](../../crates/l2tunnel-client-core/src/local/transport_operations_tests.rs).
 - [x] [LOP-05] Add the grouped CLI with request-key defaulting, watch/detach, reattachment, `--json` and the exit-code contract. Evidence: [grouped CLI](../../crates/l2tunnel-client-core/src/cli_groups.rs), [parser/exit/real-service tests](../../crates/l2tunnel-client-core/src/cli_groups_tests.rs).
-- [ ] [LOP-06] Test the acceptance matrix below with fake service backends and real Unix sockets. Every row has a local test except the first row's actual runtime completion: acceptance with a real retained plan and the event/wait sequence through the actor's own `finish`/`stage` paths are tested separately, but no test drives a real connect to readiness through version 5.
+- [x] [LOP-06] Test the acceptance matrix below with fake service backends and real Unix sockets. Evidence: [real Unix-socket concurrency/timeout/version tests](../../crates/l2tunnel-client-core/src/local/transport_operations_tests.rs), [service admission and event tests](../../crates/l2tunnel-client-core/src/service/operations_local.rs), [fake-service CLI tests](../../tools/test_fake_local_service.py), and [real Common retained-plan v5 connect/events/wait/disconnect test over a real Unix socket](../../crates/l2tunnel-client-core/src/service/tests/secure_udp_transaction.rs) (`version5_unix_socket_drives_real_common_connect_events_and_test_refusals`).
 
 ## Acceptance matrix
 

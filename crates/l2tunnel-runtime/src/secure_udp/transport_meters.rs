@@ -82,6 +82,13 @@ fn credit(table: &mut Table, value: &CreditSnapshot) -> Result<(), TableError> {
             )?;
         }
     }
+    let tx = "flow_control.session_credit.tx";
+    if let Some(requested) = value.requested_send_buffer {
+        table.put(format_args!("{tx}.sndbuf_requested"), requested)?;
+    }
+    if let Some(readback) = value.send_buffer_readback {
+        table.put(format_args!("{tx}.sndbuf_readback"), readback)?;
+    }
     Ok(())
 }
 

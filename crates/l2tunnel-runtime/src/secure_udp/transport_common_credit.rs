@@ -38,6 +38,13 @@ pub(crate) struct Counters {
     pub(crate) requested_receive_buffer: Option<u64>,
     /// The kernel's raw `SO_RCVBUF` read-back after that request.
     pub(crate) receive_buffer_readback: Option<u64>,
+    /// Send buffer requested from the data socket (up to 4 MiB).
+    pub(crate) requested_send_buffer: Option<u64>,
+    /// The kernel's raw `SO_SNDBUF` read-back after that request.
+    pub(crate) send_buffer_readback: Option<u64>,
+    /// Set when a live speed-budget raise increased `ceiling_bytes` above the
+    /// last socket buffer request so the UDP driver re-applies `SO_RCVBUF`/`SO_SNDBUF`.
+    pub(crate) buffers_dirty: bool,
 }
 
 /// Requested and effective session credit at one observation.
@@ -52,6 +59,10 @@ pub struct CreditSnapshot {
     pub requested_receive_buffer: Option<u64>,
     /// The kernel's raw read-back (Linux reports twice the granted value).
     pub receive_buffer_readback: Option<u64>,
+    /// Send buffer this endpoint requested from its UDP data socket.
+    pub requested_send_buffer: Option<u64>,
+    /// The kernel's raw `SO_SNDBUF` read-back (Linux reports twice the granted value).
+    pub send_buffer_readback: Option<u64>,
     /// Receive direction: what this endpoint grants.
     pub receiver: sc::ReceiverStatus,
     /// Send direction: what the peer granted; absent before the first data.
@@ -187,6 +198,9 @@ impl State {
         let target_bytes = (peak / 2).clamp(16 << 20, 64 << 20);
         let next_datagrams = target_datagrams.max(self.config.ceiling_datagrams);
         let next_bytes = target_bytes.max(self.config.ceiling_bytes);
+        if next_bytes > self.config.ceiling_bytes {
+            self.counters.buffers_dirty = true;
+        }
         self.config.ceiling_datagrams = next_datagrams;
         self.config.ceiling_bytes = next_bytes;
         self.receiver.raise_ceiling(next_datagrams, next_bytes);
@@ -201,6 +215,8 @@ impl State {
             effective: self.config,
             requested_receive_buffer: self.counters.requested_receive_buffer,
             receive_buffer_readback: self.counters.receive_buffer_readback,
+            requested_send_buffer: self.counters.requested_send_buffer,
+            send_buffer_readback: self.counters.send_buffer_readback,
             receiver: self.receiver.status(at(now)),
             sender: self.sender.as_ref().map(|sender| sender.status(at(now))),
             rejected: self.counters.rejected,
@@ -257,7 +273,7 @@ impl Driver {
         let Some(state) = self.credit() else {
             return Ok(());
         };
-        if state.counters.allowance_readback {
+        if state.counters.allowance_readback && !state.counters.buffers_dirty {
             return Ok(());
         }
         #[cfg(any(unix, windows))]
@@ -265,25 +281,43 @@ impl Driver {
             let target = usize::try_from(state.config.ceiling_bytes)
                 .unwrap_or(usize::MAX)
                 .min(MAX_RECEIVE_BUFFER);
+            let send_target = target.min(4 << 20);
             let sock = socket2::SockRef::from(socket);
-            if state.counters.requested_receive_buffer.is_none() {
+            if state.counters.requested_receive_buffer.is_none() || state.counters.buffers_dirty {
+                state.counters.buffers_dirty = false;
                 state.counters.requested_receive_buffer = u64::try_from(target).ok();
+                state.counters.requested_send_buffer = u64::try_from(send_target).ok();
                 // Failures leave the kernel default; the read-back shows it.
                 let _ = sock.set_recv_buffer_size(target);
                 // Also raise SO_SNDBUF (up to 4 MiB) so high-rate UDP bursts
                 // do not stall on Linux's default 212 KiB send buffer.
-                let _ = sock.set_send_buffer_size(target.min(4 << 20));
+                let _ = sock.set_send_buffer_size(send_target);
                 #[cfg(target_os = "linux")]
-                if sock
-                    .recv_buffer_size()
-                    .is_ok_and(|granted| granted / 2 < target)
                 {
-                    let _ = rustix::net::sockopt::set_socket_recv_buffer_size_force(socket, target);
+                    if sock
+                        .recv_buffer_size()
+                        .is_ok_and(|granted| granted / 2 < target)
+                    {
+                        let _ =
+                            rustix::net::sockopt::set_socket_recv_buffer_size_force(socket, target);
+                    }
+                    if sock
+                        .send_buffer_size()
+                        .is_ok_and(|granted| granted / 2 < send_target)
+                    {
+                        let _ = rustix::net::sockopt::set_socket_send_buffer_size_force(
+                            socket,
+                            send_target,
+                        );
+                    }
                 }
             }
             if let Ok(bytes) = sock.recv_buffer_size() {
                 state.counters.receive_buffer_readback = u64::try_from(bytes).ok();
                 state.observe_receive_buffer(bytes)?;
+            }
+            if let Ok(bytes) = sock.send_buffer_size() {
+                state.counters.send_buffer_readback = u64::try_from(bytes).ok();
             }
         }
         #[cfg(not(any(unix, windows)))]

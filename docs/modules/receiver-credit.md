@@ -100,18 +100,20 @@ allocation:
   The raw and carrier paths have no UDP socket to read and use 106,496 bytes,
   half of Linux's default receive buffer; status reports which one is in use.
 - Receive and send buffers: before that read-back, `credit_observe_udp` requests
-  a receive buffer of `ceiling_bytes` (using `SO_RCVBUFFORCE` on Linux when
-  `net.core.rmem_max` would cap it; the daemon holds `CAP_NET_ADMIN` for TUN)
-  and also requests `SO_SNDBUF` up to 4 MiB so high-BDP bursts do not hit small
-  default kernel send buffers. Credit can let up to `ceiling_bytes` be in flight,
-  so a receive buffer that holds it keeps a receiver stall from overflowing the
-  socket; the kernel charges only queued bytes. Without the request, every UDP
-  cell ran on the 212,992-byte default and the Packed receivers dropped up to
-  8.9% of datagrams (`work/full-matrix-20261123`). The allowance stays capped:
-  it is the grant's headroom over the measured drain, and an uncapped 16 MiB
-  allowance removed credit's limit and flooded the bottleneck queue
-  (`work/credit-20261124b/RESULTS.md`). Status and buffer metrics report the
-  requested size and the raw read-back.
+  a receive buffer of `ceiling_bytes` and a send buffer up to 4 MiB (using
+  `SO_RCVBUFFORCE` and `SO_SNDBUFFORCE` on Linux when `net.core.rmem_max`/
+  `wmem_max` would cap them and `CAP_NET_ADMIN` is present), and re-applies both
+  live whenever `RateBudgetV1` raises `ceiling_bytes`. Credit can let up to
+  `ceiling_bytes` be in flight, so a receive buffer that holds it keeps a
+  receiver stall from overflowing the socket; the kernel charges only queued
+  bytes. Without the request, every UDP cell ran on the 212,992-byte default
+  and the Packed receivers dropped up to 8.9% of datagrams
+  (`work/full-matrix-20261123`). The allowance stays capped: it is the grant's
+  headroom over the measured drain, and an uncapped 16 MiB allowance removed
+  credit's limit and flooded the bottleneck queue
+  (`work/credit-20261124b/RESULTS.md`). Status (`CreditStatus`) and CSR meters
+  (`flow_control.session_credit.rx.rcvbuf_*`, `.tx.sndbuf_*`) report the
+  requested sizes and raw kernel read-backs.
 
 The grant is
 

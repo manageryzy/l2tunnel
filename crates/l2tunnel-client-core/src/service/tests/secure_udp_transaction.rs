@@ -1094,3 +1094,264 @@ async fn tuned_device_mtu_is_lowered_on_both_ends_before_the_switch_and_restored
     }
     Ok(())
 }
+
+#[inline(never)]
+fn call_v5(
+    path: &std::path::Path,
+    action: crate::local::OperationAction,
+) -> std::pin::Pin<
+    Box<
+        dyn std::future::Future<Output = io::Result<Box<crate::local::OperationReply>>> + Send + '_,
+    >,
+> {
+    Box::pin(async move {
+        crate::local::request_operation(path, &crate::local::OperationRequest::new(action))
+            .await
+            .map(Box::new)
+    })
+}
+
+/// LOP-06 & TT-03: drive a real Common retained plan to authenticated readiness
+/// through local API v5 over a real Unix socket, observing the exact event
+/// sequence (`operation_accepted -> operation_progress -> operation_completed ->
+/// lifecycle`), `operation_wait`, live `status`, tunnel-test refusals (`busy`,
+/// `unknown_test`), and live `disconnect`.
+#[tokio::test]
+async fn version5_unix_socket_drives_real_common_connect_events_and_test_refusals() -> Result {
+    use crate::local::{
+        EventBody, OperationAction, OperationResult, Server,
+        tunnel_test::{Direction, TestRequest},
+    };
+    use std::os::unix::fs::DirBuilderExt;
+
+    let dir = std::env::temp_dir().join(format!(
+        "l2t-lop06-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    std::fs::DirBuilder::new().mode(0o700).create(&dir)?;
+    let _cleanup = scopeguard_dir(dir.clone());
+    let sock_path = dir.join("api.sock");
+
+    let hosts = [Arc::new(Host::default()), Arc::new(Host::default())];
+    let TransactionPlans {
+        plans: [client_plan, server_plan],
+        ..
+    } = transaction_plans_with(
+        l2tunnel_cover::Appearance::QuicLike,
+        &hosts,
+        TransactionFixtureOptions::baseline(),
+    )?;
+
+    let (client, client_run) = channel_with_plan(client_plan);
+    let (server, server_run) = channel();
+    let client_task = tokio::spawn(client_run);
+    let server_task = tokio::spawn(server_run);
+    let server_connect = server
+        .connect(server_plan, server.next_key().map_err(submit)?)
+        .map_err(submit)?;
+
+    let api_server = Server::bind(&sock_path)?;
+    let api_handle = client.clone();
+    let api_task = tokio::spawn(async move { api_server.serve_service(api_handle).await });
+
+    // Submit v5 Connect over the real Unix socket against the retained plan.
+    let initial = call_v5(&sock_path, OperationAction::Status {}).await?;
+    assert!(initial.ok, "{initial:?}");
+    let key = initial
+        .status
+        .as_ref()
+        .and_then(|s| s.next_request_key)
+        .ok_or("next_request_key")?;
+    let service_id = initial.service.ok_or("service id")?;
+    drop(initial);
+
+    let accepted = call_v5(&sock_path, OperationAction::Connect { request_key: key }).await?;
+    assert!(accepted.ok, "{accepted:?}");
+    let op_id = accepted.operation.as_ref().ok_or("operation")?.id;
+    drop(accepted);
+
+    // Wait for both peers to complete actual authenticated setup.
+    let waited = call_v5(
+        &sock_path,
+        OperationAction::OperationWait {
+            operation: op_id,
+            timeout_ms: 10_000,
+            service: Some(service_id),
+        },
+    )
+    .await?;
+    assert!(waited.ok, "{waited:?}");
+    let op = waited.operation.as_ref().ok_or("completed op")?;
+    assert_eq!(op.state, "completed");
+    assert!(
+        matches!(op.result, Some(OperationResult::Connected { .. })),
+        "{op:?}"
+    );
+    drop(waited);
+
+    let server_done = timeout(
+        Duration::from_secs(5),
+        server.wait(server_connect.operation),
+    )
+    .await?
+    .map_err(submit)?;
+    assert!(
+        matches!(server_done, Completed::Connected { .. }),
+        "{server_done:?}"
+    );
+
+    // Verify exact event sequence recorded by the actor over v5 Events.
+    let events_reply = call_v5(
+        &sock_path,
+        OperationAction::Events {
+            after: 0,
+            limit: 32,
+            timeout_ms: 0,
+            service: Some(service_id),
+        },
+    )
+    .await?;
+    assert!(events_reply.ok, "{events_reply:?}");
+    let events = events_reply.events.ok_or("events page")?;
+    assert!(events.events.iter().any(|e| matches!(
+        &e.event,
+        EventBody::OperationAccepted { operation, .. } if *operation == op_id
+    )));
+    assert!(events.events.iter().any(|e| matches!(
+        &e.event,
+        EventBody::OperationProgress { operation, .. } if *operation == op_id
+    )));
+    assert!(events.events.iter().any(|e| matches!(
+        &e.event,
+        EventBody::OperationCompleted { operation, .. } if *operation == op_id
+    )));
+    assert!(events.events.iter().any(|e| matches!(
+        &e.event,
+        EventBody::Lifecycle { phase, .. } if phase == "connected"
+    )));
+
+    // Verify live status reports connected and UDP send/recv buffer readbacks.
+    let live = call_v5(&sock_path, OperationAction::Status {}).await?;
+    assert_eq!(
+        live.status.as_ref().map(|s| s.phase.as_str()),
+        Some("connected")
+    );
+    let credit_status = live
+        .status
+        .as_ref()
+        .and_then(|s| s.observation.as_ref())
+        .and_then(|o| o.common.as_ref())
+        .and_then(|c| c.credit);
+    assert!(
+        credit_status.and_then(|c| c.send_buffer_readback).is_some(),
+        "expected SO_SNDBUF readback on connected UDP session: {credit_status:?}"
+    );
+    let key2 = live
+        .status
+        .as_ref()
+        .and_then(|s| s.next_request_key)
+        .ok_or("next_request_key after connect")?;
+    drop(live);
+
+    // TT-03 real-service refusal checks over the Unix socket: unknown_test, busy, cancel.
+    let missing = call_v5(
+        &sock_path,
+        OperationAction::TestGet {
+            id: Some(999),
+            timeout_ms: 0,
+        },
+    )
+    .await?;
+    assert!(!missing.ok && missing.code == "unknown_test", "{missing:?}");
+    drop(missing);
+
+    let started = call_v5(
+        &sock_path,
+        OperationAction::TestStart {
+            test: TestRequest::Ping {
+                count: 5,
+                interval_ms: 500,
+            },
+        },
+    )
+    .await?;
+    assert!(started.ok && started.code == "accepted", "{started:?}");
+    let test_id = started
+        .test
+        .as_deref()
+        .and_then(|t| t.test.as_ref())
+        .ok_or("test state")?
+        .id;
+    drop(started);
+
+    let busy = call_v5(
+        &sock_path,
+        OperationAction::TestStart {
+            test: TestRequest::Speed {
+                direction: Direction::Upload,
+                streams: 1,
+                duration_ms: 1_000,
+            },
+        },
+    )
+    .await?;
+    assert!(!busy.ok && busy.code == "busy", "{busy:?}");
+    drop(busy);
+
+    let bad_cancel = call_v5(
+        &sock_path,
+        OperationAction::TestCancel { id: test_id + 100 },
+    )
+    .await?;
+    assert!(
+        !bad_cancel.ok && bad_cancel.code == "unknown_test",
+        "{bad_cancel:?}"
+    );
+    drop(bad_cancel);
+
+    let cancelled = call_v5(&sock_path, OperationAction::TestCancel { id: test_id }).await?;
+    assert!(cancelled.ok, "{cancelled:?}");
+    drop(cancelled);
+
+    // Clean v5 Disconnect over the Unix socket.
+    let disc = call_v5(
+        &sock_path,
+        OperationAction::Disconnect { request_key: key2 },
+    )
+    .await?;
+    assert!(disc.ok, "{disc:?}");
+    let disc_op = disc.operation.as_ref().ok_or("disc op")?.id;
+    drop(disc);
+
+    let disc_done = call_v5(
+        &sock_path,
+        OperationAction::OperationWait {
+            operation: disc_op,
+            timeout_ms: 5_000,
+            service: Some(service_id),
+        },
+    )
+    .await?;
+    assert!(disc_done.ok, "{disc_done:?}");
+    drop(disc_done);
+
+    api_task.abort();
+    client_task.abort();
+    server_task.abort();
+    let _ = tokio::join!(api_task, client_task, server_task);
+    Ok(())
+}
+
+struct DirGuard(std::path::PathBuf);
+impl Drop for DirGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+fn scopeguard_dir(path: std::path::PathBuf) -> DirGuard {
+    DirGuard(path)
+}

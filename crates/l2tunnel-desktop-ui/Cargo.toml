@@ -11,6 +11,7 @@ workspace = true
 
 [dependencies]
 l2tunnel-client-core = { path = "../l2tunnel-client-core" }
+l2tunnel-meters = { path = "../l2tunnel-meters" }
 eframe = { version = "=0.35.0", default-features = false, features = ["accesskit", "default_fonts", "glow", "wayland", "x11"] }
 tokio = { version = "=1.53.1", features = ["rt", "time", "sync", "macros"] }
 serde_json = "=1.0.151"

@@ -403,6 +403,9 @@ where
                 driver.service_remote_meters(now)?;
                 driver.service_rate_budget(now)
             })?;
+            if let carrier::IoOwner::Udp(udp) = &socket {
+                driver.credit_observe_udp(udp)?;
+            }
             execution.measure_result(TimingStage::CommonSend, || {
                 driver.send_and_retry_native_ingress(
                     &mut socket,

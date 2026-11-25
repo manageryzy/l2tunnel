@@ -208,3 +208,107 @@ async fn disconnected_events_waiters_release_connection_slots_immediately() -> i
     drop(run);
     Ok(())
 }
+
+#[tokio::test(start_paused = true)]
+async fn deterministic_read_timeout_reclaims_slot_without_disrupting_service() -> io::Result<()> {
+    let directory = Directory::new()?;
+    let path = directory.socket();
+    let server = Server::bind(&path)?;
+    let (handle, run) = crate::service::channel();
+    let task = tokio::spawn(async move { server.serve_service(handle).await });
+
+    // Fill every concurrency slot with silent clients that never send a frame.
+    let mut stalled = Vec::new();
+    for _ in 0..CONCURRENT_CONNECTIONS {
+        stalled.push(UnixStream::connect(&path).await?);
+    }
+    // Wait until the server has accepted all 8 sockets and rejected a 9th,
+    // proving all 8 slots are occupied with armed 5-second read timeouts.
+    let mut occupied = false;
+    for _ in 0..32 {
+        tokio::task::yield_now().await;
+    }
+    {
+        let mut probe = UnixStream::connect(&path).await?;
+        let mut byte = [0u8; 1];
+        if matches!(probe.read(&mut byte).await, Ok(0) | Err(_)) {
+            occupied = true;
+        }
+    }
+    assert!(occupied, "expected all 8 server slots to be occupied");
+    // Advance virtual time past the 5-second per-connection read bound deterministically.
+    tokio::time::advance(Duration::from_secs(6)).await;
+    for _ in 0..32 {
+        tokio::task::yield_now().await;
+    }
+    // Resume wall clock so real Unix socket I/O does not auto-advance client timeouts.
+    tokio::time::resume();
+    // Even while stalled clients still hold their fds open, every slot was reclaimed.
+    let reply =
+        request_operation(&path, &OperationRequest::new(OperationAction::Status {})).await?;
+    assert!(reply.ok);
+    drop(stalled);
+    task.abort();
+    let _cancelled = task.await;
+    drop(run);
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn deterministic_client_timeout_reports_timed_out_for_stalled_handler() -> io::Result<()> {
+    let directory = Directory::new()?;
+    let path = directory.socket();
+    let server = Server::bind(&path)?;
+    let task = tokio::spawn(async move {
+        server
+            .serve(|_request| async move { std::future::pending::<Response>().await })
+            .await
+    });
+    let client_path = path.clone();
+    let pending = tokio::spawn(async move { request(&client_path, &legacy_status()).await });
+    for _ in 0..8 {
+        tokio::task::yield_now().await;
+    }
+    // Advance past the client's 10-second exchange deadline deterministically.
+    tokio::time::advance(Duration::from_secs(11)).await;
+    let outcome = pending.await.map_err(io::Error::other)?;
+    assert_eq!(
+        outcome.as_ref().err().map(io::Error::kind),
+        Some(io::ErrorKind::TimedOut),
+        "stalled server must trigger deterministic client timeout: {outcome:?}"
+    );
+    task.abort();
+    let _cancelled = task.await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn simultaneous_local_clients_are_all_served_within_concurrency_bound() -> io::Result<()> {
+    let directory = Directory::new()?;
+    let path = directory.socket();
+    let server = Server::bind(&path)?;
+    let (handle, run) = crate::service::channel();
+    let task = tokio::spawn(async move { server.serve_service(handle).await });
+
+    // Launch CONCURRENT_CONNECTIONS simultaneous v5 clients against the real service.
+    let mut joins = Vec::with_capacity(CONCURRENT_CONNECTIONS);
+    for idx in 0..CONCURRENT_CONNECTIONS {
+        let client_path = path.clone();
+        joins.push(tokio::spawn(async move {
+            let action = if idx % 2 == 0 {
+                OperationAction::Status {}
+            } else {
+                OperationAction::ServiceInfo {}
+            };
+            request_operation(&client_path, &OperationRequest::new(action)).await
+        }));
+    }
+    for join in joins {
+        let reply = join.await.map_err(io::Error::other)??;
+        assert!(reply.ok, "simultaneous local client failed: {reply:?}");
+    }
+    task.abort();
+    let _cancelled = task.await;
+    drop(run);
+    Ok(())
+}

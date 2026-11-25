@@ -89,6 +89,8 @@ pub(super) const HELP: &str =
   tune set [--repair off|N/D] [--device-mtu N] [--path-mtu N] [--request-key K]
            [--watch SECONDS | --detach]
       (hot switch to the setting; controls not given keep their current value)
+  tune budget --symmetric MBPS | --upload MBPS --download MBPS   (1..=10000 Mbit/s;
+      live authenticated wire speed-budget update on both peers without reconnecting)
   config switch --configuration HEX [--request-key K] [--watch SECONDS | --detach]
   config catalog --generation G --catalog HEX --offset O --limit 1..4
   profile inspect OPTIONS   (same as inspect-common-transaction-plan)
@@ -204,6 +206,7 @@ enum Command {
     Test(test::Query),
     Meters(meters::Query),
     TuneShow,
+    TuneBudget(tune::Budget),
     TuneSet {
         partial: tune::Partial,
         key: Option<u64>,
@@ -461,6 +464,7 @@ fn parse(args: &[String]) -> Result<Parsed, Usage> {
         }
         ("member", "revoke") => values.extend(["--allow-key", "--watch"]),
         ("tune", "show") => {}
+        ("tune", "budget") => values.extend(tune::BUDGET_VALUES),
         ("tune", "set") => {
             values.extend(tune::SET_VALUES);
             values.extend(["--request-key", "--watch"]);
@@ -554,6 +558,7 @@ fn parse(args: &[String]) -> Result<Parsed, Usage> {
         },
         ("test", _) => Command::Test(test::parse(verb, &positional, &options, flag)?),
         ("tune", "show") => Command::TuneShow,
+        ("tune", "budget") => Command::TuneBudget(tune::budget(&options)?),
         ("tune", _) => {
             let partial = tune::partial(&options)?;
             let Command::Submit { key, watch, .. } =
@@ -989,6 +994,29 @@ async fn execute(parsed: Parsed) -> Exit {
     };
     match command {
         Command::TuneSet { .. } => Exit::Usage,
+        Command::TuneBudget(budget) => match exchange(
+            &socket,
+            OperationAction::RateBudgetSet {
+                send_rate: budget.send_rate,
+                receive_rate: budget.receive_rate,
+            },
+        )
+        .await
+        {
+            Ok(reply) if reply.ok => {
+                output.reply(&reply, |out| {
+                    writeln!(
+                        out,
+                        "speed budget updated: up {} Mbit/s, down {} Mbit/s",
+                        budget.send_rate / 125_000,
+                        budget.receive_rate / 125_000
+                    )
+                });
+                Exit::Completed
+            }
+            Ok(reply) => refused(&output, &reply),
+            Err((exit, error)) => failed(exit, error),
+        },
         Command::TuneShow => match exchange(&socket, OperationAction::TuningGet {}).await {
             Ok(reply) if reply.ok => {
                 output.reply(&reply, |out| {

@@ -9,6 +9,52 @@ use std::path::PathBuf;
 
 /// Value options of `tune set` besides the submission options.
 pub(super) const SET_VALUES: [&str; 3] = ["--repair", "--device-mtu", "--path-mtu"];
+/// Value options of `tune budget`.
+pub(super) const BUDGET_VALUES: [&str; 3] = ["--upload", "--download", "--symmetric"];
+
+/// Requested live speed budget in bytes per second.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct Budget {
+    pub(super) send_rate: u64,
+    pub(super) receive_rate: u64,
+}
+
+fn mbps_rate(options: &BTreeMap<String, String>, name: &str) -> Result<Option<u64>, Usage> {
+    options
+        .get(name)
+        .map(|text| {
+            let mbps: u64 = text
+                .parse()
+                .map_err(|_| usage(format!("{name} must be an integer Mbit/s (1..=10000)")))?;
+            if !(1..=10_000).contains(&mbps) {
+                return Err(usage(format!("{name} must be 1..=10000 Mbit/s")));
+            }
+            Ok(mbps.saturating_mul(125_000))
+        })
+        .transpose()
+}
+
+pub(super) fn budget(options: &BTreeMap<String, String>) -> Result<Budget, Usage> {
+    let symmetric = mbps_rate(options, "--symmetric")?;
+    let upload = mbps_rate(options, "--upload")?;
+    let download = mbps_rate(options, "--download")?;
+    match (symmetric, upload, download) {
+        (Some(rate), None, None) => Ok(Budget {
+            send_rate: rate,
+            receive_rate: rate,
+        }),
+        (Some(_), _, _) => Err(usage(
+            "--symmetric cannot be combined with --upload or --download",
+        )),
+        (None, Some(send_rate), Some(receive_rate)) => Ok(Budget {
+            send_rate,
+            receive_rate,
+        }),
+        (None, _, _) => Err(usage(
+            "tune budget needs --symmetric MBPS or both --upload MBPS and --download MBPS",
+        )),
+    }
+}
 
 /// The controls `tune set` changes; unset ones keep the current value.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -186,6 +232,25 @@ mod tests {
         assert!(parse("tune set --control-socket /s").is_err());
         assert!(parse("tune set --control-socket /s --repair off --watch 5 --detach").is_err());
         assert!(parse("tune show --control-socket /s --repair off").is_err());
+        assert_eq!(
+            parse("tune budget --control-socket /s --upload 500 --download 50"),
+            Ok(super::super::Command::TuneBudget(Budget {
+                send_rate: 62_500_000,
+                receive_rate: 6_250_000,
+            }))
+        );
+        assert_eq!(
+            parse("tune budget --control-socket /s --symmetric 1000"),
+            Ok(super::super::Command::TuneBudget(Budget {
+                send_rate: 125_000_000,
+                receive_rate: 125_000_000,
+            }))
+        );
+        assert!(parse("tune budget --control-socket /s").is_err());
+        assert!(parse("tune budget --control-socket /s --upload 500").is_err());
+        assert!(parse("tune budget --control-socket /s --symmetric 500 --upload 500").is_err());
+        assert!(parse("tune budget --control-socket /s --symmetric 0").is_err());
+        assert!(parse("tune budget --control-socket /s --symmetric 10001").is_err());
     }
 
     #[test]

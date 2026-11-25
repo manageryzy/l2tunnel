@@ -185,18 +185,30 @@ pub(crate) struct Queues {
     pub(crate) incoming: VecDeque<Vec<u8>>,
     pub(crate) outgoing: VecDeque<Vec<u8>>,
     pub(crate) free: Vec<Vec<u8>>,
+    pub(crate) rx_free: Vec<Vec<u8>>,
     pub(crate) mtu: usize,
     /// Peer packets dropped because the incoming queue was full or the
     /// packet was oversized.
     pub(crate) dropped: u64,
 }
-pub(crate) struct Rx(Vec<u8>);
-impl RxToken for Rx {
-    fn consume<R, F>(self, f: F) -> R
+pub(crate) struct Rx<'a> {
+    packet: Vec<u8>,
+    rx_free: &'a mut Vec<Vec<u8>>,
+    mtu: usize,
+}
+impl RxToken for Rx<'_> {
+    fn consume<R, F>(mut self, f: F) -> R
     where
         F: FnOnce(&[u8]) -> R,
     {
-        f(&self.0)
+        let result = f(&self.packet);
+        if self.rx_free.len() < PACKET_SLOTS * 2
+            && self.packet.capacity() <= self.mtu.saturating_mul(2)
+        {
+            self.packet.clear();
+            self.rx_free.push(self.packet);
+        }
+        result
     }
 }
 pub(crate) struct Tx<'a> {
@@ -217,15 +229,19 @@ impl TxToken for Tx<'_> {
     }
 }
 impl Device for Queues {
-    type RxToken<'a> = Rx;
+    type RxToken<'a> = Rx<'a>;
     type TxToken<'a> = Tx<'a>;
-    fn receive(&mut self, _: Instant) -> Option<(Rx, Tx<'_>)> {
+    fn receive(&mut self, _: Instant) -> Option<(Rx<'_>, Tx<'_>)> {
         if self.outgoing.len() >= PACKET_SLOTS {
             return None;
         }
         let packet = self.incoming.pop_front()?;
         Some((
-            Rx(packet),
+            Rx {
+                packet,
+                rx_free: &mut self.rx_free,
+                mtu: self.mtu,
+            },
             Tx {
                 outgoing: &mut self.outgoing,
                 free: &mut self.free,
@@ -258,6 +274,7 @@ impl Queues {
             incoming: VecDeque::with_capacity(PACKET_SLOTS),
             outgoing: VecDeque::with_capacity(PACKET_SLOTS),
             free: Vec::with_capacity(PACKET_SLOTS),
+            rx_free: Vec::with_capacity(PACKET_SLOTS),
             mtu,
             dropped: 0,
         })
@@ -269,7 +286,11 @@ impl Queues {
             self.dropped = self.dropped.saturating_add(1);
             return;
         }
-        let mut buf = self.free.pop().unwrap_or_default();
+        let mut buf = self
+            .rx_free
+            .pop()
+            .or_else(|| self.free.pop())
+            .unwrap_or_default();
         buf.clear();
         buf.extend_from_slice(packet);
         self.incoming.push_back(buf);
