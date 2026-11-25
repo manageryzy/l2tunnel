@@ -1,5 +1,12 @@
 # Implementation checklist and evidence ledger
 
+The planned [meter CSR](modules/meter-csr.md) (MCSR-01..14, owner decisions
+2026-11-24) gives every meter a named read-only register. One management API
+reads them locally and from the authenticated peer. It covers buffers
+(BP-01..BP-24 at full scope), recovery, carrier and MUX/flow meters. The
+local slice (always-on collectors, local API, CLI) is contract-tested; the
+meter families, the in-band remote read and the GUI remain open.
+
 The isolated Reliable retry-enrichment draft is described in
 [the receive contract](modules/reliable.md#receive-path-and-authentication-boundary).
 It reuses canonical direct sources in uniquely mapped existing FEC generations;
@@ -666,6 +673,20 @@ The explicit fixed and measured Common proxy slices retain complete follow-up in
 [PCOM-01..PCOM-09](modules/common-tcp-proxy.md), including the finite
 [measured retained composition](modules/common-tcp-proxy-measured.md). Parent proxy,
 switching and platform gates retain their definitions.
+
+Session receiver credit (owner decisions 2026-11-23) is tracked in
+[MOD-RCREDIT-01..07](modules/receiver-credit.md): a processed window and drain
+rate in an unreliable authenticated Credit message, gating data datagrams of
+every Common profile after native Packed overran its receiver. Implemented and
+contract-tested; native Packed with 16 flows at 0% loss now passes (89.0 and
+71.7 Mbit/s, receive-buffer drops 0 and 1.3% instead of 31%), and Aligned
+with 16 flows rose from 74.3 to 85.5 Mbit/s
+([results](../work/credit-20261123b/RESULTS.md)). A burst-loss blackhole found in
+the record receiver's key-generation range is closed by a sender range bound
+and a range floor, now a clamp with a warning (MOD-RCREDIT-08..11). The UDP
+data socket requests a receive buffer of the credit byte ceiling, which ended
+Packed receive-buffer drops in native cells (MOD-RCREDIT-12). Full native
+qualification is open.
 
 Rolling TUN native release order and the return-traffic guard are tracked in
 [DP-01..DP-08](modules/delivery-policy.md). DP-01..DP-07 are contract-tested;
@@ -1402,6 +1423,43 @@ refusal now keeps the packet as the one pending original. The plain path
 stops reading and retries the packet after sends or at ingress service,
 within the same stall deadline as the coalesced path.
 [Plain-path retention test](../crates/l2tunnel-runtime/src/secure_udp/transport_common_ingress_tests.rs).
+
+The base ARQ now accepts windows of up to 8192 records (2026-11-23,
+MOD-REC-WIDE-01/02). Its 64-bit bitmap ACK limited every Aligned and Packed
+row to 64 records in flight, about 4.5 Mbit/s on the 70 ms lab with no loss.
+A direction above 64 records uses a canonical wide ACK derived from the same
+authenticated direction configuration. Windows of at most 64, and all control
+channels, keep the original bytes. The benchmark rows size the window from
+bandwidth × RTT. [Wide ACK design](modules/recovery.md#wide-ack-for-large-windows).
+
+Wide directions also got O(1) amortized scheduling and an adaptive RTO with
+once-per-RTT fast resend (2026-11-23, MOD-REC-WIDE-03/04). A reserved Reliable
+pair now moves 60,000 sources in 32 ms at window 2048 (933 ms before; 66 ms at
+window 64). Native UDP cells, owned namespaces, 100/10 Mbit/s and 70 ms RTT
+([receipts](../work/wide-ack-20261123c/ab-summary.txt)): Aligned ARQ 16 flows
+74.7 Mbit/s at 0% loss and 32.2 at 15% (4.5 and none before); Aligned Cauchy
+4 flows 19.2 at 15% (1.25 before); Aligned ARQ single flow 2.4 over UDP and 8.2
+over raw at 15% (timed out before). Packed ARQ still fails natively with
+`RetryExhausted` at 0% loss and stays open. Those runs and the last gate shared
+the host with unrelated jobs at load average 190–252: five deadline-based
+loopback tests failed under that load and pass when run alone, so a clean gate
+receipt is still owed.
+
+Three follow-up fixes (2026-11-23, MOD-REC-WIDE-04/05): fast resend now
+waits for three later acknowledged single-copy transmissions instead of one
+smoothed RTT (queue-inflated RTT caused the Packed `RetryExhausted`); a wide
+ACK visits only the sources it covers; Aligned/Packed preview reads a reserved
+receipt journal instead of rescanning every receive slot. Reliable also
+rechecks the outbound budget before each FEC-loop poll, because a larger
+retry after a fresh block source used to fail the owner with `Exhausted`. A
+clean full gate passed ([log](../work/wide-ack-20261123d/gate.log), load
+average about 10). Native reruns ([results](../work/wide-ack-20261123d/prof/RESULTS.md)):
+Aligned unchanged within noise (74.3 / 29.7 / 8.3 / 8.4); Aligned Cauchy 4
+flows 33.7 and 18.9 on two runs; Packed single flow 46.4 at 0% loss (failed
+before); Packed 16 flows passed once at 20.1 and once failed with
+`PeerTimeout`, because the Packed receiver's owner thread drops 31% of
+datagrams at its UDP socket and the control ARQ loses a liveness ping on every
+retry. That receiver overload stays open.
 
 FIX-04 and TEST-12 include a same-skb Linux receive verdict and a bounded
 UDP receive-service change. A matched 64 KiB reverse-burst workload on the

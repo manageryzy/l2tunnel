@@ -663,10 +663,15 @@ flowchart TB
     MG[Stable internal L2 management] --> S
     VX[Explicit VXLAN VTEP adapter] --> Q
     S --> C[Explicit carrier appearance and framing]
-    C --> U[Original UDP socket: OpenVPN-like / QUIC-like / media-like]
-    C --> X[Original TCP owner: real TLS then custom packet phase]
-    C --> T[Explicit retained TLS / HTTPS streaming / genuine QUIC compatibility]
+    C --> U[Original UDP socket: OpenVPN-like / QUIC-like / media-like / TLS-like]
+    C --> X[Original TCP owner: real TLS 1.3 then custom raw packet phase, optional TLS 1.3 record cover]
+    C --> T[Retained compatibility: kernel TCP+rustls / genuine Quinn QUIC, outer CC]
 ```
+
+> **Carrier role distinction (lossy-path performance vs compatibility):**
+>
+> - **Fast cover carriers (no outer congestion control):** `--carrier quic-like` / `media-like` / `tls-like` (single UDP socket with `l2tunnel-cover` framing) and `--carrier raw-packet` (genuine TCP 3-way + rustls TLS 1.3 handshake via `l2tunnel-raw-io`, then direct raw IPv4/TCP segments paced by the session's own recovery and receiver-credit layer). Selecting `--carrier raw-packet --udp-cover tls-like` additionally wraps every steady-state raw TCP segment in a canonical 5-byte TLS 1.3 Application Data record header (`0x17 0x03 0x03 <len>`) bound into `final_context`.
+> - **Retained legacy compatibility carriers (outer congestion control):** `--carrier tcp` (`retained_tls.rs`, kernel TCP + rustls) and `--carrier quic` (`l2tunnel-quic`, genuine Quinn QUIC) remain supported for environments that strictly require kernel TCP or standard QUIC endpoints, but their outer congestion controllers collapse under high packet loss (e.g., ~0.2–0.4 Mbit/s at 15% loss vs ~50–70 Mbit/s on UDP and raw-packet).
 
 The diagram is conceptual: classification precedes codec selection; the shared
 arbiter admits records into recovery; encoding may batch across admitted channel

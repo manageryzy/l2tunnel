@@ -114,6 +114,11 @@ The split `poll_feedback` and `poll_data` APIs support a retained TLS feedback l
 and UDP data lane. They use the same mandatory `OutboundBudget`; the adapter must
 allocate bounded service to each and retain a returned packet across carrier
 backpressure. Feedback-only polling does not collect or seal an outgoing block.
+One data poll may move several fresh sources into the open FEC block without
+spending budget, and ARQ may then answer with a due retry that is emitted at
+once. With the selected compact wire the budget is rechecked against the exact
+next body before every poll after the first, so a larger retry waits for the
+next call instead of failing the owner.
 `inspect_output` strictly validates the local sending role/session/epoch and
 authoritative ARQ/FEC encoding before returning `RecordKind::{Source, Feedback,
 Systematic, Repair}`. It is routing metadata, not an authentication operation.

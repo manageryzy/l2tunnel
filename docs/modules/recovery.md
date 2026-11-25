@@ -38,7 +38,8 @@ state; ACK claims still require the actual engine's send ledger in `receive`.
 - Retain immutable source payloads until cumulative/selective receipt confirms
   them. Retries serialize those retained bytes; receivers have no sender ledger.
 - Bound send/receive payload bytes, source counts, source size and source-ID span.
-  The source window is at most 64 so feedback remains fixed size. Empty payloads
+  A window of at most 64 keeps the original fixed-size feedback; larger windows,
+  up to 8192, use the [wide ACK](#wide-ack-for-large-windows). Empty payloads
   still consume one source/count slot. The receiver's window is relative to its
   next application delivery, so a slow application cannot grow retained memory.
 - ACKs contain the next missing contiguous received source ID plus a 64-bit
@@ -96,6 +97,108 @@ future/unsent acknowledgments and inconsistent payload lengths. Source IDs and
 time additions use checked arithmetic. Stats counters saturate and never alter
 protocol decisions.
 
+## Wide ACK for large windows
+
+Decided 2026-11-23 (owner, option 1): the 64-bit bitmap limited every base-ARQ
+profile to 64 records in flight. Aligned and Packed rows then measured about
+4.5 Mbit/s on the 100/10 Mbit/s, 70 ms RTT lab with no loss, against 44 Mbit/s
+for the same Aligned code over Compact ARQ. Classic ARQ behaviour and the
+optional Cauchy FEC above it stay unchanged; only the window and its feedback grow.
+
+- `send_records` and `receive_records` accept 1..=8192. A direction whose
+  configuration has both values at most 64 keeps the original ACK bytes, packet
+  kind 2 and the 20-byte body maximum, so existing configurations, digests and
+  control channels are byte-identical.
+- A direction with either value above 64 uses the wide ACK. Both peers derive
+  the format from the same authenticated direction configuration: the ACK
+  emitter reads its receive configuration, the ACK parser its send configuration.
+  Nothing is negotiated on the wire, and a legacy ACK in a wide direction (or
+  the reverse) is malformed.
+- Wide ACK: the cumulative next-missing prefix, then a bitmap of `n` bytes in
+  which bit `i % 8` of byte `i / 8` acknowledges `prefix + i`. The bitmap is
+  canonical: bit zero is clear, the last byte is nonzero (or `n` is zero), and
+  `n <= ceil(receive_records / 8)`. The packet form is kind 3: the 32-byte common
+  header, the 64-bit prefix, then the bitmap, `40 + n` bytes in total. The
+  context-free body is the varint prefix followed by the bitmap bytes.
+- Per-configuration maxima replace the fixed constants for budgets:
+  `ArqConfig::ack_packet_bytes()` (48 or `40 + ceil(receive_records / 8)`) and
+  `ArqConfig::feedback_body_max_bytes()` (20 or `10 + ceil(receive_records / 8)`).
+  Callers charge feedback with these, never the legacy 48/20 constants alone.
+- Large windows store sources by `source % window`. The existing span limits
+  (send: oldest unconfirmed to next source; receive: next delivery plus window)
+  keep every live source in a distinct slot, so lookups stay O(1). Windows of at
+  most 64 keep the original storage.
+- Management, OpenVPN-like and UDP control channels keep windows of at most 64;
+  their fixed feedback charges are unchanged and their configuration validation
+  refuses a wide window.
+- Direction-aware parsing: `inspect_packet_for` and `inspect_body_for` take the
+  acknowledged direction's configuration; `SelectiveRepeat::inspect_peer_body`
+  applies an owner's own pair. `inspect_packet` and `inspect_body` keep parsing
+  only the legacy form.
+- Reliable charges each direction with its own maximum: local output ceilings,
+  scratch and storage plans include the receive direction's ACK, peer ceilings
+  the send direction's ACK, so asymmetric legacy/wide pairs fit. Restored-source
+  staging is capped at `MAX_ARQ_WINDOW + 256` packets and 16 MiB. Staged
+  diagnostics keep the first 64 offsets in `bitmap` and the wide length in
+  `bitmap_bytes`.
+- The Aligned and Packed benchmark rows size the window from the lab's
+  bandwidth-delay product (12.5 MB/s × 70 ms in full sources, tripled for loss
+  and RTO recovery, rounded up to a power of two). That is 2048 for the UDP and
+  raw carriers. The aligned receiver's source window grows to hold the ARQ window
+  plus restored sources.
+
+## Adaptive resend and O(1) scheduling for wide windows
+
+Decided 2026-11-23 (owner): a fixed 200 ms first resend, doubling per retry,
+left wide-window Aligned at 0.9–1.4 Mbit/s at 15% loss on the 70 ms lab. Base
+ARQ gets an adaptive timer and fast resend, **only in directions above 64
+records** (the same boundary as the wide ACK). Windows of at most 64, including
+every control channel, keep the classic timer exactly.
+
+- RTT samples come from authenticated ACKs. A flight released by an ACK after
+  exactly one attempt yields `now - sent_at`, where `sent_at` is when its retry
+  timer was armed (poll time, or the physical acceptance time under physical
+  confirmation). Retried flights give no sample (Karn).
+- Smoothing follows RFC 6298: the first sample sets `srtt = R` and
+  `rttvar = R / 2`; later samples set `rttvar = 3/4 rttvar + 1/4 |srtt - R|`
+  and `srtt = 7/8 srtt + 1/8 R`.
+- `RTO = srtt + 4 rttvar + ack_delay`, at least `min(20 ms, initial_rto)` and
+  at most `maximum_rto`. Before the first sample the RTO is `initial_rto`.
+  A timeout resend doubles that flight's timer, capped at `maximum_rto`.
+- Fast resend is ordered by transmission, not by wall time. Every transmitted
+  copy gets the next transmission serial. An ACK raises the highest
+  acknowledged serial using only sources released after exactly one copy
+  (Karn: a re-sent source does not say which copy arrived). A confirmed,
+  unacknowledged copy with serial `t` becomes due now once that highest serial
+  reaches `t + 3`. Its next timer uses the current RTO without doubling, and
+  `max_retries` applies to every resend. The first version waited one
+  smoothed RTT instead; when queueing pushed the real RTT above srtt it
+  re-sent copies still queued, counted each as an attempt and exhausted
+  retries within about two seconds (native Packed `RetryExhausted`,
+  reproduced by `packed_wide_window_survives_queue_inflated_rtt_with_drops`).
+- Copies wait for that evidence in a transmission-order queue (lazy deletion,
+  reserved at twice `send_records`, compacted to current copies when full), so
+  each copy is examined once.
+- A wide ACK without diagnostic observation visits only what it covers: the
+  retained sources below its prefix (from the oldest-retained pointer) and its
+  set bitmap bits. It validates all of them before changing state. The
+  observed path keeps the original whole-window passes, and a randomized test
+  checks that both give identical results, state and output.
+- Scheduling is O(1) amortized per operation in wide directions: a deadline
+  queue (binary heap with lazy deletion, reserved at twice `send_records` and
+  rebuilt from live flights when full), pointers to the oldest retained and the
+  first unsent source, and the highest received source for exact ACK sizing.
+- Reliable's restored-source staging keeps occupancy, live and free lists, so
+  its operations cost O(live entries) rather than O(capacity).
+- A wide receive direction keeps a receipt journal: each newly stored source
+  with an arrival serial, in a ring reserved at `receive_records`. Early
+  consumers (Aligned/Packed preview of independent short frames) read
+  receipts after their own cursor in O(1) instead of rescanning every receive
+  slot on each pump; a pressure stop leaves the cursor before the refused
+  receipt. A cursor that fell out of the ring, or a Compact owner, falls back
+  to the original full scan. Native profiling had shown that scan at 14–52%
+  of daemon CPU with a 2048-record window.
+
 ## TODO and verification matrix
 
 - [x] [MOD-REC-01] Specify APIs, bounded real-payload ownership and authenticated-input premise. Evidence: [this design](#apis-and-ownership).
@@ -113,6 +216,11 @@ protocol decisions.
 - [ ] [MOD-REC-13] Add RTT estimation, transmission serial/ACK echo, delay subtraction, feedback repeats and byte-exact Python parity before completing compact/legacy ARQ gates.
 - [ ] [MOD-REC-14] Implement first-flight/bounded-gap fast recovery and independent-record release under separate parity gates.
 - [ ] [MOD-REC-15] Implement real GF(256) FEC and all remaining block/sliding/hybrid/research families.
+- [ ] [MOD-REC-WIDE-01] Widen base-ARQ windows to 8192 with the canonical wide ACK, per-configuration feedback maxima and indexed storage, keeping windows of at most 64 byte-identical; test encode/parse limits, canonical rejection, cross-format refusal, acknowledgement past offset 64 and lossy transfers with large windows.
+- [ ] [MOD-REC-WIDE-02] Charge wide feedback in every base-ARQ consumer (Reliable envelopes and geometry, selected Common wire, runtime contracts), keep control channels at windows of at most 64, size Aligned/Packed benchmark windows from bandwidth and RTT, and qualify the result natively.
+- [ ] [MOD-REC-WIDE-03] Make wide-window scheduling and Reliable restored staging O(1) amortized per operation (deadline queue, oldest/unsent pointers, highest received, restored live/free lists), with storage plans charging the new reservations; measure the per-source cost at window 64 and 2048.
+- [ ] [MOD-REC-WIDE-04] Add the adaptive RTO (RFC 6298 smoothing, Karn, 20 ms floor) and transmission-order fast resend to wide directions only, keeping windows of at most 64 on the classic timer; test sampling, backoff, fast resend under queue-inflated RTT and the unchanged classic path, then qualify Aligned/Packed natively at 0% and 15% loss.
+- [ ] [MOD-REC-WIDE-05] Make wide ACK processing and early preview independent of the window (covered-source ACK path with an equivalence test against the observed path; reserved receipt journal with cursor-based preview), with storage plans charging the journal and send-order queue; profile natively.
 - [ ] [MOD-REC-16] Integrate authenticated datagram carriers, negotiated peer source/window budgets, shared QoS/credit budgets and real namespace/netem receipts.
 - [x] [MOD-REC-17] Expose separately pollable source/feedback and authoritative borrowed packet inspection for bounded FEC composition. Evidence: [engine APIs](../../crates/l2tunnel-recovery/src/arq.rs), [split-poll ownership and inspection regression](../../crates/l2tunnel-recovery/src/arq/tests.rs).
 

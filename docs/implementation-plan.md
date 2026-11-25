@@ -581,7 +581,7 @@ Additional unfinished source and integration boundaries:
 | Unfinished boundary | Responsibility |
 | --- | --- |
 | Native Windows/Android adapter crates | Reviewed driver/FD/JNI boundaries and native device lifecycle |
-| `clients/desktop`, `clients/android` | Future desktop GUI and Kotlin Android GUI/VpnService shell |
+| `apps/l2tunnel-linux` (`gui` feature), `clients/android` | Desktop GUI (`l2tunnel-linux-gui`, egui) and future Kotlin Android GUI/VpnService shell |
 | Cross-carrier secure-session lifecycle | Complete the existing pure security/Noise/control implementation draft across every carrier, including fresh-DH exchange and default retained-state recovery; parent SEC-* gates remain open |
 | Additional carrier and appearance composition | Preserve implemented QUIC-header/RTP codecs and the selected UDP driver while qualifying native use and other carriers; no native QUIC controller or full WebRTC is implied |
 

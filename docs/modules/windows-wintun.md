@@ -48,9 +48,13 @@ The implementation uses the safe synchronous API of exactly `tun-rs 2.8.18`
 with default features disabled. The package was published on 2026-11-04 and
 was inspected from the published crate archive, including its Windows loader,
 session, adapter, packet and destructor paths. The workspace and this crate
-retain `unsafe_code = "forbid"`; no local FFI exception is introduced. This is
-a dependency-boundary source review, not a full dependency audit or a claim
-of native qualification.
+retain `unsafe_code = "forbid"` for the device; no local FFI exception is
+introduced for Wintun. This is a dependency-boundary source review, not a full
+dependency audit or a claim of native qualification. The crate's later
+named-pipe security module `local_pipe::ffi` is a separate, narrow exception
+(the crate now `deny`s `unsafe` everywhere else). It is documented in
+[Windows local service](windows-local-service.md) and is awaiting owner
+approval under the rule below.
 
 Relevant primary sources:
 

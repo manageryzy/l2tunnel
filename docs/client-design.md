@@ -13,6 +13,14 @@ lifecycle paths; no complete GUI/API parity or default state-retaining outage
 recovery is claimed by that partial implementation.
 See [client runtime](modules/client-runtime.md), [local API](modules/local-api.md)
 and [native evidence](implementation-status.md) for exact implemented scope.
+[Local operations](modules/local-operations.md) adds local API version 5
+(accepted operations, bounded wait/cancel, an exact service event log) and the
+grouped `l2tunnelctl` commands with a fixed exit-code contract. That work goes
+toward CL-04, CL-12 and CL-14 but does not complete them: revisions (CL-05),
+profiles/capabilities/diagnostics (CL-06/07/16) and GUI parity remain open.
+The [desktop GUI](modules/desktop-gui.md) is the Rust/egui binary
+`l2tunnel-linux-gui` over version 5; its first slice is implemented and its
+full design (devices, routes, SOCKS5, statistics, management) is planned.
 Windows remains a staging entry point; Android has no JNI or application shell.
 
 Keep task IDs stable when splitting work into issues. Completing a design does
@@ -48,7 +56,7 @@ protocol crates remain independent of Tokio, OS handles, clocks and privileges.
 | Existing `apps/l2tunnel-linux`; staging `apps/l2tunnel-windows` | Runnable Linux entry point; Windows currently provides help/version/plan only and rejects runtime startup | Planned common client-core/runtime reuse; Windows service/device behavior requires independent implementation and native qualification |
 | Existing `apps/l2tunneld` | Listener/server lifecycle and administrative endpoint | Reuse local control types where meaningful; reject client-only operations |
 | Existing `apps/l2tunnelctl` | CLI commands and machine-readable output | Uses local API; an explicit foreground mode may embed the same client-core |
-| Planned `clients/desktop` | Nonprivileged desktop GUI, profiles, status, operation progress and diagnostics | Linux/Windows first; framework selected at CL-17, no second protocol engine |
+| Existing `apps/l2tunnel-linux` `gui` feature (`l2tunnel-linux-gui`) | Nonprivileged desktop GUI, profiles, status, operation progress and diagnostics | egui/eframe (owner selection, CL-17); Windows GUI later in `apps/l2tunnel-windows`; no second protocol engine |
 | Existing `apps/l2tunnel-android` staging crate | rlib/cdylib status entry point; no JNI, VpnService or descriptor handoff yet | Planned narrow Android embedding boundary with explicit descriptor/socket ownership and no unwinding across FFI |
 | Planned `clients/android` | Kotlin application, VpnService lifecycle, permission UI, notifications and platform credential adapter | Calls the shared Rust core; Android GUI is independent of desktop toolkit choice |
 | Planned `testkit/client` | Fake device/service backend, local API contract fixtures and scripted client workflows | CLI/GUI parity and lifecycle tests before privileged native validation |
@@ -194,6 +202,12 @@ complete it.
   negotiated/effective settings, counters and operation outcomes. Bound capture
   duration/size; explicit packet capture remains a separate action. Export excludes
   private keys, tokens and user payload by default and uses an explicit destination.
+  Progress (2026-11-23, Linux, fake service and unit tests): `l2tunnelctl
+  diagnostics export` and the GUI Events page write the
+  [shared report](../crates/l2tunnel-client-core/src/local/diagnostics.rs)
+  (versions, status, capabilities, counters, devices, routes, retained events,
+  recent operation outcomes) to a new owner-only file, addresses redacted by
+  default. Selected service logs and bounded capture remain open.
 
 ### GUI delivery and framework decision
 
@@ -203,6 +217,9 @@ complete it.
   packaging/signing, resource usage, licensing, localization, Linux desktop
   coverage, service IPC and maintenance. Select and record one after the shared
   API is stable; no framework is selected by this plan.
+  Owner selection 2026-11-23: egui/eframe (see
+  [desktop GUI](modules/desktop-gui.md)). The prototype comparison above was
+  not performed, so this box stays open.
 - [ ] [CL-18] Implement a nonprivileged desktop GUI over the local API: service
   discovery, profile workflow, connect/disconnect, effective state, errors and
   reconnect handling. Run privileged setup through the platform service/helper;
@@ -235,6 +252,10 @@ complete it.
   the configured OS credential provider or explicitly permission-restricted
   service store. Define headless unlock/rotation/revocation behavior and secret
   redaction; do not require an interactive desktop keyring for unattended service.
+  Progress (2026-11-23, Linux): the `daemon` keeps profiles in
+  `<state-dir>/profiles/` (0700/0600); profiles hold only credential file
+  references (owner decision: validated run options). A service-owned key
+  store, rotation and revocation remain open.
 
 ### Windows service and native adapters
 
@@ -242,6 +263,14 @@ complete it.
   CLI/GUI connection. Scope named-pipe ACLs and administrative actions explicitly;
   isolate installation, driver setup and service control from ordinary connection
   management. Test user changes and concurrent interactive sessions.
+  Progress (2026-11-23, cross-compiled and unit-tested on Linux only, with no
+  native Windows run): [Windows local service](modules/windows-local-service.md)
+  implements the `l2tunnel-windows` service host (install/uninstall/run and
+  foreground mode, one directly hosted service owner), local API v1/v4/v5 on
+  the named pipe `\\.\pipe\l2tunnel` with a *proposed* DACL awaiting owner
+  confirmation, a client-side pipe-owner check, and the nonprivileged
+  `l2tunnelctl` and `l2tunnel-windows-gui` frontends. Native, ACL and
+  multi-session evidence is tracked as WLS-02..WLS-08.
 - [ ] [CL-26] Qualify separate Wintun L3 and TAP L2 adapters, handle lifetimes,
   driver distribution requirements, MTU and address/route cleanup. Determine
   VXLAN attachment support independently; do not infer it from TAP support.

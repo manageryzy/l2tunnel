@@ -36,7 +36,9 @@ Pings could age an incomplete transaction out of its 128-entry replay window.
 
 The new gate must check verified full session, remote role and physical lane
 before parsing or mutation, and reserve external delivery custody before sequence
-commitment. Liveness permits only Ping/Pong in immutable control scope.
+commitment. Liveness permits only Ping/Pong and the tunnel-test address
+exchange (`ProfileControl` tag `TunnelTestV1`, docs/modules/tunnel-tests.md) in
+immutable control scope.
 Transaction permits nested Management or an explicitly supported ProfileControl
 grammar from the registered originating data scope. Target configuration digest
 is not origin digest. DataFeedback permits only the actual registered recovery

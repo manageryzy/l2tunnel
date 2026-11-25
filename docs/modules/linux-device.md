@@ -24,6 +24,20 @@ is retained and all returned names are bounded. Protocol crates retain forbid.
 The crate is Linux-only; unsupported hosts compile no Linux API and never claim
 native device support. Native privileges are verified by the caller at runtime.
 
+`TunTap::create_persistent(name, layer, owner)` creates a named persistent
+TUN/TAP device for the service's device management (DGUI-06). It adds two
+value ioctls to the same audited boundary: `TUNSETPERSIST` (argument 1) and,
+when an owner UID is given, `TUNSETOWNER`. Both pass a plain integer, no
+pointer, on the descriptor returned by `TUNSETIFF`; the descriptor is closed
+afterwards and the device remains until it is deleted.
+
+`netconf` manages links, addresses and main-table routes over rtnetlink
+(`rtnetlink =0.24.0`, no unsafe). Lists are bounded by `LIST_LIMIT`; routes
+are added and deleted as protocol `static` in table 254 only.
+`best_route` finds the longest-prefix route toward an address, optionally
+excluding one device, for the default-route peer exception. Ownership of
+devices and routes is kept by the client-core Linux host, not by this crate.
+
 ## TODO and acceptance
 
 - [x] [MOD-LNX-01] Implement explicit-name attachment, checked packet buffers and nonblocking receive/transmit. Evidence: [implementation/tests](../../crates/l2tunnel-platform-linux/src/lib.rs).

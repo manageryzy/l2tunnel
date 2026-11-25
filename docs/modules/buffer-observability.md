@@ -102,8 +102,15 @@ one sanitized unavailable notice per reason per process, without paths or payloa
 owner emits a separate terminal `.bmetrics` JSON file. Its extension prevents the
 existing record histogram reader from mixing these populations. Diagnostic heap
 and path capacity are reported separately from authenticated protocol quotas;
-inline owner sizes remain in their normal resource plans. No disabled observer
-allocates its collector. Optional provider snapshot storage is heap-backed and reserved at construction, avoiding large disabled owner/future layouts.
+inline owner sizes remain in their normal resource plans. Optional provider snapshot storage is heap-backed and reserved at construction, avoiding large owner/future layouts.
+
+Since 2026-11-24 collection is always on ([meter CSR](meter-csr.md) decision 3):
+every observer exists, its collector holds sparse key slots (64 by default;
+an exhausted slot is counted as `slots_exhausted` and marks the owner invalid),
+and completed waits also fill a 24-bucket log2 histogram. The variables above
+now select only the end-of-session `.bmetrics` dump (decision 14); the live
+values are read from the meter CSR. The per-event cost of always-on
+collection has not been measured yet (MCSR-02).
 
 Collector tests exercise repeated refusal, overlapping causes, terminal censoring,
 clock rejection, bounded allocation and counter validity. Actual retained-TLS and
