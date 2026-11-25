@@ -248,6 +248,10 @@ async fn serve(mut commands: async_mpsc::Receiver<Command>, post: Post) {
                         Query::SocksSet(settings) => OperationAction::SocksSet {
                             settings: (**settings).clone(),
                         },
+                        Query::CarrierSwitchGet => OperationAction::CarrierSwitchGet {},
+                        Query::CarrierSwitch(target) => OperationAction::CarrierSwitch {
+                            target: target.clone(),
+                        },
                     };
                     let result = if matches!(
                         query,
@@ -255,6 +259,7 @@ async fn serve(mut commands: async_mpsc::Receiver<Command>, post: Post) {
                             | Query::TestCancel(_)
                             | Query::RateBudgetSet { .. }
                             | Query::SocksSet(_)
+                            | Query::CarrierSwitch(_)
                     ) {
                         let _permit = permits.acquire().await;
                         exchange(&path, action).await

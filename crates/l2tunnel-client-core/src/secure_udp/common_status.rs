@@ -1362,7 +1362,11 @@ mod observe {
                 }
             }
             let counters = snapshot.map(|value| value.counters);
-            let udp_cover = match settings.cover.appearance {
+            let live_carrier = snapshot.and_then(|value| value.carrier_switch);
+            let effective_appearance = live_carrier
+                .map(|cs| cs.effective_cover)
+                .unwrap_or(settings.cover.appearance);
+            let udp_cover = match effective_appearance {
                 l2tunnel_cover::Appearance::QuicLike => "quic-like",
                 l2tunnel_cover::Appearance::MediaLike => "media-like",
                 l2tunnel_cover::Appearance::TlsLike => "tls-like",
@@ -1433,8 +1437,14 @@ mod observe {
                 member: info.member.0,
                 initiator_noise: info.peers.initiator.0,
                 responder_noise: info.peers.responder.0,
-                local: info.local_addr.to_string(),
-                peer: info.peer_addr.to_string(),
+                local: live_carrier
+                    .map(|cs| cs.local_addr)
+                    .unwrap_or(info.local_addr)
+                    .to_string(),
+                peer: live_carrier
+                    .map(|cs| cs.peer_addr)
+                    .unwrap_or(info.peer_addr)
+                    .to_string(),
                 configuration: configuration.0,
                 catalog: *profile.catalog().root().as_bytes(),
                 catalog_members: u16::try_from(profile.catalog().descriptors().len())

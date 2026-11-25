@@ -82,6 +82,9 @@ class FakeService:
         }
         self.socks_password: str | None = None
         self.socks_error: str | None = None
+        # SIMULATED live carrier switch state (DGUI-14).
+        self.carrier_cover: str = 'quic-like'
+        self.carrier_switches: int = 0
         with self.lock:
             self.publish()
 
@@ -334,6 +337,41 @@ class FakeService:
         }
         self.socks_error = None
         return self.reply(True, 'ok', socks=self.socks_status_view())
+
+    def carrier_switch_view(self) -> dict:
+        reason = 'client initiates live carrier switches' if self.server else None
+        def udp(cid: str, label: str) -> dict:
+            item = {'id': cid, 'label': label, 'available': reason is None}
+            if reason:
+                item['reason'] = reason
+            return item
+        return {
+            'current_carrier': 'udp',
+            'current_cover': self.carrier_cover,
+            'local': f'127.0.0.1:{41000 + self.carrier_switches}',
+            'peer': f'127.0.0.1:{51820 + self.carrier_switches}',
+            'switches': self.carrier_switches,
+            'choices': [
+                udp('quic-like', 'UDP · QUIC-like'),
+                udp('media-like', 'UDP · Media-like (RTP)'),
+                udp('tls-like', 'UDP · TLS-like'),
+                {'id': 'tcp', 'label': 'TCP / TLS', 'available': False,
+                 'reason': 'requires TLS credentials (--cert/--key/--ca) and a TCP listener'},
+                {'id': 'quic', 'label': 'QUIC (Quinn)', 'available': False,
+                 'reason': 'requires TLS credentials (--cert/--key/--ca) and a QUIC listener'},
+            ],
+        }
+
+    def carrier_switch_apply(self, target: str) -> dict:
+        if self.phase != 'connected':
+            return self.reply(False, 'not_running')
+        if self.server:
+            return self.reply(False, 'not_coordinator')
+        if target not in {'quic-like', 'media-like', 'tls-like'}:
+            return self.reply(False, 'invalid_target')
+        self.carrier_cover = target
+        self.carrier_switches += 1
+        return self.reply(True, 'ok', status=self.status_view(), carrier_switch=self.carrier_switch_view())
 
     def info_view(self) -> dict:
         def capability(feature: str, reason: str | None) -> dict:
@@ -769,6 +807,14 @@ class FakeService:
         if command == 'socks_flows':
             with self.lock:
                 return self.reply(True, 'ok', socks_flows=self.socks_flows_view())
+        if command == 'carrier_switch_get':
+            with self.lock:
+                if self.phase != 'connected':
+                    return self.reply(False, 'not_running')
+                return self.reply(True, 'ok', carrier_switch=self.carrier_switch_view())
+        if command == 'carrier_switch':
+            with self.lock:
+                return self.carrier_switch_apply(action.get('target', ''))
         if command == 'meters_read':
             with self.lock:
                 return self.meters_read(action)

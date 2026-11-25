@@ -21,6 +21,7 @@ mod connection_reuse;
 pub mod device_mtu;
 mod prepared;
 pub use prepared::{Attachment, Client, Prepared, Server};
+mod carrier_local;
 mod common_local;
 mod common_reuse_local;
 pub mod host;

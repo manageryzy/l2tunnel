@@ -174,6 +174,8 @@ pub struct CommonSnapshot {
     /// Live meter CSR sampled with this snapshot; absent when it could not
     /// be assembled (never a protocol failure).
     pub meters: Option<std::sync::Arc<l2tunnel_meters::Table>>,
+    /// Live in-session carrier / UDP cover switch state, when running on UDP.
+    pub carrier_switch: Option<super::CarrierSwitchSnapshot>,
 }
 
 /// Actual native-byte window status, separate from recovery debt and TCP cwnd.
@@ -201,13 +203,15 @@ pub struct CommonStopped {
 pub(super) type TransactionReply = oneshot::Sender<Result<core::Epoch, SwitchError>>;
 
 /// Shared producer of complete supported generic configurations, built-in
-/// tunnel tests, in-band remote CSR meter reads, and live speed-budget updates.
+/// tunnel tests, in-band remote CSR meter reads, live speed-budget updates,
+/// and live in-session carrier switching.
 #[derive(Clone)]
 pub struct CommonControlHandle(
     pub(super) mpsc::Sender<Command>,
     pub(super) std::sync::Arc<super::tunnel_tests::Shared>,
     pub(super) std::sync::Arc<super::remote_meters::Shared>,
     pub(super) std::sync::Arc<super::rate_budget::Shared>,
+    pub(super) std::sync::Arc<super::carrier_switch::Shared>,
 );
 
 /// Unique bounded complete-configuration request receiver.
@@ -217,6 +221,7 @@ pub struct CommonControlRequests(
     pub(super) Option<std::sync::Arc<dyn super::DeviceMtu>>,
     pub(super) std::sync::Arc<super::remote_meters::Shared>,
     pub(super) std::sync::Arc<super::rate_budget::Shared>,
+    pub(super) std::sync::Arc<super::carrier_switch::Shared>,
 );
 impl CommonControlRequests {
     /// Let the session set its device MTU around live inner-size switches
@@ -237,6 +242,8 @@ pub(super) enum Command {
     MetersWake,
     /// A live speed-budget update was queued in the shared state; wake the loop.
     RateBudgetWake,
+    /// A live carrier switch was queued in the shared state; wake the loop.
+    CarrierSwitchWake,
 }
 
 /// Allocate exactly one queued request; dropping a waiter never cancels custody.
@@ -245,9 +252,16 @@ pub fn common_channel() -> (CommonControlHandle, CommonControlRequests) {
     let tests = std::sync::Arc::new(super::tunnel_tests::Shared::default());
     let meters = std::sync::Arc::new(super::remote_meters::Shared::default());
     let rate_budget = std::sync::Arc::new(super::rate_budget::Shared::default());
+    let carrier_switch = std::sync::Arc::new(super::carrier_switch::Shared::default());
     (
-        CommonControlHandle(sender, tests.clone(), meters.clone(), rate_budget.clone()),
-        CommonControlRequests(receiver, tests, None, meters, rate_budget),
+        CommonControlHandle(
+            sender,
+            tests.clone(),
+            meters.clone(),
+            rate_budget.clone(),
+            carrier_switch.clone(),
+        ),
+        CommonControlRequests(receiver, tests, None, meters, rate_budget, carrier_switch),
     )
 }
 
@@ -324,6 +338,18 @@ impl CommonControlHandle {
         receiver
             .await
             .unwrap_or(Err(super::rate_budget::RateBudgetError::Closed))
+    }
+    /// Negotiate a make-before-break live carrier / UDP cover switch with the
+    /// authenticated peer (`ProfileTag::CarrierSwitchV1`, `DGUI-14`).
+    pub async fn switch_carrier(
+        &self,
+        target: super::CarrierTarget,
+    ) -> Result<super::CarrierSwitchOutcome, super::CarrierSwitchError> {
+        let receiver = self.4.request(target)?;
+        let _ = self.0.try_send(Command::CarrierSwitchWake);
+        receiver
+            .await
+            .unwrap_or(Err(super::CarrierSwitchError::Closed))
     }
 }
 
@@ -1164,6 +1190,7 @@ impl Driver {
                     tunnel_tests: None,
                     remote_meters: None,
                     rate_budget: None,
+                    carrier_switch: None,
                     device_mtu: None,
                 },
             )
@@ -1322,6 +1349,7 @@ impl Driver {
             path_recovery: runtime.path,
             terminal: self.terminal,
             meters: None,
+            carrier_switch: self.carrier_switch_snapshot(),
         };
         snapshot.meters = super::meters::publish(&snapshot, runtime.buffer_metrics.as_ref(), now);
         Ok(snapshot)

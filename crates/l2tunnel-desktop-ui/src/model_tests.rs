@@ -943,3 +943,94 @@ fn socks5_settings_and_flows_flow() {
         }
     )));
 }
+
+#[test]
+fn live_carrier_switch_updates_view_and_refreshes_status() {
+    use l2tunnel_client_core::local::{CarrierChoice, CarrierSwitchView};
+
+    let mut model = Model::default();
+    let _ = model.attach("/run/x/api.sock");
+    let _ = model.handle(Message::Status {
+        attach: 1,
+        start_follower: true,
+        result: Ok(status_reply("connected", None, 1, 7)),
+    });
+
+    let refresh = model.refresh_carrier_switch();
+    assert_eq!(refresh.len(), 1);
+    let mut view_reply = reply("ok", 7);
+    view_reply.carrier_switch = Some(Box::new(CarrierSwitchView {
+        current_carrier: "udp".into(),
+        current_cover: Some("quic-like".into()),
+        local: "127.0.0.1:41000".into(),
+        peer: "127.0.0.1:42000".into(),
+        switches: 0,
+        choices: vec![
+            CarrierChoice {
+                id: "quic-like".into(),
+                label: "UDP / quic-like".into(),
+                available: true,
+                reason: None,
+            },
+            CarrierChoice {
+                id: "media-like".into(),
+                label: "UDP / media-like".into(),
+                available: true,
+                reason: None,
+            },
+            CarrierChoice {
+                id: "tcp".into(),
+                label: "TCP / TLS".into(),
+                available: false,
+                reason: Some("requires TLS credentials".into()),
+            },
+        ],
+    }));
+    let _ = model.handle(Message::Query {
+        attach: 1,
+        query: Query::CarrierSwitchGet,
+        result: Ok(Box::new(view_reply)),
+    });
+    assert_eq!(
+        model
+            .carrier_switch()
+            .and_then(|v| v.current_cover.as_deref()),
+        Some("quic-like")
+    );
+
+    let cmds = model.switch_carrier("media-like".into());
+    assert_eq!(cmds.len(), 1);
+    assert!(model.carrier_switch_busy());
+
+    let mut switched_reply = reply("ok", 7);
+    switched_reply.carrier_switch = Some(Box::new(CarrierSwitchView {
+        current_carrier: "udp".into(),
+        current_cover: Some("media-like".into()),
+        local: "127.0.0.1:41005".into(),
+        peer: "127.0.0.1:42005".into(),
+        switches: 1,
+        choices: vec![CarrierChoice {
+            id: "media-like".into(),
+            label: "UDP / media-like".into(),
+            available: true,
+            reason: None,
+        }],
+    }));
+    let next = model.handle(Message::Query {
+        attach: 1,
+        query: Query::CarrierSwitch("media-like".into()),
+        result: Ok(Box::new(switched_reply)),
+    });
+    assert!(!model.carrier_switch_busy());
+    assert_eq!(model.carrier_switch().map(|v| v.switches), Some(1));
+    assert_eq!(
+        model
+            .carrier_switch()
+            .and_then(|v| v.current_cover.as_deref()),
+        Some("media-like")
+    );
+    assert!(
+        next.iter().any(|cmd| matches!(cmd, Command::Status { .. })),
+        "live carrier switch should refresh status for top bar and endpoints"
+    );
+}

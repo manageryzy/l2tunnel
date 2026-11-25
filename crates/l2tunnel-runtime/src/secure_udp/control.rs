@@ -1842,7 +1842,10 @@ fn outgoing_stream(body: sc::Body<'_>) -> io::Result<streams::Stream> {
         | sc::Body::Pong { .. }
         | sc::Body::ProfileControl {
             tag:
-                sc::ProfileTag::TunnelTestV1 | sc::ProfileTag::MetersV1 | sc::ProfileTag::RateBudgetV1,
+                sc::ProfileTag::TunnelTestV1
+                | sc::ProfileTag::MetersV1
+                | sc::ProfileTag::RateBudgetV1
+                | sc::ProfileTag::CarrierSwitchV1,
             ..
         } => Ok(streams::Stream::Liveness),
         sc::Body::NativeReceipt {

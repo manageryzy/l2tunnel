@@ -306,6 +306,13 @@ pub enum OperationAction {
     },
     /// Read active and recently ended SOCKS5 flows (`DGUI-08`).
     SocksFlows {},
+    /// Read live in-session carrier-switch state and selectable targets (`DGUI-14`).
+    CarrierSwitchGet {},
+    /// Negotiate a make-before-break live carrier / UDP cover switch (`DGUI-14`).
+    CarrierSwitch {
+        /// Canonical target identifier (`quic-like`, `media-like`, `tls-like`).
+        target: String,
+    },
 }
 impl OperationAction {
     /// Whether the action submits a keyed service operation.
@@ -671,6 +678,9 @@ pub struct OperationReply {
     /// Active and recent SOCKS5 flows (`socks_flows`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub socks_flows: Option<Box<super::SocksFlows>>,
+    /// Live carrier-switch status and selectable targets (`carrier_switch_get`, `carrier_switch`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub carrier_switch: Option<Box<super::CarrierSwitchView>>,
 }
 impl OperationReply {
     /// Reply carrying only an outcome code.
@@ -699,6 +709,7 @@ impl OperationReply {
             tuning: None,
             socks: None,
             socks_flows: None,
+            carrier_switch: None,
         }
     }
 }

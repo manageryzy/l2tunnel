@@ -2,16 +2,17 @@
 
 Status: implemented for Linux (`l2tunnel-linux-gui`, shared `l2tunnel-desktop-ui`)
 and cross-compiled for Windows (`l2tunnel-windows-gui`), covering the sidebar frame,
-Overview, Connection (protocol catalog hot switching, live FEC/MTU tuning, live
-speed-budget tuning, and in-process tunnel speed/ping tests), Devices, Routes,
-SOCKS5 (RFC 1928/1929 listener over TCP-proxy profiles with CIDR allowlist and live
-flow table), Statistics (rolling charts, lane/channel/flow/device tables, and
-local/remote CSR meters with wait-latency percentiles), Management (carrier-aware
-profile editor including TCP-proxy profiles, keys, service info/stop, server
-sessions), Events, and elevated service installation/restart. Elevated root/UAC
-installer execution (`DGUI-13`), live in-session carrier switching (`DGUI-14`,
-protocol-core work), and native Windows execution (`WLS-07`) remain open. This
-does not by itself complete CL-18..CL-23 or CL-33 in [client design](../client-design.md).
+Overview, Connection (protocol catalog hot switching, live make-before-break UDP
+carrier/cover switching, live FEC/MTU tuning, live speed-budget tuning, and
+in-process tunnel speed/ping tests), Devices, Routes, SOCKS5 (RFC 1928/1929
+listener over TCP-proxy profiles with CIDR allowlist and live flow table),
+Statistics (rolling charts, lane/channel/flow/device tables, and local/remote CSR
+meters with wait-latency percentiles), Management (carrier-aware profile editor
+including TCP-proxy profiles, keys, service info/stop, server sessions), Events,
+and elevated service installation/restart. Elevated root/UAC installer execution
+(`DGUI-13`) and native Windows execution (`WLS-07`) remain open (13/14 `DGUI-*`
+tasks closed). This does not by itself complete CL-18..CL-23 or CL-33 in
+[client design](../client-design.md).
 
 ## Recorded decisions (owner, 2026-11-23)
 
@@ -193,9 +194,14 @@ Three-card layout:
 - Switching within the negotiated catalog is a hot switch
   (`switch_common_configuration`): negotiated epoch, matching digests, drain
   barrier, and the explicit point after which cancelling is unsafe (CL-20).
-- Switching to another profile outside the catalog is a reconnect with stated
-  consequences (session replaced, inner flows dropped). Live carrier switching
-  remains planned protocol work.
+- Live make-before-break UDP carrier/cover switching (`carrier_switch_get`,
+  `carrier_switch`, `ProfileTag::CarrierSwitchV1`) migrates UDP cover
+  (`quic-like`, `media-like`, `tls-like`) onto a fresh verified standby UDP
+  socket pair without dropping the session or inner flows; cross-protocol
+  `tcp`/`quic` choices are shown disabled with their explicit reason (requiring
+  TLS credentials and a listener via profile reconnect). Switching to another
+  profile outside the catalog remains a reconnect with stated consequences
+  (session replaced, inner flows dropped).
 
 ### Devices
 
@@ -303,6 +309,7 @@ queries; everything that changes state is a keyed operation.
 | Top bar, Overview | `service status`, `service info` | `status`, `service_info` (role, capabilities with reasons) | implemented |
 | Connect / Reconnect / Disconnect / Cancel | `service connect\|reconnect\|disconnect`, `operation cancel` | existing | implemented |
 | Connection: catalog, hot switch | `config catalog`, `config switch` | `catalog`, `switch_common_configuration` | implemented |
+| Connection: live carrier / UDP cover switch | `carrier show`, `carrier switch --target quic-like\|media-like\|tls-like` | `carrier_switch_get`, `carrier_switch` | implemented (UDP Common make-before-break standby socket + cover migration over `ProfileTag::CarrierSwitchV1`; `tcp`/`quic` shown disabled with explicit TLS-credential reason) |
 | Connection: live FEC/MTU tuning | `tune show`, `tune set` | `tuning_get`, `tuning_switch` | implemented (Swift, Aligned, Packed) |
 | Connection: live speed budget | `tune budget --symmetric MBPS \| --upload MBPS --download MBPS` | `rate_budget_set` | implemented (Common sessions, 1 Mbit/s..=10 Gbit/s; warns when kernel clamps `SO_RCVBUF`/`SO_SNDBUF`) |
 | Connection: tunnel speed & ping tests | `test speed\|ping\|status\|cancel` | `test_start`, `test_get`, `test_cancel` | implemented (Common TUN sessions) |
@@ -340,7 +347,7 @@ owner chose the point-to-point mapping instead.
 - [ ] [DGUI-13] Elevated service start through an installer (owner decisions 2026-11-24); GUI and CLI. Status: implemented and contract-tested ([shared start and unit](../../crates/l2tunnel-client-core/src/local/elevate.rs), [Linux installer](../../crates/l2tunnel-client-core/src/cli_system_service.rs), [CLI](../../crates/l2tunnel-client-core/src/cli_groups_start.rs), [GUI panel](../../crates/l2tunnel-desktop-ui/src/start.rs), [Windows service start](../../apps/l2tunnel-windows/src/service.rs), [fake-pkexec test](../../tools/test_service_start.py)). Open: a real pkexec install and start on Linux (root), and UAC on native Windows.
 - [x] [DGUI-11] Server role: session list, kick and member revoke; GUI and CLI. Evidence: [service](../../crates/l2tunnel-client-core/src/service/sessions_local.rs), [admission test](../../crates/l2tunnel-client-core/src/service/tests/atomic_local.rs), [shared revoke](../../crates/l2tunnel-client-core/src/local/client.rs), [CLI](../../crates/l2tunnel-client-core/src/cli_groups_sessions.rs), [GUI](../../crates/l2tunnel-desktop-ui/src/pages.rs), [fake-service CLI test](../../tools/test_fake_local_service.py), [real-daemon server checks](../../tools/test_profile_daemon.py), and isolated-namespace real-TUN authenticated pair receipt `work/quick-close-20261125/receipt.json` (`session list` 1 live session, `session kick --detach` drops & allows reconnect, `member revoke --allow-key` rotates `--allow-key` and blocks old member reconnect).
 - [x] [DGUI-12] Events page with filters and redacted diagnostic export. Evidence: [shared export](../../crates/l2tunnel-client-core/src/local/diagnostics.rs) (address redaction, new 0600 files only), [CLI](../../crates/l2tunnel-client-core/src/cli_groups.rs), [GUI model test](../../crates/l2tunnel-desktop-ui/src/model_tests.rs), [CLI test against the fake service](../../tools/test_fake_local_service.py).
-- [ ] [DGUI-14] Connection page: live protocol and carrier switching without editing the profile (owner request 2026-11-24). Status: the protocol part is implemented and integration-tested on the local demo pair ([page](../../crates/l2tunnel-desktop-ui/src/pages.rs), [readable names](../../crates/l2tunnel-client-core/src/local/describe.rs)); the existing catalog `common_switch` is used, so the CLI equivalent stays `l2tunnelctl config switch`. The carrier part is planned: the owner chose a live carrier switch inside the session (protocol work, handed to the protocol-core session); until the service offers it the control is shown disabled with that reason, never replaced by a reconnect. Merge step (owner: "then add a merge step"): [tools/merge_common_plans.py](../../tools/merge_common_plans.py) combines chosen exported rows into one multi-protocol plan with the two-member switch composer's rules (identical plans apart from the catalog, largest retained budget, equal carrier policies, distinct descriptors), and refuses anything else with the differing paths; [tests](../../tools/test_merge_common_plans.py) include digest and plan parity with that composer. Merging the demo export's six UDP rows reproduced the hand-merged plan byte for byte (catalog `35f52876…`, the one the live switches ran on) and `inspect-common-transaction-plan` accepted its 6 members. Open: the carrier switch API and its GUI/CLI wiring.
+- [x] [DGUI-14] Connection page: live protocol and carrier switching without editing the profile (owner request 2026-11-24). Evidence: protocol catalog hot switch ([Connection page](../../crates/l2tunnel-desktop-ui/src/pages.rs), [readable names](../../crates/l2tunnel-client-core/src/local/describe.rs), [plan merger](../../tools/merge_common_plans.py), [merger tests](../../tools/test_merge_common_plans.py)); authenticated in-band make-before-break UDP carrier/cover switching (`ProfileTag::CarrierSwitchV1`, [session control](../../crates/l2tunnel-management/src/session_control.rs), [control gate](../../crates/l2tunnel-management/src/control_streams/gate.rs), [runtime state machine](../../crates/l2tunnel-runtime/src/secure_udp/transport_carrier_switch.rs), [local API DTOs](../../crates/l2tunnel-client-core/src/local/carrier.rs), [service view](../../crates/l2tunnel-client-core/src/service/carrier_local.rs), [CLI `l2tunnelctl carrier show|switch`](../../crates/l2tunnel-client-core/src/cli_groups_carrier.rs), [end-to-end two-peer test](../../crates/l2tunnel-client-core/src/service/tests/secure_udp_transaction.rs) `live_carrier_switch_migrates_udp_socket_and_cover_without_dropping_session`, [GUI model test](../../crates/l2tunnel-desktop-ui/src/model_tests.rs) `live_carrier_switch_updates_view_and_refreshes_status`, [fake-service CLI test](../../tools/test_fake_local_service.py) `test_simulated_live_carrier_switch`, and isolated-namespace real-TUN receipt `work/carrier-switch-20261125/receipt.json` showing 3 live switches `quic-like -> media-like -> tls-like -> quic-like` in 120–196 ms on the same generation with `30/30` ICMP packets and `0%` loss). Cross-protocol UDP<->TCP/TLS/QUIC migration requires TLS credentials (`--cert/--key/--ca`) and a separate listener and is explicitly reported as unavailable with that reason.
 
 ## Development services
 

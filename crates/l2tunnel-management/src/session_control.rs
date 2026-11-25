@@ -32,6 +32,9 @@ pub enum ProfileTag {
     /// Authenticated live speed-budget (upload/download rate cap) update v1,
     /// carried on the Liveness stream in Control scope.
     RateBudgetV1 = 6,
+    /// Authenticated live in-session carrier / UDP cover switch v1,
+    /// carried on the Liveness stream in Control scope (DGUI-14).
+    CarrierSwitchV1 = 7,
 }
 /// Exact body length of a tunnel-test control message.
 pub const TUNNEL_TEST_BYTES: usize = 24;
@@ -39,6 +42,8 @@ pub const TUNNEL_TEST_BYTES: usize = 24;
 pub const MAX_METERS_BYTES: usize = 16 * 1024;
 /// Exact body length of a live speed-budget control message.
 pub const RATE_BUDGET_BYTES: usize = 24;
+/// Exact body length of a live carrier-switch control message.
+pub const CARRIER_SWITCH_BYTES: usize = 56;
 impl ProfileTag {
     fn decode(value: u16) -> Result<Self, Error> {
         match value {
@@ -48,6 +53,7 @@ impl ProfileTag {
             4 => Ok(Self::TunnelTestV1),
             5 => Ok(Self::MetersV1),
             6 => Ok(Self::RateBudgetV1),
+            7 => Ok(Self::CarrierSwitchV1),
             _ => Err(Error::ProfileTag),
         }
     }
@@ -310,6 +316,8 @@ impl<'a> Envelope<'a> {
                     Some([0, 3]) => 288,
                     Some([0, 4]) => TUNNEL_TEST_BYTES,
                     Some([0, 5]) => MAX_METERS_BYTES,
+                    Some([0, 6]) => RATE_BUDGET_BYTES,
+                    Some([0, 7]) => CARRIER_SWITCH_BYTES,
                     _ => MAX_PROFILE_CONTROL_BYTES,
                 };
                 if bytes.len() <= 4 || bytes.len() > 4 + maximum {
@@ -364,6 +372,7 @@ impl<'a> Envelope<'a> {
                             ProfileTag::TunnelTestV1 => TUNNEL_TEST_BYTES,
                             ProfileTag::MetersV1 => MAX_METERS_BYTES,
                             ProfileTag::RateBudgetV1 => RATE_BUDGET_BYTES,
+                            ProfileTag::CarrierSwitchV1 => CARRIER_SWITCH_BYTES,
                         } =>
             {
                 return Err(Error::Length);

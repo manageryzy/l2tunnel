@@ -216,5 +216,19 @@ class FakeServiceTest(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertNotIn('listening', replies[-1]['socks'])
 
+    def test_simulated_live_carrier_switch(self):
+        self.start()
+        self.assertEqual(self.ctl('carrier', 'show')[0], 1, 'refused while disconnected')
+        self.assertEqual(self.ctl('service', 'reconnect', '--watch', '10')[0], 0)
+        code, replies = self.ctl('carrier', 'show')
+        self.assertEqual((code, replies[-1]['carrier_switch']['current_cover']), (0, 'quic-like'))
+        self.assertEqual(self.ctl('carrier', 'switch', '--target', 'bogus')[0], 1)
+        code, replies = self.ctl('carrier', 'switch', '--target', 'media-like')
+        view = replies[-1]['carrier_switch']
+        self.assertEqual((code, view['current_cover'], view['switches']), (0, 'media-like', 1))
+        code, replies = self.ctl('carrier', 'switch', '--target', 'tls-like')
+        view = replies[-1]['carrier_switch']
+        self.assertEqual((code, view['current_cover'], view['switches']), (0, 'tls-like', 2))
+
 if __name__ == '__main__':
     unittest.main()

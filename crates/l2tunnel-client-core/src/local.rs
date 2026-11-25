@@ -4,6 +4,7 @@
 //!
 //! Basic proxy actions use version 1; current Common transactions use version 4.
 //! Sharing these types does not provide a platform device adapter.
+mod carrier;
 mod describe;
 mod framing;
 mod host;
@@ -17,6 +18,7 @@ mod sessions;
 mod socks;
 mod tuning;
 mod worker;
+pub use carrier::*;
 pub use describe::configuration_summary;
 pub use host::*;
 pub use info::*;

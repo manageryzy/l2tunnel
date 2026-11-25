@@ -27,6 +27,7 @@ pub(super) const GROUPS: &[&str] = &[
     "session",
     "member",
     "socks",
+    "carrier",
     "test",
     "tune",
 ];
@@ -79,6 +80,10 @@ pub(super) const HELP: &str =
   socks flows
       (SOCKS5 entry over a connected client TCP-proxy profile; non-loopback listen
        addresses require an explicit --allow CIDR list)
+  carrier show
+  carrier switch --target quic-like|media-like|tls-like
+      (live make-before-break UDP carrier/cover switch inside the active session
+       without reconnecting or dropping inner flows)
   test speed [--download] [--streams 1..8] [--seconds 1..30] [--detach]
   test ping [--count 1..100] [--interval-ms 100..1000] [--detach]
   test status [ID] | test cancel ID
@@ -212,6 +217,7 @@ enum Command {
     },
     Test(test::Query),
     Socks(socks::Query),
+    Carrier(carrier::Query),
     Meters(meters::Query),
     TuneShow,
     TuneBudget(tune::Budget),
@@ -496,6 +502,12 @@ fn parse(args: &[String]) -> Result<Parsed, Usage> {
                 flags.extend(more_flags);
             }
         }
+        ("carrier", _) if carrier::accepted(verb).is_some() => {
+            if let Some((more_values, more_flags)) = carrier::accepted(verb) {
+                values.extend(more_values);
+                flags.extend(more_flags);
+            }
+        }
         ("diagnostics", "export") => {
             values.push("--output");
             flags.push("--include-addresses");
@@ -572,6 +584,7 @@ fn parse(args: &[String]) -> Result<Parsed, Usage> {
         },
         ("test", _) => Command::Test(test::parse(verb, &positional, &options, flag)?),
         ("socks", _) => Command::Socks(socks::parse(verb, &options, flag)?),
+        ("carrier", _) => Command::Carrier(carrier::parse(verb, &options)?),
         ("tune", "show") => Command::TuneShow,
         ("tune", "budget") => Command::TuneBudget(tune::budget(&options)?),
         ("tune", _) => {
@@ -1047,6 +1060,7 @@ async fn execute(parsed: Parsed) -> Exit {
         },
         Command::Start(request) => start::run(*request, output.json).await,
         Command::Socks(query) => Box::pin(socks::run(&socket, &output, query)).await,
+        Command::Carrier(query) => Box::pin(carrier::run(&socket, &output, query)).await,
         Command::Diagnostics {
             output: file,
             include_addresses,
@@ -1546,6 +1560,8 @@ pub(super) fn main(args: &[String]) -> ExitCode {
     }
 }
 
+#[path = "cli_groups_carrier.rs"]
+mod carrier;
 #[path = "cli_groups_host.rs"]
 mod host;
 #[path = "cli_groups_meters.rs"]

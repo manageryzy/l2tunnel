@@ -94,6 +94,8 @@ pub use common_reuse::{
 };
 #[path = "transport_buffer_metrics.rs"]
 mod buffer_metrics;
+#[path = "transport_carrier_switch.rs"]
+mod carrier_switch;
 #[path = "transport_common_contract.rs"]
 mod common_contract;
 #[path = "transport_common_fragments.rs"]
@@ -116,6 +118,9 @@ mod rate_budget;
 mod remote_meters;
 #[path = "transport_tunnel_tests.rs"]
 mod tunnel_tests;
+pub use carrier_switch::{
+    CarrierSwitchError, CarrierSwitchOutcome, CarrierSwitchSnapshot, CarrierTarget,
+};
 pub use common::{
     CommonControlHandle, CommonControlRequests, CommonSnapshot, CommonStopped,
     NativeDeliverySnapshot, SameFlowRecovery, common_channel, run_common, run_common_on_carrier,
@@ -242,6 +247,7 @@ where
     driver.install_tunnel_tests(device.layer(), &requests);
     driver.install_remote_meters(&requests);
     driver.install_rate_budget(&requests);
+    driver.install_carrier_switch(&requests, &socket);
     driver.install_device_mtu(device.layer(), &requests);
     let mut device =
         NativeReady::with_interest(device, Interest::READABLE.add(Interest::WRITABLE))?;
@@ -403,6 +409,9 @@ where
                 driver.service_remote_meters(now)?;
                 driver.service_rate_budget(now)
             })?;
+            driver
+                .service_carrier_switch(&mut socket, now, instant)
+                .await?;
             if let carrier::IoOwner::Udp(udp) = &socket {
                 driver.credit_observe_udp(udp)?;
             }
@@ -465,6 +474,9 @@ where
                     if let Some(at) = driver.rate_budget_wake() {
                         wake.at = wake.at.min(origin + Duration::from_micros(at));
                     }
+                    if let Some(at) = driver.carrier_switch_wake(now) {
+                        wake.at = wake.at.min(origin + Duration::from_micros(at));
+                    }
                     Ok::<_, io::Error>((read_native, write_native, interest, wake))
                 })?;
             let mixed = matches!(
@@ -502,7 +514,8 @@ where
                         // The next turn takes the queued test, meter read, or rate update from shared state.
                         Some(Request::Common(common::Command::TestWake))
                         | Some(Request::Common(common::Command::MetersWake))
-                        | Some(Request::Common(common::Command::RateBudgetWake)) => {}
+                        | Some(Request::Common(common::Command::RateBudgetWake))
+                        | Some(Request::Common(common::Command::CarrierSwitchWake)) => {}
                         None => requests.close(),
                     }
                 }
@@ -1795,6 +1808,8 @@ struct Driver {
     remote_meters: Option<Box<remote_meters::Port>>,
     /// Authenticated live speed-budget updates; installed when the loop starts.
     rate_budget: Option<Box<rate_budget::Port>>,
+    /// Authenticated live in-session carrier switching; installed when the loop starts.
+    carrier_switch: Option<Box<carrier_switch::Port>>,
     /// Device MTU ordering for live inner-size switches; installed when the
     /// loop starts if the service gave a setter.
     device_mtu: Option<Box<device_mtu::Gate>>,
@@ -2122,6 +2137,7 @@ impl Driver {
                 Test(Option<[u8; control::TUNNEL_TEST_BYTES]>),
                 Meters(Vec<u8>),
                 RateBudget(Vec<u8>),
+                CarrierSwitch(Vec<u8>),
             }
             let command = match envelope.body {
                 control::Body::NativeReceipt {
@@ -2150,6 +2166,12 @@ impl Driver {
                     tag: control::ProfileTag::RateBudgetV1,
                     bytes,
                 } if scope == self.records.control_scope() => Command::RateBudget(bytes.to_vec()),
+                control::Body::ProfileControl {
+                    tag: control::ProfileTag::CarrierSwitchV1,
+                    bytes,
+                } if scope == self.records.control_scope() => {
+                    Command::CarrierSwitch(bytes.to_vec())
+                }
                 _ => {
                     return Err(protocol(
                         "unsupported or mis-scoped authenticated control body",
@@ -2188,6 +2210,7 @@ impl Driver {
                 }
                 Command::Meters(bytes) => self.receive_remote_meters(now, &bytes),
                 Command::RateBudget(bytes) => self.receive_rate_budget(now, &bytes)?,
+                Command::CarrierSwitch(bytes) => self.receive_carrier_switch(now, &bytes)?,
                 Command::Native(lane, channel, record) => {
                     self.receive_common_native_delivery(now, scope, lane, channel, record)?
                 }

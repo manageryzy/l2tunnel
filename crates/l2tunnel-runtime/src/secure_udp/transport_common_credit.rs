@@ -262,6 +262,13 @@ impl Driver {
             .as_deref_mut()
             .and_then(|runtime| runtime.credit.as_mut())
     }
+    /// Mark UDP socket buffer sizing dirty so a newly migrated UDP socket
+    /// receives the configured `SO_RCVBUF`/`SO_SNDBUF` sizing on swap.
+    pub(super) fn credit_mark_buffers_dirty(&mut self) {
+        if let Some(state) = self.credit() {
+            state.counters.buffers_dirty = true;
+        }
+    }
     /// Once, before data: ask the UDP data socket for a receive buffer of the
     /// credit byte ceiling, then read back what the kernel granted. Credit may
     /// let up to `ceiling_bytes` be in flight; a buffer that holds it keeps a

@@ -1348,6 +1348,134 @@ async fn version5_unix_socket_drives_real_common_connect_events_and_test_refusal
     Ok(())
 }
 
+#[tokio::test]
+async fn live_carrier_switch_migrates_udp_socket_and_cover_without_dropping_session() -> Result {
+    use crate::local::{OperationAction, OperationRequest};
+
+    let hosts = support::hosts();
+    let TransactionPlans { plans, .. } =
+        transaction_plans(l2tunnel_cover::Appearance::QuicLike, &hosts)?;
+    let [client_plan, server_plan] = plans;
+    let (client, client_run) = channel();
+    let (server, server_run) = channel();
+    let client_task = tokio::spawn(client_run);
+    let server_task = tokio::spawn(server_run);
+
+    let client_connect = client
+        .connect(client_plan, client.next_key().map_err(submit)?)
+        .map_err(submit)?;
+    let server_connect = server
+        .connect(server_plan, server.next_key().map_err(submit)?)
+        .map_err(submit)?;
+    tokio::try_join!(
+        connected(&client, client_connect),
+        connected(&server, server_connect)
+    )?;
+
+    let before = client
+        .operations_request(OperationRequest::new(OperationAction::CarrierSwitchGet {}))
+        .await;
+    assert!(before.ok, "{before:?}");
+    let view = before.carrier_switch.ok_or("missing carrier_switch view")?;
+    assert_eq!(view.current_carrier, "udp");
+    assert_eq!(view.current_cover.as_deref(), Some("quic-like"));
+    assert_eq!(view.switches, 0);
+    let initial_local = view.local.clone();
+    let initial_peer = view.peer.clone();
+
+    // Invalid target is refused without disturbing the active session.
+    let invalid = client
+        .operations_request(OperationRequest::new(OperationAction::CarrierSwitch {
+            target: "bogus-carrier".into(),
+        }))
+        .await;
+    assert!(
+        !invalid.ok && invalid.code == "invalid_target",
+        "{invalid:?}"
+    );
+
+    // Live make-before-break switch from quic-like -> media-like on fresh UDP ports.
+    let switched = client
+        .operations_request(OperationRequest::new(OperationAction::CarrierSwitch {
+            target: "media-like".into(),
+        }))
+        .await;
+    assert!(
+        switched.ok,
+        "carrier switch to media-like failed: {switched:?}\nclient={:?}\nserver={:?}",
+        status(&client),
+        status(&server)
+    );
+    let after = switched
+        .carrier_switch
+        .ok_or("missing carrier_switch after switch")?;
+    assert_eq!(after.current_cover.as_deref(), Some("media-like"));
+    assert_eq!(after.switches, 1);
+    assert_ne!(after.local, initial_local);
+    assert_ne!(after.peer, initial_peer);
+
+    async fn recv_packet(host: &Arc<Host>, expected: &[u8]) -> Result {
+        timeout(Duration::from_secs(3), async {
+            let mut output = [0_u8; 1601];
+            loop {
+                let read = {
+                    let app = host
+                        .application
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    app.as_ref()
+                        .ok_or("generic packet device not opened")?
+                        .recv(&mut output)
+                };
+                match read {
+                    Ok(len) => {
+                        assert_eq!(&output[..len], expected);
+                        return Ok::<(), Error>(());
+                    }
+                    Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                    Err(err) => return Err(err.into()),
+                }
+            }
+        })
+        .await?
+    }
+
+    // Exchange bidirectional packets over the migrated UDP socket without reconnecting.
+    let pkt_ab = packet(0x41, 512);
+    let pkt_ba = packet(0x42, 512);
+    hosts[0].send(&pkt_ab)?;
+    hosts[1].send(&pkt_ba)?;
+    recv_packet(&hosts[1], &pkt_ab).await?;
+    recv_packet(&hosts[0], &pkt_ba).await?;
+
+    // Second live switch from media-like -> tls-like.
+    let switched2 = client
+        .operations_request(OperationRequest::new(OperationAction::CarrierSwitch {
+            target: "tls-like".into(),
+        }))
+        .await;
+    assert!(
+        switched2.ok,
+        "carrier switch to tls-like failed: {switched2:?}"
+    );
+    let after2 = switched2
+        .carrier_switch
+        .ok_or("missing carrier_switch after second switch")?;
+    assert_eq!(after2.current_cover.as_deref(), Some("tls-like"));
+    assert_eq!(after2.switches, 2);
+
+    let pkt_ab2 = packet(0x43, 512);
+    hosts[0].send(&pkt_ab2)?;
+    recv_packet(&hosts[1], &pkt_ab2).await?;
+
+    client_task.abort();
+    server_task.abort();
+    let _ = tokio::join!(client_task, server_task);
+    Ok(())
+}
+
 struct DirGuard(std::path::PathBuf);
 impl Drop for DirGuard {
     fn drop(&mut self) {

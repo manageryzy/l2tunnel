@@ -6,10 +6,10 @@ use l2tunnel_client_core::local::elevate::{StartRequest, Started};
 use l2tunnel_client_core::local::keys::KeyReference;
 use l2tunnel_client_core::local::tunnel_test::{TestRequest, TestState};
 use l2tunnel_client_core::local::{
-    DeviceChange, DeviceState, EventBody, EventState, Feature, MeterPage, MeterSide, Metrics,
-    OperationReply, OperationResult, OperationState, ProfileChange, ProfileEntry, ProfileSummary,
-    RouteChange, RouteState, ServiceId, ServiceInfo, ServiceStatus, SessionState, SocksFlows,
-    SocksSettings, SocksStatus, TerminalState, TuningSetting, TuningView,
+    CarrierSwitchView, DeviceChange, DeviceState, EventBody, EventState, Feature, MeterPage,
+    MeterSide, Metrics, OperationReply, OperationResult, OperationState, ProfileChange,
+    ProfileEntry, ProfileSummary, RouteChange, RouteState, ServiceId, ServiceInfo, ServiceStatus,
+    SessionState, SocksFlows, SocksSettings, SocksStatus, TerminalState, TuningSetting, TuningView,
 };
 use l2tunnel_client_core::secure_udp::common_status::CanonicalConfiguration;
 use std::collections::{BTreeMap, VecDeque};
@@ -156,6 +156,10 @@ pub enum Query {
     SocksFlows,
     /// `socks_set`.
     SocksSet(Box<SocksSettings>),
+    /// `carrier_switch_get`.
+    CarrierSwitchGet,
+    /// `carrier_switch`.
+    CarrierSwitch(String),
 }
 
 /// Catalogs up to this size are shown as one list.
@@ -430,6 +434,10 @@ pub struct Model {
     socks_flows: Option<SocksFlows>,
     socks_busy: bool,
     socks_error: Option<String>,
+    /// Live in-session carrier switch view, busy flag, and error state.
+    carrier_switch: Option<CarrierSwitchView>,
+    carrier_switch_busy: bool,
+    carrier_switch_error: Option<String>,
     /// Latest CSR meter page, previous snapshot for rates, and error state.
     meters: Option<MeterPage>,
     meters_prev: Option<(MeterSide, u64, u64, BTreeMap<String, u64>)>,
@@ -623,6 +631,9 @@ impl Model {
         self.socks_flows = None;
         self.socks_busy = false;
         self.socks_error = None;
+        self.carrier_switch = None;
+        self.carrier_switch_busy = false;
+        self.carrier_switch_error = None;
         self.action_result = None;
         self.exported = None;
         self.backlog_end = None;
@@ -1194,6 +1205,38 @@ impl Model {
     pub fn socks_error(&self) -> Option<&str> {
         self.socks_error.as_deref()
     }
+    /// Read live carrier-switch targets and current carrier state.
+    pub fn refresh_carrier_switch(&mut self) -> Vec<Command> {
+        self.carrier_switch_error = None;
+        self.query(Query::CarrierSwitchGet)
+    }
+    /// Perform a live in-session make-before-break carrier / UDP cover switch.
+    pub fn switch_carrier(&mut self, target: String) -> Vec<Command> {
+        if self.carrier_switch_busy {
+            return Vec::new();
+        }
+        self.carrier_switch_busy = true;
+        self.carrier_switch_error = None;
+        self.query(Query::CarrierSwitch(target))
+    }
+    /// Latest live carrier-switch view.
+    pub fn carrier_switch(&self) -> Option<&CarrierSwitchView> {
+        self.carrier_switch.as_ref()
+    }
+    /// Whether a live carrier-switch read is in flight.
+    pub fn carrier_switch_loading(&self) -> bool {
+        self.in_flight
+            .iter()
+            .any(|query| matches!(query, Query::CarrierSwitchGet))
+    }
+    /// Whether a live carrier switch is in flight.
+    pub fn carrier_switch_busy(&self) -> bool {
+        self.carrier_switch_busy
+    }
+    /// Last live carrier-switch error, if any.
+    pub fn carrier_switch_error(&self) -> Option<&str> {
+        self.carrier_switch_error.as_deref()
+    }
     /// Identity of the attached service instance.
     pub fn service(&self) -> Option<ServiceId> {
         self.service
@@ -1338,6 +1381,13 @@ impl Model {
                             Query::SocksSet(_) => {
                                 self.socks_busy = false;
                                 self.socks_error = Some(text);
+                            }
+                            Query::CarrierSwitchGet => {
+                                self.carrier_switch_error = Some(text);
+                            }
+                            Query::CarrierSwitch(_) => {
+                                self.carrier_switch_busy = false;
+                                self.carrier_switch_error = Some(text);
                             }
                             Query::Profiles if self.profiles.is_none() => {
                                 self.profiles = Some(Vec::new());
@@ -1610,6 +1660,57 @@ impl Model {
                                 _ => format!("SOCKS5 refused ({})", bounded(&reply.code)),
                             };
                             self.socks_error = Some(reason);
+                        }
+                    }
+                    Query::CarrierSwitchGet => {
+                        if reply.ok {
+                            self.carrier_switch = reply.carrier_switch.map(|view| *view);
+                            self.carrier_switch_error = None;
+                        } else if reply.code != "not_running" {
+                            self.carrier_switch_error = Some(format!(
+                                "carrier targets refused ({})",
+                                bounded(&reply.code)
+                            ));
+                        }
+                    }
+                    Query::CarrierSwitch(target) => {
+                        self.carrier_switch_busy = false;
+                        if let Some(view) = reply.carrier_switch {
+                            self.carrier_switch = Some(*view);
+                        }
+                        if reply.ok {
+                            self.carrier_switch_error = None;
+                            if reply.status.is_some() {
+                                self.status = reply.status;
+                            }
+                            let msg = format!("Carrier switched live to {target}");
+                            self.notice = msg.clone();
+                            self.append(msg);
+                            let mut next = self.refresh(false);
+                            if let Some(q) = again {
+                                next.extend(self.query(q));
+                            }
+                            return next;
+                        } else {
+                            let reason = match reply.code.as_str() {
+                                "unsupported_carrier" => {
+                                    "live carrier switch is only supported on UDP Common sessions"
+                                        .into()
+                                }
+                                "not_coordinator" => {
+                                    "only the client can initiate a live carrier switch".into()
+                                }
+                                "probe_failed" => {
+                                    "standby UDP probe failed; kept the active carrier".into()
+                                }
+                                "peer_timeout" => {
+                                    "peer did not answer (restart the server on the latest build)"
+                                        .into()
+                                }
+                                "busy" => "another carrier switch is in progress".into(),
+                                _ => format!("carrier switch refused ({})", bounded(&reply.code)),
+                            };
+                            self.carrier_switch_error = Some(reason);
                         }
                     }
                     Query::Catalog {

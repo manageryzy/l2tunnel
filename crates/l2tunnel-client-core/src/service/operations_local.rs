@@ -522,6 +522,53 @@ impl Handle {
                 socks_flows: Some(Box::new(self.socks_flows())),
                 ..self.reply(true, "ok")
             },
+            OperationAction::CarrierSwitchGet {} => match self.carrier_switch_view() {
+                Ok(view) => OperationReply {
+                    carrier_switch: Some(Box::new(view)),
+                    ..self.reply(true, "ok")
+                },
+                Err(code) => self.reply(false, code),
+            },
+            OperationAction::CarrierSwitch { target } => {
+                use l2tunnel_runtime::secure_udp::transport::{CarrierSwitchError, CarrierTarget};
+                let Some(parsed) = CarrierTarget::parse(&target) else {
+                    return self.reply(false, "invalid_target");
+                };
+                let switcher = {
+                    let state = self.0.lock();
+                    match &state.backend {
+                        Some(ObservedBackend::SecureUdpCommon(backend)) => {
+                            Ok(backend.switcher.clone())
+                        }
+                        Some(ObservedBackend::Proxy(_)) => Err("unsupported"),
+                        None => Err("not_running"),
+                    }
+                };
+                match switcher {
+                    Err(code) => self.reply(false, code),
+                    Ok(switcher) => match switcher.switch_carrier(parsed).await {
+                        Ok(_) => OperationReply {
+                            status: Some(self.service_status()),
+                            carrier_switch: self.carrier_switch_view().ok().map(Box::new),
+                            ..self.reply(true, "ok")
+                        },
+                        Err(error) => {
+                            let code = match error {
+                                CarrierSwitchError::UnsupportedCarrier => "unsupported_carrier",
+                                CarrierSwitchError::NotCoordinator => "not_coordinator",
+                                CarrierSwitchError::Busy => "busy",
+                                CarrierSwitchError::BindFailed => "bind_failed",
+                                CarrierSwitchError::ProbeFailed => "probe_failed",
+                                CarrierSwitchError::Timeout => "peer_timeout",
+                                CarrierSwitchError::PeerRefused => "peer_refused",
+                                CarrierSwitchError::Malformed => "peer_malformed",
+                                CarrierSwitchError::Closed => "not_running",
+                            };
+                            self.reply(false, code)
+                        }
+                    },
+                }
+            }
             OperationAction::Connect { request_key } => match key(request_key) {
                 Some(key) => self.accepted(self.connect_retained(key)),
                 None => self.reply(false, "invalid_request_key"),

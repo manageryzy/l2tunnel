@@ -118,6 +118,8 @@ pub struct UiState {
     pub tests: crate::test_panel::TestForm,
     /// SOCKS5 settings draft.
     pub socks: crate::socks_panel::SocksForm,
+    /// Selected live carrier switch target on the Connection page.
+    pub carrier_target: String,
     /// Live-tuning controls being edited.
     pub tune: crate::tuning_panel::TuneForm,
     /// Elapsed milliseconds since `ServiceInfo` was fetched (for live uptime).
@@ -153,6 +155,7 @@ impl Default for UiState {
             tune: crate::tuning_panel::TuneForm::default(),
             tests: crate::test_panel::TestForm::default(),
             socks: crate::socks_panel::SocksForm::default(),
+            carrier_target: String::new(),
             info_elapsed_ms: 0,
             status_elapsed_ms: 0,
             meters_side: MeterSide::Local,
@@ -333,6 +336,9 @@ pub fn opened(model: &mut Model, page: Page) -> Vec<Command> {
             }
             if model.catalog().is_none() && model.catalog_error().is_none() {
                 commands.extend(model.catalog_page(0));
+            }
+            if model.capability(Feature::Catalog).is_ok() {
+                commands.extend(model.refresh_carrier_switch());
             }
         }
         Page::Management => {
@@ -1016,6 +1022,10 @@ fn connection(ui: &mut egui::Ui, model: &mut Model, state: &mut UiState) -> Vec<
                 &mut state.tune,
                 connected,
             ));
+            ui.add_space(6.0);
+            ui.separator();
+            ui.add_space(4.0);
+            commands.extend(carrier_switch_section(ui, model, state, connected));
         }
 
         ui.add_space(6.0);
@@ -1174,16 +1184,105 @@ fn connection(ui: &mut egui::Ui, model: &mut Model, state: &mut UiState) -> Vec<
                     ));
                 }
                 rows(ui, "connection-details-rows", &list);
-                ui.add_space(4.0);
-                ui.weak(CARRIER_SWITCH_PENDING);
             });
     });
     commands
 }
 
-const CARRIER_SWITCH_PENDING: &str = "Switching the carrier live (without reconnecting) needs \
-     protocol support that is being designed; this service does not offer it yet. Until \
-     then the carrier comes from the profile.";
+fn carrier_switch_section(
+    ui: &mut egui::Ui,
+    model: &mut Model,
+    state: &mut UiState,
+    connected: bool,
+) -> Vec<Command> {
+    let mut commands = Vec::new();
+    ui.horizontal(|ui| {
+        ui.strong("Live carrier & UDP cover");
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if model.carrier_switch_busy() || model.carrier_switch_loading() {
+                ui.spinner();
+            }
+            if connected && !model.carrier_switch_loading() && ui.small_button("Refresh").clicked()
+            {
+                commands.extend(model.refresh_carrier_switch());
+            }
+        });
+    });
+    if !connected {
+        ui.weak("Connect first to switch carrier/cover live without reconnecting.");
+        return commands;
+    }
+    if model.carrier_switch().is_none()
+        && !model.carrier_switch_loading()
+        && model.carrier_switch_error().is_none()
+    {
+        commands.extend(model.refresh_carrier_switch());
+    }
+    if let Some(error) = model.carrier_switch_error() {
+        ui.colored_label(ui.visuals().warn_fg_color, error);
+    }
+    let Some(view) = model.carrier_switch().cloned() else {
+        ui.weak("Loading live carrier choices…");
+        return commands;
+    };
+    let current_id = view
+        .current_cover
+        .as_deref()
+        .unwrap_or(view.current_carrier.as_str());
+    if state.carrier_target.is_empty() || !view.choices.iter().any(|c| c.id == state.carrier_target)
+    {
+        state.carrier_target = current_id.to_owned();
+    }
+    ui.weak(format!(
+        "Active: {} · {} → {} · {} live switches (make-before-break, keeps session & inner flows)",
+        current_id, view.local, view.peer, view.switches
+    ));
+    ui.add_space(4.0);
+    for choice in &view.choices {
+        let is_current = choice.id == current_id;
+        ui.horizontal_wrapped(|ui| {
+            ui.add_enabled_ui(choice.available && !model.carrier_switch_busy(), |ui| {
+                ui.radio_value(
+                    &mut state.carrier_target,
+                    choice.id.clone(),
+                    choice.label.as_str(),
+                );
+            });
+            if is_current {
+                dot(ui, Tone::Good);
+                ui.colored_label(egui::Color32::from_rgb(90, 190, 110), "in use");
+            } else if !choice.available
+                && let Some(reason) = &choice.reason
+            {
+                ui.weak(format!("— {reason}"));
+            }
+        });
+    }
+    let selected_available = view
+        .choices
+        .iter()
+        .any(|c| c.id == state.carrier_target && c.available);
+    let can_switch = connected
+        && selected_available
+        && state.carrier_target != current_id
+        && !model.carrier_switch_busy();
+    ui.add_space(4.0);
+    ui.horizontal_wrapped(|ui| {
+        if ui
+            .add_enabled(can_switch, egui::Button::new("Switch carrier live"))
+            .clicked()
+        {
+            commands.extend(model.switch_carrier(state.carrier_target.clone()));
+        }
+        if state.carrier_target != current_id && ui.button("Reset").clicked() {
+            state.carrier_target = current_id.to_owned();
+        }
+        if model.carrier_switch_busy() {
+            ui.weak("Probing standby carrier and migrating…");
+        }
+    });
+    commands
+}
 
 fn layer_text(layer: Option<DeviceLayer>) -> &'static str {
     match layer {
