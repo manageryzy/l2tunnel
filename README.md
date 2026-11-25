@@ -8,17 +8,63 @@ session state, records, MUX, recovery and codecs.
 **Current status:** the Common record runtime (`--record-profile common`) is
 runnable on Linux over authenticated UDP (`quic-like`, `media-like`, `tls-like`,
 `openvpn-like`), raw-packet TCP (`raw-packet`, with optional `--udp-cover tls-like`),
-TCP/TLS (`tcp`), and genuine QUIC (`quic`), carrying TAP, TUN, and VXLAN traffic
-with Swift, Aligned, Packed, Compact, Rolling, Striped, Research, and TCP-proxy
-record profiles. A shared local control API v5 backs `l2tunnelctl`, the
-`l2tunneld` / `l2tunnel-linux` daemon, and the `egui` desktop GUI
+TCP/TLS (`tcp`), and genuine QUIC (`quic`), carrying TAP, TUN, and RFC 7348
+VXLAN/VTEP traffic with Swift, Aligned, Packed, Compact, Rolling, Striped,
+Research, and TCP-proxy record profiles. A shared local control API v5 backs
+`l2tunnelctl`, the `l2tunneld` / `l2tunnel-linux` daemon (with bounded automatic
+fresh-authentication recovery enabled by default), and the `egui` desktop GUI
 (`l2tunnel-linux-gui` / `l2tunnel-windows-gui`), including live protocol and
-FEC/MTU tuning, live speed-budget tuning (`1 Mbit/s..=10 Gbit/s`), local and
-remote CSR meters, and in-process tunnel speed/ping tests. Windows service/Wintun
-and Android FD-broker binaries cross-compile and pass unit/Wine checks, while
-native Windows/Android device qualification, GUI SOCKS5, live carrier switching,
-and full 49-mode parity acceptance remain open. This is not a complete
-production VPN. See [current implementation status](docs/implementation-status.md).
+FEC/MTU tuning, live speed-budget tuning (`1 Mbit/s..=10 Gbit/s`), live
+make-before-break UDP carrier/cover switching, RFC 1928/1929 SOCKS5 over
+TCP-proxy, local and remote CSR meters, and in-process tunnel speed/ping tests.
+Windows service/Wintun and Android FD-broker binaries cross-compile and pass
+unit/Wine checks, while native Windows/Android device qualification, multi-core
+scaling past the single-core CPU ceiling, state-retaining outage recovery, and
+full 49-mode parity acceptance remain open. This is not a complete production
+VPN. See [current implementation status](docs/implementation-status.md).
+
+## Desktop GUI
+
+The nonprivileged `egui` desktop frontend (`l2tunnel-linux-gui` /
+`l2tunnel-windows-gui`) talks to the daemon over local API v5; closing the
+window never disconnects an active session.
+
+![Overview page — live connected session, throughput sparkline, and recent activity](docs/images/gui-overview.png)
+
+<details>
+<summary>More UI snapshots (Connection live tuning &amp; carrier switch, Statistics &amp; carrier lanes)</summary>
+
+**Connection — live FEC/MTU tuning, speed budget, and make-before-break UDP carrier/cover switching**
+
+![Connection page — live FEC/MTU tuning, speed budget presets, and UDP carrier/cover switching](docs/images/gui-connection.png)
+
+**Statistics — live throughput/packet charts and per-lane drop/error counters**
+
+![Statistics page — live network throughput, packet rates, and carrier lane counters](docs/images/gui-statistics.png)
+
+</details>
+
+## Speed test & real-kernel highlights
+
+Measured on Linux in strictly isolated owned network namespaces over real kernel
+`tun0` (`mtu 1500`, 8 TCP streams across distinct ports with Linux per-netns TCP
+autotuning, `tc netem` applied before connect, host sysctls untouched) using the
+release `l2tunneld` binary with `swift-fec-udp` (1/4 systematic GF(2^8) repair,
+16 channels, `SO_RCVBUFFORCE`/`SO_SNDBUFFORCE` automatic buffer sizing, and
+bounded high-BDP session receiver credit):
+
+| Path (`tc netem`, 70 ms RTT / 15% loss each way) | Goodput (`swift-fec-udp`) | Wire efficiency | `l2tunneld` CPU (A / B) | Credit stalls | UDP `RcvbufErrors` |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `100 / 10 Mbit/s` | **81.77 Mbit/s** | **81.8%** | 53% / 68% | 812 | **0 / 0** |
+| `200 / 20 Mbit/s` | **159.36 Mbit/s** | **79.7%** | 88% / 91% | 10 | **0 / 0** |
+| `300 / 30 Mbit/s` | **220.10 Mbit/s** | **73.4%** | 111% / 94% | 28 | **0 / 0** |
+| `500 / 50 Mbit/s` | **224.07 Mbit/s** | 44.8% *(single-core CPU ceiling)* | 110% / 83% | **0** | **0 / 0** |
+| `1000 / 100 Mbit/s` | **238.30 Mbit/s** | 23.8% *(single-core CPU ceiling)* | 107% / 80% | **0** | **0 / 0** |
+| `1000 / 1000 Mbit/s` clean (`0 ms`, `0%` loss) | **222.89 Mbit/s** *(FEC)* / **284.91 Mbit/s** *(ARQ)* | *(single-core CPU ceiling)* | 123–124% / 112–116% | **0** | **0 / 0** |
+
+- **Zero UDP socket drops (`0/0` `RcvbufErrors`)** through 1 Gbit/s without modifying host `net.core.rmem_max`.
+- **Scaling boundary:** on this Linux host, one `l2tunneld` owner loop saturates around `~220–238 Mbit/s` (`swift-fec-udp`) and `~285 Mbit/s` (`swift-arq-udp` clean); in-process release simulation (not kernel qualification) reaches `76.0–78.5%` of wire budget up to `1000/100 Mbit/s` under 70 ms RTT / 15% loss.
+- **Live carrier switching & VXLAN:** make-before-break UDP cover switching (`quic-like` ↔ `media-like` ↔ `tls-like`) verified with 0% packet loss across live switches; RFC 7348 VXLAN/VTEP with mixed untagged + 802.1Q VLAN filtering (`vlan_filtering 1`), dual isolated VNIs, and kernel-VXLAN interop verified under 15% loss + 25% reorder. See [implementation status](docs/implementation-status.md) and [receiver credit](docs/modules/receiver-credit.md).
 
 ## Start here
 
@@ -61,10 +107,10 @@ server/client pair (authenticated Common UDP session) for desktop GUI and CLI
 testing:
 
 ```sh
-python3 tools/local_real_pair.py prepare --row demo-multi-udp
-python3 tools/local_real_pair.py run --side server --replace
-python3 tools/local_real_pair.py run --side client --replace
-./target/release/l2tunnel-linux-gui
+python3 tools/local_real_pair.py prepare --row swift-arq-udp
+python3 tools/local_real_pair.py run --side b --replace
+python3 tools/local_real_pair.py run --side a --replace
+./target/release/l2tunnel-linux-gui --socket /tmp/l2tunnel-real/control-a.sock
 ```
 
 ## Local control CLI (`l2tunnelctl`, API v5)
@@ -74,12 +120,14 @@ Start a daemon or endpoint with `--control-socket /private/owned-directory/servi
 uses the same local API v5 as the desktop GUI:
 
 ```sh
-l2tunnelctl --socket /private/owned-directory/service.sock status
-l2tunnelctl --socket /private/owned-directory/service.sock tune show
-l2tunnelctl --socket /private/owned-directory/service.sock tune set --repair 1/4
-l2tunnelctl --socket /private/owned-directory/service.sock meters read --side remote
-l2tunnelctl --socket /private/owned-directory/service.sock test speed --direction upload --streams 4 --seconds 10
-l2tunnelctl --socket /private/owned-directory/service.sock test ping --probes 10
+l2tunnelctl --control-socket /private/owned-directory/service.sock service status
+l2tunnelctl --control-socket /private/owned-directory/service.sock tune show
+l2tunnelctl --control-socket /private/owned-directory/service.sock tune set --repair 1/4
+l2tunnelctl --control-socket /private/owned-directory/service.sock tune budget --upload 200 --download 100
+l2tunnelctl --control-socket /private/owned-directory/service.sock carrier switch --target media-like
+l2tunnelctl --control-socket /private/owned-directory/service.sock meters read --remote
+l2tunnelctl --control-socket /private/owned-directory/service.sock test speed --streams 4 --seconds 10
+l2tunnelctl --control-socket /private/owned-directory/service.sock test ping --count 10
 ```
 
 Only the authenticated initiator coordinates peer configuration switches. A
