@@ -348,6 +348,19 @@ the chosen driver artifact and terms before packaging.
   and storage behavior after provider capability testing; never assume that a
   nonexportable OS key can satisfy every Rust crypto API. Keep credentials out of
   backups/logs and define unlock, rotation and removal behavior.
+  Progress (2026-11-26, JVM unit-tested and live-verified on Android 12 API 32 +
+  Android 15 API 35 x86_64 MuMu emulators; no physical Android device run yet):
+  `clients/android` implements a 4-tab Jetpack Compose + Material 3 (Material You)
+  UI (`Overview`, `Connection`, `Profiles & Keys`, `Stats & Logs`) over Local API v5
+  (`carrier_switch`, `tuning_get`/`tuning_switch`, `rate_budget_set`, `test_start`/
+  `test_get`/`test_cancel`, `meters_read`, `events`), per-app split tunneling
+  (`ALL`/`EXCLUDE`/`INCLUDE` with mandatory anti-loop self-exclusion), safe `.zip`
+  profile bundle import, redacted diagnostics JSON export (`CL-16`), and
+  `KeystoreSecretStore` AES-256-GCM envelope encryption under `AndroidKeyStore`
+  (`noBackupFilesDir`, `allowBackup="false"`, ephemeral runtime staging scrubbed
+  immediately upon Rust `R` ready signal; verified live on API 32 & API 35 in
+  [receipt](../work/android-ui-20261126/receipt.json)). Physical device and
+  biometric/user-unlock policy qualification remain open.
 
 The [official VpnService reference](https://developer.android.com/reference/android/net/VpnService)
 is the platform contract for permission, IP-device creation and socket protection.

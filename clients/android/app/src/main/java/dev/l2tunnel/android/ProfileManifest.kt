@@ -7,6 +7,28 @@ import java.io.File
 /** Explicit refusal for unsupported L2/VXLAN attachments on standard Android VpnService (CL-28). */
 class UnsupportedLayerException(message: String) : IllegalArgumentException(message)
 
+/** Per-app split-tunneling mode for Android `VpnService.Builder`. */
+enum class SplitTunnelMode(val wire: String) {
+    /** Route all apps through the VPN (always excluding `dev.l2tunnel.android` to prevent loops). */
+    ALL("all"),
+
+    /** Route all apps except the selected packages (and always `dev.l2tunnel.android`). */
+    EXCLUDE("exclude"),
+
+    /** Route only the selected packages (never `dev.l2tunnel.android`). */
+    INCLUDE("include"),
+    ;
+
+    companion object {
+        fun parse(raw: String?): SplitTunnelMode = when (raw?.trim()?.lowercase()) {
+            null, "", "all" -> ALL
+            "exclude", "disallow", "disallowed" -> EXCLUDE
+            "include", "allow", "allowed" -> INCLUDE
+            else -> throw IllegalArgumentException("Unsupported split_tunnel_mode: $raw")
+        }
+    }
+}
+
 /**
  * Validated Android L3 VPN profile combining the Rust native client manifest (`client.json`)
  * and optional Android `VpnService.Builder` interface parameters (`android_vpn.json`).
@@ -23,19 +45,79 @@ data class AndroidVpnProfile(
     val tunMtu: Int,
     val noiseProfile: String,
     val handshakeSeconds: Int,
+    val tuneRepair: String?,
     val tunAddress: String,
     val tunPrefixLength: Int,
     val routes: List<Pair<String, Int>>,
     val dnsServers: List<String>,
+    val splitTunnelMode: SplitTunnelMode = SplitTunnelMode.ALL,
+    val splitTunnelApps: List<String> = emptyList(),
 ) {
+    fun toClientJson(): String {
+        val obj = JSONObject()
+            .put("version", 1)
+            .put("carrier", "udp")
+            .put("layer", "tun")
+            .put("cover", cover)
+            .put("udp_bind", udpBind)
+            .put("udp_peer", udpPeer)
+            .put("path_mtu", pathMtu)
+            .put("tun_mtu", tunMtu)
+            .put("noise_profile", noiseProfile)
+            .put("handshake_seconds", handshakeSeconds)
+        if (!tuneRepair.isNullOrBlank()) {
+            obj.put("tune_repair", tuneRepair.trim())
+        }
+        return obj.toString(2) + "\n"
+    }
+
+    fun toAndroidVpnJson(): String {
+        val routesArr = JSONArray()
+        for ((dest, prefix) in routes) {
+            routesArr.put("$dest/$prefix")
+        }
+        val dnsArr = JSONArray()
+        for (dns in dnsServers) {
+            dnsArr.put(dns)
+        }
+        val appsArr = JSONArray()
+        for (pkg in splitTunnelApps.distinct().sorted()) {
+            appsArr.put(pkg)
+        }
+        return JSONObject()
+            .put("tun_address", tunAddress)
+            .put("tun_prefix", tunPrefixLength)
+            .put("routes", routesArr)
+            .put("dns", dnsArr)
+            .put("split_tunnel_mode", splitTunnelMode.wire)
+            .put("split_tunnel_apps", appsArr)
+            .toString(2) + "\n"
+    }
+
+    /**
+     * Computes the exact `(allowed, disallowed)` package lists to apply to `VpnService.Builder`,
+     * guaranteeing the tunnel app itself (`selfPackage`) is NEVER routed into `tun0` (anti-loop).
+     */
+    fun resolveSplitTunnelPackages(selfPackage: String): Pair<List<String>, List<String>> {
+        val clean = splitTunnelApps.map { it.trim() }.filter { it.isNotEmpty() && it != selfPackage }.distinct()
+        return when (splitTunnelMode) {
+            SplitTunnelMode.ALL -> emptyList<String>() to listOf(selfPackage)
+            SplitTunnelMode.EXCLUDE -> emptyList<String>() to (clean + selfPackage).distinct()
+            SplitTunnelMode.INCLUDE -> clean to emptyList()
+        }
+    }
+
     companion object {
         const val DEFAULT_TUN_ADDRESS = "10.231.0.2"
         const val DEFAULT_TUN_PREFIX = 30
         val DEFAULT_ROUTES: List<Pair<String, Int>> = listOf("0.0.0.0" to 0)
-        val DEFAULT_DNS: List<String> = listOf("1.1.1.1")
+        val DEFAULT_DNS: List<String> = emptyList()
 
-        private val SUPPORTED_COVERS = setOf("quic-like", "media-like", "tls-like")
-        private val SUPPORTED_NOISE = setOf("ik", "ikpsk2")
+        val SUPPORTED_COVERS: List<String> = listOf("quic-like", "media-like", "tls-like")
+        val SUPPORTED_NOISE: List<String> = listOf("ik", "ikpsk2")
+        val REQUIRED_NON_SECRET_FILES: List<String> = listOf("client.json", "common.json", "noise-peer.pub")
+        val REQUIRED_SECRET_FILES: List<String> = listOf("noise-private.key", "member.pk8", "admission.key")
+        val OPTIONAL_SECRET_FILES: List<String> = listOf("psk.key")
 
         /**
          * Parse and validate `client.json` (plus optional `android_vpn.json`) from JSON text.
@@ -87,10 +169,18 @@ data class AndroidVpnProfile(
             require(tunMtu in 1280..65519) { "tun_mtu must be in 1280..65519" }
             require(handshakeSeconds in 1..120) { "handshake_seconds must be in 1..120" }
 
+            val tuneRepair = if (client.has("tune_repair") && !client.isNull("tune_repair")) {
+                client.optString("tune_repair", "").trim().ifEmpty { null }
+            } else {
+                null
+            }
+
             var tunAddress = DEFAULT_TUN_ADDRESS
             var tunPrefix = DEFAULT_TUN_PREFIX
             var routes = DEFAULT_ROUTES
             var dns = DEFAULT_DNS
+            var splitMode = SplitTunnelMode.ALL
+            var splitApps: List<String> = emptyList()
 
             if (!androidVpnJsonText.isNullOrBlank()) {
                 val vpn = JSONObject(androidVpnJsonText)
@@ -116,6 +206,18 @@ data class AndroidVpnProfile(
                     }
                     dns = list
                 }
+                if (vpn.has("split_tunnel_mode") && !vpn.isNull("split_tunnel_mode")) {
+                    splitMode = SplitTunnelMode.parse(vpn.getString("split_tunnel_mode"))
+                }
+                if (vpn.has("split_tunnel_apps") && !vpn.isNull("split_tunnel_apps")) {
+                    val arr = vpn.getJSONArray("split_tunnel_apps")
+                    val list = mutableListOf<String>()
+                    for (i in 0 until arr.length()) {
+                        val pkg = arr.getString(i).trim()
+                        if (pkg.isNotEmpty()) list.add(pkg)
+                    }
+                    splitApps = list.distinct()
+                }
             }
 
             return AndroidVpnProfile(
@@ -127,23 +229,45 @@ data class AndroidVpnProfile(
                 tunMtu = tunMtu,
                 noiseProfile = noiseProfile,
                 handshakeSeconds = handshakeSeconds,
+                tuneRepair = tuneRepair,
                 tunAddress = tunAddress,
                 tunPrefixLength = tunPrefix,
                 routes = routes,
                 dnsServers = dns,
+                splitTunnelMode = splitMode,
+                splitTunnelApps = splitApps,
             )
         }
 
+        /**
+         * Validates and loads a profile directory, accepting either Keystore-encrypted
+         * `<secret>.enc` files (CL-31) or legacy plain secret files (for CLI/harness staging).
+         */
         fun loadFromDirectory(profileDir: File): AndroidVpnProfile {
             val clientFile = File(profileDir, "client.json")
             require(clientFile.isFile) { "Missing ${clientFile.name} in ${profileDir.name}" }
-            val requiredFiles = listOf("common.json", "noise-private.key", "noise-peer.pub", "member.pk8", "admission.key")
-            for (name in requiredFiles) {
+            for (name in listOf("common.json", "noise-peer.pub")) {
                 require(File(profileDir, name).isFile) { "Missing required profile file: $name" }
+            }
+            for (secret in REQUIRED_SECRET_FILES) {
+                val hasEnc = File(profileDir, "$secret${KeystoreSecretStore.ENC_SUFFIX}").isFile
+                val hasPlain = File(profileDir, secret).isFile
+                require(hasEnc || hasPlain) { "Missing required key file: $secret" }
             }
             val vpnFile = File(profileDir, "android_vpn.json")
             val vpnText = if (vpnFile.isFile) vpnFile.readText() else null
             return parse(profileDir, clientFile.readText(), vpnText)
+        }
+
+        fun parseCidrsText(text: String): List<Pair<String, Int>> {
+            val arr = JSONArray()
+            text.split(',', '\n', ';')
+                .map { it.trim() }
+                .filter { it.isNotEmpty() }
+                .forEach { arr.put(it) }
+            val out = parseCidrs(arr)
+            require(out.isNotEmpty()) { "At least one CIDR route is required" }
+            return out
         }
 
         private fun parseCidrs(array: JSONArray): List<Pair<String, Int>> {
