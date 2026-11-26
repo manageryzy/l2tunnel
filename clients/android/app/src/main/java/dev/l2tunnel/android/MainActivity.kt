@@ -157,6 +157,15 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun requestVpnAndStart() {
+        val dir = defaultProfileDir()
+        try {
+            AndroidVpnProfile.loadFromDirectory(dir)
+        } catch (e: Exception) {
+            refreshProfileHint()
+            statusHeadline.text = "Profile required"
+            statusDetails.text = "Cannot connect: ${e.message}\nPlace client.json, common.json, and key files in ${dir.absolutePath}."
+            return
+        }
         refreshProfileHint()
         val prepareIntent = VpnService.prepare(this)
         if (prepareIntent != null) {

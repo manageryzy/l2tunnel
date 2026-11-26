@@ -112,6 +112,10 @@ class L2TunnelVpnService : VpnService() {
     }
 
     private fun startTunnel(profileDir: File) {
+        // Android requires startForeground() on every startForegroundService() entry path
+        // (even if we abort and stopSelf() immediately), otherwise API 26+ throws a fatal
+        // ForegroundServiceDidNotStartInTimeException and kills the app process.
+        startForegroundServiceNotification("Starting l2tunnel…")
         if (!active.compareAndSet(false, true)) {
             Log.i(TAG, "Ignoring duplicate start request while tunnel is active")
             return
@@ -130,6 +134,7 @@ class L2TunnelVpnService : VpnService() {
                     profileName = profileDir.name,
                 ),
             )
+            stopForeground(STOP_FOREGROUND_REMOVE)
             stopSelf()
             return
         }
@@ -141,16 +146,17 @@ class L2TunnelVpnService : VpnService() {
                 VpnUiState(
                     running = false,
                     phase = "failed",
-                    headline = "Invalid profile",
+                    headline = "Invalid or missing profile",
                     detail = e.message,
                     profileName = profileDir.name,
                 ),
             )
+            stopForeground(STOP_FOREGROUND_REMOVE)
             stopSelf()
             return
         }
         activeProfile = profile
-        startForegroundServiceNotification("Connecting to ${profile.udpPeer}…")
+        updateNotification("Connecting to ${profile.udpPeer}…")
         publishState(
             VpnUiState(
                 running = true,
