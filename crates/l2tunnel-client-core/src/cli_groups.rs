@@ -1121,7 +1121,9 @@ async fn execute(parsed: Parsed) -> Exit {
         Command::Profile(query) => {
             let action = match &query {
                 profile::Query::List => OperationAction::ProfileList {},
-                profile::Query::Show(name) | profile::Query::Export { name, .. } => {
+                profile::Query::Show(name)
+                | profile::Query::Export { name, .. }
+                | profile::Query::Share { name, .. } => {
                     OperationAction::ProfileGet { name: name.clone() }
                 }
                 profile::Query::Validate(name) => {
@@ -1173,6 +1175,58 @@ async fn execute(parsed: Parsed) -> Exit {
                             Exit::Completed
                         } else {
                             Exit::Failed
+                        }
+                    }
+                    profile::Query::Share {
+                        name,
+                        include_secrets,
+                        tun,
+                        routes,
+                        dns,
+                    } => {
+                        let built = reply
+                            .profile
+                            .as_ref()
+                            .ok_or_else(|| "service replied without a profile".to_owned())
+                            .and_then(|entry| {
+                                let mut share =
+                                    local::share_uri::ShareProfile::from_profile_document(
+                                        Some(name),
+                                        &entry.document,
+                                        *include_secrets,
+                                    )
+                                    .map_err(|e| e.to_string())?;
+                                if let Some(t) = tun {
+                                    share.tun = Some(t.clone());
+                                }
+                                if !routes.is_empty() {
+                                    share.routes = routes.clone();
+                                }
+                                if !dns.is_empty() {
+                                    share.dns = dns.clone();
+                                }
+                                share.encode().map_err(|e| e.to_string())
+                            });
+                        match built {
+                            Ok(uri) => {
+                                let _written = if output.json {
+                                    writeln!(
+                                        io::stdout().lock(),
+                                        "{}",
+                                        serde_json::json!({
+                                            "uri": uri,
+                                            "includes_secrets": include_secrets
+                                        })
+                                    )
+                                } else {
+                                    writeln!(io::stdout().lock(), "{uri}")
+                                };
+                                Exit::Completed
+                            }
+                            Err(error) => {
+                                note(format!("cannot share {name}: {error}"));
+                                Exit::Failed
+                            }
                         }
                     }
                     profile::Query::Export { output: file, .. } => {

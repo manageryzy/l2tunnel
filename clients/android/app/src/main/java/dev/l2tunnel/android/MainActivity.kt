@@ -67,6 +67,7 @@ class MainActivity : ComponentActivity() {
     private var activeProfileIdState by mutableStateOf<String?>(null)
     private var overviewErrorState by mutableStateOf<String?>(null)
     private var profileBannerState by mutableStateOf<String?>(null)
+    private var pendingIncomingUri by mutableStateOf<String?>(null)
     private var pendingKeyTarget: Pair<String, String>? = null
     private var pendingDiagnosticsRedact: Boolean = true
 
@@ -117,6 +118,7 @@ class MainActivity : ComponentActivity() {
             legacyDefaultDir = File(filesDir, "profiles/default"),
         )
         reloadProfiles()
+        captureDeepLink(intent)
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
             ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) !=
@@ -132,6 +134,18 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        captureDeepLink(intent)
+    }
+
+    private fun captureDeepLink(intent: Intent?) {
+        val data = intent?.data ?: return
+        if (data.scheme.equals("l2tunnel", ignoreCase = true)) {
+            pendingIncomingUri = data.toString()
+        }
+    }
+
     override fun onResume() {
         super.onResume()
         reloadProfiles()
@@ -143,6 +157,9 @@ class MainActivity : ComponentActivity() {
         val vpnState by L2TunnelVpnService.uiState.collectAsStateWithLifecycle()
         var selectedTab by rememberSaveable { mutableIntStateOf(0) }
         val activeSummary = profilesState.firstOrNull { it.id == activeProfileIdState }
+        if (pendingIncomingUri != null && selectedTab != 2) {
+            selectedTab = 2
+        }
 
         val tabs = listOf(
             Triple("Overview", Icons.Filled.Home, 0),
@@ -278,9 +295,44 @@ class MainActivity : ComponentActivity() {
                             activeProfileId = activeProfileIdState,
                             statusBanner = profileBannerState,
                             isWideLayout = isWide,
+                            incomingShareUri = pendingIncomingUri,
+                            onConsumeIncomingShareUri = { pendingIncomingUri = null },
                             onSelectProfile = { id -> selectProfile(id) },
                             onImportZip = {
                                 importZipLauncher.launch(arrayOf("application/zip", "application/octet-stream", "*/*"))
+                            },
+                            onImportShareUri = { uriText, customName ->
+                                try {
+                                    val nativeBin = File(applicationInfo.nativeLibraryDir, "libl2tunnel_android_service.so")
+                                    val defaultPlan = resources.openRawResource(R.raw.default_common_plan).use { it.readBytes() }
+                                    val imported = profileStore.importShareUri(
+                                        uriText = uriText,
+                                        overrideName = customName,
+                                        nativeBinary = nativeBin,
+                                        defaultCommonPlanBytes = defaultPlan,
+                                    )
+                                    reloadProfiles()
+                                    overviewErrorState = null
+                                    profileBannerState = if (imported.isValid) {
+                                        "Imported '${imported.id}' from Share URI (Keystore AES-GCM sealed, ready to connect)."
+                                    } else {
+                                        "Imported '${imported.id}' from Share URI (${imported.validationError})."
+                                    }
+                                    null
+                                } catch (e: Exception) {
+                                    e.message ?: "Invalid share URI"
+                                }
+                            },
+                            onBuildShareUri = { id, includeSecrets ->
+                                profileStore.exportShareUri(id, includeSecrets)
+                            },
+                            onSystemShareText = { text, subject ->
+                                val share = Intent(Intent.ACTION_SEND).apply {
+                                    type = "text/plain"
+                                    putExtra(Intent.EXTRA_SUBJECT, subject)
+                                    putExtra(Intent.EXTRA_TEXT, text)
+                                }
+                                startActivity(Intent.createChooser(share, "Share l2tunnel profile URI"))
                             },
                             onCreateProfile = { newId ->
                                 try {

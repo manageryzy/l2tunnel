@@ -221,6 +221,101 @@ class ProfileStore(
         }
     }
 
+    /**
+     * Builds a canonical `l2tunnel://v1/connect?...` share URI for profile `id`.
+     * Omits all private keys unless `includeSecrets = true`.
+     */
+    fun exportShareUri(id: String, includeSecrets: Boolean = false): String {
+        val dir = profileDir(id)
+        val summary = summarize(dir)
+        val prof = summary.editableProfile
+            ?: throw IOException("Profile '$id' has no valid client.json to share")
+        val peerPubFile = File(dir, "noise-peer.pub")
+        val peerPub = if (peerPubFile.isFile) {
+            val bytes = peerPubFile.readBytes()
+            if (bytes.size == 32) bytes else null
+        } else {
+            null
+        }
+        val secrets = if (includeSecrets) {
+            ShareSecrets(
+                admission = readOptionalSecret(dir, "admission.key"),
+                noisePrivate = readOptionalSecret(dir, "noise-private.key"),
+                memberPk8 = readOptionalSecret(dir, "member.pk8"),
+                noisePsk = if (prof.noiseProfile == "ikpsk2") readOptionalSecret(dir, "noise-psk.key") else null,
+            )
+        } else {
+            ShareSecrets()
+        }
+        try {
+            return ShareProfileUri(
+                name = id,
+                peer = prof.udpPeer,
+                cover = prof.cover,
+                noise = prof.noiseProfile,
+                peerPub = peerPub,
+                tunMtu = prof.tunMtu,
+                pathMtu = prof.pathMtu,
+                handshakeSeconds = prof.handshakeSeconds,
+                tun = "${prof.tunAddress}/${prof.tunPrefixLength}",
+                routes = prof.routes.map { "${it.first}/${it.second}" },
+                dns = prof.dnsServers,
+                tuneRepair = prof.tuneRepair,
+                secrets = secrets,
+            ).encode()
+        } finally {
+            secrets.zeroize()
+        }
+    }
+
+    /**
+     * Imports a canonical `l2tunnel://v1/connect?...` share URI into a Keystore-sealed profile.
+     * - Seals any embedded private keys directly into AndroidKeyStore AES-256-GCM.
+     * - If private keys were omitted (safe public URI) and `nativeBinary` is provided,
+     *   auto-generates fresh Keystore-sealed client keys so the profile is ready to pair.
+     * - Writes bundled `defaultCommonPlanBytes` to `common.json` if provided.
+     */
+    fun importShareUri(
+        uriText: String,
+        overrideName: String? = null,
+        nativeBinary: File? = null,
+        defaultCommonPlanBytes: ByteArray? = null,
+    ): StoredProfileSummary {
+        val parsed = ShareProfileUri.decode(uriText)
+        try {
+            val safeId = sanitizeProfileId(overrideName?.takeIf { it.isNotBlank() } ?: parsed.name ?: "shared")
+            val dir = profileDir(safeId)
+            val profile = parsed.toAndroidVpnProfile(dir)
+            saveEditedProfile(safeId, profile)
+            if (defaultCommonPlanBytes != null && defaultCommonPlanBytes.isNotEmpty() && !File(dir, "common.json").isFile) {
+                KeystoreSecretStore.writeOwnerOnlyBytes(File(dir, "common.json"), defaultCommonPlanBytes)
+            }
+            parsed.peerPub?.let { pub ->
+                KeystoreSecretStore.writeOwnerOnlyBytes(File(dir, "noise-peer.pub"), pub)
+            }
+            // Generate missing local client keys first if needed, then overlay any URI-supplied secrets.
+            val missingClientKey = parsed.secrets.noisePrivate == null || parsed.secrets.memberPk8 == null || parsed.secrets.admission == null
+            if (missingClientKey && nativeBinary != null && nativeBinary.isFile && nativeBinary.canExecute()) {
+                generateKeysIntoKeystore(safeId, nativeBinary, defaultCommonPlanBytes)
+            }
+            parsed.secrets.admission?.let { secretStore.writeEncryptedSecret(dir, "admission.key", it) }
+            parsed.secrets.noisePrivate?.let { secretStore.writeEncryptedSecret(dir, "noise-private.key", it) }
+            parsed.secrets.memberPk8?.let { secretStore.writeEncryptedSecret(dir, "member.pk8", it) }
+            parsed.secrets.noisePsk?.let { secretStore.writeEncryptedSecret(dir, "noise-psk.key", it) }
+            setActiveProfile(safeId)
+            return summarize(dir)
+        } finally {
+            parsed.secrets.zeroize()
+        }
+    }
+
+    private fun readOptionalSecret(dir: File, name: String): ByteArray? =
+        try {
+            secretStore.readSecret(dir, name)
+        } catch (_: Exception) {
+            null
+        }
+
     private fun readPublicHex(file: File): String? {
         if (!file.isFile) return null
         val bytes = file.readBytes()

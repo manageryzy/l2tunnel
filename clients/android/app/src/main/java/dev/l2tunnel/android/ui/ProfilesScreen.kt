@@ -31,7 +31,9 @@ import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.FileUpload
 import androidx.compose.material.icons.filled.Key
+import androidx.compose.material.icons.filled.Link
 import androidx.compose.material.icons.filled.Lock
+import androidx.compose.material.icons.filled.Share
 import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.AssistChip
@@ -47,6 +49,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -65,6 +68,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.DialogProperties
 import dev.l2tunnel.android.AndroidVpnProfile
+import dev.l2tunnel.android.ShareProfileUri
 import dev.l2tunnel.android.SplitTunnelMode
 import dev.l2tunnel.android.StoredProfileSummary
 import java.io.File
@@ -81,8 +85,13 @@ fun ProfilesScreen(
     activeProfileId: String?,
     statusBanner: String?,
     isWideLayout: Boolean,
+    incomingShareUri: String? = null,
+    onConsumeIncomingShareUri: () -> Unit = {},
     onSelectProfile: (String) -> Unit,
     onImportZip: () -> Unit,
+    onImportShareUri: (String, String?) -> String?,
+    onBuildShareUri: (String, Boolean) -> String,
+    onSystemShareText: (String, String) -> Unit,
     onCreateProfile: (String) -> String?,
     onGenerateKeystoreKeys: (String) -> Unit,
     onSaveHexKey: (String, String, String) -> String?,
@@ -94,11 +103,20 @@ fun ProfilesScreen(
 ) {
     var editingProfileId by remember { mutableStateOf<String?>(null) }
     var splitEditingProfileId by remember { mutableStateOf<String?>(null) }
+    var sharingProfileId by remember { mutableStateOf<String?>(null) }
+    var importUriDialogOpen by remember { mutableStateOf(false) }
+    var importUriDraft by remember { mutableStateOf("") }
     var createDialogOpen by remember { mutableStateOf(false) }
     var newProfileName by remember { mutableStateOf("") }
     var duplicateTargetFor by remember { mutableStateOf<String?>(null) }
     var duplicateName by remember { mutableStateOf("") }
     var deleteConfirmId by remember { mutableStateOf<String?>(null) }
+
+    if (!incomingShareUri.isNullOrBlank()) {
+        importUriDraft = incomingShareUri
+        importUriDialogOpen = true
+        onConsumeIncomingShareUri()
+    }
 
     val editingSummary = profiles.firstOrNull { it.id == editingProfileId }
     val splitEditingSummary = profiles.firstOrNull { it.id == splitEditingProfileId }
@@ -126,7 +144,17 @@ fun ProfilesScreen(
                     Button(onClick = onImportZip) {
                         Icon(Icons.Filled.FileUpload, contentDescription = null, modifier = Modifier.size(18.dp))
                         Spacer(Modifier.width(8.dp))
-                        Text("Import .zip Bundle")
+                        Text("Import .zip")
+                    }
+                    FilledTonalButton(
+                        onClick = {
+                            importUriDraft = ""
+                            importUriDialogOpen = true
+                        },
+                    ) {
+                        Icon(Icons.Filled.Link, contentDescription = null, modifier = Modifier.size(18.dp))
+                        Spacer(Modifier.width(6.dp))
+                        Text("Import URI")
                     }
                     FilledTonalButton(
                         onClick = {
@@ -232,6 +260,12 @@ fun ProfilesScreen(
                                     }
                                 }
                                 Row {
+                                    IconButton(
+                                        onClick = { sharingProfileId = summary.id },
+                                        enabled = editable != null,
+                                    ) {
+                                        Icon(Icons.Filled.Share, contentDescription = "Share profile URI")
+                                    }
                                     // Always enabled so incomplete profiles can attach missing common.json/keys!
                                     IconButton(onClick = { editingProfileId = summary.id }) {
                                         Icon(Icons.Filled.Edit, contentDescription = "Edit profile")
@@ -377,6 +411,33 @@ fun ProfilesScreen(
                 },
             )
         }
+    }
+
+    // Import Share URI Dialog (`l2tunnel://v1/connect?...`)
+    if (importUriDialogOpen) {
+        ImportShareUriDialog(
+            initialUri = importUriDraft,
+            isWideLayout = isWideLayout,
+            onDismiss = { importUriDialogOpen = false },
+            onImport = { uri, customName ->
+                val err = onImportShareUri(uri, customName)
+                if (err == null) {
+                    importUriDialogOpen = false
+                }
+                err
+            },
+        )
+    }
+
+    // Export / Share Profile URI Dialog
+    sharingProfileId?.let { id ->
+        ShareProfileUriDialog(
+            profileId = id,
+            isWideLayout = isWideLayout,
+            onBuildUri = { includeSecrets -> onBuildShareUri(id, includeSecrets) },
+            onSystemShare = { uri -> onSystemShareText(uri, "l2tunnel profile: $id") },
+            onDismiss = { sharingProfileId = null },
+        )
     }
 
     // Create New Profile Dialog (automatically generates Keystore AES-GCM keys + default common.json)
@@ -782,7 +843,6 @@ private fun ProfileEditorDialog(
         },
     )
 }
-
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun AppSplitTunnelDialog(
@@ -905,6 +965,241 @@ private fun AppSplitTunnelDialog(
         },
         dismissButton = {
             TextButton(onClick = onDismiss) { Text("Cancel") }
+        },
+    )
+}
+
+@Composable
+private fun ImportShareUriDialog(
+    initialUri: String,
+    isWideLayout: Boolean,
+    onDismiss: () -> Unit,
+    onImport: (String, String?) -> String?,
+) {
+    val clipboard = LocalClipboardManager.current
+    var uriText by remember(initialUri) { mutableStateOf(initialUri) }
+    var customName by remember { mutableStateOf("") }
+    var errorText by remember { mutableStateOf<String?>(null) }
+
+    val preview = remember(uriText) {
+        if (uriText.isBlank()) null else try {
+            Result.success(ShareProfileUri.decode(uriText))
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        properties = DialogProperties(usePlatformDefaultWidth = false),
+        modifier = Modifier
+            .fillMaxWidth(if (isWideLayout) 0.72f else 0.94f)
+            .widthIn(max = 680.dp),
+        title = { Text("Import l2tunnel:// Share URI") },
+        text = {
+            Column(
+                modifier = Modifier
+                    .heightIn(max = 420.dp)
+                    .verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    OutlinedButton(
+                        onClick = {
+                            clipboard.getText()?.text?.let {
+                                uriText = it.trim()
+                                errorText = null
+                            }
+                        },
+                    ) {
+                        Icon(Icons.Filled.ContentCopy, contentDescription = null, modifier = Modifier.size(16.dp))
+                        Spacer(Modifier.width(6.dp))
+                        Text("Paste from Clipboard")
+                    }
+                }
+                OutlinedTextField(
+                    value = uriText,
+                    onValueChange = {
+                        uriText = it
+                        errorText = null
+                    },
+                    label = { Text("l2tunnel://v1/connect?...") },
+                    minLines = 3,
+                    maxLines = 5,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                OutlinedTextField(
+                    value = customName,
+                    onValueChange = { customName = it },
+                    label = { Text("Profile name override (optional)") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                preview?.onSuccess { p ->
+                    Surface(
+                        color = MaterialTheme.colorScheme.secondaryContainer,
+                        contentColor = MaterialTheme.colorScheme.onSecondaryContainer,
+                        shape = MaterialTheme.shapes.small,
+                    ) {
+                        Column(modifier = Modifier.fillMaxWidth().padding(10.dp)) {
+                            Text(
+                                text = "Peer: ${p.peer} · Cover: ${p.cover} · Noise: ${p.noise.uppercase()} · MTU: ${p.tunMtu}",
+                                style = MaterialTheme.typography.bodySmall,
+                                fontWeight = FontWeight.Medium,
+                            )
+                            Text(
+                                text = if (p.secrets.isEmpty) {
+                                    "Public URI (no private keys) — fresh client keys will be generated & sealed in Android Keystore."
+                                } else {
+                                    "Full provisioning URI — embedded secrets will be sealed directly into Android Keystore AES-GCM."
+                                },
+                                style = MaterialTheme.typography.labelSmall,
+                            )
+                        }
+                    }
+                }?.onFailure { e ->
+                    Text(
+                        text = e.message ?: "Invalid URI",
+                        color = MaterialTheme.colorScheme.error,
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                }
+                if (!errorText.isNullOrBlank()) {
+                    Text(
+                        text = errorText!!,
+                        color = MaterialTheme.colorScheme.error,
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                }
+            }
+        },
+        confirmButton = {
+            Button(
+                enabled = preview?.isSuccess == true,
+                onClick = {
+                    val err = onImport(uriText, customName.trim().ifEmpty { null })
+                    if (err != null) errorText = err
+                },
+            ) { Text("Import Profile") }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text("Cancel") }
+        },
+    )
+}
+
+@Composable
+private fun ShareProfileUriDialog(
+    profileId: String,
+    isWideLayout: Boolean,
+    onBuildUri: (Boolean) -> String,
+    onSystemShare: (String) -> Unit,
+    onDismiss: () -> Unit,
+) {
+    val clipboard = LocalClipboardManager.current
+    var includeSecrets by remember(profileId) { mutableStateOf(false) }
+    var copiedBanner by remember { mutableStateOf<String?>(null) }
+
+    val built = remember(profileId, includeSecrets) {
+        try {
+            Result.success(onBuildUri(includeSecrets))
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        properties = DialogProperties(usePlatformDefaultWidth = false),
+        modifier = Modifier
+            .fillMaxWidth(if (isWideLayout) 0.72f else 0.94f)
+            .widthIn(max = 680.dp),
+        title = { Text("Share Profile: $profileId") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = "Include private keys (full provisioning)",
+                            style = MaterialTheme.typography.bodyMedium,
+                            fontWeight = FontWeight.Medium,
+                        )
+                        Text(
+                            text = if (includeSecrets) {
+                                "Warning: URI contains private credentials — share only over a trusted channel."
+                            } else {
+                                "Safe default: shares server endpoint, cover, MTU, routes & server public key only."
+                            },
+                            style = MaterialTheme.typography.labelSmall,
+                            color = if (includeSecrets) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                    Spacer(Modifier.width(10.dp))
+                    Switch(
+                        checked = includeSecrets,
+                        onCheckedChange = {
+                            includeSecrets = it
+                            copiedBanner = null
+                        },
+                    )
+                }
+                built.onSuccess { uri ->
+                    Surface(
+                        color = MaterialTheme.colorScheme.surfaceVariant,
+                        shape = MaterialTheme.shapes.small,
+                    ) {
+                        Text(
+                            text = uri,
+                            style = MaterialTheme.typography.labelSmall,
+                            fontFamily = FontFamily.Monospace,
+                            maxLines = 5,
+                            overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier.fillMaxWidth().padding(10.dp),
+                        )
+                    }
+                }.onFailure { e ->
+                    Text(
+                        text = e.message ?: "Cannot build share URI",
+                        color = MaterialTheme.colorScheme.error,
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                }
+                if (!copiedBanner.isNullOrBlank()) {
+                    Text(
+                        text = copiedBanner!!,
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.primary,
+                    )
+                }
+            }
+        },
+        confirmButton = {
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                built.getOrNull()?.let { uri ->
+                    OutlinedButton(onClick = { onSystemShare(uri) }) {
+                        Icon(Icons.Filled.Share, contentDescription = null, modifier = Modifier.size(16.dp))
+                        Spacer(Modifier.width(6.dp))
+                        Text("Share…")
+                    }
+                    Button(
+                        onClick = {
+                            clipboard.setText(AnnotatedString(uri))
+                            copiedBanner = "Copied l2tunnel:// URI to clipboard."
+                        },
+                    ) {
+                        Icon(Icons.Filled.ContentCopy, contentDescription = null, modifier = Modifier.size(16.dp))
+                        Spacer(Modifier.width(6.dp))
+                        Text("Copy URI")
+                    }
+                }
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text("Close") }
         },
     )
 }

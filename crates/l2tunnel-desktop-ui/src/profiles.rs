@@ -42,6 +42,8 @@ pub struct Editor {
     pub save_error: Option<String>,
     /// Destination path for exporting this profile directly from the editor.
     pub export_path: String,
+    /// Opt-in flag for including private credentials in a copied `l2tunnel://` share URI.
+    pub share_include_secrets: bool,
 }
 impl Editor {
     /// A new client profile with the usual fixed choices filled in.
@@ -155,6 +157,8 @@ pub struct ProfileState {
     pub browser: Option<Browser>,
     /// Import/export file path.
     pub file: String,
+    /// Pasted `l2tunnel://v1/connect?...` URI to import.
+    pub share_uri_input: String,
     /// Profile awaiting a second click to delete.
     pub confirm: Option<String>,
     /// Connect card selection.
@@ -318,11 +322,58 @@ pub fn section(ui: &mut egui::Ui, model: &mut Model, state: &mut ProfileState) -
             import(model, state);
         }
     });
+    ui.horizontal_wrapped(|ui| {
+        ui.label("Import Share URI");
+        ui.add(
+            egui::TextEdit::singleline(&mut state.share_uri_input)
+                .hint_text("l2tunnel://v1/connect?peer=...")
+                .desired_width(360.0),
+        );
+        if ui
+            .add_enabled(
+                !state.share_uri_input.trim().is_empty(),
+                egui::Button::new("Import URI"),
+            )
+            .clicked()
+        {
+            import_share_uri(model, state);
+        }
+    });
     ui.weak(
         "A profile holds the service's run options; keys stay files the profile names. \
          Saving needs a runnable plan.",
     );
     commands
+}
+
+fn import_share_uri(model: &mut Model, state: &mut ProfileState) {
+    let raw = state.share_uri_input.trim();
+    match local::share_uri::ShareProfile::decode(raw) {
+        Ok(parsed) => {
+            let name = parsed
+                .name
+                .as_deref()
+                .filter(|n| validate_profile_name(n).is_ok())
+                .unwrap_or("shared")
+                .to_owned();
+            let home = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
+                .map(PathBuf::from);
+            let key_dir = home.map(|h| h.join(".local/share/l2tunnel/shared-keys").join(&name));
+            match parsed.to_profile_document(key_dir.as_deref()) {
+                Ok(document) => {
+                    state.editor = Some(Editor::from_document(name, document));
+                    state.share_uri_input.clear();
+                    model.notice = if parsed.secrets.is_empty() {
+                        "Imported public share URI into editor; attach/generate local client keys and Save.".into()
+                    } else {
+                        "Imported provisioning share URI into editor (keys written 0600); review and Save.".into()
+                    };
+                }
+                Err(error) => model.notice = format!("Share URI import failed: {error}"),
+            }
+        }
+        Err(error) => model.notice = format!("Invalid share URI: {error}"),
+    }
 }
 
 fn import(model: &mut Model, state: &mut ProfileState) {
@@ -700,6 +751,34 @@ fn footer(
                 Ok(()) => format!("Exported to {}", path.display()),
                 Err(error) => format!("Export failed: {}: {error}", path.display()),
             };
+        }
+        ui.separator();
+        ui.checkbox(&mut editor.share_include_secrets, "Include secrets")
+            .on_hover_text("Off by default (safe public share). Enable only to copy a full provisioning URI containing private keys.");
+        if ui
+            .add_enabled(document.is_ok(), egui::Button::new("🔗 Copy Share URI"))
+            .on_hover_text("Copy l2tunnel://v1/connect?... URI to clipboard for CLI, Desktop GUI, or Android")
+            .clicked()
+            && let Ok(document) = &document
+        {
+            let name = editor.name.trim();
+            match local::share_uri::ShareProfile::from_profile_document(
+                (!name.is_empty()).then_some(name),
+                document,
+                editor.share_include_secrets,
+            )
+            .and_then(|share| share.encode())
+            {
+                Ok(uri) => {
+                    ui.ctx().copy_text(uri);
+                    model.notice = if editor.share_include_secrets {
+                        "Copied full provisioning l2tunnel:// URI (includes secrets!) to clipboard.".into()
+                    } else {
+                        "Copied public l2tunnel:// share URI (no private keys) to clipboard.".into()
+                    };
+                }
+                Err(error) => model.notice = format!("Share URI failed: {error}"),
+            }
         }
     });
     close

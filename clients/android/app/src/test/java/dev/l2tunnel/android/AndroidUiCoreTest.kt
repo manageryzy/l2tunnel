@@ -281,4 +281,59 @@ class AndroidUiCoreTest {
         assertEquals(9L, ev?.first)
         assertEquals("#8 phase=connected", ev?.second?.first())
     }
+
+    @Test
+    fun shareUriMatchesRustCanonicalVectorAndImportsIntoKeystore() {
+        val canonical =
+            "l2tunnel://v1/connect?name=office&peer=192.168.210.108%3A24461&cover=quic-like&noise=ik" +
+                "&peer_pub=1111111111111111111111111111111111111111111111111111111111111111" +
+                "&tun=10.236.0.2%2F30&routes=0.0.0.0%2F0&dns=1.1.1.1&tune_repair=off%2C1%2F8%2C1%2F4"
+        val decoded = ShareProfileUri.decode(canonical)
+        assertEquals("office", decoded.name)
+        assertEquals("192.168.210.108:24461", decoded.peer)
+        assertEquals("quic-like", decoded.cover)
+        assertEquals(canonical, decoded.encode())
+
+        // TAP layer must be explicitly refused
+        try {
+            ShareProfileUri.decode("l2tunnel://v1/connect?peer=192.168.1.1%3A24461&layer=tap")
+            fail("TAP share URI must throw UnsupportedLayerException")
+        } catch (_: UnsupportedLayerException) {
+        }
+
+        // Full provisioning URI imports directly into Keystore-sealed files with zero plaintext left on disk
+        val tmpRoot = Files.createTempDirectory("l2t-uri-test-").toFile()
+        try {
+            val secretStore = KeystoreSecretStore(InMemoryAesKeyProvider())
+            val profileStore = ProfileStore(File(tmpRoot, "profiles"), secretStore = secretStore)
+            val fullUri = decoded.copy(
+                secrets = ShareSecrets(
+                    admission = ByteArray(32) { 0x22 },
+                    noisePrivate = ByteArray(32) { 0x33 },
+                    memberPk8 = ByteArray(48) { 0x44 },
+                ),
+            ).encode()
+            val imported = profileStore.importShareUri(
+                uriText = fullUri,
+                defaultCommonPlanBytes = "{}".toByteArray(),
+            )
+            assertEquals("office", imported.id)
+            assertTrue(imported.isValid)
+            assertTrue(imported.keystoreSealed)
+            assertFalse(File(imported.directory, "noise-private.key").exists())
+            assertTrue(File(imported.directory, "noise-private.key.enc").isFile)
+
+            // Default export omits secrets; opt-in export round-trips
+            val publicExport = profileStore.exportShareUri("office", includeSecrets = false)
+            assertFalse(publicExport.contains("&adm="))
+            assertFalse(publicExport.contains("&key="))
+            assertFalse(publicExport.contains("&member="))
+            val fullExport = profileStore.exportShareUri("office", includeSecrets = true)
+            assertTrue(fullExport.contains("&adm=2222"))
+            assertTrue(fullExport.contains("&key=3333"))
+            assertTrue(fullExport.contains("&member="))
+        } finally {
+            tmpRoot.deleteRecursively()
+        }
+    }
 }

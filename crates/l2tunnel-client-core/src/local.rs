@@ -38,6 +38,7 @@ pub mod diagnostics;
 #[cfg(any(unix, windows))]
 pub mod elevate;
 pub mod keys;
+pub mod share_uri;
 #[cfg(any(unix, windows))]
 mod transport;
 pub mod tunnel_test;

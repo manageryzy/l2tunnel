@@ -16,7 +16,8 @@ pub(super) fn accepted(verb: &str) -> Option<(&'static [&'static str], &'static 
     Some(match verb {
         "list" | "show" | "validate" | "keys" => (&[], &[]),
         "export" => (&["--output"], &[]),
-        "import" => (&["--file", "--revision"], &[]),
+        "share" => (&["--tun", "--routes", "--dns"], &["--include-secrets"]),
+        "import" => (&["--file", "--uri", "--key-dir", "--revision"], &[]),
         "delete" => (&["--revision"], &[]),
         "default" => (&[], &["--clear"]),
         _ => return None,
@@ -64,6 +65,38 @@ fn read_document(path: &str) -> Result<ProfileDocument, Usage> {
     Ok(document)
 }
 
+/// Read a share URI from `--uri` (use `--uri -` to read from stdin so secrets avoid shell history).
+fn read_share_uri_document(
+    uri_arg: &str,
+    profile_name: &str,
+    key_dir: Option<&str>,
+) -> Result<ProfileDocument, Usage> {
+    use std::io::Read;
+    let raw = if uri_arg == "-" {
+        let mut buf = String::new();
+        io::stdin()
+            .take(crate::local::share_uri::MAX_SHARE_URI_BYTES as u64 + 1)
+            .read_to_string(&mut buf)
+            .map_err(|e| usage(format!("cannot read URI from stdin: {e}")))?;
+        buf
+    } else {
+        uri_arg.to_owned()
+    };
+    let parsed = crate::local::share_uri::ShareProfile::decode(&raw)
+        .map_err(|e| usage(format!("invalid share URI: {e}")))?;
+    let default_dir = key_dir.map(PathBuf::from).or_else(|| {
+        let home = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
+            .map(PathBuf::from)?;
+        Some(
+            home.join(".local/share/l2tunnel/shared-keys")
+                .join(profile_name),
+        )
+    });
+    parsed
+        .to_profile_document(default_dir.as_deref())
+        .map_err(|e| usage(format!("cannot materialize shared profile: {e}")))
+}
+
 /// Read-only profile command.
 #[derive(Debug, Eq, PartialEq)]
 pub(super) enum Query {
@@ -71,7 +104,17 @@ pub(super) enum Query {
     Show(String),
     Validate(String),
     Keys(String),
-    Export { name: String, output: PathBuf },
+    Export {
+        name: String,
+        output: PathBuf,
+    },
+    Share {
+        name: String,
+        include_secrets: bool,
+        tun: Option<String>,
+        routes: Vec<String>,
+        dns: Vec<String>,
+    },
 }
 
 /// Parse a profile verb: a query, or the change it submits.
@@ -93,15 +136,51 @@ pub(super) fn parse(
                 .map(PathBuf::from)
                 .ok_or_else(|| usage("missing --output FILE"))?,
         }),
-        "import" => Err(ProfileChange::Save {
+        "share" => Ok(Query::Share {
             name: name(positional)?,
-            document: read_document(
-                options
-                    .get("--file")
-                    .ok_or_else(|| usage("missing --file FILE"))?,
-            )?,
-            expected_revision: revision(options)?,
+            include_secrets: flag("--include-secrets"),
+            tun: options.get("--tun").cloned(),
+            routes: options
+                .get("--routes")
+                .map(|s| {
+                    s.split(',')
+                        .map(str::trim)
+                        .filter(|v| !v.is_empty())
+                        .map(str::to_owned)
+                        .collect()
+                })
+                .unwrap_or_default(),
+            dns: options
+                .get("--dns")
+                .map(|s| {
+                    s.split(',')
+                        .map(str::trim)
+                        .filter(|v| !v.is_empty())
+                        .map(str::to_owned)
+                        .collect()
+                })
+                .unwrap_or_default(),
         }),
+        "import" => {
+            let profile_name = name(positional)?;
+            let document = match (options.get("--file"), options.get("--uri")) {
+                (Some(file), None) => read_document(file)?,
+                (None, Some(uri)) => read_share_uri_document(
+                    uri,
+                    &profile_name,
+                    options.get("--key-dir").map(String::as_str),
+                )?,
+                (Some(_), Some(_)) => {
+                    return Err(usage("pass either --file FILE or --uri URI, not both"));
+                }
+                (None, None) => return Err(usage("missing --file FILE or --uri URI")),
+            };
+            Err(ProfileChange::Save {
+                name: profile_name,
+                document,
+                expected_revision: revision(options)?,
+            })
+        }
         "delete" => Err(ProfileChange::Delete {
             name: name(positional)?,
             expected_revision: revision(options)?
