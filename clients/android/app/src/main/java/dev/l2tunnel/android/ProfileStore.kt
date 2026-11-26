@@ -11,12 +11,16 @@ data class StoredProfileSummary(
     val id: String,
     val directory: File,
     val profile: AndroidVpnProfile?,
+    /** Best-effort parsed manifest (`client.json` + `android_vpn.json`) even when keys/common.json are still missing. */
+    val draftProfile: AndroidVpnProfile?,
     val validationError: String?,
     val keystoreSealed: Boolean,
     val peerKeyFingerprint: String?,
     val presentSecrets: List<String>,
+    val presentFiles: Set<String>,
 ) {
     val isValid: Boolean get() = profile != null && validationError == null
+    val editableProfile: AndroidVpnProfile? get() = profile ?: draftProfile
 }
 
 /**
@@ -75,6 +79,21 @@ class ProfileStore(
         } catch (e: Exception) {
             null to (e.message ?: e.javaClass.simpleName)
         }
+        val draft = profile ?: try {
+            val clientFile = File(dir, "client.json")
+            if (clientFile.isFile) {
+                val vpnFile = File(dir, "android_vpn.json")
+                AndroidVpnProfile.parse(
+                    dir,
+                    clientFile.readText(),
+                    if (vpnFile.isFile) vpnFile.readText() else null,
+                )
+            } else {
+                null
+            }
+        } catch (_: Exception) {
+            null
+        }
         val peerKeyFile = File(dir, "noise-peer.pub")
         val fingerprint = if (peerKeyFile.isFile) {
             KeystoreSecretStore.sha256ShortHex(peerKeyFile.readBytes())
@@ -84,15 +103,45 @@ class ProfileStore(
         val secrets = KeystoreSecretStore.ALL_SECRET_NAMES.filter { secret ->
             File(dir, "$secret${KeystoreSecretStore.ENC_SUFFIX}").isFile || File(dir, secret).isFile
         }
+        val present = buildSet {
+            for (name in listOf("client.json", "android_vpn.json", "common.json", "noise-peer.pub")) {
+                if (File(dir, name).isFile) add(name)
+            }
+            for (secret in secrets) add(secret)
+        }
         return StoredProfileSummary(
             id = id,
             directory = dir,
             profile = profile,
+            draftProfile = draft,
             validationError = err,
             keystoreSealed = secretStore.isKeystoreSealed(dir),
             peerKeyFingerprint = fingerprint,
             presentSecrets = secrets,
+            presentFiles = present,
         )
+    }
+
+    fun createNewProfile(id: String): StoredProfileSummary {
+        val safeId = sanitizeProfileId(id)
+        val dir = profileDir(safeId)
+        require(!dir.exists()) { "Profile '$safeId' already exists" }
+        val template = AndroidVpnProfile(
+            profileDir = dir,
+            cover = "quic-like",
+            udpBind = "0.0.0.0:0",
+            udpPeer = "192.168.1.1:24461",
+            pathMtu = 1500,
+            tunMtu = 1500,
+            noiseProfile = "ik",
+            handshakeSeconds = 30,
+            tuneRepair = "off,1/8,1/4",
+            tunAddress = AndroidVpnProfile.DEFAULT_TUN_ADDRESS,
+            tunPrefixLength = AndroidVpnProfile.DEFAULT_TUN_PREFIX,
+            routes = listOf("0.0.0.0" to 0),
+            dnsServers = emptyList(),
+        )
+        return saveEditedProfile(safeId, template)
     }
 
     fun saveEditedProfile(id: String, updated: AndroidVpnProfile): StoredProfileSummary {

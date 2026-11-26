@@ -16,6 +16,7 @@ import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
@@ -23,6 +24,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Apps
+import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.Delete
@@ -58,15 +60,18 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.window.DialogProperties
 import dev.l2tunnel.android.AndroidVpnProfile
 import dev.l2tunnel.android.SplitTunnelMode
 import dev.l2tunnel.android.StoredProfileSummary
+import java.io.File
 
 private data class InstalledAppItem(
     val packageName: String,
     val label: String,
 )
 
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 fun ProfilesScreen(
     profiles: List<StoredProfileSummary>,
@@ -75,17 +80,23 @@ fun ProfilesScreen(
     isWideLayout: Boolean,
     onSelectProfile: (String) -> Unit,
     onImportZip: () -> Unit,
+    onCreateProfile: (String) -> Unit,
     onSaveProfile: (String, AndroidVpnProfile) -> Unit,
     onDuplicateProfile: (String, String) -> Unit,
     onDeleteProfile: (String) -> Unit,
     onSealKeystore: (String) -> Unit,
     onReplaceKeyFile: (String, String) -> Unit,
 ) {
-    var editingSummary by remember { mutableStateOf<StoredProfileSummary?>(null) }
-    var splitEditingSummary by remember { mutableStateOf<StoredProfileSummary?>(null) }
+    var editingProfileId by remember { mutableStateOf<String?>(null) }
+    var splitEditingProfileId by remember { mutableStateOf<String?>(null) }
+    var createDialogOpen by remember { mutableStateOf(false) }
+    var newProfileName by remember { mutableStateOf("") }
     var duplicateTargetFor by remember { mutableStateOf<String?>(null) }
     var duplicateName by remember { mutableStateOf("") }
     var deleteConfirmId by remember { mutableStateOf<String?>(null) }
+
+    val editingSummary = profiles.firstOrNull { it.id == editingProfileId }
+    val splitEditingSummary = profiles.firstOrNull { it.id == splitEditingProfileId }
 
     val importCard: @Composable () -> Unit = {
         Card(modifier = Modifier.fillMaxWidth()) {
@@ -103,11 +114,24 @@ fun ProfilesScreen(
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                FlowRow(
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
                     Button(onClick = onImportZip) {
                         Icon(Icons.Filled.FileUpload, contentDescription = null, modifier = Modifier.size(18.dp))
                         Spacer(Modifier.width(8.dp))
                         Text("Import .zip Bundle")
+                    }
+                    FilledTonalButton(
+                        onClick = {
+                            newProfileName = "profile-${profiles.size + 1}"
+                            createDialogOpen = true
+                        },
+                    ) {
+                        Icon(Icons.Filled.Add, contentDescription = null, modifier = Modifier.size(18.dp))
+                        Spacer(Modifier.width(6.dp))
+                        Text("New Profile")
                     }
                 }
                 if (!statusBanner.isNullOrBlank()) {
@@ -142,7 +166,7 @@ fun ProfilesScreen(
                             style = MaterialTheme.typography.titleSmall,
                         )
                         Text(
-                            text = "Import a .zip archive containing client.json, common.json, noise-peer.pub, noise-private.key, member.pk8, and admission.key (plus optional android_vpn.json and psk.key).",
+                            text = "Import a .zip archive or tap New Profile to configure client.json, common.json, noise-peer.pub, noise-private.key, member.pk8, and admission.key.",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
@@ -151,6 +175,7 @@ fun ProfilesScreen(
             } else {
                 profiles.forEach { summary ->
                     val isActive = summary.id == activeProfileId
+                    val editable = summary.editableProfile
                     Card(
                         modifier = Modifier.fillMaxWidth(),
                         colors = CardDefaults.cardColors(
@@ -194,7 +219,7 @@ fun ProfilesScreen(
                                             text = if (prof != null) {
                                                 "${prof.udpPeer} · ${prof.cover} · TUN ${prof.tunAddress}/${prof.tunPrefixLength}"
                                             } else {
-                                                "Invalid: ${summary.validationError}"
+                                                "Incomplete: ${summary.validationError}"
                                             },
                                             style = MaterialTheme.typography.bodySmall,
                                             color = if (prof != null) MaterialTheme.colorScheme.onSurfaceVariant else MaterialTheme.colorScheme.error,
@@ -202,10 +227,8 @@ fun ProfilesScreen(
                                     }
                                 }
                                 Row {
-                                    IconButton(
-                                        onClick = { editingSummary = summary },
-                                        enabled = summary.profile != null,
-                                    ) {
+                                    // Always enabled so incomplete profiles can attach missing common.json/keys!
+                                    IconButton(onClick = { editingProfileId = summary.id }) {
                                         Icon(Icons.Filled.Edit, contentDescription = "Edit profile")
                                     }
                                     IconButton(
@@ -222,34 +245,47 @@ fun ProfilesScreen(
                                 }
                             }
 
-                            Row(
+                            FlowRow(
                                 horizontalArrangement = Arrangement.spacedBy(8.dp),
-                                verticalAlignment = Alignment.CenterVertically,
+                                verticalArrangement = Arrangement.spacedBy(6.dp),
                             ) {
-                                AssistChip(
-                                    onClick = { if (!summary.keystoreSealed) onSealKeystore(summary.id) },
-                                    leadingIcon = {
-                                        Icon(
-                                            imageVector = if (summary.keystoreSealed) Icons.Filled.Lock else Icons.Filled.Warning,
-                                            contentDescription = null,
-                                            modifier = Modifier.size(16.dp),
+                                when {
+                                    summary.keystoreSealed -> {
+                                        AssistChip(
+                                            onClick = { editingProfileId = summary.id },
+                                            leadingIcon = {
+                                                Icon(Icons.Filled.Lock, contentDescription = null, modifier = Modifier.size(16.dp))
+                                            },
+                                            label = { Text("Keystore AES-GCM") },
                                         )
-                                    },
-                                    label = {
-                                        Text(
-                                            if (summary.keystoreSealed) "Keystore AES-GCM" else "Seal in Keystore",
+                                    }
+                                    summary.presentSecrets.isNotEmpty() -> {
+                                        AssistChip(
+                                            onClick = { onSealKeystore(summary.id) },
+                                            leadingIcon = {
+                                                Icon(Icons.Filled.Warning, contentDescription = null, modifier = Modifier.size(16.dp))
+                                            },
+                                            label = { Text("Seal in Keystore") },
                                         )
-                                    },
-                                )
-                                if (summary.profile != null) {
-                                    val prof = summary.profile
-                                    val splitLabel = when (prof.splitTunnelMode) {
+                                    }
+                                    else -> {
+                                        AssistChip(
+                                            onClick = { editingProfileId = summary.id },
+                                            leadingIcon = {
+                                                Icon(Icons.Filled.Warning, contentDescription = null, modifier = Modifier.size(16.dp))
+                                            },
+                                            label = { Text("Attach Keys in Edit") },
+                                        )
+                                    }
+                                }
+                                if (editable != null) {
+                                    val splitLabel = when (editable.splitTunnelMode) {
                                         SplitTunnelMode.ALL -> "Split: All"
-                                        SplitTunnelMode.EXCLUDE -> "Exclude ${prof.splitTunnelApps.size}"
-                                        SplitTunnelMode.INCLUDE -> "Only ${prof.splitTunnelApps.size}"
+                                        SplitTunnelMode.EXCLUDE -> "Exclude ${editable.splitTunnelApps.size}"
+                                        SplitTunnelMode.INCLUDE -> "Only ${editable.splitTunnelApps.size}"
                                     }
                                     AssistChip(
-                                        onClick = { splitEditingSummary = summary },
+                                        onClick = { splitEditingProfileId = summary.id },
                                         leadingIcon = {
                                             Icon(Icons.Filled.Apps, contentDescription = null, modifier = Modifier.size(16.dp))
                                         },
@@ -299,38 +335,68 @@ fun ProfilesScreen(
         }
     }
 
-    // Typed L3 TUN Profile Editor Dialog
-    editingSummary?.let { summary ->
-        summary.profile?.let { prof ->
-            ProfileEditorDialog(
-                profileId = summary.id,
-                initial = prof,
-                onDismiss = { editingSummary = null },
-                onSave = { updated ->
-                    onSaveProfile(summary.id, updated)
-                    editingSummary = null
+    // Typed L3 TUN Profile Editor Dialog (landscape-aware, always editable even when incomplete)
+    if (editingSummary != null) {
+        val initial = editingSummary.editableProfile ?: defaultProfileTemplate(editingSummary.directory)
+        ProfileEditorDialog(
+            profileId = editingSummary.id,
+            initial = initial,
+            presentFiles = editingSummary.presentFiles,
+            isWideLayout = isWideLayout,
+            onDismiss = { editingProfileId = null },
+            onSave = { updated ->
+                onSaveProfile(editingSummary.id, updated)
+                editingProfileId = null
+            },
+            onReplaceKeyFile = { fileName -> onReplaceKeyFile(editingSummary.id, fileName) },
+        )
+    }
+
+    // Per-App Split Tunneling Dialog
+    if (splitEditingSummary != null) {
+        val prof = splitEditingSummary.editableProfile
+        if (prof != null) {
+            AppSplitTunnelDialog(
+                initialMode = prof.splitTunnelMode,
+                initialPackages = prof.splitTunnelApps,
+                isWideLayout = isWideLayout,
+                onDismiss = { splitEditingProfileId = null },
+                onSave = { mode, pkgs ->
+                    onSaveProfile(
+                        splitEditingSummary.id,
+                        prof.copy(splitTunnelMode = mode, splitTunnelApps = pkgs),
+                    )
+                    splitEditingProfileId = null
                 },
-                onReplaceKeyFile = { fileName -> onReplaceKeyFile(summary.id, fileName) },
             )
         }
     }
 
-    // Per-App Split Tunneling Dialog
-    splitEditingSummary?.let { summary ->
-        summary.profile?.let { prof ->
-            AppSplitTunnelDialog(
-                initialMode = prof.splitTunnelMode,
-                initialPackages = prof.splitTunnelApps,
-                onDismiss = { splitEditingSummary = null },
-                onSave = { mode, pkgs ->
-                    onSaveProfile(
-                        summary.id,
-                        prof.copy(splitTunnelMode = mode, splitTunnelApps = pkgs),
-                    )
-                    splitEditingSummary = null
-                },
-            )
-        }
+    // Create New Profile Dialog
+    if (createDialogOpen) {
+        AlertDialog(
+            onDismissRequest = { createDialogOpen = false },
+            title = { Text("Create New Profile") },
+            text = {
+                OutlinedTextField(
+                    value = newProfileName,
+                    onValueChange = { newProfileName = it },
+                    label = { Text("Profile name") },
+                    singleLine = true,
+                )
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        onCreateProfile(newProfileName)
+                        createDialogOpen = false
+                    },
+                ) { Text("Create") }
+            },
+            dismissButton = {
+                TextButton(onClick = { createDialogOpen = false }) { Text("Cancel") }
+            },
+        )
     }
 
     // Duplicate Profile Dialog
@@ -381,36 +447,166 @@ fun ProfilesScreen(
     }
 }
 
+private fun defaultProfileTemplate(dir: File): AndroidVpnProfile =
+    AndroidVpnProfile(
+        profileDir = dir,
+        cover = "quic-like",
+        udpBind = "0.0.0.0:0",
+        udpPeer = "192.168.1.1:24461",
+        pathMtu = 1500,
+        tunMtu = 1500,
+        noiseProfile = "ik",
+        handshakeSeconds = 30,
+        tuneRepair = "off,1/8,1/4",
+        tunAddress = AndroidVpnProfile.DEFAULT_TUN_ADDRESS,
+        tunPrefixLength = AndroidVpnProfile.DEFAULT_TUN_PREFIX,
+        routes = listOf("0.0.0.0" to 0),
+        dnsServers = emptyList(),
+    )
+
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun ProfileEditorDialog(
     profileId: String,
     initial: AndroidVpnProfile,
+    presentFiles: Set<String>,
+    isWideLayout: Boolean,
     onDismiss: () -> Unit,
     onSave: (AndroidVpnProfile) -> Unit,
     onReplaceKeyFile: (String) -> Unit,
 ) {
-    var udpPeer by remember { mutableStateOf(initial.udpPeer) }
-    var cover by remember { mutableStateOf(initial.cover) }
-    var noiseProfile by remember { mutableStateOf(initial.noiseProfile) }
-    var tunMtu by remember { mutableStateOf(initial.tunMtu.toString()) }
-    var pathMtu by remember { mutableStateOf(initial.pathMtu.toString()) }
-    var tunAddress by remember { mutableStateOf(initial.tunAddress) }
-    var tunPrefix by remember { mutableStateOf(initial.tunPrefixLength.toString()) }
-    var routesText by remember {
+    var udpPeer by remember(profileId) { mutableStateOf(initial.udpPeer) }
+    var cover by remember(profileId) { mutableStateOf(initial.cover) }
+    var noiseProfile by remember(profileId) { mutableStateOf(initial.noiseProfile) }
+    var tunMtu by remember(profileId) { mutableStateOf(initial.tunMtu.toString()) }
+    var pathMtu by remember(profileId) { mutableStateOf(initial.pathMtu.toString()) }
+    var tunAddress by remember(profileId) { mutableStateOf(initial.tunAddress) }
+    var tunPrefix by remember(profileId) { mutableStateOf(initial.tunPrefixLength.toString()) }
+    var routesText by remember(profileId) {
         mutableStateOf(initial.routes.joinToString(", ") { "${it.first}/${it.second}" })
     }
-    var dnsText by remember { mutableStateOf(initial.dnsServers.joinToString(", ")) }
-    var tuneRepair by remember { mutableStateOf(initial.tuneRepair ?: "off,1/8,1/4") }
+    var dnsText by remember(profileId) { mutableStateOf(initial.dnsServers.joinToString(", ")) }
+    var tuneRepair by remember(profileId) { mutableStateOf(initial.tuneRepair ?: "off,1/8,1/4") }
     var errorText by remember { mutableStateOf<String?>(null) }
+
+    val leftFields: @Composable () -> Unit = {
+        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            OutlinedTextField(
+                value = udpPeer,
+                onValueChange = { udpPeer = it },
+                label = { Text("Server Endpoint (host:port)") },
+                singleLine = true,
+                modifier = Modifier.fillMaxWidth(),
+            )
+            Text("Initial UDP Cover", style = MaterialTheme.typography.labelMedium)
+            FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                AndroidVpnProfile.SUPPORTED_COVERS.forEach { c ->
+                    FilterChip(
+                        selected = cover == c,
+                        onClick = { cover = c },
+                        label = { Text(c) },
+                    )
+                }
+            }
+            Text("Noise Profile", style = MaterialTheme.typography.labelMedium)
+            FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                AndroidVpnProfile.SUPPORTED_NOISE.forEach { n ->
+                    FilterChip(
+                        selected = noiseProfile == n,
+                        onClick = { noiseProfile = n },
+                        label = { Text(n.uppercase()) },
+                    )
+                }
+            }
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                OutlinedTextField(
+                    value = tunAddress,
+                    onValueChange = { tunAddress = it },
+                    label = { Text("TUN IP") },
+                    singleLine = true,
+                    modifier = Modifier.weight(2f),
+                )
+                OutlinedTextField(
+                    value = tunPrefix,
+                    onValueChange = { tunPrefix = it },
+                    label = { Text("Prefix") },
+                    singleLine = true,
+                    modifier = Modifier.weight(1f),
+                )
+            }
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                OutlinedTextField(
+                    value = tunMtu,
+                    onValueChange = { tunMtu = it },
+                    label = { Text("TUN MTU") },
+                    singleLine = true,
+                    modifier = Modifier.weight(1f),
+                )
+                OutlinedTextField(
+                    value = pathMtu,
+                    onValueChange = { pathMtu = it },
+                    label = { Text("Path MTU") },
+                    singleLine = true,
+                    modifier = Modifier.weight(1f),
+                )
+            }
+        }
+    }
+
+    val rightFields: @Composable () -> Unit = {
+        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            OutlinedTextField(
+                value = routesText,
+                onValueChange = { routesText = it },
+                label = { Text("CIDR Routes (comma-separated)") },
+                modifier = Modifier.fillMaxWidth(),
+            )
+            OutlinedTextField(
+                value = dnsText,
+                onValueChange = { dnsText = it },
+                label = { Text("DNS Servers (optional)") },
+                singleLine = true,
+                modifier = Modifier.fillMaxWidth(),
+            )
+            OutlinedTextField(
+                value = tuneRepair,
+                onValueChange = { tuneRepair = it },
+                label = { Text("Live Tuning FEC Catalog (optional)") },
+                singleLine = true,
+                modifier = Modifier.fillMaxWidth(),
+            )
+            Text("Required Plan & Key Files (Keystore sealed)", style = MaterialTheme.typography.labelMedium)
+            FlowRow(
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                verticalArrangement = Arrangement.spacedBy(6.dp),
+            ) {
+                listOf("common.json", "noise-peer.pub", "noise-private.key", "member.pk8", "admission.key").forEach { f ->
+                    val present = f in presentFiles
+                    OutlinedButton(onClick = { onReplaceKeyFile(f) }) {
+                        Icon(
+                            imageVector = if (present) Icons.Filled.Check else Icons.Filled.Add,
+                            contentDescription = null,
+                            modifier = Modifier.size(14.dp),
+                        )
+                        Spacer(Modifier.width(4.dp))
+                        Text(f, style = MaterialTheme.typography.labelSmall)
+                    }
+                }
+            }
+        }
+    }
 
     AlertDialog(
         onDismissRequest = onDismiss,
+        properties = DialogProperties(usePlatformDefaultWidth = false),
+        modifier = Modifier
+            .fillMaxWidth(if (isWideLayout) 0.86f else 0.94f)
+            .widthIn(max = 840.dp),
         title = { Text("Edit Profile: $profileId") },
         text = {
             Column(
                 modifier = Modifier
-                    .heightIn(max = 460.dp)
+                    .heightIn(max = if (isWideLayout) 380.dp else 480.dp)
                     .verticalScroll(rememberScrollState()),
                 verticalArrangement = Arrangement.spacedBy(8.dp),
             ) {
@@ -419,95 +615,18 @@ private fun ProfileEditorDialog(
                     style = MaterialTheme.typography.labelSmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
-                OutlinedTextField(
-                    value = udpPeer,
-                    onValueChange = { udpPeer = it },
-                    label = { Text("Server Endpoint (host:port)") },
-                    singleLine = true,
-                    modifier = Modifier.fillMaxWidth(),
-                )
-                Text("Initial UDP Cover", style = MaterialTheme.typography.labelMedium)
-                FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                    AndroidVpnProfile.SUPPORTED_COVERS.forEach { c ->
-                        FilterChip(
-                            selected = cover == c,
-                            onClick = { cover = c },
-                            label = { Text(c) },
-                        )
+                if (isWideLayout) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(14.dp),
+                        verticalAlignment = Alignment.Top,
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) { leftFields() }
+                        Column(modifier = Modifier.weight(1f)) { rightFields() }
                     }
-                }
-                Text("Noise Profile", style = MaterialTheme.typography.labelMedium)
-                FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                    AndroidVpnProfile.SUPPORTED_NOISE.forEach { n ->
-                        FilterChip(
-                            selected = noiseProfile == n,
-                            onClick = { noiseProfile = n },
-                            label = { Text(n.uppercase()) },
-                        )
-                    }
-                }
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    OutlinedTextField(
-                        value = tunAddress,
-                        onValueChange = { tunAddress = it },
-                        label = { Text("TUN IP") },
-                        singleLine = true,
-                        modifier = Modifier.weight(2f),
-                    )
-                    OutlinedTextField(
-                        value = tunPrefix,
-                        onValueChange = { tunPrefix = it },
-                        label = { Text("Prefix") },
-                        singleLine = true,
-                        modifier = Modifier.weight(1f),
-                    )
-                }
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    OutlinedTextField(
-                        value = tunMtu,
-                        onValueChange = { tunMtu = it },
-                        label = { Text("TUN MTU") },
-                        singleLine = true,
-                        modifier = Modifier.weight(1f),
-                    )
-                    OutlinedTextField(
-                        value = pathMtu,
-                        onValueChange = { pathMtu = it },
-                        label = { Text("Path MTU") },
-                        singleLine = true,
-                        modifier = Modifier.weight(1f),
-                    )
-                }
-                OutlinedTextField(
-                    value = routesText,
-                    onValueChange = { routesText = it },
-                    label = { Text("CIDR Routes (comma-separated)") },
-                    modifier = Modifier.fillMaxWidth(),
-                )
-                OutlinedTextField(
-                    value = dnsText,
-                    onValueChange = { dnsText = it },
-                    label = { Text("DNS Servers (optional, comma-separated)") },
-                    singleLine = true,
-                    modifier = Modifier.fillMaxWidth(),
-                )
-                OutlinedTextField(
-                    value = tuneRepair,
-                    onValueChange = { tuneRepair = it },
-                    label = { Text("Live Tuning FEC Catalog (optional)") },
-                    singleLine = true,
-                    modifier = Modifier.fillMaxWidth(),
-                )
-                Spacer(Modifier.height(4.dp))
-                Text("Rotate / Replace Key Files (Keystore sealed)", style = MaterialTheme.typography.labelMedium)
-                FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                    listOf("noise-private.key", "noise-peer.pub", "member.pk8", "admission.key", "common.json").forEach { f ->
-                        OutlinedButton(onClick = { onReplaceKeyFile(f) }) {
-                            Icon(Icons.Filled.Add, contentDescription = null, modifier = Modifier.size(14.dp))
-                            Spacer(Modifier.width(4.dp))
-                            Text(f, style = MaterialTheme.typography.labelSmall)
-                        }
-                    }
+                } else {
+                    leftFields()
+                    rightFields()
                 }
                 if (!errorText.isNullOrBlank()) {
                     Text(
@@ -541,7 +660,6 @@ private fun ProfileEditorDialog(
                             dnsServers = parsedDns,
                             tuneRepair = tuneRepair.trim().ifEmpty { null },
                         )
-                        // Validate via strict parser before saving.
                         AndroidVpnProfile.parse(initial.profileDir, updated.toClientJson(), updated.toAndroidVpnJson())
                         onSave(updated)
                     } catch (e: Exception) {
@@ -561,6 +679,7 @@ private fun ProfileEditorDialog(
 private fun AppSplitTunnelDialog(
     initialMode: SplitTunnelMode,
     initialPackages: List<String>,
+    isWideLayout: Boolean,
     onDismiss: () -> Unit,
     onSave: (SplitTunnelMode, List<String>) -> Unit,
 ) {
@@ -594,6 +713,10 @@ private fun AppSplitTunnelDialog(
 
     AlertDialog(
         onDismissRequest = onDismiss,
+        properties = DialogProperties(usePlatformDefaultWidth = false),
+        modifier = Modifier
+            .fillMaxWidth(if (isWideLayout) 0.72f else 0.94f)
+            .widthIn(max = 680.dp),
         title = { Text("Per-App Split Tunneling") },
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -627,7 +750,7 @@ private fun AppSplitTunnelDialog(
                         singleLine = true,
                         modifier = Modifier.fillMaxWidth(),
                     )
-                    LazyColumn(modifier = Modifier.height(260.dp)) {
+                    LazyColumn(modifier = Modifier.height(if (isWideLayout) 220.dp else 260.dp)) {
                         items(filtered, key = { it.packageName }) { app ->
                             val checked = app.packageName in selected
                             Row(

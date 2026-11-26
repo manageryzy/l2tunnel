@@ -282,6 +282,15 @@ class MainActivity : ComponentActivity() {
                             onImportZip = {
                                 importZipLauncher.launch(arrayOf("application/zip", "application/octet-stream", "*/*"))
                             },
+                            onCreateProfile = { newId ->
+                                try {
+                                    val created = profileStore.createNewProfile(newId)
+                                    reloadProfiles()
+                                    profileBannerState = "Created '${created.id}'. Attach common.json and key files in Edit."
+                                } catch (e: Exception) {
+                                    profileBannerState = "Create failed: ${e.message}"
+                                }
+                            },
                             onSaveProfile = { id, updated ->
                                 try {
                                     profileStore.saveEditedProfile(id, updated)
