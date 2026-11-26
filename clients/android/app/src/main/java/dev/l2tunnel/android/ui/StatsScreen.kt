@@ -46,6 +46,7 @@ import java.util.Locale
 @Composable
 fun StatsScreen(
     state: VpnUiState,
+    isWideLayout: Boolean,
     onExportDiagnostics: (Boolean) -> Unit,
 ) {
     val scroll = rememberScrollState()
@@ -59,153 +60,203 @@ fun StatsScreen(
             .padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
-        // 1. Live Throughput & RTT Charts
-        Card(modifier = Modifier.fillMaxWidth()) {
-            Column(
-                modifier = Modifier.padding(16.dp),
-                verticalArrangement = Arrangement.spacedBy(10.dp),
+        if (isWideLayout) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(14.dp),
+                verticalAlignment = Alignment.Top,
             ) {
+                Column(
+                    modifier = Modifier.weight(1f),
+                    verticalArrangement = Arrangement.spacedBy(12.dp),
+                ) {
+                    ChartsCard(state = state)
+                    CountersCard(state = state)
+                }
+                Column(
+                    modifier = Modifier.weight(1f),
+                    verticalArrangement = Arrangement.spacedBy(12.dp),
+                ) {
+                    DiagnosticsAndEventsCard(
+                        state = state,
+                        redactEndpoints = redactEndpoints,
+                        onToggleRedact = { redactEndpoints = it },
+                        onExportDiagnostics = onExportDiagnostics,
+                        timeFmt = timeFmt,
+                    )
+                    MetersCard(state = state)
+                }
+            }
+        } else {
+            ChartsCard(state = state)
+            CountersCard(state = state)
+            MetersCard(state = state)
+            DiagnosticsAndEventsCard(
+                state = state,
+                redactEndpoints = redactEndpoints,
+                onToggleRedact = { redactEndpoints = it },
+                onExportDiagnostics = onExportDiagnostics,
+                timeFmt = timeFmt,
+            )
+        }
+    }
+}
+
+@Composable
+private fun ChartsCard(state: VpnUiState) {
+    Card(modifier = Modifier.fillMaxWidth()) {
+        Column(
+            modifier = Modifier.padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp),
+        ) {
+            Text(
+                text = "Rolling Wire Throughput & RTT (${state.history.size} samples)",
+                style = MaterialTheme.typography.titleMedium,
+                fontWeight = FontWeight.SemiBold,
+            )
+            val txValues = state.history.map { it.txBytesPerSec }
+            val rttValues = state.history.mapNotNull { it.rttMs }
+            Text(
+                text = "Wire TX: ${Formatters.rateBytesPerSec(state.txBytesPerSec)} · RTT: ${Formatters.rttMicros(state.rttMicros)}",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            LineChart(
+                values = txValues,
+                color = MaterialTheme.colorScheme.primary,
+                minMaxFloor = 1024f,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(84.dp),
+            )
+            if (rttValues.size >= 2) {
                 Text(
-                    text = "Rolling Wire Throughput & RTT (Last ${state.history.size} samples)",
-                    style = MaterialTheme.typography.titleMedium,
-                    fontWeight = FontWeight.SemiBold,
-                )
-                val txValues = state.history.map { it.txBytesPerSec }
-                val rttValues = state.history.mapNotNull { it.rttMs }
-                Text(
-                    text = "Wire TX: ${Formatters.rateBytesPerSec(state.txBytesPerSec)} · RTT: ${Formatters.rttMicros(state.rttMicros)}",
-                    style = MaterialTheme.typography.bodySmall,
+                    text = "Session RTT (ms) · min ${String.format("%.2f", rttValues.min())} / max ${String.format("%.2f", rttValues.max())} ms",
+                    style = MaterialTheme.typography.labelSmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
                 LineChart(
-                    values = txValues,
-                    color = MaterialTheme.colorScheme.primary,
-                    minMaxFloor = 1024f,
+                    values = rttValues,
+                    color = MaterialTheme.colorScheme.tertiary,
+                    minMaxFloor = 1f,
                     modifier = Modifier
                         .fillMaxWidth()
-                        .height(84.dp),
+                        .height(64.dp),
                 )
-                if (rttValues.size >= 2) {
-                    Text(
-                        text = "Session RTT (ms) · min ${String.format("%.2f", rttValues.min())} / max ${String.format("%.2f", rttValues.max())} ms",
-                        style = MaterialTheme.typography.labelSmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
-                    LineChart(
-                        values = rttValues,
-                        color = MaterialTheme.colorScheme.tertiary,
-                        minMaxFloor = 1f,
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .height(64.dp),
-                    )
-                }
             }
         }
+    }
+}
 
-        // 2. Wire & TUN Counters
-        Card(modifier = Modifier.fillMaxWidth()) {
-            Column(
-                modifier = Modifier.padding(16.dp),
-                verticalArrangement = Arrangement.spacedBy(6.dp),
-            ) {
-                Text(
-                    text = "Transport & TUN Counters",
-                    style = MaterialTheme.typography.titleMedium,
-                    fontWeight = FontWeight.SemiBold,
-                )
-                StatRow("Wire Sent", "${Formatters.bytes(state.wireSentBytes)} (${state.wireSentPackets} pkts)")
-                StatRow("Wire Received", "${state.wireReceivedPackets} pkts")
-                StatRow("Socket Drops / Rx Errors", "${state.wireSendDrops} / ${state.wireReceiveErrors}")
-                StatRow("Rejected / Replay", "${state.wireRejectedPackets} / ${state.wireReplayRejections}")
-                StatRow("TUN Read / Written", "${state.nativeReadPackets} / ${state.nativeWrittenPackets} pkts")
-                StatRow("TUN Backpressure Drops", "${state.nativeBackpressureDrops}")
-            }
+@Composable
+private fun CountersCard(state: VpnUiState) {
+    Card(modifier = Modifier.fillMaxWidth()) {
+        Column(
+            modifier = Modifier.padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(6.dp),
+        ) {
+            Text(
+                text = "Transport & TUN Counters",
+                style = MaterialTheme.typography.titleMedium,
+                fontWeight = FontWeight.SemiBold,
+            )
+            StatRow("Wire Sent", "${Formatters.bytes(state.wireSentBytes)} (${state.wireSentPackets} pkts)")
+            StatRow("Wire Received", "${state.wireReceivedPackets} pkts")
+            StatRow("Socket Drops / Rx Errors", "${state.wireSendDrops} / ${state.wireReceiveErrors}")
+            StatRow("Rejected / Replay", "${state.wireRejectedPackets} / ${state.wireReplayRejections}")
+            StatRow("TUN Read / Written", "${state.nativeReadPackets} / ${state.nativeWrittenPackets} pkts")
+            StatRow("TUN Backpressure Drops", "${state.nativeBackpressureDrops}")
         }
+    }
+}
 
-        // 3. Local CSR Meters (meters_read)
-        if (state.meters.isNotEmpty()) {
-            Card(modifier = Modifier.fillMaxWidth()) {
-                Column(
-                    modifier = Modifier.padding(16.dp),
-                    verticalArrangement = Arrangement.spacedBy(4.dp),
+@Composable
+private fun MetersCard(state: VpnUiState) {
+    if (state.meters.isEmpty()) return
+    Card(modifier = Modifier.fillMaxWidth()) {
+        Column(
+            modifier = Modifier.padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(4.dp),
+        ) {
+            Text(
+                text = "Local CSR Meters (${state.meters.size})",
+                style = MaterialTheme.typography.titleMedium,
+                fontWeight = FontWeight.SemiBold,
+            )
+            Spacer(Modifier.height(4.dp))
+            state.meters.take(20).forEach { m ->
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
                 ) {
                     Text(
-                        text = "Local CSR Meters (${state.meters.size})",
-                        style = MaterialTheme.typography.titleMedium,
+                        text = m.path,
+                        style = MaterialTheme.typography.labelSmall,
+                        fontFamily = FontFamily.Monospace,
+                        modifier = Modifier.weight(1f),
+                    )
+                    Spacer(Modifier.width(8.dp))
+                    Text(
+                        text = m.value.toString(),
+                        style = MaterialTheme.typography.labelSmall,
+                        fontFamily = FontFamily.Monospace,
                         fontWeight = FontWeight.SemiBold,
                     )
-                    Spacer(Modifier.height(4.dp))
-                    state.meters.take(24).forEach { m ->
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.SpaceBetween,
-                        ) {
-                            Text(
-                                text = m.path,
-                                style = MaterialTheme.typography.labelSmall,
-                                fontFamily = FontFamily.Monospace,
-                                modifier = Modifier.weight(1f),
-                            )
-                            Spacer(Modifier.width(8.dp))
-                            Text(
-                                text = m.value.toString(),
-                                style = MaterialTheme.typography.labelSmall,
-                                fontFamily = FontFamily.Monospace,
-                                fontWeight = FontWeight.SemiBold,
-                            )
-                        }
-                    }
                 }
             }
         }
+    }
+}
 
-        // 4. Redacted Diagnostics Export (CL-16)
-        Card(modifier = Modifier.fillMaxWidth()) {
-            Column(
-                modifier = Modifier.padding(16.dp),
-                verticalArrangement = Arrangement.spacedBy(8.dp),
-            ) {
+@Composable
+private fun DiagnosticsAndEventsCard(
+    state: VpnUiState,
+    redactEndpoints: Boolean,
+    onToggleRedact: (Boolean) -> Unit,
+    onExportDiagnostics: (Boolean) -> Unit,
+    timeFmt: SimpleDateFormat,
+) {
+    Card(modifier = Modifier.fillMaxWidth()) {
+        Column(
+            modifier = Modifier.padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            Text(
+                text = "Diagnostics & Bounded Event Log",
+                style = MaterialTheme.typography.titleMedium,
+                fontWeight = FontWeight.SemiBold,
+            )
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Checkbox(checked = redactEndpoints, onCheckedChange = onToggleRedact)
                 Text(
-                    text = "Diagnostics & Bounded Event Log",
-                    style = MaterialTheme.typography.titleMedium,
-                    fontWeight = FontWeight.SemiBold,
+                    text = "Redact IP endpoints (private keys are always excluded)",
+                    style = MaterialTheme.typography.bodySmall,
                 )
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Checkbox(
-                        checked = redactEndpoints,
-                        onCheckedChange = { redactEndpoints = it },
-                    )
-                    Text(
-                        text = "Redact IP endpoints (private keys are always excluded)",
-                        style = MaterialTheme.typography.bodySmall,
-                    )
-                }
-                Button(onClick = { onExportDiagnostics(redactEndpoints) }) {
-                    Icon(Icons.Filled.Download, contentDescription = null, modifier = Modifier.size(18.dp))
-                    Spacer(Modifier.width(8.dp))
-                    Text("Export Diagnostics JSON")
-                }
-                HorizontalDivider(modifier = Modifier.padding(vertical = 4.dp))
-                if (state.events.isEmpty()) {
-                    Text(
-                        text = "No events recorded yet.",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
-                } else {
-                    state.events.takeLast(40).asReversed().forEach { ev ->
-                        val msg = if (redactEndpoints) {
-                            DiagnosticsExporter.redactAddresses(ev.message)
-                        } else {
-                            ev.message
-                        }
-                        Text(
-                            text = "[${timeFmt.format(Date(ev.timestampMs))}] ${ev.source}: $msg",
-                            style = MaterialTheme.typography.labelSmall,
-                            fontFamily = FontFamily.Monospace,
-                        )
+            }
+            Button(onClick = { onExportDiagnostics(redactEndpoints) }) {
+                Icon(Icons.Filled.Download, contentDescription = null, modifier = Modifier.size(18.dp))
+                Spacer(Modifier.width(8.dp))
+                Text("Export Diagnostics JSON")
+            }
+            HorizontalDivider(modifier = Modifier.padding(vertical = 4.dp))
+            if (state.events.isEmpty()) {
+                Text(
+                    text = "No events recorded yet.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            } else {
+                state.events.takeLast(25).asReversed().forEach { ev ->
+                    val msg = if (redactEndpoints) {
+                        DiagnosticsExporter.redactAddresses(ev.message)
+                    } else {
+                        ev.message
                     }
+                    Text(
+                        text = "[${timeFmt.format(Date(ev.timestampMs))}] ${ev.source}: $msg",
+                        style = MaterialTheme.typography.labelSmall,
+                        fontFamily = FontFamily.Monospace,
+                    )
                 }
             }
         }

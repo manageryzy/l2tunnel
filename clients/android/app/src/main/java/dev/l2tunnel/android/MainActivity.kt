@@ -3,6 +3,7 @@ package dev.l2tunnel.android
 import android.Manifest
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.content.res.Configuration
 import android.net.Uri
 import android.net.VpnService
 import android.os.Build
@@ -13,6 +14,8 @@ import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material.icons.Icons
@@ -24,9 +27,12 @@ import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.NavigationBar
 import androidx.compose.material3.NavigationBarItem
+import androidx.compose.material3.NavigationRail
+import androidx.compose.material3.NavigationRailItem
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
+import androidx.compose.material3.VerticalDivider
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
@@ -34,6 +40,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import dev.l2tunnel.android.ui.ConnectionScreen
@@ -144,154 +151,184 @@ class MainActivity : ComponentActivity() {
             Triple("Stats", Icons.Filled.Assessment, 3),
         )
 
+        val config = LocalConfiguration.current
+        val isWide = config.orientation == Configuration.ORIENTATION_LANDSCAPE || config.screenWidthDp >= 600
+
         Scaffold(
             topBar = {
-                TopAppBar(
-                    title = {
-                        Text(
-                            text = when (selectedTab) {
-                                0 -> "l2tunnel"
-                                1 -> "Connection"
-                                2 -> "Profiles & Keys"
-                                else -> "Stats & Logs"
-                            },
-                        )
-                    },
-                )
+                if (!isWide) {
+                    TopAppBar(
+                        title = {
+                            Text(
+                                text = when (selectedTab) {
+                                    0 -> "l2tunnel"
+                                    1 -> "Connection"
+                                    2 -> "Profiles & Keys"
+                                    else -> "Stats & Logs"
+                                },
+                            )
+                        },
+                    )
+                }
             },
             bottomBar = {
-                NavigationBar {
-                    tabs.forEach { (label, icon, index) ->
-                        NavigationBarItem(
-                            selected = selectedTab == index,
-                            onClick = { selectedTab = index },
-                            icon = { Icon(icon, contentDescription = label) },
-                            label = { Text(label) },
-                        )
+                if (!isWide) {
+                    NavigationBar {
+                        tabs.forEach { (label, icon, index) ->
+                            NavigationBarItem(
+                                selected = selectedTab == index,
+                                onClick = { selectedTab = index },
+                                icon = { Icon(icon, contentDescription = label) },
+                                label = { Text(label) },
+                            )
+                        }
                     }
                 }
             },
         ) { innerPadding ->
-            Box(
+            Row(
                 modifier = Modifier
                     .fillMaxSize()
                     .padding(innerPadding),
             ) {
-                when (selectedTab) {
-                    0 -> OverviewScreen(
-                        state = vpnState,
-                        profiles = profilesState,
-                        activeProfile = activeSummary,
-                        inlineError = overviewErrorState,
-                        onSelectProfile = { id -> selectProfile(id) },
-                        onConnect = { requestVpnAndStart() },
-                        onReconnect = { sendServiceAction(L2TunnelVpnService.ACTION_RECONNECT) },
-                        onDisconnect = { sendServiceAction(L2TunnelVpnService.ACTION_STOP) },
-                        onOpenProfilesTab = { selectedTab = 2 },
-                    )
-                    1 -> ConnectionScreen(
-                        state = vpnState,
-                        onSwitchCover = { target ->
-                            startService(
-                                Intent(this@MainActivity, L2TunnelVpnService::class.java)
-                                    .setAction(L2TunnelVpnService.ACTION_SWITCH_COVER)
-                                    .putExtra(L2TunnelVpnService.EXTRA_COVER, target),
+                if (isWide) {
+                    NavigationRail(modifier = Modifier.fillMaxHeight()) {
+                        tabs.forEach { (label, icon, index) ->
+                            NavigationRailItem(
+                                selected = selectedTab == index,
+                                onClick = { selectedTab = index },
+                                icon = { Icon(icon, contentDescription = label) },
+                                label = { Text(label) },
                             )
-                        },
-                        onTuningSwitch = { setting ->
-                            startService(
-                                Intent(this@MainActivity, L2TunnelVpnService::class.java)
-                                    .setAction(L2TunnelVpnService.ACTION_TUNE_SWITCH)
-                                    .putExtra(L2TunnelVpnService.EXTRA_TUNE_REPAIR, setting.repair)
-                                    .putExtra(L2TunnelVpnService.EXTRA_TUNE_DEV_MTU, setting.deviceMtu)
-                                    .putExtra(L2TunnelVpnService.EXTRA_TUNE_PATH_MTU, setting.pathMtu),
-                            )
-                        },
-                        onRateBudgetSet = { sendBps, recvBps ->
-                            startService(
-                                Intent(this@MainActivity, L2TunnelVpnService::class.java)
-                                    .setAction(L2TunnelVpnService.ACTION_RATE_BUDGET)
-                                    .putExtra(L2TunnelVpnService.EXTRA_SEND_RATE_BPS, sendBps)
-                                    .putExtra(L2TunnelVpnService.EXTRA_RECV_RATE_BPS, recvBps),
-                            )
-                        },
-                        onTestPing = { count ->
-                            startService(
-                                Intent(this@MainActivity, L2TunnelVpnService::class.java)
-                                    .setAction(L2TunnelVpnService.ACTION_TEST_PING)
-                                    .putExtra(L2TunnelVpnService.EXTRA_TEST_COUNT, count),
-                            )
-                        },
-                        onTestSpeed = { dir, streams, durationMs ->
-                            startService(
-                                Intent(this@MainActivity, L2TunnelVpnService::class.java)
-                                    .setAction(L2TunnelVpnService.ACTION_TEST_SPEED)
-                                    .putExtra(L2TunnelVpnService.EXTRA_TEST_DIRECTION, dir)
-                                    .putExtra(L2TunnelVpnService.EXTRA_TEST_STREAMS, streams)
-                                    .putExtra(L2TunnelVpnService.EXTRA_TEST_DURATION_MS, durationMs),
-                            )
-                        },
-                        onTestCancel = { id ->
-                            startService(
-                                Intent(this@MainActivity, L2TunnelVpnService::class.java)
-                                    .setAction(L2TunnelVpnService.ACTION_TEST_CANCEL)
-                                    .putExtra(L2TunnelVpnService.EXTRA_TEST_ID, id),
-                            )
-                        },
-                    )
-                    2 -> ProfilesScreen(
-                        profiles = profilesState,
-                        activeProfileId = activeProfileIdState,
-                        statusBanner = profileBannerState,
-                        onSelectProfile = { id -> selectProfile(id) },
-                        onImportZip = {
-                            importZipLauncher.launch(arrayOf("application/zip", "application/octet-stream", "*/*"))
-                        },
-                        onSaveProfile = { id, updated ->
-                            try {
-                                profileStore.saveEditedProfile(id, updated)
+                        }
+                    }
+                    VerticalDivider()
+                }
+                Box(
+                    modifier = Modifier
+                        .weight(1f)
+                        .fillMaxHeight(),
+                ) {
+                    when (selectedTab) {
+                        0 -> OverviewScreen(
+                            state = vpnState,
+                            profiles = profilesState,
+                            activeProfile = activeSummary,
+                            inlineError = overviewErrorState,
+                            isWideLayout = isWide,
+                            onSelectProfile = { id -> selectProfile(id) },
+                            onConnect = { requestVpnAndStart() },
+                            onReconnect = { sendServiceAction(L2TunnelVpnService.ACTION_RECONNECT) },
+                            onDisconnect = { sendServiceAction(L2TunnelVpnService.ACTION_STOP) },
+                            onOpenProfilesTab = { selectedTab = 2 },
+                        )
+                        1 -> ConnectionScreen(
+                            state = vpnState,
+                            isWideLayout = isWide,
+                            onSwitchCover = { target ->
+                                startService(
+                                    Intent(this@MainActivity, L2TunnelVpnService::class.java)
+                                        .setAction(L2TunnelVpnService.ACTION_SWITCH_COVER)
+                                        .putExtra(L2TunnelVpnService.EXTRA_COVER, target),
+                                )
+                            },
+                            onTuningSwitch = { setting ->
+                                startService(
+                                    Intent(this@MainActivity, L2TunnelVpnService::class.java)
+                                        .setAction(L2TunnelVpnService.ACTION_TUNE_SWITCH)
+                                        .putExtra(L2TunnelVpnService.EXTRA_TUNE_REPAIR, setting.repair)
+                                        .putExtra(L2TunnelVpnService.EXTRA_TUNE_DEV_MTU, setting.deviceMtu)
+                                        .putExtra(L2TunnelVpnService.EXTRA_TUNE_PATH_MTU, setting.pathMtu),
+                                )
+                            },
+                            onRateBudgetSet = { sendBps, recvBps ->
+                                startService(
+                                    Intent(this@MainActivity, L2TunnelVpnService::class.java)
+                                        .setAction(L2TunnelVpnService.ACTION_RATE_BUDGET)
+                                        .putExtra(L2TunnelVpnService.EXTRA_SEND_RATE_BPS, sendBps)
+                                        .putExtra(L2TunnelVpnService.EXTRA_RECV_RATE_BPS, recvBps),
+                                )
+                            },
+                            onTestPing = { count ->
+                                startService(
+                                    Intent(this@MainActivity, L2TunnelVpnService::class.java)
+                                        .setAction(L2TunnelVpnService.ACTION_TEST_PING)
+                                        .putExtra(L2TunnelVpnService.EXTRA_TEST_COUNT, count),
+                                )
+                            },
+                            onTestSpeed = { dir, streams, durationMs ->
+                                startService(
+                                    Intent(this@MainActivity, L2TunnelVpnService::class.java)
+                                        .setAction(L2TunnelVpnService.ACTION_TEST_SPEED)
+                                        .putExtra(L2TunnelVpnService.EXTRA_TEST_DIRECTION, dir)
+                                        .putExtra(L2TunnelVpnService.EXTRA_TEST_STREAMS, streams)
+                                        .putExtra(L2TunnelVpnService.EXTRA_TEST_DURATION_MS, durationMs),
+                                )
+                            },
+                            onTestCancel = { id ->
+                                startService(
+                                    Intent(this@MainActivity, L2TunnelVpnService::class.java)
+                                        .setAction(L2TunnelVpnService.ACTION_TEST_CANCEL)
+                                        .putExtra(L2TunnelVpnService.EXTRA_TEST_ID, id),
+                                )
+                            },
+                        )
+                        2 -> ProfilesScreen(
+                            profiles = profilesState,
+                            activeProfileId = activeProfileIdState,
+                            statusBanner = profileBannerState,
+                            isWideLayout = isWide,
+                            onSelectProfile = { id -> selectProfile(id) },
+                            onImportZip = {
+                                importZipLauncher.launch(arrayOf("application/zip", "application/octet-stream", "*/*"))
+                            },
+                            onSaveProfile = { id, updated ->
+                                try {
+                                    profileStore.saveEditedProfile(id, updated)
+                                    reloadProfiles()
+                                    profileBannerState = "Saved profile '$id'."
+                                } catch (e: Exception) {
+                                    profileBannerState = "Save failed: ${e.message}"
+                                }
+                            },
+                            onDuplicateProfile = { src, dst ->
+                                try {
+                                    val dup = profileStore.duplicateProfile(src, dst)
+                                    reloadProfiles()
+                                    profileBannerState = "Duplicated '$src' -> '${dup.id}' (Keystore sealed)."
+                                } catch (e: Exception) {
+                                    profileBannerState = "Duplicate failed: ${e.message}"
+                                }
+                            },
+                            onDeleteProfile = { id ->
+                                profileStore.deleteProfile(id)
                                 reloadProfiles()
-                                profileBannerState = "Saved profile '$id'."
-                            } catch (e: Exception) {
-                                profileBannerState = "Save failed: ${e.message}"
-                            }
-                        },
-                        onDuplicateProfile = { src, dst ->
-                            try {
-                                val dup = profileStore.duplicateProfile(src, dst)
-                                reloadProfiles()
-                                profileBannerState = "Duplicated '$src' -> '${dup.id}' (Keystore sealed)."
-                            } catch (e: Exception) {
-                                profileBannerState = "Duplicate failed: ${e.message}"
-                            }
-                        },
-                        onDeleteProfile = { id ->
-                            profileStore.deleteProfile(id)
-                            reloadProfiles()
-                            profileBannerState = "Wiped and deleted profile '$id'."
-                        },
-                        onSealKeystore = { id ->
-                            try {
-                                profileStore.sealProfileWithKeystore(id)
-                                reloadProfiles()
-                                profileBannerState = "Sealed '$id' private keys with Android Keystore AES-256-GCM."
-                            } catch (e: Exception) {
-                                profileBannerState = "Keystore seal failed: ${e.message}"
-                            }
-                        },
-                        onReplaceKeyFile = { id, fileName ->
-                            pendingKeyTarget = id to fileName
-                            importSingleFileLauncher.launch(arrayOf("*/*"))
-                        },
-                    )
-                    else -> StatsScreen(
-                        state = vpnState,
-                        onExportDiagnostics = { redact ->
-                            pendingDiagnosticsRedact = redact
-                            val ts = SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US).format(Date())
-                            exportDiagnosticsLauncher.launch("l2tunnel-diagnostics-$ts.json")
-                        },
-                    )
+                                profileBannerState = "Wiped and deleted profile '$id'."
+                            },
+                            onSealKeystore = { id ->
+                                try {
+                                    profileStore.sealProfileWithKeystore(id)
+                                    reloadProfiles()
+                                    profileBannerState = "Sealed '$id' private keys with Android Keystore AES-256-GCM."
+                                } catch (e: Exception) {
+                                    profileBannerState = "Keystore seal failed: ${e.message}"
+                                }
+                            },
+                            onReplaceKeyFile = { id, fileName ->
+                                pendingKeyTarget = id to fileName
+                                importSingleFileLauncher.launch(arrayOf("*/*"))
+                            },
+                        )
+                        else -> StatsScreen(
+                            state = vpnState,
+                            isWideLayout = isWide,
+                            onExportDiagnostics = { redact ->
+                                pendingDiagnosticsRedact = redact
+                                val ts = SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US).format(Date())
+                                exportDiagnosticsLauncher.launch("l2tunnel-diagnostics-$ts.json")
+                            },
+                        )
+                    }
                 }
             }
         }

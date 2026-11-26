@@ -72,6 +72,7 @@ fun ProfilesScreen(
     profiles: List<StoredProfileSummary>,
     activeProfileId: String?,
     statusBanner: String?,
+    isWideLayout: Boolean,
     onSelectProfile: (String) -> Unit,
     onImportZip: () -> Unit,
     onSaveProfile: (String, AndroidVpnProfile) -> Unit,
@@ -86,14 +87,7 @@ fun ProfilesScreen(
     var duplicateName by remember { mutableStateOf("") }
     var deleteConfirmId by remember { mutableStateOf<String?>(null) }
 
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .verticalScroll(rememberScrollState())
-            .padding(16.dp),
-        verticalArrangement = Arrangement.spacedBy(12.dp),
-    ) {
-        // Header + Import ZIP action
+    val importCard: @Composable () -> Unit = {
         Card(modifier = Modifier.fillMaxWidth()) {
             Column(
                 modifier = Modifier.padding(16.dp),
@@ -133,149 +127,175 @@ fun ProfilesScreen(
                 }
             }
         }
+    }
 
-        if (profiles.isEmpty()) {
-            Card(modifier = Modifier.fillMaxWidth()) {
-                Column(
-                    modifier = Modifier.padding(20.dp),
-                    verticalArrangement = Arrangement.spacedBy(8.dp),
-                ) {
-                    Text(
-                        text = "No profiles stored yet",
-                        style = MaterialTheme.typography.titleSmall,
-                    )
-                    Text(
-                        text = "Import a .zip archive containing client.json, common.json, noise-peer.pub, noise-private.key, member.pk8, and admission.key (plus optional android_vpn.json and psk.key).",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
-                }
-            }
-        } else {
-            profiles.forEach { summary ->
-                val isActive = summary.id == activeProfileId
-                Card(
-                    modifier = Modifier.fillMaxWidth(),
-                    colors = CardDefaults.cardColors(
-                        containerColor = if (isActive) {
-                            MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.45f)
-                        } else {
-                            MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.6f)
-                        },
-                    ),
-                ) {
+    val profilesList: @Composable () -> Unit = {
+        Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+            if (profiles.isEmpty()) {
+                Card(modifier = Modifier.fillMaxWidth()) {
                     Column(
-                        modifier = Modifier.padding(14.dp),
+                        modifier = Modifier.padding(20.dp),
                         verticalArrangement = Arrangement.spacedBy(8.dp),
                     ) {
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.SpaceBetween,
-                            verticalAlignment = Alignment.CenterVertically,
-                        ) {
-                            Row(
-                                verticalAlignment = Alignment.CenterVertically,
-                                modifier = Modifier
-                                    .weight(1f)
-                                    .clickable { onSelectProfile(summary.id) },
-                            ) {
-                                Icon(
-                                    imageVector = if (isActive) Icons.Filled.CheckCircle else Icons.Filled.Key,
-                                    contentDescription = null,
-                                    tint = if (isActive) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
-                                    modifier = Modifier.size(22.dp),
-                                )
-                                Spacer(Modifier.width(8.dp))
-                                Column {
-                                    Text(
-                                        text = summary.id + if (isActive) " (Active)" else "",
-                                        style = MaterialTheme.typography.titleMedium,
-                                        fontWeight = FontWeight.SemiBold,
-                                    )
-                                    val prof = summary.profile
-                                    Text(
-                                        text = if (prof != null) {
-                                            "${prof.udpPeer} · ${prof.cover} · TUN ${prof.tunAddress}/${prof.tunPrefixLength}"
-                                        } else {
-                                            "Invalid: ${summary.validationError}"
-                                        },
-                                        style = MaterialTheme.typography.bodySmall,
-                                        color = if (prof != null) MaterialTheme.colorScheme.onSurfaceVariant else MaterialTheme.colorScheme.error,
-                                    )
-                                }
-                            }
-                            Row {
-                                IconButton(
-                                    onClick = { editingSummary = summary },
-                                    enabled = summary.profile != null,
-                                ) {
-                                    Icon(Icons.Filled.Edit, contentDescription = "Edit profile")
-                                }
-                                IconButton(
-                                    onClick = {
-                                        duplicateTargetFor = summary.id
-                                        duplicateName = "${summary.id}-copy"
-                                    },
-                                ) {
-                                    Icon(Icons.Filled.ContentCopy, contentDescription = "Duplicate profile")
-                                }
-                                IconButton(onClick = { deleteConfirmId = summary.id }) {
-                                    Icon(Icons.Filled.Delete, contentDescription = "Delete profile")
-                                }
-                            }
-                        }
-
-                        Row(
-                            horizontalArrangement = Arrangement.spacedBy(8.dp),
-                            verticalAlignment = Alignment.CenterVertically,
-                        ) {
-                            AssistChip(
-                                onClick = { if (!summary.keystoreSealed) onSealKeystore(summary.id) },
-                                leadingIcon = {
-                                    Icon(
-                                        imageVector = if (summary.keystoreSealed) Icons.Filled.Lock else Icons.Filled.Warning,
-                                        contentDescription = null,
-                                        modifier = Modifier.size(16.dp),
-                                    )
-                                },
-                                label = {
-                                    Text(
-                                        if (summary.keystoreSealed) "Keystore AES-GCM" else "Seal in Keystore",
-                                    )
-                                },
-                            )
-                            if (summary.profile != null) {
-                                val prof = summary.profile
-                                val splitLabel = when (prof.splitTunnelMode) {
-                                    SplitTunnelMode.ALL -> "Split: All"
-                                    SplitTunnelMode.EXCLUDE -> "Exclude ${prof.splitTunnelApps.size}"
-                                    SplitTunnelMode.INCLUDE -> "Only ${prof.splitTunnelApps.size}"
-                                }
-                                AssistChip(
-                                    onClick = { splitEditingSummary = summary },
-                                    leadingIcon = {
-                                        Icon(Icons.Filled.Apps, contentDescription = null, modifier = Modifier.size(16.dp))
-                                    },
-                                    label = { Text(splitLabel) },
-                                )
-                            }
-                        }
-
                         Text(
-                            text = "Peer pubkey SHA-256: ${summary.peerKeyFingerprint ?: "—"} · " +
-                                "Keys present: ${summary.presentSecrets.joinToString(", ").ifEmpty { "none" }}",
-                            style = MaterialTheme.typography.labelSmall,
+                            text = "No profiles stored yet",
+                            style = MaterialTheme.typography.titleSmall,
+                        )
+                        Text(
+                            text = "Import a .zip archive containing client.json, common.json, noise-peer.pub, noise-private.key, member.pk8, and admission.key (plus optional android_vpn.json and psk.key).",
+                            style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
+                    }
+                }
+            } else {
+                profiles.forEach { summary ->
+                    val isActive = summary.id == activeProfileId
+                    Card(
+                        modifier = Modifier.fillMaxWidth(),
+                        colors = CardDefaults.cardColors(
+                            containerColor = if (isActive) {
+                                MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.45f)
+                            } else {
+                                MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.6f)
+                            },
+                        ),
+                    ) {
+                        Column(
+                            modifier = Modifier.padding(14.dp),
+                            verticalArrangement = Arrangement.spacedBy(8.dp),
+                        ) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    modifier = Modifier
+                                        .weight(1f)
+                                        .clickable { onSelectProfile(summary.id) },
+                                ) {
+                                    Icon(
+                                        imageVector = if (isActive) Icons.Filled.CheckCircle else Icons.Filled.Key,
+                                        contentDescription = null,
+                                        tint = if (isActive) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
+                                        modifier = Modifier.size(22.dp),
+                                    )
+                                    Spacer(Modifier.width(8.dp))
+                                    Column {
+                                        Text(
+                                            text = summary.id + if (isActive) " (Active)" else "",
+                                            style = MaterialTheme.typography.titleMedium,
+                                            fontWeight = FontWeight.SemiBold,
+                                        )
+                                        val prof = summary.profile
+                                        Text(
+                                            text = if (prof != null) {
+                                                "${prof.udpPeer} · ${prof.cover} · TUN ${prof.tunAddress}/${prof.tunPrefixLength}"
+                                            } else {
+                                                "Invalid: ${summary.validationError}"
+                                            },
+                                            style = MaterialTheme.typography.bodySmall,
+                                            color = if (prof != null) MaterialTheme.colorScheme.onSurfaceVariant else MaterialTheme.colorScheme.error,
+                                        )
+                                    }
+                                }
+                                Row {
+                                    IconButton(
+                                        onClick = { editingSummary = summary },
+                                        enabled = summary.profile != null,
+                                    ) {
+                                        Icon(Icons.Filled.Edit, contentDescription = "Edit profile")
+                                    }
+                                    IconButton(
+                                        onClick = {
+                                            duplicateTargetFor = summary.id
+                                            duplicateName = "${summary.id}-copy"
+                                        },
+                                    ) {
+                                        Icon(Icons.Filled.ContentCopy, contentDescription = "Duplicate profile")
+                                    }
+                                    IconButton(onClick = { deleteConfirmId = summary.id }) {
+                                        Icon(Icons.Filled.Delete, contentDescription = "Delete profile")
+                                    }
+                                }
+                            }
 
-                        if (!isActive) {
-                            FilledTonalButton(onClick = { onSelectProfile(summary.id) }) {
-                                Text("Set Active")
+                            Row(
+                                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                AssistChip(
+                                    onClick = { if (!summary.keystoreSealed) onSealKeystore(summary.id) },
+                                    leadingIcon = {
+                                        Icon(
+                                            imageVector = if (summary.keystoreSealed) Icons.Filled.Lock else Icons.Filled.Warning,
+                                            contentDescription = null,
+                                            modifier = Modifier.size(16.dp),
+                                        )
+                                    },
+                                    label = {
+                                        Text(
+                                            if (summary.keystoreSealed) "Keystore AES-GCM" else "Seal in Keystore",
+                                        )
+                                    },
+                                )
+                                if (summary.profile != null) {
+                                    val prof = summary.profile
+                                    val splitLabel = when (prof.splitTunnelMode) {
+                                        SplitTunnelMode.ALL -> "Split: All"
+                                        SplitTunnelMode.EXCLUDE -> "Exclude ${prof.splitTunnelApps.size}"
+                                        SplitTunnelMode.INCLUDE -> "Only ${prof.splitTunnelApps.size}"
+                                    }
+                                    AssistChip(
+                                        onClick = { splitEditingSummary = summary },
+                                        leadingIcon = {
+                                            Icon(Icons.Filled.Apps, contentDescription = null, modifier = Modifier.size(16.dp))
+                                        },
+                                        label = { Text(splitLabel) },
+                                    )
+                                }
+                            }
+
+                            Text(
+                                text = "Peer pubkey SHA-256: ${summary.peerKeyFingerprint ?: "—"} · " +
+                                    "Keys present: ${summary.presentSecrets.joinToString(", ").ifEmpty { "none" }}",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+
+                            if (!isActive) {
+                                FilledTonalButton(onClick = { onSelectProfile(summary.id) }) {
+                                    Text("Set Active")
+                                }
                             }
                         }
                     }
                 }
             }
+        }
+    }
+
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .verticalScroll(rememberScrollState())
+            .padding(16.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp),
+    ) {
+        if (isWideLayout) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(14.dp),
+                verticalAlignment = Alignment.Top,
+            ) {
+                Column(modifier = Modifier.weight(0.42f)) { importCard() }
+                Column(modifier = Modifier.weight(0.58f)) { profilesList() }
+            }
+        } else {
+            importCard()
+            profilesList()
         }
     }
 
