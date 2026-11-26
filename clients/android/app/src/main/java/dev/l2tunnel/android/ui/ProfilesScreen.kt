@@ -56,7 +56,10 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -80,7 +83,9 @@ fun ProfilesScreen(
     isWideLayout: Boolean,
     onSelectProfile: (String) -> Unit,
     onImportZip: () -> Unit,
-    onCreateProfile: (String) -> Unit,
+    onCreateProfile: (String) -> String?,
+    onGenerateKeystoreKeys: (String) -> Unit,
+    onSaveHexKey: (String, String, String) -> String?,
     onSaveProfile: (String, AndroidVpnProfile) -> Unit,
     onDuplicateProfile: (String, String) -> Unit,
     onDeleteProfile: (String) -> Unit,
@@ -270,11 +275,11 @@ fun ProfilesScreen(
                                     }
                                     else -> {
                                         AssistChip(
-                                            onClick = { editingProfileId = summary.id },
+                                            onClick = { onGenerateKeystoreKeys(summary.id) },
                                             leadingIcon = {
-                                                Icon(Icons.Filled.Warning, contentDescription = null, modifier = Modifier.size(16.dp))
+                                                Icon(Icons.Filled.Key, contentDescription = null, modifier = Modifier.size(16.dp))
                                             },
-                                            label = { Text("Attach Keys in Edit") },
+                                            label = { Text("Generate Keystore Keys") },
                                         )
                                     }
                                 }
@@ -341,13 +346,15 @@ fun ProfilesScreen(
         ProfileEditorDialog(
             profileId = editingSummary.id,
             initial = initial,
-            presentFiles = editingSummary.presentFiles,
+            summary = editingSummary,
             isWideLayout = isWideLayout,
             onDismiss = { editingProfileId = null },
             onSave = { updated ->
                 onSaveProfile(editingSummary.id, updated)
                 editingProfileId = null
             },
+            onGenerateKeystoreKeys = { onGenerateKeystoreKeys(editingSummary.id) },
+            onSaveHexKey = { fileName, hex -> onSaveHexKey(editingSummary.id, fileName, hex) },
             onReplaceKeyFile = { fileName -> onReplaceKeyFile(editingSummary.id, fileName) },
         )
     }
@@ -372,26 +379,36 @@ fun ProfilesScreen(
         }
     }
 
-    // Create New Profile Dialog
+    // Create New Profile Dialog (automatically generates Keystore AES-GCM keys + default common.json)
     if (createDialogOpen) {
         AlertDialog(
             onDismissRequest = { createDialogOpen = false },
-            title = { Text("Create New Profile") },
+            title = { Text("New Keystore Profile") },
             text = {
-                OutlinedTextField(
-                    value = newProfileName,
-                    onValueChange = { newProfileName = it },
-                    label = { Text("Profile name") },
-                    singleLine = true,
-                )
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text(
+                        text = "Generates fresh Ed25519 member + X25519 Noise + admission keys sealed in Android Keystore (AES-256-GCM) and a default L3 common.json plan.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    OutlinedTextField(
+                        value = newProfileName,
+                        onValueChange = { newProfileName = it },
+                        label = { Text("Profile name") },
+                        singleLine = true,
+                    )
+                }
             },
             confirmButton = {
                 Button(
                     onClick = {
-                        onCreateProfile(newProfileName)
+                        val createdId = onCreateProfile(newProfileName)
                         createDialogOpen = false
+                        if (createdId != null) {
+                            editingProfileId = createdId
+                        }
                     },
-                ) { Text("Create") }
+                ) { Text("Create & Open Editor") }
             },
             dismissButton = {
                 TextButton(onClick = { createDialogOpen = false }) { Text("Cancel") }
@@ -469,12 +486,16 @@ private fun defaultProfileTemplate(dir: File): AndroidVpnProfile =
 private fun ProfileEditorDialog(
     profileId: String,
     initial: AndroidVpnProfile,
-    presentFiles: Set<String>,
+    summary: StoredProfileSummary,
     isWideLayout: Boolean,
     onDismiss: () -> Unit,
     onSave: (AndroidVpnProfile) -> Unit,
+    onGenerateKeystoreKeys: () -> Unit,
+    onSaveHexKey: (String, String) -> String?,
     onReplaceKeyFile: (String) -> Unit,
 ) {
+    val clipboard = LocalClipboardManager.current
+    val presentFiles = summary.presentFiles
     var udpPeer by remember(profileId) { mutableStateOf(initial.udpPeer) }
     var cover by remember(profileId) { mutableStateOf(initial.cover) }
     var noiseProfile by remember(profileId) { mutableStateOf(initial.noiseProfile) }
@@ -487,6 +508,9 @@ private fun ProfileEditorDialog(
     }
     var dnsText by remember(profileId) { mutableStateOf(initial.dnsServers.joinToString(", ")) }
     var tuneRepair by remember(profileId) { mutableStateOf(initial.tuneRepair ?: "off,1/8,1/4") }
+    var peerPubHex by remember(profileId) { mutableStateOf("") }
+    var admissionHex by remember(profileId) { mutableStateOf("") }
+    var copiedNotice by remember { mutableStateOf<String?>(null) }
     var errorText by remember { mutableStateOf<String?>(null) }
 
     val leftFields: @Composable () -> Unit = {
@@ -575,7 +599,78 @@ private fun ProfileEditorDialog(
                 singleLine = true,
                 modifier = Modifier.fillMaxWidth(),
             )
-            Text("Required Plan & Key Files (Keystore sealed)", style = MaterialTheme.typography.labelMedium)
+            Text("Keystore Keys & Plan Files", style = MaterialTheme.typography.labelMedium)
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                FilledTonalButton(onClick = onGenerateKeystoreKeys) {
+                    Icon(Icons.Filled.Key, contentDescription = null, modifier = Modifier.size(16.dp))
+                    Spacer(Modifier.width(6.dp))
+                    Text("Generate Keys in Keystore", style = MaterialTheme.typography.labelMedium)
+                }
+            }
+            if (summary.clientNoisePubHex != null || summary.clientMemberPubHex != null) {
+                FlowRow(
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    verticalArrangement = Arrangement.spacedBy(6.dp),
+                ) {
+                    summary.clientNoisePubHex?.let { hex ->
+                        AssistChip(
+                            onClick = {
+                                clipboard.setText(AnnotatedString(hex))
+                                copiedNotice = "Copied client Noise pubkey (${hex.take(12)}…)"
+                            },
+                            leadingIcon = { Icon(Icons.Filled.ContentCopy, contentDescription = null, modifier = Modifier.size(14.dp)) },
+                            label = { Text("Copy Noise Pub: ${hex.take(10)}…", fontFamily = FontFamily.Monospace) },
+                        )
+                    }
+                    summary.clientMemberPubHex?.let { hex ->
+                        AssistChip(
+                            onClick = {
+                                clipboard.setText(AnnotatedString(hex))
+                                copiedNotice = "Copied client Member pubkey (${hex.take(12)}…)"
+                            },
+                            leadingIcon = { Icon(Icons.Filled.ContentCopy, contentDescription = null, modifier = Modifier.size(14.dp)) },
+                            label = { Text("Copy Member Pub: ${hex.take(10)}…", fontFamily = FontFamily.Monospace) },
+                        )
+                    }
+                }
+            }
+            if (!copiedNotice.isNullOrBlank()) {
+                Text(
+                    text = copiedNotice!!,
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.primary,
+                )
+            }
+            OutlinedTextField(
+                value = peerPubHex,
+                onValueChange = { peerPubHex = it },
+                label = {
+                    Text(
+                        if ("noise-peer.pub" in presentFiles) {
+                            "Server Noise Pubkey (64 hex · saved ✓)"
+                        } else {
+                            "Server Noise Pubkey (paste 64 hex)"
+                        },
+                    )
+                },
+                singleLine = true,
+                modifier = Modifier.fillMaxWidth(),
+            )
+            OutlinedTextField(
+                value = admissionHex,
+                onValueChange = { admissionHex = it },
+                label = {
+                    Text(
+                        if ("admission.key" in presentFiles) {
+                            "Admission Secret (64 hex · Keystore sealed ✓)"
+                        } else {
+                            "Admission Secret (paste 64 hex)"
+                        },
+                    )
+                },
+                singleLine = true,
+                modifier = Modifier.fillMaxWidth(),
+            )
             FlowRow(
                 horizontalArrangement = Arrangement.spacedBy(6.dp),
                 verticalArrangement = Arrangement.spacedBy(6.dp),
@@ -661,6 +756,20 @@ private fun ProfileEditorDialog(
                             tuneRepair = tuneRepair.trim().ifEmpty { null },
                         )
                         AndroidVpnProfile.parse(initial.profileDir, updated.toClientJson(), updated.toAndroidVpnJson())
+                        if (peerPubHex.isNotBlank()) {
+                            val err = onSaveHexKey("noise-peer.pub", peerPubHex)
+                            if (err != null) {
+                                errorText = "Server Noise Pubkey: $err"
+                                return@Button
+                            }
+                        }
+                        if (admissionHex.isNotBlank()) {
+                            val err = onSaveHexKey("admission.key", admissionHex)
+                            if (err != null) {
+                                errorText = "Admission Secret: $err"
+                                return@Button
+                            }
+                        }
                         onSave(updated)
                     } catch (e: Exception) {
                         errorText = e.message ?: "Invalid profile settings"

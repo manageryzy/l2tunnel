@@ -16,6 +16,8 @@ data class StoredProfileSummary(
     val validationError: String?,
     val keystoreSealed: Boolean,
     val peerKeyFingerprint: String?,
+    val clientNoisePubHex: String? = null,
+    val clientMemberPubHex: String? = null,
     val presentSecrets: List<String>,
     val presentFiles: Set<String>,
 ) {
@@ -100,11 +102,13 @@ class ProfileStore(
         } else {
             null
         }
+        val clientNoisePubHex = readPublicHex(File(dir, "noise-client.pub"))
+        val clientMemberPubHex = readPublicHex(File(dir, "member.pub"))
         val secrets = KeystoreSecretStore.ALL_SECRET_NAMES.filter { secret ->
             File(dir, "$secret${KeystoreSecretStore.ENC_SUFFIX}").isFile || File(dir, secret).isFile
         }
         val present = buildSet {
-            for (name in listOf("client.json", "android_vpn.json", "common.json", "noise-peer.pub")) {
+            for (name in listOf("client.json", "android_vpn.json", "common.json", "noise-peer.pub", "noise-client.pub", "member.pub")) {
                 if (File(dir, name).isFile) add(name)
             }
             for (secret in secrets) add(secret)
@@ -117,12 +121,18 @@ class ProfileStore(
             validationError = err,
             keystoreSealed = secretStore.isKeystoreSealed(dir),
             peerKeyFingerprint = fingerprint,
+            clientNoisePubHex = clientNoisePubHex,
+            clientMemberPubHex = clientMemberPubHex,
             presentSecrets = secrets,
             presentFiles = present,
         )
     }
 
-    fun createNewProfile(id: String): StoredProfileSummary {
+    fun createNewProfile(
+        id: String,
+        nativeBinary: File? = null,
+        defaultCommonPlanBytes: ByteArray? = null,
+    ): StoredProfileSummary {
         val safeId = sanitizeProfileId(id)
         val dir = profileDir(safeId)
         require(!dir.exists()) { "Profile '$safeId' already exists" }
@@ -141,7 +151,81 @@ class ProfileStore(
             routes = listOf("0.0.0.0" to 0),
             dnsServers = emptyList(),
         )
-        return saveEditedProfile(safeId, template)
+        saveEditedProfile(safeId, template)
+        if (defaultCommonPlanBytes != null && defaultCommonPlanBytes.isNotEmpty()) {
+            KeystoreSecretStore.writeOwnerOnlyBytes(File(dir, "common.json"), defaultCommonPlanBytes)
+        }
+        if (nativeBinary != null && nativeBinary.isFile && nativeBinary.canExecute()) {
+            generateKeysIntoKeystore(safeId, nativeBinary, defaultCommonPlanBytes)
+        }
+        setActiveProfile(safeId)
+        return summarize(dir)
+    }
+
+    /**
+     * Generates fresh Ed25519 member + X25519 Noise + 32-byte admission keys via the shared Rust
+     * binary (`--keygen`), immediately seals all private keys under AndroidKeyStore AES-256-GCM,
+     * preserves public keys (`member.pub`, `noise-client.pub`) for server provisioning, and scrubs
+     * the temporary keygen staging directory.
+     */
+    fun generateKeysIntoKeystore(
+        id: String,
+        nativeBinary: File,
+        defaultCommonPlanBytes: ByteArray? = null,
+    ): StoredProfileSummary {
+        val dir = profileDir(id)
+        dir.mkdirs()
+        KeystoreSecretStore.setOwnerOnlyDir(dir)
+        val tmpDir = File(profilesRoot, ".keygen-${dir.name}-${System.nanoTime()}")
+        try {
+            tmpDir.mkdirs()
+            KeystoreSecretStore.setOwnerOnlyDir(tmpDir)
+            val proc = ProcessBuilder(nativeBinary.absolutePath, "--keygen", tmpDir.absolutePath)
+                .redirectErrorStream(true)
+                .start()
+            val out = proc.inputStream.bufferedReader().readText()
+            val code = proc.waitFor()
+            if (code != 0) {
+                throw IOException("Native key generation failed (exit $code): ${out.trim()}")
+            }
+            for (secret in AndroidVpnProfile.REQUIRED_SECRET_FILES) {
+                val raw = File(tmpDir, secret).readBytes()
+                try {
+                    secretStore.writeEncryptedSecret(dir, secret, raw)
+                } finally {
+                    raw.fill(0)
+                }
+            }
+            for (pub in listOf("member.pub", "noise-client.pub")) {
+                val src = File(tmpDir, pub)
+                if (src.isFile) {
+                    KeystoreSecretStore.writeOwnerOnlyBytes(File(dir, pub), src.readBytes())
+                }
+            }
+            if (defaultCommonPlanBytes != null && !File(dir, "common.json").isFile) {
+                KeystoreSecretStore.writeOwnerOnlyBytes(File(dir, "common.json"), defaultCommonPlanBytes)
+            }
+            return summarize(dir)
+        } finally {
+            KeystoreSecretStore.scrubDirectory(tmpDir)
+        }
+    }
+
+    /** Saves a 32-byte key supplied as 64 hex characters (sealing secrets into AndroidKeyStore). */
+    fun saveHexKey32(id: String, fileName: String, hexText: String): StoredProfileSummary {
+        val bytes = parseHex32(hexText)
+        return try {
+            saveCredentialFile(id, fileName, bytes)
+        } finally {
+            bytes.fill(0)
+        }
+    }
+
+    private fun readPublicHex(file: File): String? {
+        if (!file.isFile) return null
+        val bytes = file.readBytes()
+        if (bytes.size != 32) return null
+        return bytes.joinToString("") { "%02x".format(it) }
     }
 
     fun saveEditedProfile(id: String, updated: AndroidVpnProfile): StoredProfileSummary {
@@ -279,11 +363,26 @@ class ProfileStore(
             "android_vpn.json",
             "common.json",
             "noise-peer.pub",
+            "noise-client.pub",
+            "member.pub",
             "noise-private.key",
             "member.pk8",
             "admission.key",
-            "psk.key",
+            "noise-psk.key",
         )
+
+        fun parseHex32(raw: String): ByteArray {
+            val cleaned = raw.trim().replace(" ", "").replace(":", "").lowercase()
+            require(cleaned.length == 64) { "Expected 64 hex characters (32 bytes), got ${cleaned.length}" }
+            val out = ByteArray(32)
+            for (i in 0 until 32) {
+                val hi = Character.digit(cleaned[i * 2], 16)
+                val lo = Character.digit(cleaned[i * 2 + 1], 16)
+                require(hi >= 0 && lo >= 0) { "Invalid hex character at position ${i * 2}" }
+                out[i] = ((hi shl 4) or lo).toByte()
+            }
+            return out
+        }
 
         fun sanitizeProfileId(raw: String): String {
             val cleaned = raw.trim().lowercase().replace(Regex("[^a-z0-9._-]"), "-")

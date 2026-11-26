@@ -284,11 +284,40 @@ class MainActivity : ComponentActivity() {
                             },
                             onCreateProfile = { newId ->
                                 try {
-                                    val created = profileStore.createNewProfile(newId)
+                                    val nativeBin = File(applicationInfo.nativeLibraryDir, "libl2tunnel_android_service.so")
+                                    val defaultPlan = resources.openRawResource(R.raw.default_common_plan).use { it.readBytes() }
+                                    val created = profileStore.createNewProfile(newId, nativeBin, defaultPlan)
                                     reloadProfiles()
-                                    profileBannerState = "Created '${created.id}'. Attach common.json and key files in Edit."
+                                    profileBannerState = if (created.keystoreSealed) {
+                                        "Created '${created.id}' with fresh Keystore AES-GCM keys & default common.json. Add server Peer Noise Pubkey in Edit."
+                                    } else {
+                                        "Created '${created.id}'. Generate keys or attach key files in Edit."
+                                    }
+                                    created.id
                                 } catch (e: Exception) {
                                     profileBannerState = "Create failed: ${e.message}"
+                                    null
+                                }
+                            },
+                            onGenerateKeystoreKeys = { id ->
+                                try {
+                                    val nativeBin = File(applicationInfo.nativeLibraryDir, "libl2tunnel_android_service.so")
+                                    val defaultPlan = resources.openRawResource(R.raw.default_common_plan).use { it.readBytes() }
+                                    profileStore.generateKeysIntoKeystore(id, nativeBin, defaultPlan)
+                                    reloadProfiles()
+                                    profileBannerState = "Generated fresh client keys sealed in Android Keystore AES-GCM for '$id'."
+                                } catch (e: Exception) {
+                                    profileBannerState = "Keygen failed: ${e.message}"
+                                }
+                            },
+                            onSaveHexKey = { id, fileName, hexText ->
+                                try {
+                                    profileStore.saveHexKey32(id, fileName, hexText)
+                                    reloadProfiles()
+                                    profileBannerState = "Saved '$fileName' into profile '$id'."
+                                    null
+                                } catch (e: Exception) {
+                                    e.message ?: "Invalid 64-hex key"
                                 }
                             },
                             onSaveProfile = { id, updated ->

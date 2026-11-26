@@ -117,7 +117,7 @@ data class AndroidVpnProfile(
         val SUPPORTED_NOISE: List<String> = listOf("ik", "ikpsk2")
         val REQUIRED_NON_SECRET_FILES: List<String> = listOf("client.json", "common.json", "noise-peer.pub")
         val REQUIRED_SECRET_FILES: List<String> = listOf("noise-private.key", "member.pk8", "admission.key")
-        val OPTIONAL_SECRET_FILES: List<String> = listOf("psk.key")
+        val OPTIONAL_SECRET_FILES: List<String> = listOf("noise-psk.key")
 
         /**
          * Parse and validate `client.json` (plus optional `android_vpn.json`) from JSON text.

@@ -134,7 +134,15 @@ impl PacketDevice for Tun {
 
 pub(super) fn enter() -> io::Result<()> {
     let mut args = std::env::args_os().skip(1);
-    let directory = PathBuf::from(args.next().ok_or_else(protocol)?);
+    let first = args.next().ok_or_else(protocol)?;
+    if first == "--keygen" {
+        let out_dir = PathBuf::from(args.next().ok_or_else(protocol)?);
+        if args.next().is_some() {
+            return Err(protocol());
+        }
+        return generate_profile_keys(&out_dir);
+    }
+    let directory = PathBuf::from(first);
     let path = PathBuf::from(args.next().ok_or_else(protocol)?);
     let name = args
         .next()
@@ -148,6 +156,26 @@ pub(super) fn enter() -> io::Result<()> {
         .enable_all()
         .build()?
         .block_on(run(directory, path, name))
+}
+
+fn generate_profile_keys(out_dir: &std::path::Path) -> io::Result<()> {
+    use l2tunnel_client_core::local::keys::{KeyGeneration, generate};
+    std::fs::create_dir_all(out_dir)?;
+    let member_pub = generate(&KeyGeneration::Member {
+        private: out_dir.join("member.pk8"),
+        public: out_dir.join("member.pub"),
+    })?
+    .ok_or_else(protocol)?;
+    let noise_pub = generate(&KeyGeneration::Noise {
+        private: out_dir.join("noise-private.key"),
+        public: out_dir.join("noise-client.pub"),
+    })?
+    .ok_or_else(protocol)?;
+    generate(&KeyGeneration::Secret {
+        output: out_dir.join("admission.key"),
+    })?;
+    println!(r#"{{"member_pub":"{member_pub}","noise_pub":"{noise_pub}"}}"#);
+    Ok(())
 }
 
 async fn run(directory: PathBuf, path: PathBuf, name: String) -> io::Result<()> {
@@ -332,6 +360,33 @@ mod tests {
         server_thread
             .join()
             .map_err(|_| io::Error::other("broker thread panicked"))??;
+        Ok(())
+    }
+
+    #[test]
+    fn keygen_mode_writes_valid_member_noise_and_admission_files() -> io::Result<()> {
+        let dir = std::env::temp_dir().join(format!(
+            "l2t-android-keygen-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        generate_profile_keys(&dir)?;
+        for name in [
+            "member.pk8",
+            "member.pub",
+            "noise-private.key",
+            "noise-client.pub",
+            "admission.key",
+        ] {
+            assert!(dir.join(name).is_file(), "missing generated file {name}");
+        }
+        assert_eq!(std::fs::read(dir.join("member.pub"))?.len(), 32);
+        assert_eq!(std::fs::read(dir.join("noise-client.pub"))?.len(), 32);
+        assert_eq!(std::fs::read(dir.join("noise-private.key"))?.len(), 32);
+        assert_eq!(std::fs::read(dir.join("admission.key"))?.len(), 32);
+        std::fs::remove_dir_all(&dir)?;
         Ok(())
     }
 }
