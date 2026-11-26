@@ -144,6 +144,11 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    override fun onResume() {
+        super.onResume()
+        refreshProfileHint()
+    }
+
     private fun defaultProfileDir(): File = File(filesDir, "profiles/default")
 
     private fun refreshProfileHint() {
