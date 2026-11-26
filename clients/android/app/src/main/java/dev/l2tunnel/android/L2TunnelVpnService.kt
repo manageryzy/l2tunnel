@@ -116,6 +116,23 @@ class L2TunnelVpnService : VpnService() {
             Log.i(TAG, "Ignoring duplicate start request while tunnel is active")
             return
         }
+        // Always invoke VpnService.prepare() so ConnectivityService binds this package as the
+        // active prepared VPN app before any VpnService.protect() or Builder.establish() call.
+        if (VpnService.prepare(this) != null) {
+            active.set(false)
+            Log.w(TAG, "VPN permission not granted; user authorization via MainActivity required")
+            publishState(
+                VpnUiState(
+                    running = false,
+                    phase = "failed",
+                    headline = "VPN permission required",
+                    detail = "Grant VPN authorization in the app before connecting.",
+                    profileName = profileDir.name,
+                ),
+            )
+            stopSelf()
+            return
+        }
         val profile = try {
             AndroidVpnProfile.loadFromDirectory(profileDir)
         } catch (e: Exception) {
@@ -247,12 +264,21 @@ class L2TunnelVpnService : VpnService() {
         pollJob?.cancel()
         pollJob = serviceScope.launch {
             launch {
+                try {
+                    proc.inputStream.bufferedReader().forEachLine { line ->
+                        Log.i("L2TunnelRust", line)
+                    }
+                } catch (_: Exception) {
+                }
+            }
+            launch {
                 val exit = proc.waitFor()
                 if (active.get()) {
                     Log.w(TAG, "Rust Android service exited unexpectedly (code=$exit)")
                     stopTunnel("Service exited (code $exit)")
                 }
             }
+            var pollFailures = 0
             while (isActive && active.get()) {
                 val client = apiClient
                 if (client != null && apiSocketFile?.exists() == true) {
@@ -260,6 +286,7 @@ class L2TunnelVpnService : VpnService() {
                         val st = client.status()
                         val m = try { client.metrics() } catch (_: Exception) { null }
                         val c = try { client.carrierShow() } catch (_: Exception) { null }
+                        pollFailures = 0
                         val headline = formatHeadline(st)
                         val effectiveCover = c?.currentCover ?: st.cover ?: profile.cover
                         publishState(
@@ -277,8 +304,11 @@ class L2TunnelVpnService : VpnService() {
                             ),
                         )
                         updateNotification("$headline · $effectiveCover")
-                    } catch (_: Exception) {
-                        // Socket may still be initializing during first handshake turn.
+                    } catch (e: Exception) {
+                        pollFailures += 1
+                        if (pollFailures <= 3 || pollFailures % 10 == 0) {
+                            Log.w(TAG, "Local API v5 poll failed (#$pollFailures): ${e.javaClass.simpleName}: ${e.message}")
+                        }
                     }
                 }
                 delay(1500L)

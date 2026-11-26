@@ -4,8 +4,11 @@ import android.net.LocalServerSocket
 import android.net.LocalSocket
 import android.os.ParcelFileDescriptor
 import android.os.Process
+import android.system.ErrnoException
+import android.system.Os
 import android.util.Log
 import java.io.Closeable
+import java.io.FileDescriptor
 import java.io.IOException
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
@@ -99,28 +102,36 @@ class FdBrokerServer(
         }
     }
 
+    private fun closeQuietly(fd: FileDescriptor) {
+        try {
+            Os.close(fd)
+        } catch (_: ErrnoException) {
+        }
+    }
+
     private fun handleProtect(client: LocalSocket) {
         val fds = client.ancillaryFileDescriptors
         if (fds == null || fds.size != 1) {
-            fds?.forEach { fd ->
-                try {
-                    ParcelFileDescriptor.dup(fd).close()
-                } catch (_: IOException) {
-                }
-            }
+            Log.w(TAG, "protect: expected 1 ancillary FD, got ${fds?.size ?: 0}")
+            fds?.forEach { closeQuietly(it) }
             client.outputStream.write('0'.code)
             client.outputStream.flush()
             return
         }
+        val received = fds[0]
         val ok = try {
-            // ParcelFileDescriptor.dup gives us an owned safe handle to pass its raw int FD
-            // to VpnService.protect() without leaking descriptors across JNI boundaries.
-            ParcelFileDescriptor.dup(fds[0]).use { pfd ->
-                protectFd(pfd.fd)
+            // ParcelFileDescriptor.dup lets us safely read the integer FD for VpnService.protect(),
+            // while Os.close(received) in finally guarantees the original SCM_RIGHTS FD never leaks.
+            ParcelFileDescriptor.dup(received).use { pfd ->
+                val result = protectFd(pfd.fd)
+                Log.i(TAG, "protect(fd=${pfd.fd}) -> $result")
+                result
             }
         } catch (e: IOException) {
             Log.w(TAG, "Failed to inspect protected socket FD: ${e.message}")
             false
+        } finally {
+            closeQuietly(received)
         }
         client.outputStream.write(if (ok) '1'.code else '0'.code)
         client.outputStream.flush()
@@ -128,6 +139,7 @@ class FdBrokerServer(
 
     private fun handleTun(client: LocalSocket) {
         val pfd = establishTun()
+        Log.i(TAG, "establishTun() -> ${if (pfd != null) "fd=${pfd.fd}" else "null"}")
         if (pfd == null) {
             client.outputStream.write('0'.code)
             client.outputStream.flush()

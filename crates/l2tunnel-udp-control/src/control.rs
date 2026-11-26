@@ -184,12 +184,17 @@ impl ControlEngine {
         now: Duration,
     ) -> Result<ReceiveOutcome, Error> {
         now_check(now, self.last_now, self.expires)?;
-        let expected = if self.role == 0 {
-            self.config.path.server
+        let peer_ok = if self.role == 0 {
+            peer == self.config.path.server
+        } else if self.config.path.is_dynamic_client() {
+            peer.is_ipv4() == self.config.path.server.is_ipv4()
+                && peer.port() != 0
+                && !peer.ip().is_unspecified()
+                && !peer.ip().is_multicast()
         } else {
-            self.config.path.client
+            peer == self.config.path.client
         };
-        if peer != expected
+        if !peer_ok
             || bytes.len() < CONTROL_OVERHEAD
             || bytes.len() > self.config.max_datagram()
             || !matches!(bytes[0], 32 | 40)

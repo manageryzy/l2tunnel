@@ -1255,9 +1255,26 @@ mod observe {
             }
             .map_err(invalid)?;
             let path = settings.gate.path;
-            let (local, peer) = match info.role {
-                Role::Initiator => (path.client, path.server),
-                Role::Responder => (path.server, path.client),
+            let (local_ok, peer_ok) = if path.is_dynamic_client() {
+                match info.role {
+                    Role::Initiator => (
+                        info.local_addr.is_ipv4() == path.client.is_ipv4()
+                            && info.local_addr.port() != 0,
+                        info.peer_addr == path.server,
+                    ),
+                    Role::Responder => (
+                        info.local_addr == path.server,
+                        info.peer_addr.is_ipv4() == path.client.is_ipv4()
+                            && info.peer_addr.port() != 0
+                            && !info.peer_addr.ip().is_unspecified(),
+                    ),
+                }
+            } else {
+                let (local, peer) = match info.role {
+                    Role::Initiator => (path.client, path.server),
+                    Role::Responder => (path.server, path.client),
+                };
+                (info.local_addr == local, info.peer_addr == peer)
             };
             if info.peers != profile.peers()
                 || info.authenticated.configuration != configuration.0
@@ -1266,8 +1283,8 @@ mod observe {
                 || info.authenticated.outer != expected.outer
                 || info.authenticated.member != expected.member
                 || info.member != settings.member
-                || info.local_addr != local
-                || info.peer_addr != peer
+                || !local_ok
+                || !peer_ok
                 || snapshot.is_some_and(|value| {
                     value.info != info
                         || value.configuration != configuration

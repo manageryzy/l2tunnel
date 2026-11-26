@@ -239,9 +239,11 @@ async fn authenticate_selected_secure_udp(
         check(deadline)?;
     }
     setup::stage(shared, accepted.operation, SetupStage::SocketConnect);
-    socket.connect(peer).await.inspect_err(|_| {
-        setup::reason(shared, accepted.operation, SetupFailureReason::LocalIo);
-    })?;
+    if !(role == Role::Responder && selected.gate.path.is_dynamic_client()) {
+        socket.connect(peer).await.inspect_err(|_| {
+            setup::reason(shared, accepted.operation, SetupFailureReason::LocalIo);
+        })?;
+    }
     check(deadline)?;
     if role == Role::Responder {
         shared.lock().snapshot.listening = Some(Listening {

@@ -41,5 +41,6 @@ ANDROID_HOME="$HOME/Android/Sdk" gradle testDebugUnitTest assembleDebug
 ## Qualification boundary
 
 Cross-compilation of `arm64-v8a`/`x86_64` native binaries, host Rust broker/
-socket-protection tests, JVM unit tests, and debug APK assembly do not
+socket-protection tests, JVM unit tests, debug APK assembly, and unprivileged
+Android 12 (API 32) / Android 15 (API 35) x86_64 emulator runs do not
 substitute for physical Android device qualification (`CL-35`, `TEST-14`).

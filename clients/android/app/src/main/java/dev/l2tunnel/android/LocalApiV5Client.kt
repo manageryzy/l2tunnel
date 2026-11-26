@@ -22,12 +22,8 @@ object LocalApiV5Codec {
 
     fun encodeRequest(action: JSONObject): ByteArray {
         val envelope = JSONObject()
-        envelope.put("version", VERSION)
-        val keys = action.keys()
-        while (keys.hasNext()) {
-            val k = keys.next()
-            envelope.put(k, action.get(k))
-        }
+            .put("version", VERSION)
+            .put("action", action)
         val payload = envelope.toString().toByteArray(StandardCharsets.UTF_8)
         if (payload.isEmpty() || payload.size > REQUEST_LIMIT) {
             throw IOException("Local API v5 request exceeds bound (${payload.size} bytes)")
@@ -172,15 +168,16 @@ class LocalApiV5Client(
     private val timeoutMs: Int = 4000,
 ) {
     fun request(action: JSONObject): JSONObject {
-        val socket = LocalSocket()
+        val socket = LocalSocket(LocalSocket.SOCKET_STREAM)
         return socket.use { s ->
-            s.soTimeout = timeoutMs
             s.connect(
                 LocalSocketAddress(
                     socketPath.absolutePath,
                     LocalSocketAddress.Namespace.FILESYSTEM,
                 ),
             )
+            // Android's LocalSocket only allocates the native FD inside connect().
+            s.soTimeout = timeoutMs
             val encoded = LocalApiV5Codec.encodeRequest(action)
             LocalApiV5Codec.writeFrame(s.outputStream, encoded)
             LocalApiV5Codec.readFrame(s.inputStream)

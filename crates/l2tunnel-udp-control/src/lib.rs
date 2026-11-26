@@ -28,13 +28,23 @@ impl Secret {
     }
 }
 
-/// Fixed caller-configured endpoints, identical at both peers; no NAT rebinding.
+/// Caller-configured endpoints, identical at both peers.
+///
+/// When `client` is the unspecified address with port `0` (`0.0.0.0:0` or `[::]:0`),
+/// the server accepts the client from its observed NAT address after verifying the
+/// return-path cookie bound to that observed address.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Path {
-    /// Client UDP endpoint, with a nonzero port.
+    /// Client UDP endpoint (`0.0.0.0:0` / `[::]:0` for dynamic NAT clients, or fixed nonzero).
     pub client: SocketAddr,
     /// Server UDP endpoint, with a nonzero port.
     pub server: SocketAddr,
+}
+impl Path {
+    /// Whether the client endpoint is dynamic (ephemeral/NAT), configured as `0.0.0.0:0` or `[::]:0`.
+    pub fn is_dynamic_client(self) -> bool {
+        self.client.ip().is_unspecified() && self.client.port() == 0
+    }
 }
 
 /// All bounds are included in the computed gate profile digest.
@@ -149,14 +159,24 @@ impl Config {
         if self.arq.wide_feedback() {
             return Err(Error::Configuration);
         }
-        for address in [self.path.client, self.path.server] {
-            if address.port() == 0
-                || address.ip().is_unspecified()
-                || address.ip().is_multicast()
-                || matches!(address, SocketAddr::V6(value) if value.scope_id() != 0 || value.flowinfo() != 0)
-            {
-                return Err(Error::Configuration);
-            }
+        let bad_v6 = |addr: SocketAddr| matches!(addr, SocketAddr::V6(value) if value.scope_id() != 0 || value.flowinfo() != 0);
+        if self.path.server.port() == 0
+            || self.path.server.ip().is_unspecified()
+            || self.path.server.ip().is_multicast()
+            || bad_v6(self.path.server)
+        {
+            return Err(Error::Configuration);
+        }
+        if !self.path.is_dynamic_client()
+            && (self.path.client.port() == 0
+                || self.path.client.ip().is_unspecified()
+                || self.path.client.ip().is_multicast()
+                || bad_v6(self.path.client))
+        {
+            return Err(Error::Configuration);
+        }
+        if bad_v6(self.path.client) {
+            return Err(Error::Configuration);
         }
         if self.path.client == self.path.server
             || self.path.client.is_ipv4() != self.path.server.is_ipv4()

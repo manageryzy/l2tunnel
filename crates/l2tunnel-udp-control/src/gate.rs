@@ -106,9 +106,23 @@ impl ServerGate {
         let Some(frame) = parse(bytes, &self.admission, self.config, self.profile) else {
             return Ok(GateEvent::Ignored);
         };
-        if peer != self.config.path.client || !matches!(frame[2], 1 | 3) {
+        let peer_ok = if self.config.path.is_dynamic_client() {
+            peer.is_ipv4() == self.config.path.server.is_ipv4()
+                && peer.port() != 0
+                && !peer.ip().is_unspecified()
+                && !peer.ip().is_multicast()
+        } else {
+            peer == self.config.path.client
+        };
+        if !peer_ok || !matches!(frame[2], 1 | 3) {
             return Ok(GateEvent::Ignored);
         }
+        // Bind the stateless return-path cookie to the observed source endpoint so
+        // dynamic NAT clients still prove return-path reachability at their actual (ip, port).
+        let cookie_path = Path {
+            client: peer,
+            server: self.config.path.server,
+        };
         self.last_now = now;
         self.prune(now);
         let nonce = array16(&frame[8..24]);
@@ -151,7 +165,7 @@ impl ServerGate {
             retry[2] = 2;
             retry[24..40].copy_from_slice(&server_nonce);
             retry[40..48].copy_from_slice(&micros(expires)?.to_be_bytes());
-            let cookie = mac(&self.cookie, COOKIE_DOMAIN, &retry[..80], self.config.path);
+            let cookie = mac(&self.cookie, COOKIE_DOMAIN, &retry[..80], cookie_path);
             retry[80..112].copy_from_slice(&cookie);
             sign(&mut retry, &self.admission, self.config.path);
             self.responses_left -= 1;
@@ -175,7 +189,7 @@ impl ServerGate {
             &self.cookie,
             COOKIE_DOMAIN,
             &retry[..80],
-            self.config.path,
+            cookie_path,
             &frame[80..112],
         ) {
             return Ok(GateEvent::Ignored);

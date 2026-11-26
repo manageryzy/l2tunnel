@@ -636,15 +636,29 @@ fn selection_for(
     } else {
         (address("--udp-bind")?, address("--udp-peer")?)
     };
-    if local.port() == 0
-        || peer.port() == 0
-        || local.ip().is_unspecified()
-        || peer.ip().is_unspecified()
+    let is_dynamic = |addr: SocketAddr| addr.ip().is_unspecified() && addr.port() == 0;
+    let client_addr = if role == security::Role::Initiator {
+        local
+    } else {
+        peer
+    };
+    let server_addr = if role == security::Role::Initiator {
+        peer
+    } else {
+        local
+    };
+    if server_addr.port() == 0
+        || server_addr.ip().is_unspecified()
+        || server_addr.ip().is_multicast()
+        || (!is_dynamic(client_addr)
+            && (client_addr.port() == 0
+                || client_addr.ip().is_unspecified()
+                || client_addr.ip().is_multicast()))
         || local.is_ipv4() != peer.is_ipv4()
         || local == peer
     {
         return Err(input(
-            "secure UDP requires a fixed distinct nonzero endpoint pair",
+            "secure UDP requires a fixed distinct nonzero endpoint pair (or 0.0.0.0:0 / [::]:0 dynamic client)",
         ));
     }
     let vxlan = if inspection {

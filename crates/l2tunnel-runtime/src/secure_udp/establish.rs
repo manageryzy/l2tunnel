@@ -138,6 +138,43 @@ impl<R: RawBacking> SocketBacking<R> {
             )),
         }
     }
+    pub(in crate::secure_udp) async fn recv_from_udp(
+        &mut self,
+        output: &mut [u8],
+    ) -> io::Result<(usize, SocketAddr)> {
+        match self {
+            Self::Udp(socket) => socket.recv_from(output).await,
+            _ => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "dynamic client endpoints require raw UDP socket",
+            )),
+        }
+    }
+    pub(in crate::secure_udp) async fn send_to_udp(
+        &mut self,
+        data: &[u8],
+        target: SocketAddr,
+    ) -> io::Result<usize> {
+        match self {
+            Self::Udp(socket) => socket.send_to(data, target).await,
+            _ => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "dynamic client endpoints require raw UDP socket",
+            )),
+        }
+    }
+    pub(in crate::secure_udp) async fn connect_udp(
+        &mut self,
+        target: SocketAddr,
+    ) -> io::Result<()> {
+        match self {
+            Self::Udp(socket) => socket.connect(target).await,
+            _ => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "dynamic client endpoints require raw UDP socket",
+            )),
+        }
+    }
     pub(in crate::secure_udp) async fn recv(&mut self, output: &mut [u8]) -> io::Result<usize> {
         match self {
             Self::Udp(socket) => socket.recv(output).await,
@@ -1247,6 +1284,7 @@ async fn accept_inner<R: RawBacking>(
     let mut input = vec![0; socket.receive_capacity(setup.config.cover.limits().max_packet_bytes)?];
     let mut output = vec![0; setup.config.cover.limits().max_packet_bytes];
     let mut server_nonce = nonce(entropy)?;
+    let dynamic_client = setup.gate.path.is_dynamic_client();
     let ticket = loop {
         report.bootstrap(statistics, None);
         let now = Instant::now();
@@ -1258,33 +1296,72 @@ async fn accept_inner<R: RawBacking>(
         } else {
             quota.refill.min(deadline)
         };
-        tokio::select! {
-            received = socket.recv(&mut input), if ready => {
-                before(Instant::now(), deadline)?;
-                quota.charge();
-                let Some(length) = received_length(received, &mut statistics)? else { continue; };
-                statistics.received_datagrams = statistics.received_datagrams.saturating_add(1);
-                report.bootstrap(statistics, None);
-                let Some(frame) = gate_body(setup, &input[..length]) else { ignored(&mut statistics); continue; };
-                let event = admission.gate.receive(setup.gate.path.client, frame, server_nonce, elapsed(origin, Instant::now())?)?;
-                report.server(admission.statistics());
-                match event {
-                    gate::GateEvent::Retry(retry) => {
-                        let length = gate_packet(setup, &retry, next_outer, &mut output)?;
-                        report.bootstrap(statistics, None);
-            let accepted = send_backing(&mut socket, &output[..length], deadline).await?;
-                        sent(&mut statistics, length, accepted);
-                        advance(&mut next_outer)?;
-                        emitted(&mut statistics, length);
-                        statistics.gate_retries = statistics.gate_retries.saturating_add(1);
-                        report.bootstrap(statistics, None);
-                        server_nonce = nonce(entropy)?;
+        let received_peer: Option<(io::Result<usize>, SocketAddr)> = if dynamic_client {
+            tokio::select! {
+                received = socket.recv_from_udp(&mut input), if ready => {
+                    match received {
+                        Ok((len, src)) => Some((Ok(len), src)),
+                        Err(err) => Some((Err(err), setup.gate.path.client)),
                     }
-                    gate::GateEvent::Accepted(ticket) => break ticket,
-                    _ => ignored(&mut statistics),
                 }
+                _ = sleep_until(wake) => None,
             }
-            _ = sleep_until(wake) => {}
+        } else {
+            tokio::select! {
+                received = socket.recv(&mut input), if ready => {
+                    Some((received, setup.gate.path.client))
+                }
+                _ = sleep_until(wake) => None,
+            }
+        };
+        let Some((received, src_addr)) = received_peer else {
+            continue;
+        };
+        before(Instant::now(), deadline)?;
+        quota.charge();
+        let Some(length) = received_length(received, &mut statistics)? else {
+            continue;
+        };
+        statistics.received_datagrams = statistics.received_datagrams.saturating_add(1);
+        report.bootstrap(statistics, None);
+        let Some(frame) = gate_body(setup, &input[..length]) else {
+            ignored(&mut statistics);
+            continue;
+        };
+        let event = admission.gate.receive(
+            src_addr,
+            frame,
+            server_nonce,
+            elapsed(origin, Instant::now())?,
+        )?;
+        report.server(admission.statistics());
+        match event {
+            gate::GateEvent::Retry(retry) => {
+                let length = gate_packet(setup, &retry, next_outer, &mut output)?;
+                report.bootstrap(statistics, None);
+                let accepted = if dynamic_client {
+                    timeout_at(deadline, socket.send_to_udp(&output[..length], src_addr))
+                        .await
+                        .map_err(|_| Error::Deadline)?
+                        .is_ok_and(|sent| sent == length)
+                        .into()
+                } else {
+                    send_backing(&mut socket, &output[..length], deadline).await?
+                };
+                sent(&mut statistics, length, accepted);
+                advance(&mut next_outer)?;
+                emitted(&mut statistics, length);
+                statistics.gate_retries = statistics.gate_retries.saturating_add(1);
+                report.bootstrap(statistics, None);
+                server_nonce = nonce(entropy)?;
+            }
+            gate::GateEvent::Accepted(ticket) => {
+                if dynamic_client {
+                    socket.connect_udp(src_addr).await?;
+                }
+                break ticket;
+            }
+            _ => ignored(&mut statistics),
         }
     };
     let session = ticket.session();
@@ -1513,14 +1590,17 @@ impl<R: RawBacking> Exchange<R> {
                     statistics,
                     core.control.as_ref().map(gate::ControlEngine::statistics),
                 );
-                let peer = peer(self.setup.gate.path, role);
+                let actual_peer = self
+                    .socket
+                    .peer_addr()
+                    .unwrap_or_else(|_| peer(self.setup.gate.path, role));
                 let tail = BootstrapTail {
                     core,
                     confirmation: Some(confirmation),
                     peer_confirmation,
                     peer_confirmation_len,
                     parser,
-                    peer,
+                    peer: actual_peer,
                 };
                 return Ok(EstablishedState {
                     socket: self.socket,
@@ -1573,11 +1653,15 @@ impl<R: RawBacking> Exchange<R> {
                         Ok(decoded) if decoded.phase == cover::Phase::Handshake => decoded,
                         _ => { ignored(&mut core.statistics); continue; }
                     };
+                    let actual_peer = self
+                        .socket
+                        .peer_addr()
+                        .unwrap_or_else(|_| peer(self.setup.gate.path, role));
                     if decoded.protected.first() == Some(&GATE_TAG) {
                         if let Some(server) = server.as_deref_mut()
                             && decoded.protected.len() == 1 + gate::GATE_BYTES {
                                 let fresh_nonce = server_nonce.ok_or(Error::Protocol)?;
-                                match server.gate.receive(self.setup.gate.path.client, &decoded.protected[1..], fresh_nonce, elapsed(self.origin, now)?)? {
+                                match server.gate.receive(actual_peer, &decoded.protected[1..], fresh_nonce, elapsed(self.origin, now)?)? {
                                     gate::GateEvent::Retry(frame) => {
                                         let length = gate_packet(self.setup, &frame, self.next_outer, &mut output)?;
                                         report.bootstrap(core.statistics, core.control.as_ref().map(gate::ControlEngine::statistics));
@@ -1595,7 +1679,7 @@ impl<R: RawBacking> Exchange<R> {
                         ignored(&mut core.statistics);
                         continue;
                     }
-                    let Some(outcome) = core.receive_peer(decoded.protected, peer(self.setup.gate.path, role), now)? else { ignored(&mut core.statistics); continue; };
+                    let Some(outcome) = core.receive_peer(decoded.protected, actual_peer, now)? else { ignored(&mut core.statistics); continue; };
                     if outcome == gate::ReceiveOutcome::Fresh
                         && let Some(client) = &mut self.client {
                         client.confirm_peer_control(elapsed(self.origin, now)?)?;
@@ -1756,6 +1840,25 @@ fn socket_path<R: RawBacking>(
     path: gate::Path,
     role: hs::Role,
 ) -> Result<(), Error> {
+    if path.is_dynamic_client() {
+        match role {
+            hs::Role::Initiator => {
+                let local = socket.local_addr()?;
+                if local.is_ipv4() != path.client.is_ipv4()
+                    || local.port() == 0
+                    || socket.peer_addr()? != path.server
+                {
+                    return Err(Error::Configuration("actual dynamic client UDP path"));
+                }
+            }
+            hs::Role::Responder => {
+                if socket.local_addr()? != path.server {
+                    return Err(Error::Configuration("actual dynamic responder UDP bind"));
+                }
+            }
+        }
+        return Ok(());
+    }
     let (local, remote) = match role {
         hs::Role::Initiator => (path.client, path.server),
         hs::Role::Responder => (path.server, path.client),

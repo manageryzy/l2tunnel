@@ -300,38 +300,49 @@ the chosen driver artifact and terms before packaging.
   lifecycle/notification behavior for supported Android versions, and revocation
   handling. Standard operation is TUN/L3; no root, raw-socket or TAP capability is
   presumed. Keep unsupported L2/VXLAN attachment scenarios explicit.
-  Progress (2026-11-25, cross-compiled + host/JVM unit-tested; no physical Android
+  Progress (2026-11-26, cross-compiled, host/JVM unit-tested, and live-verified on
+  Android 12 API 32 + Android 15 API 35 x86_64 MuMu emulators; no physical Android
   device run yet): `clients/android` implements `MainActivity` (`VpnService.prepare()`,
   API 33+ `POST_NOTIFICATIONS`), `L2TunnelVpnService` (`Builder` L3 TUN, foreground
   `specialUse` notification, `onRevoke()` cleanup), and `AndroidVpnProfile` (explicit
   `UnsupportedLayerException` refusal for TAP/VXLAN, matched by `UdpClientProfile::load`
   in `l2tunnel-client-core`), packaged into `app-debug.apk` with stripped `arm64-v8a`
-  and `x86_64` `libl2tunnel_android_service.so`.
+  and `x86_64` `libl2tunnel_android_service.so`. Unprivileged (`run-as` + UI taps)
+  emulator runs against a Linux `l2tunneld` server verified `tun0` creation, real ICMP
+  forwarding (5/5, 0% loss, `~4.7–4.9 ms` avg), and clean teardown with zero orphans or
+  leftover `tun0`/`service.sock` ([receipt](../work/android-emu-20261126/receipt.json)).
 - [ ] [CL-29] Protect every outer/control socket with `VpnService.protect()`
   before connecting/sending through the VPN path, including newly joined lanes
   and reconnect sockets. Specify JNI ownership, descriptor close/dup rules,
   callback threads, cancellation and process death. Fail connection setup when
   protection or the descriptor handoff fails.
-  Progress (2026-11-25, host-tested + cross-compiled; no physical Android device run
-  yet): `FdBrokerServer` (`clients/android`) verifies `peerCredentials.uid == myUid()`,
-  handles `M`/`P`/`T`/`R`, closes received `ParcelFileDescriptor` handles in `finally`,
-  and `l2tunnel-runtime` (`transport_carrier_switch.rs`) now invokes
-  `udp_socket_protector` on every standby UDP socket opened during make-before-break
-  live carrier switching before `connect()`/`try_send()` (tested by
+  Progress (2026-11-26, host-tested, cross-compiled, and live-verified on Android 12
+  API 32 + Android 15 API 35 MuMu emulators; no physical Android device run yet):
+  `FdBrokerServer` (`clients/android`) verifies `peerCredentials.uid == myUid()`,
+  handles `M`/`P`/`T`/`R`, closes both the received raw `FileDescriptor` and wrapped
+  `ParcelFileDescriptor` in `finally`, and `l2tunnel-runtime`
+  (`transport_carrier_switch.rs`) invokes `udp_socket_protector` on every standby UDP
+  socket opened during make-before-break live carrier switching before
+  `connect()`/`try_send()` (host-tested by
   `udp_socket_protector_covers_initial_and_live_carrier_switch_sockets` and
-  `broker_protect_and_open_tun_round_trip_and_reject_bad_replies`).
+  `broker_protect_and_open_tun_round_trip_and_reject_bad_replies`; live emulator
+  runs confirmed `3/3` `VpnService.protect() -> true` across initial connect, live
+  `quic-like -> media-like` cover switch, and UI reconnect on both API 32 and API 35).
 - [ ] [CL-30] Implement Android network-change, background/foreground, permission
   revocation and reconnect behavior with bounded work and battery-aware retry
   limits. Test Wi-Fi/mobile transitions and app recreation without duplicate
   tunnels, retained packet descriptors or route loops. Validate always-on/lockdown
   behavior only if included in the declared supported configuration.
-  Progress (2026-11-25, host/JVM unit-tested; no physical Android device run yet):
-  `l2tunnel-android-service` now serves full Local API v5 (`serve_service`) with
-  battery-aware bounded auto-recovery (`8` attempts, `2s..=60s`) and ephemeral
-  `0.0.0.0:0`/`[::]:0` mobile bind support; `NetworkChangeCoordinator` +
-  `ConnectivityManager.NetworkCallback` debounce transitions (`1.5 s`, max `6`
-  reconnects per `5 min`) and `L2TunnelVpnService` enforces single-tunnel
-  `AtomicBoolean` guarding. Physical Wi-Fi/cellular transition testing remains open.
+  Progress (2026-11-26, host/JVM unit-tested and live-verified on Android 12 API 32 +
+  Android 15 API 35 MuMu emulators; no physical Android device run yet):
+  `l2tunnel-android-service` serves full Local API v5 (`serve_service`) with
+  battery-aware bounded auto-recovery (`8` attempts, `2s..=60s`), dynamic NAT
+  `0.0.0.0:0`/`[::]:0` endpoint binding (server-side cookie bound to observed NAT
+  source address), and verified UI `Reconnect`/`Disconnect` + live UDP cover switching;
+  `NetworkChangeCoordinator` + `ConnectivityManager.NetworkCallback` debounce
+  transitions (`1.5 s`, max `6` reconnects per `5 min`) and `L2TunnelVpnService`
+  enforces single-tunnel `AtomicBoolean` guarding. Physical Wi-Fi/cellular transition
+  testing remains open.
 - [ ] [CL-31] Add Android credential-provider integration and a UI using the
   same configuration/operation contracts as desktop. Select supported key types
   and storage behavior after provider capability testing; never assume that a

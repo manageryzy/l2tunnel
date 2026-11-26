@@ -1214,5 +1214,79 @@ async fn terminal_retry_exhaustion_retires_real_noise_final_custody() {
     );
 }
 
+#[tokio::test]
+async fn dynamic_nat_client_establishes_over_unconnected_responder_socket() {
+    let client = UdpSocket::bind("127.0.0.1:0").await.expect("client bind");
+    let server = UdpSocket::bind("127.0.0.1:0").await.expect("server bind");
+    let client_actual = client.local_addr().expect("client addr");
+    let server_addr = server.local_addr().expect("server addr");
+    client.connect(server_addr).await.expect("client connect");
+    // Deliberately leave `server` unconnected and advertise dynamic `0.0.0.0:0`
+    // client path so `accept()` must bind the stateless cookie to the observed
+    // NAT source address and connect only after `GateEvent::Accepted`.
+    let dynamic_path = gate::Path {
+        client: "0.0.0.0:0".parse().expect("dynamic client"),
+        server: server_addr,
+    };
+    let client_cfg = config(
+        dynamic_path,
+        cover::Appearance::QuicLike,
+        hs::Role::Initiator,
+        hs::Profile::Ik,
+    );
+    let server_cfg = config(
+        dynamic_path,
+        cover::Appearance::QuicLike,
+        hs::Role::Responder,
+        hs::Profile::Ik,
+    );
+    let origin = Instant::now();
+    let end = origin + Duration::from_secs(3);
+    let mut admission = ServerAdmission::new(
+        server_cfg,
+        peers(),
+        gate::Secret::new([1; 32]),
+        gate::Secret::new([2; 32]),
+        origin,
+    )
+    .expect("admission");
+    let mut client_entropy = Entropy::new(41);
+    let mut server_entropy = Entropy::new(51);
+    let (client_res, server_res) = tokio::join!(
+        connect(
+            client,
+            client_cfg,
+            identity(hs::Role::Initiator, hs::Profile::Ik),
+            gate::Secret::new([1; 32]),
+            end,
+            &mut client_entropy,
+        ),
+        accept(
+            server,
+            identity(hs::Role::Responder, hs::Profile::Ik),
+            &mut admission,
+            end,
+            &mut server_entropy,
+        )
+    );
+    let client_est = client_res.expect("dynamic client Noise completion");
+    let server_est = server_res.expect("unconnected server Noise completion");
+    assert_eq!(client_est.binding, server_est.binding);
+    assert_eq!(
+        server_est
+            .socket
+            .peer_addr()
+            .expect("server connected peer"),
+        client_actual
+    );
+    assert_eq!(
+        client_est
+            .socket
+            .peer_addr()
+            .expect("client connected peer"),
+        server_addr
+    );
+}
+
 #[path = "establish_tuning_tests.rs"]
 mod tuning;

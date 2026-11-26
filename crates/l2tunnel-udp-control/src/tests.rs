@@ -498,3 +498,49 @@ fn promotion_rejects_late_regressed_invalid_and_overflow_without_changing_deadli
     );
     assert_eq!(engine.absolute_deadline(), original);
 }
+
+#[test]
+fn dynamic_nat_client_binds_cookie_to_observed_source_address() -> Result<(), Error> {
+    let mut cfg = config();
+    cfg.path.client = "0.0.0.0:0".parse().map_err(|_| Error::Configuration)?;
+    assert!(cfg.path.is_dynamic_client());
+    let now = Duration::from_millis(10);
+    let mut client = ClientGate::new(cfg, Secret::new([1; 32]), [9; 16], now)?;
+    let mut server = ServerGate::new(cfg, Secret::new([1; 32]), Secret::new([2; 32]), now)?;
+
+    let nat_a: SocketAddr = "192.168.210.172:54866"
+        .parse()
+        .map_err(|_| Error::Configuration)?;
+    let nat_spoof: SocketAddr = "192.168.210.172:54867"
+        .parse()
+        .map_err(|_| Error::Configuration)?;
+
+    let hello = client.poll(now)?.ok_or(Error::Malformed)?;
+    let GateEvent::Retry(retry) = server.receive(nat_a, &hello, [7; 16], now)? else {
+        panic!("expected Retry for dynamic NAT client");
+    };
+    let client_ticket = client
+        .receive_retry(cfg.path.server, &retry, now)?
+        .ok_or(Error::Malformed)?;
+    let echo = client.poll(now)?.ok_or(Error::Malformed)?;
+
+    // Echo replayed from a different NAT port must be ignored because the cookie binds nat_a.
+    assert!(matches!(
+        server.receive(nat_spoof, &echo, [8; 16], now)?,
+        GateEvent::Ignored
+    ));
+    // Echo from the real NAT address succeeds and yields matching control engines.
+    let GateEvent::Accepted(server_ticket) = server.receive(nat_a, &echo, [8; 16], now)? else {
+        panic!("expected Accepted from observed NAT source");
+    };
+    let mut c_eng = ControlEngine::new(client_ticket, now)?;
+    let mut s_eng = ControlEngine::new(server_ticket, now)?;
+    assert_eq!(c_eng.write(b"mobile-nat-ok", now)?, 13);
+    let mut buf = vec![0; c_eng.max_datagram_bytes()];
+    let n = c_eng.poll(now, &mut buf)?.ok_or(Error::Malformed)?;
+    assert_eq!(s_eng.receive(nat_a, &buf[..n], now)?, ReceiveOutcome::Fresh);
+    let mut out = [0; 32];
+    let got = s_eng.read(&mut out, now)?;
+    assert_eq!(&out[..got], b"mobile-nat-ok");
+    Ok(())
+}

@@ -18,7 +18,7 @@ class LocalApiV5CodecTest {
         LocalApiV5Codec.writeFrame(wire, reqBytes)
         val decodedReq = LocalApiV5Codec.readFrame(ByteArrayInputStream(wire.toByteArray()))
         assertEquals(5, decodedReq.getInt("version"))
-        assertEquals("status", decodedReq.getString("command"))
+        assertEquals("status", decodedReq.getJSONObject("action").getString("command"))
 
         val replyJson = JSONObject(
             """
