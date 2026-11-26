@@ -16,12 +16,17 @@ fresh-authentication recovery enabled by default), and the `egui` desktop GUI
 (`l2tunnel-linux-gui` / `l2tunnel-windows-gui`), including live protocol and
 FEC/MTU tuning, live speed-budget tuning (`1 Mbit/s..=10 Gbit/s`), live
 make-before-break UDP carrier/cover switching, RFC 1928/1929 SOCKS5 over
-TCP-proxy, local and remote CSR meters, and in-process tunnel speed/ping tests.
-Windows service/Wintun and Android FD-broker binaries cross-compile and pass
-unit/Wine checks, while native Windows/Android device qualification, multi-core
-scaling past the single-core CPU ceiling, state-retaining outage recovery, and
-full 49-mode parity acceptance remain open. This is not a complete production
-VPN. See [current implementation status](docs/implementation-status.md).
+TCP-proxy, local and remote CSR meters, in-process tunnel speed/ping tests,
+and cross-platform `l2tunnel://v1/connect` profile share URIs. The Android
+`VpnService` client (`clients/android`, Jetpack Compose + Material You) runs
+the shared Rust `l2tunnel-android-service` binary (`arm64-v8a` / `x86_64`) with
+`AndroidKeyStore` AES-256-GCM key sealing, per-app split tunneling, and
+unprivileged live emulator verification on Android 12 (API 32) and Android 15
+(API 35). Windows service/Wintun binaries cross-compile and pass unit/Wine
+checks, while native Windows and physical Android device qualification,
+multi-core scaling past the single-core CPU ceiling, state-retaining outage
+recovery, and full 49-mode parity acceptance remain open. This is not a
+complete production VPN. See [current implementation status](docs/implementation-status.md).
 
 ## Desktop GUI
 
@@ -43,6 +48,62 @@ window never disconnects an active session.
 ![Statistics page — live network throughput, packet rates, and carrier lane counters](docs/images/gui-statistics.png)
 
 </details>
+
+## Android Client (`VpnService`, Jetpack Compose + Material You)
+
+The Android client ([clients/android](clients/android/README.md)) pairs a
+Jetpack Compose Material 3 / Material You adaptive UI (bottom `NavigationBar`
+on compact portrait screens; left `NavigationRail` + 2-column dashboards on
+landscape/tablet screens) with the cross-compiled Rust `l2tunnel-android-service`
+binary over Local API v5 and a UID-verified `SCM_RIGHTS` FD broker (`VpnService.protect()`
+on initial, reconnect, and standby carrier-switch sockets). Private keys are
+sealed at rest under `AndroidKeyStore` AES-256-GCM inside `noBackupFilesDir`
+and scrubbed from ephemeral staging immediately upon tunnel readiness.
+
+![Android Overview — Material You landscape dashboard with live peer, RTT, wire rate, and Keystore security status](docs/images/android-overview.png)
+
+<details>
+<summary>More Android UI snapshots (Connection live controls, Profiles &amp; Keystore, Stats &amp; Event Log)</summary>
+
+**Connection — make-before-break UDP cover switch, live FEC tuning, speed budget, and in-process `TunnelTestV1`**
+
+![Android Connection — live UDP cover switch, FEC ratio chips, wire speed budget, and TunnelTestV1 ping result](docs/images/android-connection.png)
+
+**Profiles &amp; Keys — multi-profile store, `AndroidKeyStore` AES-GCM sealing, `.zip` / `l2tunnel://` URI import, and per-app split tunneling**
+
+![Android Profiles — Android Keystore AES-GCM sealed profile with split-tunnel and share controls](docs/images/android-profiles.png)
+
+**Stats &amp; Logs — live rolling TX/RTT area charts, transport/TUN counters, and redacted diagnostics export**
+
+![Android Stats — live rolling TX throughput and RTT charts with transport counters and Local API v5 events](docs/images/android-stats.png)
+
+</details>
+
+## Profile Share URIs (`l2tunnel://v1/connect`)
+
+Profiles can be exchanged quickly between `l2tunnelctl`, the Desktop GUI, and
+Android (including direct `l2tunnel://` Android deep links) using a versioned,
+validated URI format (`<= 16 KiB`, strictly TUN L3):
+
+- **Default (public / safe — zero private keys):** shares server `peer`, UDP
+  `cover`, `noise` profile, pinned server `peer_pub`, MTUs, optional `tun`,
+  `routes`, `dns`, and `tune_repair`. Importing on Android automatically
+  generates fresh local client keys sealed in `AndroidKeyStore` and writes the
+  default L3 `common.json` plan.
+- **Full provisioning (explicit opt-in only):** `--include-secrets` (CLI) or
+  the unchecked **Include secrets** toggle (Desktop GUI / Android) embeds
+  `adm`, `key`, `member`, and optional `psk` (`noise=ikpsk2`). Secrets are
+  never logged; on CLI use `--uri -` to read from stdin out of shell history.
+
+```sh
+# Export a public client-onboarding URI (also derives peer_pub automatically from a serve profile)
+l2tunnelctl --control-socket /private/owned-directory/service.sock profile share my-server \
+  --tun 10.236.0.2/30 --routes 0.0.0.0/0
+
+# Import a share URI via stdin (keeps any embedded secrets out of shell history)
+printf '%s\n' 'l2tunnel://v1/connect?...' | \
+  l2tunnelctl --control-socket /private/owned-directory/service.sock profile import my-client --uri -
+```
 
 ## Speed test & real-kernel highlights
 

@@ -350,12 +350,16 @@ the chosen driver artifact and terms before packaging.
   backups/logs and define unlock, rotation and removal behavior.
   Progress (2026-11-26, JVM unit-tested and live-verified on Android 12 API 32 +
   Android 15 API 35 x86_64 MuMu emulators; no physical Android device run yet):
-  `clients/android` implements a 4-tab Jetpack Compose + Material 3 (Material You)
-  UI (`Overview`, `Connection`, `Profiles & Keys`, `Stats & Logs`) over Local API v5
-  (`carrier_switch`, `tuning_get`/`tuning_switch`, `rate_budget_set`, `test_start`/
-  `test_get`/`test_cancel`, `meters_read`, `events`), per-app split tunneling
+  `clients/android` implements an adaptive 4-tab Jetpack Compose + Material 3
+  (Material You) UI (portrait `NavigationBar`; landscape/wide `NavigationRail` +
+  2-column dashboards and dialogs) over Local API v5 (`carrier_switch`,
+  `tuning_get`/`tuning_switch`, `rate_budget_set`, `test_start`/`test_get`/
+  `test_cancel`, `meters_read`, `events`), per-app split tunneling
   (`ALL`/`EXCLUDE`/`INCLUDE` with mandatory anti-loop self-exclusion), safe `.zip`
-  profile bundle import, redacted diagnostics JSON export (`CL-16`), and
+  bundle import, cross-platform `l2tunnel://v1/connect` share URI import/export &
+  Android deep linking (public by default; opt-in secret provisioning), native
+  `--keygen` Keystore profile creation with bundled default L3 `common.json` and
+  64-hex key paste/copy, redacted diagnostics JSON export (`CL-16`), and
   `KeystoreSecretStore` AES-256-GCM envelope encryption under `AndroidKeyStore`
   (`noBackupFilesDir`, `allowBackup="false"`, ephemeral runtime staging scrubbed
   immediately upon Rust `R` ready signal; verified live on API 32 & API 35 in

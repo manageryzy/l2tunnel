@@ -5,10 +5,11 @@ shared Rust `l2tunnel-android-service` runtime (`CL-28`, `CL-29`, `CL-30`, `CL-3
 
 ## Architecture
 
-- **UI (4-tab Material 3 / Material You):**
+- **Adaptive UI (4-tab Material 3 / Material You):**
+  - Follows system light/dark with Android 12+ Material You dynamic colors, automatically switching between portrait `TopAppBar` + bottom `NavigationBar` and landscape/wide (`>= 600 dp`) left `NavigationRail` + 2-column dashboards and dialogs.
   - `Overview`: hero Connect/Disconnect/Reconnect card, profile switcher, peer/cover/RTT/TX/RX telemetry tiles, and live TX sparkline.
   - `Connection`: live make-before-break UDP cover switcher (`quic-like` / `media-like` / `tls-like`), live FEC/MTU tuning (`tuning_get`/`tuning_switch`), live wire speed budget (`rate_budget_set`), and in-process `TunnelTestV1` ping/speed tests.
-  - `Profiles & Keys`: multi-profile store under `noBackupFilesDir`, safe `.zip` bundle importer, typed L3 TUN editor, per-app split tunneling (`all` / `exclude` / `include` with mandatory anti-loop self-exclusion), and `KeystoreSecretStore` AES-256-GCM envelope encryption under `AndroidKeyStore` (ephemeral runtime staging is zeroed and deleted immediately on Rust readiness `R` or stop).
+  - `Profiles & Keys`: multi-profile store under `noBackupFilesDir`, safe `.zip` bundle importer, `l2tunnel://v1/connect` share URI import/export & Android deep-link handler (public by default; opt-in full provisioning), one-tap **New Profile** with automatic native `--keygen` + bundled `default_common_plan.json`, typed L3 TUN editor with 64-hex key paste & copyable client public keys, per-app split tunneling (`all` / `exclude` / `include` with mandatory anti-loop self-exclusion), and `KeystoreSecretStore` AES-256-GCM envelope encryption under `AndroidKeyStore` (ephemeral runtime staging is zeroed and deleted immediately on Rust readiness `R` or stop).
   - `Stats & Logs`: rolling 60-sample TX & RTT charts, transport/TUN counters, local CSR meters (`meters_read`), bounded redacted event log, and SAF redacted diagnostics JSON export (`CL-16`).
 
 - **Native owner (`apps/l2tunnel-android`):** Cross-compiled for `arm64-v8a` and
