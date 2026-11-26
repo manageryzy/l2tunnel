@@ -30,6 +30,8 @@ pub(super) const GROUPS: &[&str] = &[
     "carrier",
     "test",
     "tune",
+    "policy",
+    "plan",
 ];
 /// Default and maximum client-side watch bound for submissions, in seconds.
 const DEFAULT_WATCH_SECONDS: u64 = 120;
@@ -103,6 +105,15 @@ pub(super) const HELP: &str =
       (hot switch to the setting; controls not given keep their current value)
   tune budget --symmetric MBPS | --upload MBPS --download MBPS   (1..=10000 Mbit/s;
       live authenticated wire speed-budget update on both peers without reconnecting)
+  plan tune --input BASE.json --output OUT.json --device-mtu N --path-mtu M [--repair off|N/D] [--force]
+      (offline: generate a Common plan with custom Internal/Device MTU and Capsule/Path MTU,
+       supporting Internal MTU > Capsule MTU segmentation, e.g. --device-mtu 4096 --path-mtu 1300)
+  policy presets
+  policy lookup IP [--db CSV | --mmdb FILE]
+  policy test IP [--preset NAME | --rules FILE | --rule MATCH=ACTION,...] [--default tunnel|direct|reject] [--db CSV | --mmdb FILE]
+  policy compile [--preset NAME | --rules FILE | --rule MATCH=ACTION,...] [--default tunnel|direct|reject] [--peer IP] [--db CSV]
+      (offline: CIDR, ASN, GeoIP country/region, Continent, and Private/LAN redirect policy
+       evaluation and exact minimal TUN route compilation)
   config switch --configuration HEX [--request-key K] [--watch SECONDS | --detach]
   config catalog --generation G --catalog HEX --offset O --limit 1..4
   profile inspect OPTIONS   (same as inspect-common-transaction-plan)
@@ -197,6 +208,7 @@ enum Command {
     },
     Delegate(&'static str),
     KeyGenerate(local::keys::KeyGeneration),
+    LocalTool(policy::LocalToolCommand),
     Info,
     Sessions,
     Revoke {
@@ -522,6 +534,12 @@ fn parse(args: &[String]) -> Result<Parsed, Usage> {
                 flags.push("--detach");
             }
         }
+        ("policy" | "plan", _) if policy::accepted(group, verb).is_some() => {
+            if let Some((more_values, more_flags)) = policy::accepted(group, verb) {
+                values.extend(more_values);
+                flags.extend(more_flags);
+            }
+        }
         _ => return Err(usage(format!("unknown command {group} {verb}"))),
     }
     if group == "service" && matches!(verb, "connect" | "reconnect") {
@@ -535,7 +553,7 @@ fn parse(args: &[String]) -> Result<Parsed, Usage> {
     let flag = |name: &str| set.iter().any(|value| value == name);
     if (!matches!(
         group,
-        "operation" | "device" | "route" | "profile" | "test" | "meters"
+        "operation" | "device" | "route" | "profile" | "test" | "meters" | "policy"
     ) || verb == "list")
         && !positional.is_empty()
     {
@@ -695,6 +713,9 @@ fn parse(args: &[String]) -> Result<Parsed, Usage> {
                 follow: flag("--follow"),
                 service: service(&options)?,
             }
+        }
+        ("policy" | "plan", _) => {
+            Command::LocalTool(policy::parse(group, verb, &positional, &options, flag)?)
         }
         _ => return Err(usage(format!("unknown command {group} {verb}"))),
     };
@@ -1581,7 +1602,7 @@ async fn execute(parsed: Parsed) -> Exit {
                 Err((exit, error)) => failed(exit, error),
             }
         }
-        Command::Delegate(_) | Command::KeyGenerate(_) => Exit::Usage,
+        Command::Delegate(_) | Command::KeyGenerate(_) | Command::LocalTool(_) => Exit::Usage,
     }
 }
 
@@ -1598,6 +1619,11 @@ pub(super) fn main(args: &[String]) -> ExitCode {
         let mut forwarded = vec![target.to_owned()];
         forwarded.extend(args.iter().skip(2).cloned());
         return super::main_entry(forwarded);
+    }
+    if let Command::LocalTool(tool) = parsed.command {
+        let mut out = io::stdout().lock();
+        let mut err = io::stderr().lock();
+        return policy::run(tool, parsed.json, &mut out, &mut err).into();
     }
     if let Command::KeyGenerate(generation) = &parsed.command {
         return match local::keys::generate(generation) {
@@ -1640,6 +1666,8 @@ mod carrier;
 mod host;
 #[path = "cli_groups_meters.rs"]
 mod meters;
+#[path = "cli_groups_policy.rs"]
+mod policy;
 #[path = "cli_groups_profile.rs"]
 mod profile;
 #[path = "cli_groups_sessions.rs"]

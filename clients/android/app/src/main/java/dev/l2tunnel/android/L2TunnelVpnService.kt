@@ -31,7 +31,9 @@ import kotlinx.coroutines.launch
 import java.io.File
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.atomic.AtomicReference
 
 /** One bounded chart sample for the Overview/Stats live throughput & RTT plots. */
 data class TelemetrySample(
@@ -94,7 +96,11 @@ data class VpnUiState(
  */
 class L2TunnelVpnService : VpnService() {
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val lifecycleLock = Any()
     private val active = AtomicBoolean(false)
+    private val sessionToken = AtomicLong(0L)
+    private val lastStartId = AtomicInteger(-1)
+    private val lastRustOutput = AtomicReference<String?>(null)
     private val networkCoordinator = NetworkChangeCoordinator()
     private val secretStore = KeystoreSecretStore()
 
@@ -119,9 +125,10 @@ class L2TunnelVpnService : VpnService() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        lastStartId.set(startId)
         when (intent?.action) {
             ACTION_STOP -> {
-                stopTunnel("Disconnected")
+                requestStopTunnel("Disconnected", failed = false, detail = null)
                 return START_NOT_STICKY
             }
             ACTION_RECONNECT -> {
@@ -178,139 +185,170 @@ class L2TunnelVpnService : VpnService() {
     override fun onRevoke() {
         Log.i(TAG, "VPN permission revoked by system; tearing down immediately")
         appendEvent("android", "VPN permission revoked by system")
-        stopTunnel("VPN permission revoked")
+        requestStopTunnel("VPN permission revoked", failed = false, detail = null)
         super.onRevoke()
     }
 
     override fun onDestroy() {
-        stopTunnel("Stopped")
+        teardownSessionSync(expectedToken = null, reason = "Stopped", failed = false, detail = null, stopService = false)
         serviceScope.cancel()
         super.onDestroy()
     }
 
     private fun startTunnel(profileDir: File) {
-        // Android requires startForeground() on every startForegroundService() entry path
-        // (even if we abort and stopSelf() immediately), otherwise API 26+ throws a fatal
+        // Android requires startForeground() synchronously on every startForegroundService()
+        // entry path (even if we abort immediately), otherwise API 26+ throws
         // ForegroundServiceDidNotStartInTimeException and kills the app process.
         startForegroundServiceNotification("Starting l2tunnel…")
-        if (!active.compareAndSet(false, true)) {
+        if (active.get()) {
             Log.i(TAG, "Ignoring duplicate start request while tunnel is active")
             return
         }
-        // Always invoke VpnService.prepare() so ConnectivityService binds this package as the
-        // active prepared VPN app before any VpnService.protect() or Builder.establish() call.
-        if (VpnService.prepare(this) != null) {
-            active.set(false)
-            Log.w(TAG, "VPN permission not granted; user authorization via MainActivity required")
+        val token = sessionToken.incrementAndGet()
+        serviceScope.launch {
+            startTunnelLocked(profileDir, token)
+        }
+    }
+
+    private fun startTunnelLocked(profileDir: File, token: Long) {
+        synchronized(lifecycleLock) {
+            if (sessionToken.get() != token) return
+            if (!active.compareAndSet(false, true)) {
+                Log.i(TAG, "Ignoring duplicate start request while tunnel is active")
+                return
+            }
+            // Always invoke VpnService.prepare() so ConnectivityService binds this package as the
+            // active prepared VPN app before any VpnService.protect() or Builder.establish() call.
+            if (VpnService.prepare(this) != null) {
+                active.set(false)
+                Log.w(TAG, "VPN permission not granted; user authorization via MainActivity required")
+                publishState(
+                    _uiState.value.copy(
+                        running = false,
+                        phase = "failed",
+                        headline = "VPN permission required",
+                        detail = "Grant VPN authorization in the app before connecting.",
+                        profileName = profileDir.name,
+                    ),
+                )
+                stopForegroundIfCurrent(token)
+                return
+            }
+            val profile = try {
+                AndroidVpnProfile.loadFromDirectory(profileDir)
+            } catch (e: Exception) {
+                active.set(false)
+                publishState(
+                    _uiState.value.copy(
+                        running = false,
+                        phase = "failed",
+                        headline = "Invalid or missing profile",
+                        detail = e.message,
+                        profileName = profileDir.name,
+                    ),
+                )
+                stopForegroundIfCurrent(token)
+                return
+            }
+            activeProfile = profile
+            lastEventCursor = 0L
+            lastRustOutput.set(null)
+            appendEvent("android", "Starting profile '${profileDir.name}' (${profile.cover})")
+            updateNotification("Connecting to ${profile.udpPeer}…")
             publishState(
-                _uiState.value.copy(
-                    running = false,
-                    phase = "failed",
-                    headline = "VPN permission required",
-                    detail = "Grant VPN authorization in the app before connecting.",
+                VpnUiState(
+                    running = true,
+                    phase = "authenticating",
+                    headline = "Connecting…",
+                    peer = profile.udpPeer,
+                    cover = profile.cover,
                     profileName = profileDir.name,
+                    events = _uiState.value.events,
                 ),
             )
-            stopForeground(STOP_FOREGROUND_REMOVE)
-            stopSelf()
-            return
-        }
-        val profile = try {
-            AndroidVpnProfile.loadFromDirectory(profileDir)
-        } catch (e: Exception) {
-            active.set(false)
-            publishState(
-                _uiState.value.copy(
-                    running = false,
-                    phase = "failed",
-                    headline = "Invalid or missing profile",
+
+            val runDir = File(filesDir, "run").apply {
+                mkdirs()
+                KeystoreSecretStore.setOwnerOnlyDir(this)
+            }
+            val sockFile = File(runDir, "service.sock")
+            if (sockFile.exists()) {
+                sockFile.delete()
+            }
+            apiSocketFile = sockFile
+            apiClient = LocalApiV5Client(sockFile)
+
+            // Materialize decrypted ephemeral secrets in `noBackupFilesDir/runtime/<run-id>/`
+            // and scrub them immediately upon Rust readiness (`R`) or teardown.
+            val runtimeStage = File(
+                File(noBackupFilesDir, "runtime"),
+                "run-${AndroidProcess.myPid()}-${BROKER_SEQ.incrementAndGet()}",
+            )
+            val materializedDir = try {
+                secretStore.materializeRuntimeDirectory(profileDir, runtimeStage)
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to decrypt Keystore profile secrets: ${e.message}")
+                KeystoreSecretStore.scrubDirectory(runtimeStage)
+                teardownLocked(
+                    expectedToken = token,
+                    reason = "Keystore decryption failed",
+                    failed = true,
                     detail = e.message,
-                    profileName = profileDir.name,
-                ),
+                    stopService = true,
+                )
+                return
+            }
+            ephemeralRuntimeDir = materializedDir
+
+            val brokerName = "l2tunnel-vpn-${AndroidProcess.myPid()}-${BROKER_SEQ.incrementAndGet()}"
+            val fdBroker = FdBrokerServer(
+                abstractName = brokerName,
+                protectFd = { rawFd -> protect(rawFd) },
+                establishTun = { buildTunInterface(profile) },
+                onReady = {
+                    // Rust has already read all keys into memory; zero and delete plaintext copies now.
+                    scrubEphemeralSecrets()
+                    appendEvent("android", "Tunnel established; ephemeral secret staging wiped")
+                    updateNotification("Connected · ${profile.udpPeer}")
+                },
             )
-            stopForeground(STOP_FOREGROUND_REMOVE)
-            stopSelf()
-            return
-        }
-        activeProfile = profile
-        lastEventCursor = 0L
-        appendEvent("android", "Starting profile '${profileDir.name}' (${profile.cover})")
-        updateNotification("Connecting to ${profile.udpPeer}…")
-        publishState(
-            VpnUiState(
-                running = true,
-                phase = "authenticating",
-                headline = "Connecting…",
-                peer = profile.udpPeer,
-                cover = profile.cover,
-                profileName = profileDir.name,
-                events = _uiState.value.events,
-            ),
-        )
+            broker = fdBroker
+            fdBroker.start()
 
-        val runDir = File(filesDir, "run").apply {
-            mkdirs()
-            KeystoreSecretStore.setOwnerOnlyDir(this)
-        }
-        val sockFile = File(runDir, "service.sock")
-        if (sockFile.exists()) {
-            sockFile.delete()
-        }
-        apiSocketFile = sockFile
-        apiClient = LocalApiV5Client(sockFile)
+            val binary = File(applicationInfo.nativeLibraryDir, NATIVE_BINARY_NAME)
+            if (!binary.isFile || !binary.canExecute()) {
+                teardownLocked(
+                    expectedToken = token,
+                    reason = "Missing native binary",
+                    failed = true,
+                    detail = "Missing executable ${binary.name}",
+                    stopService = true,
+                )
+                return
+            }
 
-        // Materialize decrypted ephemeral secrets in `noBackupFilesDir/runtime/<run-id>/`
-        // and scrub them immediately upon Rust readiness (`R`) or teardown.
-        val runtimeStage = File(
-            File(noBackupFilesDir, "runtime"),
-            "run-${AndroidProcess.myPid()}-${BROKER_SEQ.incrementAndGet()}",
-        )
-        val materializedDir = try {
-            secretStore.materializeRuntimeDirectory(profileDir, runtimeStage)
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to decrypt Keystore profile secrets: ${e.message}")
-            KeystoreSecretStore.scrubDirectory(runtimeStage)
-            stopTunnel("Keystore decryption failed: ${e.message}")
-            return
-        }
-        ephemeralRuntimeDir = materializedDir
-
-        val brokerName = "l2tunnel-vpn-${AndroidProcess.myPid()}-${BROKER_SEQ.incrementAndGet()}"
-        val fdBroker = FdBrokerServer(
-            abstractName = brokerName,
-            protectFd = { rawFd -> protect(rawFd) },
-            establishTun = { buildTunInterface(profile) },
-            onReady = {
-                // Rust has already read all keys into memory; zero and delete plaintext copies now.
-                scrubEphemeralSecrets()
-                appendEvent("android", "Tunnel established; ephemeral secret staging wiped")
-                updateNotification("Connected · ${profile.udpPeer}")
-            },
-        )
-        broker = fdBroker
-        fdBroker.start()
-
-        val binary = File(applicationInfo.nativeLibraryDir, NATIVE_BINARY_NAME)
-        if (!binary.isFile || !binary.canExecute()) {
-            stopTunnel("Missing native binary ${binary.name}")
-            return
-        }
-
-        try {
-            val proc = ProcessBuilder(
-                binary.absolutePath,
-                materializedDir.absolutePath,
-                sockFile.absolutePath,
-                brokerName,
-            )
-                .redirectErrorStream(true)
-                .start()
-            childProcess = proc
-            registerNetworkCallback()
-            startSupervisionLoops(proc, profile)
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to start Rust Android service: ${e.message}")
-            stopTunnel("Service launch failed: ${e.message}")
+            try {
+                val proc = ProcessBuilder(
+                    binary.absolutePath,
+                    materializedDir.absolutePath,
+                    sockFile.absolutePath,
+                    brokerName,
+                )
+                    .redirectErrorStream(true)
+                    .start()
+                childProcess = proc
+                registerNetworkCallback()
+                startSupervisionLoops(proc, profile, token)
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to start Rust Android service: ${e.message}")
+                teardownLocked(
+                    expectedToken = token,
+                    reason = "Service launch failed",
+                    failed = true,
+                    detail = e.message,
+                    stopService = true,
+                )
+            }
         }
     }
 
@@ -319,7 +357,7 @@ class L2TunnelVpnService : VpnService() {
             .setSession("l2tunnel-${profile.profileDir.name}")
             .setMtu(profile.tunMtu)
             .addAddress(profile.tunAddress, profile.tunPrefixLength)
-        for ((dest, prefix) in profile.routes) {
+        for ((dest, prefix) in profile.resolveEffectiveRoutes()) {
             builder.addRoute(dest, prefix)
         }
         for (dns in profile.dnsServers) {
@@ -374,12 +412,17 @@ class L2TunnelVpnService : VpnService() {
         }
     }
 
-    private fun startSupervisionLoops(proc: Process, profile: AndroidVpnProfile) {
+    private fun startSupervisionLoops(proc: Process, profile: AndroidVpnProfile, token: Long) {
         pollJob?.cancel()
         pollJob = serviceScope.launch {
-            launch {
+            val stderrJob = launch {
                 try {
                     proc.inputStream.bufferedReader().forEachLine { line ->
+                        val trimmed = line.trim()
+                        if (trimmed.isNotEmpty()) {
+                            lastRustOutput.set(trimmed)
+                            appendEvent("rust", trimmed)
+                        }
                         Log.i("L2TunnelRust", line)
                     }
                 } catch (_: Exception) {
@@ -387,10 +430,22 @@ class L2TunnelVpnService : VpnService() {
             }
             launch {
                 val exit = proc.waitFor()
-                if (active.get()) {
-                    Log.w(TAG, "Rust Android service exited unexpectedly (code=$exit)")
+                try {
+                    // Let the stdout/stderr reader drain the final error line before publishing.
+                    kotlinx.coroutines.withTimeoutOrNull(250L) { stderrJob.join() }
+                } catch (_: Exception) {
+                }
+                if (sessionToken.get() == token && active.get()) {
+                    val rustMsg = lastRustOutput.get()
+                    Log.w(TAG, "Rust Android service exited unexpectedly (code=$exit): $rustMsg")
                     appendEvent("rust", "Service exited unexpectedly (code=$exit)")
-                    stopTunnel("Service exited (code $exit)")
+                    teardownSessionSync(
+                        expectedToken = token,
+                        reason = if (exit == 0) "Disconnected" else "Tunnel service failed (exit $exit)",
+                        failed = exit != 0,
+                        detail = rustMsg,
+                        stopService = true,
+                    )
                 }
             }
             var pollFailures = 0
@@ -398,7 +453,7 @@ class L2TunnelVpnService : VpnService() {
             var prevSentBytes: Long? = null
             var prevRecvPkts: Long? = null
             var prevTimeMs: Long? = null
-            while (isActive && active.get()) {
+            while (isActive && active.get() && sessionToken.get() == token) {
                 val client = apiClient
                 if (client != null && apiSocketFile?.exists() == true) {
                     try {
@@ -465,12 +520,17 @@ class L2TunnelVpnService : VpnService() {
                         val headline = formatHeadline(st)
                         val effectiveCover = c?.currentCover ?: st.cover ?: profile.cover
                         val currentState = _uiState.value
+                        val effectiveDetail = st.terminalReason ?: if (st.phase == "failed") {
+                            "Handshake/admission did not complete — check server address, UDP cover, and client/admission keys (see Stats & Logs)."
+                        } else {
+                            null
+                        }
                         publishState(
                             currentState.copy(
                                 running = true,
                                 phase = st.phase,
                                 headline = headline,
-                                detail = st.terminalReason,
+                                detail = effectiveDetail,
                                 peer = st.peer ?: profile.udpPeer,
                                 cover = effectiveCover,
                                 carrierSwitches = c?.switches ?: currentState.carrierSwitches,
@@ -621,7 +681,55 @@ class L2TunnelVpnService : VpnService() {
         }
     }
 
-    private fun stopTunnel(reason: String) {
+    private fun requestStopTunnel(reason: String, failed: Boolean, detail: String?) {
+        // Advance token immediately so any concurrent start or exit watcher yields,
+        // and run process/broker teardown off the main thread to avoid UI stalls.
+        val stopToken = sessionToken.incrementAndGet()
+        serviceScope.launch {
+            teardownSessionSync(
+                expectedToken = stopToken,
+                reason = reason,
+                failed = failed,
+                detail = detail,
+                stopService = true,
+            )
+        }
+    }
+
+    private fun stopForegroundIfCurrent(token: Long) {
+        if (sessionToken.get() == token) {
+            stopForeground(STOP_FOREGROUND_REMOVE)
+            val id = lastStartId.get()
+            if (id >= 0) {
+                stopSelf(id)
+            } else {
+                stopSelf()
+            }
+        }
+    }
+
+    private fun teardownSessionSync(
+        expectedToken: Long?,
+        reason: String,
+        failed: Boolean,
+        detail: String?,
+        stopService: Boolean,
+    ) {
+        synchronized(lifecycleLock) {
+            teardownLocked(expectedToken, reason, failed, detail, stopService)
+        }
+    }
+
+    private fun teardownLocked(
+        expectedToken: Long?,
+        reason: String,
+        failed: Boolean,
+        detail: String?,
+        stopService: Boolean,
+    ) {
+        if (expectedToken != null && sessionToken.get() != expectedToken) {
+            return
+        }
         val wasActive = active.getAndSet(false)
         pollJob?.cancel()
         pollJob = null
@@ -670,15 +778,23 @@ class L2TunnelVpnService : VpnService() {
             publishState(
                 VpnUiState(
                     running = false,
-                    phase = "disconnected",
+                    phase = if (failed) "failed" else "disconnected",
                     headline = reason,
+                    detail = detail,
                     profileName = activeProfile?.profileDir?.name,
                     events = _uiState.value.events,
                 ),
             )
         }
-        stopForeground(STOP_FOREGROUND_REMOVE)
-        stopSelf()
+        if (stopService && (expectedToken == null || sessionToken.get() == expectedToken)) {
+            stopForeground(STOP_FOREGROUND_REMOVE)
+            val id = lastStartId.get()
+            if (id >= 0) {
+                stopSelf(id)
+            } else {
+                stopSelf()
+            }
+        }
     }
 
     private fun appendEvent(source: String, message: String) {

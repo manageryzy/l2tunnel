@@ -261,6 +261,8 @@ class ProfileStore(
                 routes = prof.routes.map { "${it.first}/${it.second}" },
                 dns = prof.dnsServers,
                 tuneRepair = prof.tuneRepair,
+                tuneDeviceMtu = prof.tuneDeviceMtu,
+                tunePathMtu = prof.tunePathMtu,
                 secrets = secrets,
             ).encode()
         } finally {
@@ -299,8 +301,16 @@ class ProfileStore(
                 generateKeysIntoKeystore(safeId, nativeBinary, defaultCommonPlanBytes)
             }
             parsed.secrets.admission?.let { secretStore.writeEncryptedSecret(dir, "admission.key", it) }
-            parsed.secrets.noisePrivate?.let { secretStore.writeEncryptedSecret(dir, "noise-private.key", it) }
-            parsed.secrets.memberPk8?.let { secretStore.writeEncryptedSecret(dir, "member.pk8", it) }
+            parsed.secrets.noisePrivate?.let {
+                secretStore.writeEncryptedSecret(dir, "noise-private.key", it)
+                // Remove any stale public key left over from an earlier local keygen.
+                File(dir, "noise-client.pub").delete()
+            }
+            parsed.secrets.memberPk8?.let {
+                secretStore.writeEncryptedSecret(dir, "member.pk8", it)
+                // Remove any stale public key left over from an earlier local keygen.
+                File(dir, "member.pub").delete()
+            }
             parsed.secrets.noisePsk?.let { secretStore.writeEncryptedSecret(dir, "noise-psk.key", it) }
             setActiveProfile(safeId)
             return summarize(dir)
@@ -330,7 +340,8 @@ class ProfileStore(
         // Re-validate before writing so invalid configs are never persisted.
         val clientJson = updated.toClientJson()
         val vpnJson = updated.toAndroidVpnJson()
-        AndroidVpnProfile.parse(dir, clientJson, vpnJson)
+        val parsed = AndroidVpnProfile.parse(dir, clientJson, vpnJson)
+        AndroidVpnProfile.validateAgainstCommonPlan(parsed, File(dir, "common.json"))
         KeystoreSecretStore.writeOwnerOnlyBytes(File(dir, "client.json"), clientJson.toByteArray(Charsets.UTF_8))
         KeystoreSecretStore.writeOwnerOnlyBytes(File(dir, "android_vpn.json"), vpnJson.toByteArray(Charsets.UTF_8))
         return summarize(dir)

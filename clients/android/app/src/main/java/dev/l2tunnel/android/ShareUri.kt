@@ -46,6 +46,8 @@ data class ShareProfileUri(
     val routes: List<String> = emptyList(),
     val dns: List<String> = emptyList(),
     val tuneRepair: String? = null,
+    val tuneDeviceMtu: String? = null,
+    val tunePathMtu: String? = null,
     val secrets: ShareSecrets = ShareSecrets(),
 ) {
     fun encode(): String {
@@ -63,6 +65,8 @@ data class ShareProfileUri(
         if (routes.isNotEmpty()) pairs.add("routes" to percentEncode(routes.joinToString(",")))
         if (dns.isNotEmpty()) pairs.add("dns" to percentEncode(dns.joinToString(",")))
         if (!tuneRepair.isNullOrBlank()) pairs.add("tune_repair" to percentEncode(tuneRepair.trim()))
+        if (!tuneDeviceMtu.isNullOrBlank()) pairs.add("tune_device_mtu" to percentEncode(tuneDeviceMtu.trim()))
+        if (!tunePathMtu.isNullOrBlank()) pairs.add("tune_path_mtu" to percentEncode(tunePathMtu.trim()))
         secrets.admission?.let { pairs.add("adm" to hexEncode(it)) }
         secrets.noisePrivate?.let { pairs.add("key" to hexEncode(it)) }
         secrets.memberPk8?.let { pairs.add("member" to base64UrlEncode(it)) }
@@ -119,6 +123,8 @@ data class ShareProfileUri(
             noiseProfile = noise,
             handshakeSeconds = handshakeSeconds,
             tuneRepair = tuneRepair,
+            tuneDeviceMtu = tuneDeviceMtu,
+            tunePathMtu = tunePathMtu,
             tunAddress = tunAddr,
             tunPrefixLength = tunPrefix,
             routes = parsedRoutes,
@@ -132,7 +138,8 @@ data class ShareProfileUri(
         const val MAX_MEMBER_DER_BYTES = 256
         private val KNOWN_KEYS = setOf(
             "name", "peer", "cover", "noise", "peer_pub", "mtu", "path_mtu", "hs",
-            "tun", "routes", "dns", "tune_repair", "layer", "adm", "key", "member", "psk",
+            "tun", "routes", "dns", "tune_repair", "tune_device_mtu", "tune_path_mtu",
+            "layer", "adm", "key", "member", "psk",
         )
 
         fun decode(raw: String): ShareProfileUri {
@@ -200,6 +207,8 @@ data class ShareProfileUri(
                 ?.filter { it.isNotEmpty() }
                 ?: emptyList()
             val tuneRepair = map["tune_repair"]?.trim()?.ifEmpty { null }
+            val tuneDeviceMtu = map["tune_device_mtu"]?.trim()?.ifEmpty { null }
+            val tunePathMtu = map["tune_path_mtu"]?.trim()?.ifEmpty { null }
             val secrets = ShareSecrets(
                 admission = map["adm"]?.let { ProfileStore.parseHex32(it) },
                 noisePrivate = map["key"]?.let { ProfileStore.parseHex32(it) },
@@ -219,6 +228,8 @@ data class ShareProfileUri(
                 routes = routes,
                 dns = dns,
                 tuneRepair = tuneRepair,
+                tuneDeviceMtu = tuneDeviceMtu,
+                tunePathMtu = tunePathMtu,
                 secrets = secrets,
             )
             parsed.validate()

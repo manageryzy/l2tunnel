@@ -332,8 +332,85 @@ class AndroidUiCoreTest {
             assertTrue(fullExport.contains("&adm=2222"))
             assertTrue(fullExport.contains("&key=3333"))
             assertTrue(fullExport.contains("&member="))
+
+            // Importing a Full Provisioning URI over a profile with stale local pubkeys removes them
+            File(imported.directory, "noise-client.pub").writeBytes(ByteArray(32) { 0x55 })
+            File(imported.directory, "member.pub").writeBytes(ByteArray(32) { 0x66 })
+            val overwritten = profileStore.importShareUri(
+                uriText = fullUri,
+                defaultCommonPlanBytes = "{}".toByteArray(),
+            )
+            assertFalse(File(overwritten.directory, "noise-client.pub").exists())
+            assertFalse(File(overwritten.directory, "member.pub").exists())
+
+            // path_mtu smaller than common.json initial L2RC descriptor (1500 = 0x05dc) is rejected early
+            val fakeCommon = """{"initial_index":0,"catalog":["4c3252430201020000000000000005dc0000"]}"""
+            val commonFile = File(overwritten.directory, "common.json")
+            commonFile.writeText(fakeCommon)
+            assertEquals(1500, AndroidVpnProfile.readCommonPlanInitialPathMtu(commonFile))
+            try {
+                profileStore.saveEditedProfile("office", overwritten.profile!!.copy(pathMtu = 1300))
+                fail("path_mtu < common.json initial path_mtu must be rejected")
+            } catch (e: IllegalArgumentException) {
+                assertTrue(e.message!!.contains("1500"))
+            }
+
+            // Internal MTU > Capsule MTU is accepted when common.json matches (e.g. Internal 4096 > Capsule 1300 = 0x0514)
+            val jumboCommon = """{"initial_index":0,"catalog":["4c3252430201020000000000000005140000"]}"""
+            commonFile.writeText(jumboCommon)
+            assertEquals(1300, AndroidVpnProfile.readCommonPlanInitialPathMtu(commonFile))
+            val savedJumbo = profileStore.saveEditedProfile(
+                "office",
+                overwritten.profile!!.copy(
+                    tunMtu = 4096,
+                    pathMtu = 1300,
+                    tuneDeviceMtu = "1500,4096",
+                    tunePathMtu = "1280,1300,1400",
+                ),
+            )
+            assertTrue(savedJumbo.isValid)
+            assertEquals(4096, savedJumbo.profile?.tunMtu)
+            assertEquals(1300, savedJumbo.profile?.pathMtu)
+            val jumboUri = profileStore.exportShareUri("office", includeSecrets = false)
+            val parsedJumbo = ShareProfileUri.decode(jumboUri)
+            assertEquals(4096, parsedJumbo.tunMtu)
+            assertEquals(1300, parsedJumbo.pathMtu)
+            assertEquals("1500,4096", parsedJumbo.tuneDeviceMtu)
+            assertEquals("1280,1300,1400", parsedJumbo.tunePathMtu)
         } finally {
             tmpRoot.deleteRecursively()
         }
+    }
+
+    @Test
+    fun redirectPolicyEvaluatesAsnGeoIpContinentAndCompilesRoutes() {
+        val db = IpGeoAsnDatabase.builtin()
+        val cnPreset = RedirectPolicy.preset("bypass-cn-and-lan")
+        assertEquals(RedirectAction.DIRECT, cnPreset.evaluate("192.168.1.50", db).action)
+        assertEquals(RedirectAction.DIRECT, cnPreset.evaluate("114.114.114.114", db).action)
+        assertEquals(4134, cnPreset.evaluate("114.114.114.114", db).geo?.asn)
+        assertEquals(RedirectAction.TUNNEL, cnPreset.evaluate("8.8.8.8", db).action)
+        assertEquals("US", cnPreset.evaluate("8.8.8.8", db).geo?.country)
+
+        val asnPreset = RedirectPolicy.preset("tunnel-cloudflare-google")
+        assertEquals(RedirectAction.TUNNEL, asnPreset.evaluate("1.1.1.1", db).action)
+        assertEquals(RedirectAction.DIRECT, asnPreset.evaluate("114.114.114.114", db).action)
+
+        // Exact CIDR subtraction excludes peer endpoint IP and bypassed GeoIP/LAN prefixes
+        val compiled = cnPreset.compileIpv4Routes(
+            db = db,
+            peerHost = "198.51.100.10:24461",
+            alwaysIncludeCidrs = listOf("192.168.236.0" to 30),
+        )
+        val incCidrs = compiled.includeRoutes.mapNotNull { Ipv4Cidr.parse("${it.first}/${it.second}") }
+        assertFalse(incCidrs.any { it.contains(Ipv4Cidr.parseIp("198.51.100.10")!!) })
+        assertFalse(incCidrs.any { it.contains(Ipv4Cidr.parseIp("114.114.114.114")!!) })
+        assertTrue(incCidrs.any { it.contains(Ipv4Cidr.parseIp("8.8.8.8")!!) })
+        // Explicit tunnel subnet route is preserved even though PrivateLan is Direct
+        assertTrue(incCidrs.any { it.contains(Ipv4Cidr.parseIp("192.168.236.1")!!) })
+
+        // JSON persistence round-trip via android_vpn.json
+        val parsed = RedirectPolicy.fromJson(cnPreset.toJson())
+        assertEquals(cnPreset, parsed)
     }
 }

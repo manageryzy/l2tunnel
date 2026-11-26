@@ -7,7 +7,7 @@ fn main() -> std::process::ExitCode {
     match android::enter() {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("Android Common owner failed ({:?})", error.kind());
+            eprintln!("Android Common owner failed ({:?}): {error}", error.kind());
             std::process::ExitCode::FAILURE
         }
     }

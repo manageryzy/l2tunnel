@@ -16,6 +16,8 @@ mod fixture;
 pub mod model;
 #[cfg(any(unix, windows))]
 mod pages;
+#[cfg(any(unix, windows))]
+mod policy_panel;
 pub mod present;
 pub mod profile_fields;
 #[cfg(any(unix, windows))]

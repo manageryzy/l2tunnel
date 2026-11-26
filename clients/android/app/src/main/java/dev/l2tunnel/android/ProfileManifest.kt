@@ -46,12 +46,15 @@ data class AndroidVpnProfile(
     val noiseProfile: String,
     val handshakeSeconds: Int,
     val tuneRepair: String?,
+    val tuneDeviceMtu: String? = null,
+    val tunePathMtu: String? = null,
     val tunAddress: String,
     val tunPrefixLength: Int,
     val routes: List<Pair<String, Int>>,
     val dnsServers: List<String>,
     val splitTunnelMode: SplitTunnelMode = SplitTunnelMode.ALL,
     val splitTunnelApps: List<String> = emptyList(),
+    val redirectPolicy: RedirectPolicy? = null,
 ) {
     fun toClientJson(): String {
         val obj = JSONObject()
@@ -67,6 +70,12 @@ data class AndroidVpnProfile(
             .put("handshake_seconds", handshakeSeconds)
         if (!tuneRepair.isNullOrBlank()) {
             obj.put("tune_repair", tuneRepair.trim())
+        }
+        if (!tuneDeviceMtu.isNullOrBlank()) {
+            obj.put("tune_device_mtu", tuneDeviceMtu.trim())
+        }
+        if (!tunePathMtu.isNullOrBlank()) {
+            obj.put("tune_path_mtu", tunePathMtu.trim())
         }
         return obj.toString(2) + "\n"
     }
@@ -84,14 +93,30 @@ data class AndroidVpnProfile(
         for (pkg in splitTunnelApps.distinct().sorted()) {
             appsArr.put(pkg)
         }
-        return JSONObject()
+        val obj = JSONObject()
             .put("tun_address", tunAddress)
             .put("tun_prefix", tunPrefixLength)
             .put("routes", routesArr)
             .put("dns", dnsArr)
             .put("split_tunnel_mode", splitTunnelMode.wire)
             .put("split_tunnel_apps", appsArr)
-            .toString(2) + "\n"
+        redirectPolicy?.let { obj.put("redirect_policy", it.toJson()) }
+        return obj.toString(2) + "\n"
+    }
+
+    /**
+     * Resolves the effective IPv4 TUN routes to apply to `VpnService.Builder`, compiling
+     * ASN / GeoIP / Continent / CIDR redirect rules via exact interval subtraction when enabled.
+     */
+    fun resolveEffectiveRoutes(db: IpGeoAsnDatabase = IpGeoAsnDatabase.builtin()): List<Pair<String, Int>> {
+        val policy = redirectPolicy
+        if (policy == null || !policy.enabled) return routes
+        val compiled = policy.compileIpv4Routes(
+            db = db,
+            peerHost = udpPeer,
+            alwaysIncludeCidrs = routes,
+        )
+        return compiled.includeRoutes.ifEmpty { routes }
     }
 
     /**
@@ -174,6 +199,16 @@ data class AndroidVpnProfile(
             } else {
                 null
             }
+            val tuneDeviceMtu = if (client.has("tune_device_mtu") && !client.isNull("tune_device_mtu")) {
+                client.optString("tune_device_mtu", "").trim().ifEmpty { null }
+            } else {
+                null
+            }
+            val tunePathMtu = if (client.has("tune_path_mtu") && !client.isNull("tune_path_mtu")) {
+                client.optString("tune_path_mtu", "").trim().ifEmpty { null }
+            } else {
+                null
+            }
 
             var tunAddress = DEFAULT_TUN_ADDRESS
             var tunPrefix = DEFAULT_TUN_PREFIX
@@ -181,6 +216,7 @@ data class AndroidVpnProfile(
             var dns = DEFAULT_DNS
             var splitMode = SplitTunnelMode.ALL
             var splitApps: List<String> = emptyList()
+            var redirectPolicy: RedirectPolicy? = null
 
             if (!androidVpnJsonText.isNullOrBlank()) {
                 val vpn = JSONObject(androidVpnJsonText)
@@ -218,6 +254,9 @@ data class AndroidVpnProfile(
                     }
                     splitApps = list.distinct()
                 }
+                if (vpn.has("redirect_policy") && !vpn.isNull("redirect_policy")) {
+                    redirectPolicy = RedirectPolicy.fromJson(vpn.getJSONObject("redirect_policy"))
+                }
             }
 
             return AndroidVpnProfile(
@@ -230,12 +269,15 @@ data class AndroidVpnProfile(
                 noiseProfile = noiseProfile,
                 handshakeSeconds = handshakeSeconds,
                 tuneRepair = tuneRepair,
+                tuneDeviceMtu = tuneDeviceMtu,
+                tunePathMtu = tunePathMtu,
                 tunAddress = tunAddress,
                 tunPrefixLength = tunPrefix,
                 routes = routes,
                 dnsServers = dns,
                 splitTunnelMode = splitMode,
                 splitTunnelApps = splitApps,
+                redirectPolicy = redirectPolicy,
             )
         }
 
@@ -256,7 +298,39 @@ data class AndroidVpnProfile(
             }
             val vpnFile = File(profileDir, "android_vpn.json")
             val vpnText = if (vpnFile.isFile) vpnFile.readText() else null
-            return parse(profileDir, clientFile.readText(), vpnText)
+            val parsed = parse(profileDir, clientFile.readText(), vpnText)
+            validateAgainstCommonPlan(parsed, File(profileDir, "common.json"))
+            return parsed
+        }
+
+        /**
+         * Reads the initial catalog entry's `path_mtu` (big-endian `u64` at bytes 8..16 of the
+         * `L2RC` v2 binary descriptor) from `common.json`, returning `null` if unavailable.
+         */
+        fun readCommonPlanInitialPathMtu(commonFile: File): Int? {
+            if (!commonFile.isFile) return null
+            return try {
+                val obj = JSONObject(commonFile.readText())
+                val catalog = obj.optJSONArray("catalog") ?: return null
+                val idx = obj.optInt("initial_index", 0)
+                if (idx < 0 || idx >= catalog.length()) return null
+                val hex = catalog.optString(idx, "").trim()
+                if (hex.length < 32) return null
+                // Magic "L2RC" (4c325243) + version 2 (02)
+                if (!hex.substring(0, 10).equals("4c32524302", ignoreCase = true)) return null
+                val mtuLong = hex.substring(16, 32).toLong(16)
+                if (mtuLong in 1L..65535L) mtuLong.toInt() else null
+            } catch (_: Exception) {
+                null
+            }
+        }
+
+        /** Verifies `client.json`'s `path_mtu` is large enough for `common.json`'s initial descriptor. */
+        fun validateAgainstCommonPlan(profile: AndroidVpnProfile, commonFile: File) {
+            val planMtu = readCommonPlanInitialPathMtu(commonFile) ?: return
+            require(profile.pathMtu >= planMtu) {
+                "path_mtu (${profile.pathMtu}) must be at least $planMtu to match common.json"
+            }
         }
 
         fun parseCidrsText(text: String): List<Pair<String, Int>> {

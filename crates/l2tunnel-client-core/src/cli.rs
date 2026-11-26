@@ -321,14 +321,6 @@ pub fn main_entry(args: impl IntoIterator<Item = String>) -> ExitCode {
         println!("\n{}", system_service::HELP);
         return ExitCode::SUCCESS;
     }
-    #[cfg(any(unix, windows))]
-    if groups::GROUPS.contains(&args[0].as_str()) {
-        return groups::main(&args);
-    }
-    #[cfg(target_os = "linux")]
-    if args[0] == "system-service" {
-        return system_service::main(&args[1..]);
-    }
     if args.as_slice() == ["--version"] {
         println!("l2tunnel {}", env!("CARGO_PKG_VERSION"));
         return ExitCode::SUCCESS;
@@ -338,6 +330,14 @@ pub fn main_entry(args: impl IntoIterator<Item = String>) -> ExitCode {
             "Current production entries use Common compact Records with explicit original UDP, OpenVPN, raw TCP, retained TLS or genuine QUIC carriers. Algorithms remain explicit catalog configurations. Common active TUN credit, Windows service, complete Python mode parity and native qualification remain unfinished."
         );
         return ExitCode::SUCCESS;
+    }
+    #[cfg(any(unix, windows))]
+    if groups::GROUPS.contains(&args[0].as_str()) {
+        return groups::main(&args);
+    }
+    #[cfg(target_os = "linux")]
+    if args[0] == "system-service" {
+        return system_service::main(&args[1..]);
     }
     let command = &args[0];
     let mut allowed = match command.as_str() {

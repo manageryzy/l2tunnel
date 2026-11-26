@@ -210,14 +210,17 @@ private fun LiveTuningCard(
             } else {
                 val cur = tuning.current ?: tuning.entries.first()
                 Text(
-                    text = "Current: repair=${cur.repair} · device MTU=${cur.deviceMtu} · path MTU=${cur.pathMtu}",
+                    text = "Current: repair=${cur.repair} · Internal MTU=${cur.deviceMtu} B · Capsule MTU=${cur.pathMtu} B" +
+                        if (cur.deviceMtu > cur.pathMtu) " (Segmented: Internal > Capsule)" else "",
                     style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    color = if (cur.deviceMtu > cur.pathMtu) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
                 )
                 Text("FEC repair ratio", style = MaterialTheme.typography.labelMedium)
                 FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     tuning.repairChoices.forEach { repair ->
                         val target = tuning.entries.firstOrNull {
+                            it.repair == repair && it.deviceMtu == cur.deviceMtu && it.pathMtu == cur.pathMtu
+                        } ?: tuning.entries.firstOrNull {
                             it.repair == repair && it.deviceMtu == cur.deviceMtu
                         } ?: tuning.entries.firstOrNull { it.repair == repair }
                         FilterChip(
@@ -229,10 +232,12 @@ private fun LiveTuningCard(
                     }
                 }
                 if (tuning.deviceMtuChoices.size > 1) {
-                    Text("TUN MTU", style = MaterialTheme.typography.labelMedium)
+                    Text("Internal TUN MTU", style = MaterialTheme.typography.labelMedium)
                     FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         tuning.deviceMtuChoices.forEach { mtu ->
                             val target = tuning.entries.firstOrNull {
+                                it.repair == cur.repair && it.deviceMtu == mtu && it.pathMtu == cur.pathMtu
+                            } ?: tuning.entries.firstOrNull {
                                 it.repair == cur.repair && it.deviceMtu == mtu
                             } ?: tuning.entries.firstOrNull { it.deviceMtu == mtu }
                             FilterChip(
@@ -240,6 +245,24 @@ private fun LiveTuningCard(
                                 enabled = connected && target != null,
                                 onClick = { if (target != null) onTuningSwitch(target) },
                                 label = { Text("$mtu B") },
+                            )
+                        }
+                    }
+                }
+                if (tuning.pathMtuChoices.size > 1) {
+                    Text("Capsule / Path MTU (outer wire cap)", style = MaterialTheme.typography.labelMedium)
+                    FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        tuning.pathMtuChoices.forEach { pmtu ->
+                            val target = tuning.entries.firstOrNull {
+                                it.repair == cur.repair && it.deviceMtu == cur.deviceMtu && it.pathMtu == pmtu
+                            } ?: tuning.entries.firstOrNull {
+                                it.repair == cur.repair && it.pathMtu == pmtu
+                            } ?: tuning.entries.firstOrNull { it.pathMtu == pmtu }
+                            FilterChip(
+                                selected = cur.pathMtu == pmtu,
+                                enabled = connected && target != null,
+                                onClick = { if (target != null) onTuningSwitch(target) },
+                                label = { Text("$pmtu B") },
                             )
                         }
                     }

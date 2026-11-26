@@ -103,6 +103,7 @@ fun ProfilesScreen(
 ) {
     var editingProfileId by remember { mutableStateOf<String?>(null) }
     var splitEditingProfileId by remember { mutableStateOf<String?>(null) }
+    var redirectEditingProfileId by remember { mutableStateOf<String?>(null) }
     var sharingProfileId by remember { mutableStateOf<String?>(null) }
     var importUriDialogOpen by remember { mutableStateOf(false) }
     var importUriDraft by remember { mutableStateOf("") }
@@ -120,6 +121,7 @@ fun ProfilesScreen(
 
     val editingSummary = profiles.firstOrNull { it.id == editingProfileId }
     val splitEditingSummary = profiles.firstOrNull { it.id == splitEditingProfileId }
+    val redirectEditingSummary = profiles.firstOrNull { it.id == redirectEditingProfileId }
 
     val importCard: @Composable () -> Unit = {
         Card(modifier = Modifier.fillMaxWidth()) {
@@ -330,6 +332,19 @@ fun ProfilesScreen(
                                         },
                                         label = { Text(splitLabel) },
                                     )
+                                    val redir = editable.redirectPolicy
+                                    val redirLabel = if (redir != null && redir.enabled) {
+                                        "Rules: ${redir.rules.count { it.enabled }} active"
+                                    } else {
+                                        "Redirect Rules"
+                                    }
+                                    AssistChip(
+                                        onClick = { redirectEditingProfileId = summary.id },
+                                        leadingIcon = {
+                                            Icon(Icons.Filled.Link, contentDescription = null, modifier = Modifier.size(16.dp))
+                                        },
+                                        label = { Text(redirLabel) },
+                                    )
                                 }
                             }
 
@@ -408,6 +423,26 @@ fun ProfilesScreen(
                         prof.copy(splitTunnelMode = mode, splitTunnelApps = pkgs),
                     )
                     splitEditingProfileId = null
+                },
+            )
+        }
+    }
+
+    // Detailed Redirect Rules (GeoIP / ASN / CIDR) Dialog
+    if (redirectEditingSummary != null) {
+        val prof = redirectEditingSummary.editableProfile
+        if (prof != null) {
+            RedirectRulesDialog(
+                profileId = redirectEditingSummary.id,
+                initial = prof,
+                isWideLayout = isWideLayout,
+                onDismiss = { redirectEditingProfileId = null },
+                onSave = { policy ->
+                    onSaveProfile(
+                        redirectEditingSummary.id,
+                        prof.copy(redirectPolicy = policy),
+                    )
+                    redirectEditingProfileId = null
                 },
             )
         }
@@ -569,6 +604,8 @@ private fun ProfileEditorDialog(
     }
     var dnsText by remember(profileId) { mutableStateOf(initial.dnsServers.joinToString(", ")) }
     var tuneRepair by remember(profileId) { mutableStateOf(initial.tuneRepair ?: "off,1/8,1/4") }
+    var tuneDeviceMtu by remember(profileId) { mutableStateOf(initial.tuneDeviceMtu ?: "") }
+    var tunePathMtu by remember(profileId) { mutableStateOf(initial.tunePathMtu ?: "1280,1300,1400,1500") }
     var peerPubHex by remember(profileId) { mutableStateOf("") }
     var admissionHex by remember(profileId) { mutableStateOf("") }
     var copiedNotice by remember { mutableStateOf<String?>(null) }
@@ -660,6 +697,22 @@ private fun ProfileEditorDialog(
                 singleLine = true,
                 modifier = Modifier.fillMaxWidth(),
             )
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                OutlinedTextField(
+                    value = tuneDeviceMtu,
+                    onValueChange = { tuneDeviceMtu = it },
+                    label = { Text("Live Internal MTUs") },
+                    singleLine = true,
+                    modifier = Modifier.weight(1f),
+                )
+                OutlinedTextField(
+                    value = tunePathMtu,
+                    onValueChange = { tunePathMtu = it },
+                    label = { Text("Live Capsule MTUs") },
+                    singleLine = true,
+                    modifier = Modifier.weight(1f),
+                )
+            }
             Text("Keystore Keys & Plan Files", style = MaterialTheme.typography.labelMedium)
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 FilledTonalButton(onClick = onGenerateKeystoreKeys) {
@@ -815,8 +868,18 @@ private fun ProfileEditorDialog(
                             routes = parsedRoutes,
                             dnsServers = parsedDns,
                             tuneRepair = tuneRepair.trim().ifEmpty { null },
+                            tuneDeviceMtu = tuneDeviceMtu.trim().ifEmpty { null },
+                            tunePathMtu = tunePathMtu.trim().ifEmpty { null },
                         )
-                        AndroidVpnProfile.parse(initial.profileDir, updated.toClientJson(), updated.toAndroidVpnJson())
+                        val parsedUpdated = AndroidVpnProfile.parse(
+                            initial.profileDir,
+                            updated.toClientJson(),
+                            updated.toAndroidVpnJson(),
+                        )
+                        AndroidVpnProfile.validateAgainstCommonPlan(
+                            parsedUpdated,
+                            File(initial.profileDir, "common.json"),
+                        )
                         if (peerPubHex.isNotBlank()) {
                             val err = onSaveHexKey("noise-peer.pub", peerPubHex)
                             if (err != null) {
@@ -1049,9 +1112,9 @@ private fun ImportShareUriDialog(
                             )
                             Text(
                                 text = if (p.secrets.isEmpty) {
-                                    "Public URI (no private keys) — fresh client keys will be generated & sealed in Android Keystore."
+                                    "Public URI (no client secrets) — fresh keys will be generated locally. Register noise-client.pub, member.pub & admission.key on the server before connecting, or paste a Full Provisioning URI."
                                 } else {
-                                    "Full provisioning URI — embedded secrets will be sealed directly into Android Keystore AES-GCM."
+                                    "Full provisioning URI — embedded admission/Noise/member secrets will be sealed directly into Android Keystore AES-GCM."
                                 },
                                 style = MaterialTheme.typography.labelSmall,
                             )

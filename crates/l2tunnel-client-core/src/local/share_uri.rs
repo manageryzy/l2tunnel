@@ -95,6 +95,10 @@ pub struct ShareProfile {
     pub dns: Vec<String>,
     /// Optional live-tuning FEC catalog (e.g. `off,1/8,1/4`).
     pub tune_repair: Option<String>,
+    /// Optional live-tuning internal/device MTU choices (e.g. `1500,4096`).
+    pub tune_device_mtu: Option<String>,
+    /// Optional live-tuning outer capsule/path MTU choices (e.g. `1280,1300,1400,1500`).
+    pub tune_path_mtu: Option<String>,
     /// Optional secret provisioning fields (absent in default public URIs).
     pub secrets: ShareSecrets,
 }
@@ -183,6 +187,16 @@ impl ShareProfile {
         {
             pairs.push(("tune_repair", percent_encode(tr.trim())));
         }
+        if let Some(td) = &self.tune_device_mtu
+            && !td.trim().is_empty()
+        {
+            pairs.push(("tune_device_mtu", percent_encode(td.trim())));
+        }
+        if let Some(tp) = &self.tune_path_mtu
+            && !tp.trim().is_empty()
+        {
+            pairs.push(("tune_path_mtu", percent_encode(tp.trim())));
+        }
         if let Some(adm) = &self.secrets.admission {
             pairs.push(("adm", hex_encode(adm)));
         }
@@ -268,6 +282,8 @@ impl ShareProfile {
                     | "routes"
                     | "dns"
                     | "tune_repair"
+                    | "tune_device_mtu"
+                    | "tune_path_mtu"
                     | "layer"
                     | "adm"
                     | "key"
@@ -329,6 +345,11 @@ impl ShareProfile {
             })
             .unwrap_or_default();
         let tune_repair = map.get("tune_repair").cloned().filter(|s| !s.is_empty());
+        let tune_device_mtu = map
+            .get("tune_device_mtu")
+            .cloned()
+            .filter(|s| !s.is_empty());
+        let tune_path_mtu = map.get("tune_path_mtu").cloned().filter(|s| !s.is_empty());
         let secrets = ShareSecrets {
             admission: map.get("adm").map(|h| hex_decode_32(h)).transpose()?,
             noise_private: map.get("key").map(|h| hex_decode_32(h)).transpose()?,
@@ -348,6 +369,8 @@ impl ShareProfile {
             routes,
             dns,
             tune_repair,
+            tune_device_mtu,
+            tune_path_mtu,
             secrets,
         };
         parsed.validate()?;
@@ -393,6 +416,8 @@ impl ShareProfile {
             .and_then(|s| s.parse::<u16>().ok())
             .unwrap_or(30);
         let tune_repair = opt("--tune-repair").map(str::to_owned);
+        let tune_device_mtu = opt("--tune-device-mtu").map(str::to_owned);
+        let tune_path_mtu = opt("--tune-path-mtu").map(str::to_owned);
 
         let (peer, peer_pub) = match doc.role {
             ProfileRole::Connect => {
@@ -465,6 +490,8 @@ impl ShareProfile {
             routes: Vec::new(),
             dns: Vec::new(),
             tune_repair,
+            tune_device_mtu,
+            tune_path_mtu,
             secrets,
         };
         share.validate()?;
@@ -491,6 +518,12 @@ impl ShareProfile {
         options.insert("--max-path-mtu".into(), self.path_mtu.to_string());
         if let Some(tr) = &self.tune_repair {
             options.insert("--tune-repair".into(), tr.clone());
+        }
+        if let Some(td) = &self.tune_device_mtu {
+            options.insert("--tune-device-mtu".into(), td.clone());
+        }
+        if let Some(tp) = &self.tune_path_mtu {
+            options.insert("--tune-path-mtu".into(), tp.clone());
         }
         if let Some(dir) = key_dir {
             std::fs::create_dir_all(dir)
@@ -725,6 +758,8 @@ mod tests {
             routes: vec!["0.0.0.0/0".into()],
             dns: vec!["1.1.1.1".into()],
             tune_repair: Some("off,1/8,1/4".into()),
+            tune_device_mtu: None,
+            tune_path_mtu: None,
             secrets: ShareSecrets::default(),
         };
         let uri = public.encode()?;

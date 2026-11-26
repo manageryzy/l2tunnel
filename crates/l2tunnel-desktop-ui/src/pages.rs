@@ -102,6 +102,8 @@ pub struct UiState {
     pub confirm: Option<String>,
     /// New-route form.
     pub route: RouteForm,
+    /// Redirect policy (GeoIP / ASN / CIDR) draft and live tester.
+    pub policy: crate::policy_panel::PolicyForm,
     /// Stored profiles section and picker.
     pub profiles: crate::profiles::ProfileState,
     /// Member revoke: new member public key file.
@@ -146,6 +148,7 @@ impl Default for UiState {
             editing: None,
             confirm: None,
             route: RouteForm::default(),
+            policy: crate::policy_panel::PolicyForm::default(),
             profiles: crate::profiles::ProfileState::default(),
             revoke: String::new(),
             export: String::new(),
@@ -1706,6 +1709,13 @@ fn routes(ui: &mut egui::Ui, model: &mut Model, state: &mut UiState) -> Vec<Comm
             commands.extend(model.change_route(change));
         }
     });
+    let peer_ip = model
+        .status()
+        .and_then(|s| s.observation.as_ref())
+        .and_then(|o| o.common.as_ref())
+        .and_then(|c| c.peer.parse::<std::net::SocketAddr>().ok())
+        .map(|addr| addr.ip());
+    crate::policy_panel::show(ui, &mut state.policy, peer_ip);
     commands
 }
 

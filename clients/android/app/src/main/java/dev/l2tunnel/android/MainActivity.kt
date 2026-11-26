@@ -303,6 +303,11 @@ class MainActivity : ComponentActivity() {
                             },
                             onImportShareUri = { uriText, customName ->
                                 try {
+                                    val parsedPreview = ShareProfileUri.decode(uriText)
+                                    val hasFullClientSecrets = parsedPreview.secrets.admission != null &&
+                                        parsedPreview.secrets.noisePrivate != null &&
+                                        parsedPreview.secrets.memberPk8 != null
+                                    parsedPreview.secrets.zeroize()
                                     val nativeBin = File(applicationInfo.nativeLibraryDir, "libl2tunnel_android_service.so")
                                     val defaultPlan = resources.openRawResource(R.raw.default_common_plan).use { it.readBytes() }
                                     val imported = profileStore.importShareUri(
@@ -313,10 +318,13 @@ class MainActivity : ComponentActivity() {
                                     )
                                     reloadProfiles()
                                     overviewErrorState = null
-                                    profileBannerState = if (imported.isValid) {
-                                        "Imported '${imported.id}' from Share URI (Keystore AES-GCM sealed, ready to connect)."
-                                    } else {
-                                        "Imported '${imported.id}' from Share URI (${imported.validationError})."
+                                    profileBannerState = when {
+                                        !imported.isValid ->
+                                            "Imported '${imported.id}' from Share URI (${imported.validationError})."
+                                        hasFullClientSecrets ->
+                                            "Imported '${imported.id}' from Full Provisioning URI (Keystore AES-GCM sealed, ready to connect)."
+                                        else ->
+                                            "Imported '${imported.id}' from Public URI with new local keys — register noise-client.pub, member.pub & admission.key on the server before connecting (or import a Full Provisioning URI)."
                                     }
                                     null
                                 } catch (e: Exception) {
