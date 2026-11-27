@@ -7,9 +7,10 @@ use l2tunnel_platform_windows::Config;
 use std::{collections::BTreeMap, io, net::SocketAddr, path::PathBuf, time::Duration};
 
 /// Accepted configuration syntax and explicit execution capability limits.
-pub const HELP: &str = r"l2tunnel-windows service install HOST_OPTIONS | service start | service install-start ENCODED | service uninstall | service run HOST_OPTIONS | foreground HOST_OPTIONS
-HOST_OPTIONS: --profile ABSOLUTE_DIR --wintun-dll ABSOLUTE_DLL --wintun-sha256 HEX64 --address IPV4/PREFIX [--pipe \\.\pipe\NAME]
-The installed service (LocalSystem, manual start) owns the original UDP Common tunnel with an explicitly pinned Wintun L3 adapter and serves local API v1/v4/v5 on the named pipe (default \\.\pipe\l2tunnel). Use the nonprivileged l2tunnelctl or l2tunnel-windows-gui with --control-socket/--socket set to that pipe. `service start` starts the installed service and waits until it runs; `service install-start` is the UAC entry of `l2tunnelctl service start --install` and the GUI (host options hex-encoded as one argument). `service run` is only for the service control manager; `foreground` serves in an elevated console until Ctrl+C. The tunnel stays disconnected until a client submits connect. The legacy tcp-tls connect command only validates its configuration. Other commands: plan, --help, --version.";
+pub const HELP: &str = r"l2tunnel-windows daemon DAEMON_OPTIONS | service install DAEMON_OPTIONS | service install HOST_OPTIONS | service start | service install-start [ENCODED] | service uninstall | service run HOST_OPTIONS | service run-daemon DAEMON_OPTIONS | foreground HOST_OPTIONS | dpapi seal --input FILE --output FILE [--scope machine|user]
+DAEMON_OPTIONS (recommended): --state-dir ABSOLUTE_DIR [--wintun-dll ABSOLUTE_DLL --wintun-sha256 HEX64] [--address IPV4/PREFIX] [--pipe \\.\pipe\NAME] [--skip-acl-check]
+HOST_OPTIONS (legacy single-profile): --profile ABSOLUTE_DIR --wintun-dll ABSOLUTE_DLL --wintun-sha256 HEX64 --address IPV4/PREFIX [--pipe \\.\pipe\NAME]
+`service start` automatically installs the multi-profile LocalSystem daemon service under %ProgramFiles%\l2tunnel if it is not registered yet; `service install-start` reinstalls from the current binary and restarts it. The installed service (LocalSystem, manual start) owns the Wintun L3 adapter, Windows IP routes, multi-profile store, Event Log + rotating service.log diagnostics, sleep/resume + network-change reconnect, and DPAPI secret unsealing, supporting UDP covers (quic-like/media-like/tls-like), openvpn-like, TCP/TLS 1.3 (tcp), and QUIC (quic) over local API v5 (default pipe \\.\pipe\l2tunnel). Use nonprivileged l2tunnelctl or l2tunnel-windows-gui. Other commands: plan, --help, --version.";
 
 /// One parsed command; parsing opens no sockets, credentials or devices.
 pub enum Command {
@@ -189,6 +190,18 @@ pub fn parse(args: &[String]) -> io::Result<Command> {
 pub(crate) fn device_shape(dll: &str, pin: &str, address: &str) -> io::Result<()> {
     let unspecified = SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, 0));
     device_config(dll, pin, address, 1280, unspecified).map(drop)
+}
+
+/// Check only the IPv4/prefix address shape (for unpinned daemon options where
+/// `wintun.dll` is discovered from the install directory on connect).
+pub(crate) fn address_shape(address: &str) -> io::Result<()> {
+    let placeholder_dll = if cfg!(windows) {
+        r"C:\Program Files\l2tunnel\wintun.dll"
+    } else {
+        "/wintun.dll"
+    };
+    let placeholder_pin = "0".repeat(64);
+    device_shape(placeholder_dll, &placeholder_pin, address)
 }
 
 pub(crate) fn device_config(

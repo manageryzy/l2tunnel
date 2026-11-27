@@ -50,7 +50,7 @@ enum Outer {
         io_timeout_micros: u64,
     },
 }
-pub(super) fn read(bytes: &[u8], connection: crate::ConnectionConfig) -> io::Result<Settings> {
+pub(crate) fn read(bytes: &[u8], connection: crate::ConnectionConfig) -> io::Result<Settings> {
     if bytes.is_empty() || bytes.len() > 16 * 1024 {
         return Err(invalid("maintained policy exceeds input bound"));
     }

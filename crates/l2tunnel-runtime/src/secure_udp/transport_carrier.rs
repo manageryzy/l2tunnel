@@ -826,7 +826,7 @@ fn udp_write(socket: &UdpIo, bytes: &[u8], deadline: Instant) -> io::Result<Send
     if Instant::now() >= deadline {
         return Err(io::ErrorKind::TimedOut.into());
     }
-    let written = socket.try_send(bytes)?;
+    let written = super::try_send_udp(socket, bytes)?;
     if written != bytes.len() {
         return Err(io::Error::new(
             io::ErrorKind::WriteZero,

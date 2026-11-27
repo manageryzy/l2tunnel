@@ -12,16 +12,28 @@ pub(in crate::service::owner) async fn establish(
     requested: Arc<crate::secure_udp::common_transaction_profile::Profile>,
     outer_config: opaque::Config,
 ) -> io::Result<Active> {
+    #[cfg(windows)]
+    let device = {
+        setup::stage(shared, accepted.operation, SetupStage::Attachment);
+        let dev = plan.open_common_native().await.inspect_err(|_| {
+            setup::reason(shared, accepted.operation, SetupFailureReason::LocalIo);
+        })?;
+        check(deadline)?;
+        dev
+    };
     let Authenticated {
         effective,
         parts,
         contract,
     } = authenticate(shared, plan, accepted, deadline, requested, outer_config).await?;
     let info = parts.info;
-    setup::stage(shared, accepted.operation, SetupStage::Attachment);
-    let device = plan.open_native().inspect_err(|_| {
-        setup::reason(shared, accepted.operation, SetupFailureReason::LocalIo);
-    })?;
+    #[cfg(not(windows))]
+    let device = {
+        setup::stage(shared, accepted.operation, SetupStage::Attachment);
+        plan.open_common_native().await.inspect_err(|_| {
+            setup::reason(shared, accepted.operation, SetupFailureReason::LocalIo);
+        })?
+    };
     check(deadline)?;
     let (switcher, requests) = transport::common_channel();
     let requests = crate::service::device_mtu::tune(&plan.data.attachment, &effective, requests);

@@ -797,6 +797,7 @@ fn transient_receive_errors_are_counted_and_fatal_socket_errors_stay_errors() {
     for kind in [
         io::ErrorKind::WouldBlock,
         io::ErrorKind::ConnectionRefused,
+        io::ErrorKind::ConnectionReset,
         io::ErrorKind::PermissionDenied,
         io::ErrorKind::HostUnreachable,
         io::ErrorKind::NetworkUnreachable,
@@ -809,7 +810,7 @@ fn transient_receive_errors_are_counted_and_fatal_socket_errors_stay_errors() {
             None
         );
     }
-    assert_eq!(statistics.socket_receive_errors, 6);
+    assert_eq!(statistics.socket_receive_errors, 7);
     assert!(matches!(
         received_length(
             Err(io::Error::from(io::ErrorKind::InvalidInput)),
@@ -817,7 +818,7 @@ fn transient_receive_errors_are_counted_and_fatal_socket_errors_stay_errors() {
         ),
         Err(Error::Io(_))
     ));
-    assert_eq!(statistics.socket_receive_errors, 6);
+    assert_eq!(statistics.socket_receive_errors, 7);
 }
 #[tokio::test]
 async fn mismatched_pinned_context_never_releases_a_root() {

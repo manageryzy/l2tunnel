@@ -4,9 +4,9 @@ use super::*;
 use l2tunnel::record_configuration::Configuration;
 use l2tunnel_runtime::secure_udp::transport;
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub(super) mod carrier;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub(super) mod maintained;
 #[cfg(unix)]
 pub(super) mod raw;
@@ -18,6 +18,19 @@ pub(super) async fn establish(
     deadline: Instant,
     profile: Arc<crate::secure_udp::common_transaction_profile::Profile>,
 ) -> io::Result<Active> {
+    // On Windows, creating a Wintun adapter (PnP driver init + IPv4 setup) can
+    // take several seconds. Open it before starting the handshake so the remote
+    // peer never exhausts its ~4.85 s initial control-stream retries while
+    // waiting for local Wintun setup; if authentication fails, `device` drops cleanly.
+    #[cfg(windows)]
+    let device = {
+        setup::stage(shared, accepted.operation, SetupStage::Attachment);
+        let dev = plan.open_common_native().await.inspect_err(|_| {
+            setup::reason(shared, accepted.operation, SetupFailureReason::LocalIo);
+        })?;
+        check(deadline)?;
+        dev
+    };
     let session = authenticate_selected_secure_udp(
         shared,
         plan,
@@ -44,10 +57,13 @@ pub(super) async fn establish(
         ));
     }
     let parts = session.into_parts();
-    setup::stage(shared, accepted.operation, SetupStage::Attachment);
-    let device = plan.open_common_native().await.inspect_err(|_| {
-        setup::reason(shared, accepted.operation, SetupFailureReason::LocalIo);
-    })?;
+    #[cfg(not(windows))]
+    let device = {
+        setup::stage(shared, accepted.operation, SetupStage::Attachment);
+        plan.open_common_native().await.inspect_err(|_| {
+            setup::reason(shared, accepted.operation, SetupFailureReason::LocalIo);
+        })?
+    };
     check(deadline)?;
     let (switcher, requests) = transport::common_channel();
     let requests = crate::service::device_mtu::tune(&plan.data.attachment, &profile, requests);

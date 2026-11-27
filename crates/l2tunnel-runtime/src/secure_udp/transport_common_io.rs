@@ -1774,6 +1774,7 @@ impl Driver {
                 if matches!(
                     error.kind(),
                     io::ErrorKind::ConnectionRefused
+                        | io::ErrorKind::ConnectionReset
                         | io::ErrorKind::HostUnreachable
                         | io::ErrorKind::NetworkUnreachable
                         | io::ErrorKind::NetworkDown

@@ -1715,7 +1715,12 @@ fn routes(ui: &mut egui::Ui, model: &mut Model, state: &mut UiState) -> Vec<Comm
         .and_then(|o| o.common.as_ref())
         .and_then(|c| c.peer.parse::<std::net::SocketAddr>().ok())
         .map(|addr| addr.ip());
-    crate::policy_panel::show(ui, &mut state.policy, peer_ip);
+    let selected_dev = (!state.route.device.is_empty()).then_some(state.route.device.as_str());
+    if let Some(route_change) =
+        crate::policy_panel::show(ui, &mut state.policy, peer_ip, selected_dev)
+    {
+        commands.extend(model.change_route(route_change));
+    }
     commands
 }
 

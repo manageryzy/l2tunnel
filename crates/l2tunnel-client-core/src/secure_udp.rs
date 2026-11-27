@@ -6,7 +6,7 @@
 #[cfg(all(test, unix))]
 pub(crate) mod common_fixture;
 #[cfg(unix)]
-pub(crate) use crate::cli::secure_udp_frontend::{common_cli, common_runtime_cli};
+pub(crate) use crate::cli::secure_udp_frontend::{common_cli, common_runtime_cli, maintained_cli};
 #[cfg(not(unix))]
 pub(crate) mod common_cli;
 #[cfg(not(unix))]
@@ -21,6 +21,8 @@ pub(crate) mod datagram_profile;
 pub mod live_tuning;
 /// Explicit maintained TCP/TLS and genuine QUIC Common transport policies.
 pub mod maintained;
+#[cfg(not(unix))]
+pub(crate) mod maintained_cli;
 /// Load a provisioned native Common UDP client.
 pub mod native_client;
 /// Bounded performance telemetry shared by CLI and embedding frontends.

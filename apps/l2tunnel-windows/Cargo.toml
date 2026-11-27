@@ -30,6 +30,7 @@ l2tunnel-core = { path = "../../crates/l2tunnel-core" }
 l2tunnel-device = { path = "../../crates/l2tunnel-device" }
 l2tunnel-platform-windows = { path = "../../crates/l2tunnel-platform-windows" }
 l2tunnel-desktop-ui = { path = "../../crates/l2tunnel-desktop-ui", optional = true }
+ring = "=0.17.14"
 tokio = { version = "=1.53.1", features = ["rt-multi-thread", "macros", "signal", "time", "sync"] }
 zeroize = "=1.9.0"
 

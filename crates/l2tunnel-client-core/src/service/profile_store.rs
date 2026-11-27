@@ -13,6 +13,7 @@ use crate::local::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::io::{self, Write};
+#[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -50,14 +51,17 @@ fn write_private(path: &Path, value: &impl Serialize) -> io::Result<()> {
     let text = serde_json::to_vec_pretty(value).map_err(io::Error::other)?;
     let temporary = path.with_extension("tmp");
     {
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&temporary)?;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let mut file = options.open(&temporary)?;
         file.write_all(&text)?;
         file.sync_all()?;
+    }
+    #[cfg(windows)]
+    if path.exists() {
+        let _ = std::fs::remove_file(path);
     }
     std::fs::rename(&temporary, path)
 }
@@ -80,7 +84,11 @@ impl FileStore {
     /// Open (creating `profiles/` if needed) in an already checked state directory.
     pub fn open(state_directory: &Path, prepare: Preparer) -> io::Result<Arc<Self>> {
         let directory = state_directory.join("profiles");
-        match std::fs::DirBuilder::new().mode(0o700).create(&directory) {
+        #[cfg_attr(not(unix), allow(unused_mut))]
+        let mut builder = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        builder.mode(0o700);
+        match builder.create(&directory) {
             Ok(()) => {}
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
                 if !std::fs::symlink_metadata(&directory)?.is_dir() {

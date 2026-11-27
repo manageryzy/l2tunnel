@@ -237,11 +237,26 @@ fn read_file(
         // This reader does not claim to inspect or qualify the file's ACL.
     }
     let mut bytes = Zeroizing::new(Vec::new());
-    let limit = u64::try_from(maximum)
+    #[cfg(windows)]
+    let read_max = if private {
+        maximum.saturating_mul(2).saturating_add(1024)
+    } else {
+        maximum
+    };
+    #[cfg(not(windows))]
+    let read_max = maximum;
+    let limit = u64::try_from(read_max)
         .ok()
         .and_then(|bound| bound.checked_add(1))
         .ok_or_else(|| invalid("credential length overflow"))?;
     file.take(limit).read_to_end(&mut bytes)?;
+    if bytes.len() > read_max {
+        return Err(invalid("credential file exceeds exact bound"));
+    }
+    #[cfg(windows)]
+    if private && l2tunnel_platform_windows::dpapi::is_sealed(&bytes) {
+        bytes = l2tunnel_platform_windows::dpapi::unprotect_secret(&bytes)?;
+    }
     if bytes.len() > maximum {
         return Err(invalid("credential file exceeds exact bound"));
     }

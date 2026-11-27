@@ -7,6 +7,17 @@ use std::{
 
 fn execute() -> io::Result<()> {
     let arguments: Vec<String> = std::env::args().skip(1).collect();
+    #[cfg(windows)]
+    if arguments.is_empty()
+        && let Ok(exe) = std::env::current_exe()
+        && let Some(dir) = exe.parent()
+    {
+        let gui = dir.join("l2tunnel-windows-gui.exe");
+        if gui.is_file() {
+            std::process::Command::new(gui).spawn()?;
+            return Ok(());
+        }
+    }
     if let Some(command) = l2tunnel_windows::service::parse(&arguments) {
         return l2tunnel_windows::service::execute(command?);
     }
@@ -19,7 +30,7 @@ fn execute() -> io::Result<()> {
         ),
         Command::Plan => writeln!(
             io::stdout().lock(),
-            "Windows service host (cross-compiled; not yet executed on native Windows) serves local API v1/v4/v5 on a named pipe with a proposed DACL and owns a provisioned original UDP Common tunnel with a pinned Wintun L3 device. Windows TAP, alternate carriers, credential vault, event logging, sleep/recovery and native hardware qualification remain open.\n{}",
+            "Windows multi-profile service daemon (cross-compiled; native Windows hardware qualification remains open) serves local API v1/v4/v5 on a protected named pipe and owns pinned Wintun L3 adapters, Windows IP Helper routes, live MTU tuning, DPAPI secret unsealing, Event Log + service.log diagnostics, sleep/network-change reconnect, and UDP/OpenVPN-like/TCP-TLS/QUIC Common carriers. Windows TAP/VXLAN L2 and native hardware receipts remain open.\n{}",
             l2tunnel::IMPLEMENTATION_STATUS
         ),
         Command::Connect(plan) => {

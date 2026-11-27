@@ -1819,6 +1819,18 @@ struct Driver {
     device_mtu: Option<Box<device_mtu::Gate>>,
 }
 
+/// Nonblocking UDP datagram send that cannot be stalled by an un-armed Tokio
+/// `Interest::WRITABLE` cache on Windows Mio/AFD.
+pub(super) fn try_send_udp(socket: &tokio::net::UdpSocket, bytes: &[u8]) -> io::Result<usize> {
+    match socket.try_send(bytes) {
+        #[cfg(windows)]
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+            socket2::SockRef::from(socket).send(bytes)
+        }
+        other => other,
+    }
+}
+
 impl Driver {
     fn take_inputs(&mut self) -> io::Result<buffers::Inputs> {
         match self.inputs.take() {
@@ -2657,7 +2669,7 @@ impl Driver {
         self.outer = self.outer.checked_add(1).ok_or_else(exhausted)?;
         self.counters.wire_packets = self.counters.wire_packets.saturating_add(1);
         self.counters.wire_bytes = self.counters.wire_bytes.saturating_add(cost as u64);
-        match socket.try_send(&self.buffers.wire[..bytes]) {
+        match try_send_udp(socket, &self.buffers.wire[..bytes]) {
             Ok(sent) if sent == bytes => {
                 self.counters.socket_accepted_packets =
                     self.counters.socket_accepted_packets.saturating_add(1);
@@ -2850,7 +2862,7 @@ impl Driver {
                 let origin = self.origin;
                 if self.send_common_user_sampled(
                     now,
-                    |bytes| socket.try_send(bytes),
+                    |bytes| try_send_udp(socket, bytes),
                     || clock(origin, sample()).map(|at| at.max(now)),
                 )? {
                     emitted += 1;

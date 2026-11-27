@@ -16,6 +16,11 @@ eframe = { version = "=0.35.0", default-features = false, features = ["accesskit
 tokio = { version = "=1.53.1", features = ["rt", "time", "sync", "macros"] }
 serde_json = "=1.0.151"
 
+[target.'cfg(windows)'.dependencies]
+# On Windows enable wgpu (DX12 / DX11 / Vulkan / Microsoft WARP software fallback)
+# alongside glow so the GUI always renders even on VMs, RDP, or OpenGL 1.1 hosts.
+eframe = { version = "=0.35.0", default-features = false, features = ["accesskit", "default_fonts", "glow", "wgpu"] }
+
 [dev-dependencies]
 # A real canonical configuration for switch tests (same fixture as client-core).
 l2tunnel = { path = "../l2tunnel" }

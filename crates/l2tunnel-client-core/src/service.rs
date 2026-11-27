@@ -27,12 +27,13 @@ mod common_reuse_local;
 pub mod host;
 #[cfg(target_os = "linux")]
 pub mod host_linux;
+#[cfg(windows)]
+pub mod host_windows;
 mod info_local;
 mod meters_local;
 mod metrics_local;
 mod operations_local;
 mod owner;
-#[cfg(unix)]
 pub mod profile_store;
 pub mod profiles;
 mod proxy_backend;

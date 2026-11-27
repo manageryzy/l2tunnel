@@ -122,6 +122,38 @@ impl DeviceMtuHost for LinuxDevice {
     }
 }
 
+/// A Windows Wintun device controlled via [`l2tunnel_platform_windows::MtuController`].
+#[cfg(windows)]
+pub struct WindowsDevice {
+    controller: l2tunnel_platform_windows::MtuController,
+}
+#[cfg(windows)]
+impl WindowsDevice {
+    /// Wrap a live Wintun MTU controller.
+    pub fn new(controller: l2tunnel_platform_windows::MtuController) -> Self {
+        Self { controller }
+    }
+}
+#[cfg(windows)]
+impl DeviceMtuHost for WindowsDevice {
+    fn get(&self) -> MtuFuture<'_, u32> {
+        let ctrl = self.controller.clone();
+        Box::pin(async move {
+            tokio::task::spawn_blocking(move || ctrl.get_mtu())
+                .await
+                .map_err(io::Error::other)?
+        })
+    }
+    fn set(&self, mtu: u32) -> MtuFuture<'_, ()> {
+        let ctrl = self.controller.clone();
+        Box::pin(async move {
+            tokio::task::spawn_blocking(move || ctrl.set_mtu(mtu))
+                .await
+                .map_err(io::Error::other)?
+        })
+    }
+}
+
 #[cfg(test)]
 #[path = "device_mtu_tests.rs"]
 mod tests;

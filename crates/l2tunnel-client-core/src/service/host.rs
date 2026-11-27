@@ -60,12 +60,23 @@ pub async fn attach_state_dir(handle: &Handle, directory: Option<&String>) -> io
             .attach_host(host)
             .map_err(|_| io::Error::other("a device/route host is already attached"))
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(windows)]
+    {
+        let host = super::host_windows::WindowsHost::open(
+            std::path::Path::new(directory),
+            l2tunnel_platform_windows::MtuController::new(),
+        )
+        .await?;
+        handle
+            .attach_host(host)
+            .map_err(|_| io::Error::other("a device/route host is already attached"))
+    }
+    #[cfg(not(any(target_os = "linux", windows)))]
     {
         let _ = (handle, directory);
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
-            "--state-dir device/route management is implemented on Linux only",
+            "--state-dir device/route management is implemented on Linux and Windows only",
         ))
     }
 }

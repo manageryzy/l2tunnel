@@ -32,6 +32,37 @@ pub const MAXIMUM_WAIT: Duration = Duration::from_secs(600);
 pub const LINUX_PROGRAM: &str = "/usr/local/libexec/l2tunnel/l2tunnel-linux";
 /// Linux: directory of systemd system units.
 pub const LINUX_UNIT_DIRECTORY: &str = "/etc/systemd/system";
+
+/// Windows: default administrator-owned installation directory (`%ProgramFiles%\l2tunnel`).
+pub fn windows_install_dir() -> PathBuf {
+    std::env::var_os("ProgramFiles")
+        .map(|root| PathBuf::from(root).join("l2tunnel"))
+        .unwrap_or_else(|| PathBuf::from(r"C:\Program Files\l2tunnel"))
+}
+
+/// Windows: default administrator-owned copy of the service program
+/// (`%ProgramFiles%\l2tunnel\l2tunnel-windows.exe`).
+pub fn windows_program() -> PathBuf {
+    windows_install_dir().join("l2tunnel-windows.exe")
+}
+
+/// Windows: default state directory for the multi-profile daemon service
+/// (`%ProgramData%\l2tunnel\state`).
+pub fn windows_state_dir() -> PathBuf {
+    std::env::var_os("ProgramData")
+        .map(|root| PathBuf::from(root).join("l2tunnel").join("state"))
+        .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData\l2tunnel\state"))
+}
+
+/// Windows: diagnostic file recording the last elevated `service start` /
+/// `install-start` error so unprivileged callers (GUI/CLI) can display why
+/// UAC-elevated startup failed (since `ShellExecuteExW` does not pipe stderr).
+pub fn windows_start_error_log() -> PathBuf {
+    windows_state_dir()
+        .parent()
+        .map(|parent| parent.join("last-start-error.txt"))
+        .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData\l2tunnel\last-start-error.txt"))
+}
 /// Bound of one readiness probe.
 const PROBE: Duration = Duration::from_secs(2);
 /// Readiness polling period.
@@ -449,16 +480,23 @@ mod platform {
     }
 
     pub(super) fn check(request: &StartRequest) -> Result<(), StartError> {
-        if let Some(options) = &request.install {
+        if let Some(options) = &request.install
+            && !options.is_empty()
+        {
             encode_arguments(options).map_err(|error| StartError::Invalid(error.to_string()))?;
         }
         Ok(())
     }
 
-    /// Run `service start` or `service install-start` through UAC.
+    /// Run `service start` (which automatically installs the service if missing)
+    /// or `service install-start [ENCODED]` through UAC.
     pub(super) async fn start(request: &StartRequest) -> Result<bool, StartError> {
+        let missing_installed = !super::windows_program().is_file();
         let arguments = match &request.install {
             None => vec!["service".to_owned(), "start".to_owned()],
+            Some(options) if options.is_empty() => {
+                vec!["service".to_owned(), "install-start".to_owned()]
+            }
             Some(options) => vec![
                 "service".to_owned(),
                 "install-start".to_owned(),
@@ -479,12 +517,14 @@ mod platform {
         .map_err(|error| StartError::Launch(io::Error::other(error)))?
         .map_err(StartError::Launch)?;
         match status.code() {
-            Some(0) => Ok(request.install.is_some()),
+            Some(0) => Ok(request.install.is_some() || missing_installed),
             Some(ELEVATION_FAILED) => Err(StartError::Dismissed),
-            code => Err(StartError::Failed {
-                code,
-                output: String::new(),
-            }),
+            code => {
+                let output = std::fs::read_to_string(super::windows_start_error_log())
+                    .map(|text| text.trim().chars().take(512).collect::<String>())
+                    .unwrap_or_default();
+                Err(StartError::Failed { code, output })
+            }
         }
     }
 }

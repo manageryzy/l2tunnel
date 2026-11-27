@@ -338,6 +338,63 @@ state.
 The full `tools/check.py` was not run, because the local virtual environment
 lacks the simulator's optional dependencies.
 
+## Recent Windows parity & hardening additions (2026-11-27)
+
+Still **cross-compiled and Wine-tested only** (native Windows hardware qualification
+remains open until `Verify-L2TunnelWindows.ps1` runs on a real Windows host):
+
+- **Multi-profile daemon mode (`--state-dir`):** `l2tunnel-windows daemon` and
+  `l2tunnel-windows service install --state-dir DIR --wintun-dll DLL --wintun-sha256 HEX`
+  attach the shared cross-platform `FileStore`, `WindowsHost` (IP Helper routing),
+  and `AutoRecoveryPolicy::default_enabled()` so `l2tunnelctl` and
+  `l2tunnel-windows-gui` have full multi-profile, Share URI, and route parity with Linux.
+- **All non-raw Common carriers on Windows:** `quic-like`, `media-like`, `tls-like`,
+  `openvpn-like`, maintained `tcp` (TLS 1.3 with custom `--sni`), and genuine `quic`
+  (Quinn) prepare and attach cleanly to Wintun L3 (`raw-packet` and `--layer tap`
+  remain explicitly refused with `Unsupported`).
+- **Live Wintun MTU (`MtuController` / `WindowsDevice`):** `Device::open_with_mtu`
+  exposes live MTU read/update to `service::device_mtu::DeviceMtuHost` for live
+  `Internal MTU > Capsule MTU` switches.
+- **Narrow documented FFI modules in `l2tunnel-platform-windows` (awaiting owner
+  approval alongside `local_pipe::ffi`):**
+  - `routes::ffi`: `iphlpapi.dll` (`CreateIpForwardEntry2`, `DeleteIpForwardEntry2`,
+    `GetIpForwardTable2`, `GetBestRoute2`) with crash-safe `<state-dir>/host-state.json`
+    ownership tracking and automatic peer anti-loop bypass routes.
+  - `dpapi::ffi`: `CryptProtectData` / `CryptUnprotectData` (`L2DP` envelope +
+    zeroizing buffers, `l2tunnel-windows dpapi seal`, transparent unsealing in
+    `credentials::read_secret` / `read_member_der`).
+  - `security::ffi`: `GetNamedSecurityInfoW` + DACL audit (`WLS-08`) verifying
+    admin-only ownership and no non-admin write ACEs on install/state/DLL folders.
+  - `event_log::ffi`: Windows Event Log (`RegisterEventSourceW`/`ReportEventW`)
+    paired with bounded rotating `<state-dir>/service.log` (`CL-27`).
+  - `net_watch::ffi`: `NotifyIpInterfaceChange` + SCM `ServiceControl::PowerEvent`
+    (`ResumeAutomatic`/`ResumeSuspend`/`ResumeCritical`) through `TransitionLimiter`
+    (`1.5 s` debounce, `6 / 5 min` cap).
+- **One-click auto-install & Windows rendering (Linux GUI parity):**
+  `l2tunnel-windows-gui.exe` stays unprivileged and attaches to `\\.\pipe\l2tunnel`
+  just like `l2tunnel-linux-gui`. When no service answers, clicking **"Start service…"**
+  prompts UAC for `l2tunnel-windows.exe service start`, which automatically installs
+  the multi-profile LocalSystem daemon service into `%ProgramFiles%\l2tunnel` (hardening
+  directory ACLs with `icacls.exe`, copying an adjacent `wintun.dll` if present, and
+  creating `%ProgramData%\l2tunnel\state`) whenever the service is missing (`ERROR_SERVICE_DOES_NOT_EXIST`).
+  Zero-argument `service install-start` reinstalls from the current binary and restarts
+  the service (backing the GUI's **"Install & restart service…"** update banner and
+  `Advanced -> Reinstall`). On Windows the GUI prefers `eframe`'s `wgpu` renderer
+  (DX12 / DX11 / Vulkan / Microsoft WARP software fallback) with automatic clean-process
+  `--renderer glow` fallback, and displays a native Win32 `MessageBoxW` plus
+  `%LOCALAPPDATA%\l2tunnel\gui-startup.log` on startup errors. Launching
+  `l2tunnel-windows.exe` with no arguments spawns the sibling `l2tunnel-windows-gui.exe`
+  when present.
+- **Packaging & native qualification scripts:** `scripts/build-windows-bundle.sh`
+  produces `dist/l2tunnel-windows-x86_64.zip` containing release `l2tunnel-windows.exe`,
+  `l2tunnel-windows-gui.exe` (supporting `l2tunnel://` deep-link arguments),
+  `l2tunnelctl.exe`, default 1500/1500 and jumbo 4096>1300 Common plans, and
+  `scripts/windows/{Install,Uninstall,Verify}-L2Tunnel*.ps1`.
+- **2026-11-27 Wine 9.0 & cross-check evidence:**
+  - `cargo clippy --target x86_64-pc-windows-gnu -p l2tunnel-platform-windows -p l2tunnel-windows --features gui -p l2tunnel-desktop-ui -p l2tunnelctl --all-targets --no-deps --locked -- -D warnings`: passed (0 warnings).
+  - `RUSTDOCFLAGS='-D warnings' cargo doc --target x86_64-pc-windows-gnu --no-deps --locked -p l2tunnel-platform-windows -p l2tunnel-windows -p l2tunnel-desktop-ui -p l2tunnelctl`: passed.
+  - Wine 9.0: `l2tunnel-platform-windows` **14/14 passed** (including native `CryptProtectData`/`CryptUnprotectData` DPAPI round-trip), `l2tunnel-windows` **19/19 passed**, release `l2tunnelctl.exe` (`policy lookup`, `policy test`, `plan tune --device-mtu 4096 --path-mtu 1300`) and release `l2tunnel-windows.exe` (`dpapi seal`, `plan`) all passed.
+
 ## Awaiting owner review
 
 - The proposed DACL (IU read/write without instance creation), or a dedicated

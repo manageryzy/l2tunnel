@@ -180,7 +180,7 @@ pub(super) fn establish(shared: Arc<Shared>, plan: Prepared, accepted: Accepted)
             deadline,
             common::establish(&shared, &plan, accepted, deadline, profile)
         ),
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         Transport::SecureUdpCommonMaintained(profile) => selected!(
             deadline,
             common::maintained::establish(&shared, &plan, accepted, deadline, profile)
@@ -194,7 +194,7 @@ pub(super) fn establish(shared: Arc<Shared>, plan: Prepared, accepted: Accepted)
             deadline,
             common::raw::establish(&shared, &plan, accepted, deadline, profile, raw, opener)
         ),
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         Transport::SecureUdpCommonCarrier { profile, outer } => selected!(
             deadline,
             common::carrier::establish(&shared, &plan, accepted, deadline, profile, *outer)
@@ -215,7 +215,7 @@ async fn authenticate_selected_secure_udp(
     let role = match &plan.data.endpoint {
         Endpoint::SecureClient(_) => Role::Initiator,
         Endpoint::SecureServer(_) => Role::Responder,
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         _ => {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -319,7 +319,7 @@ async fn authenticate_selected_secure_udp(
                 )
                 .await?
         }
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         _ => {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,

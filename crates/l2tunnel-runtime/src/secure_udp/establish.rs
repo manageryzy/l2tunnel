@@ -2009,11 +2009,15 @@ fn received_length(
     }
 }
 /// Native path conditions consume a bounded attempt, preserving retained ARQ.
+///
+/// Includes `ConnectionReset` because Windows Winsock maps ICMP Port Unreachable
+/// on UDP sockets to `WSAECONNRESET` (10054), whereas Unix reports `ECONNREFUSED`.
 pub(super) fn path_loss(error: &io::Error) -> bool {
     matches!(
         error.kind(),
         io::ErrorKind::WouldBlock
             | io::ErrorKind::ConnectionRefused
+            | io::ErrorKind::ConnectionReset
             | io::ErrorKind::PermissionDenied
             | io::ErrorKind::HostUnreachable
             | io::ErrorKind::NetworkUnreachable

@@ -37,7 +37,14 @@ impl Default for PolicyForm {
 }
 
 /// Render the Redirect Rules (ASN / GeoIP / CIDR) editor and live IP tester.
-pub fn show(ui: &mut egui::Ui, form: &mut PolicyForm, peer_ip: Option<IpAddr>) {
+/// Returns an optional `RouteChange` when the user applies a compiled route to
+/// the active tunnel device.
+pub fn show(
+    ui: &mut egui::Ui,
+    form: &mut PolicyForm,
+    peer_ip: Option<IpAddr>,
+    target_device: Option<&str>,
+) -> Option<l2tunnel_client_core::local::RouteChange> {
     ui.add_space(12.0);
     ui.separator();
     ui.add_space(6.0);
@@ -169,4 +176,27 @@ pub fn show(ui: &mut egui::Ui, form: &mut PolicyForm, peer_ip: Option<IpAddr>) {
         compiled.exclude_v4.len(),
         compiled.expanded_prefixes
     ));
+    let mut applied = None;
+    if let Some(dev) = target_device.filter(|d| !d.is_empty())
+        && let Some(first_cidr) = compiled.include_v4.first()
+    {
+        ui.horizontal(|ui| {
+            if ui
+                .button(format!("Apply first route ({first_cidr}) to {dev}"))
+                .clicked()
+            {
+                applied = Some(l2tunnel_client_core::local::RouteChange::Add {
+                    destination: first_cidr.clone(),
+                    gateway: None,
+                    device: dev.to_owned(),
+                    metric: None,
+                });
+            }
+            ui.weak(format!(
+                "Full batch: l2tunnelctl policy compile --preset … ({} routes)",
+                compiled.include_v4.len()
+            ));
+        });
+    }
+    applied
 }

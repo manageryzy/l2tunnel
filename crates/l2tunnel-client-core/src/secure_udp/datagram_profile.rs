@@ -65,7 +65,7 @@ impl Common {
             .ok_or_else(|| input("raw final capacity below authenticated framing"))?;
         Ok((overhead, maximum_body))
     }
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub(crate) fn bootstrap_arq_geometry(
         self,
         settings: &mut secure_udp::Settings,
@@ -90,7 +90,7 @@ impl Common {
             .ok_or_else(|| input("carrier bootstrap receive geometry overflow"))?;
         Ok(())
     }
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub(crate) fn carrier_geometry(
         self,
         settings: &mut secure_udp::Settings,

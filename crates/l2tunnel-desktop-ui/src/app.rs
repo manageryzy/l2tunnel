@@ -67,6 +67,13 @@ impl App {
         app.dispatch(commands);
         app
     }
+    /// Pre-populate the Share URI import field (e.g. from a Windows `l2tunnel://` deep link).
+    pub fn prefill_share_uri(&mut self, uri: String) {
+        self.page = Page::Management;
+        self.ui.profiles.share_uri_input = uri;
+        self.model.notice =
+            "Loaded l2tunnel:// Share URI — review and click Import URI on Management".into();
+    }
     fn dispatch(&mut self, commands: Vec<Command>) {
         if !commands.is_empty() && !self.worker.send(commands) {
             self.model.notice = "Background worker unavailable; restart the GUI".into();

@@ -18,12 +18,22 @@ use std::io::Read;
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 
+/// Windows DPAPI secret envelope sealing (`L2DP`, CL-27).
+pub mod dpapi;
+/// Bounded rotating file diagnostics and Windows Event Log reporter (CL-27).
+pub mod event_log;
 /// Local API named-pipe names, proposed access policy and security boundary.
 pub mod local_pipe;
 #[cfg(windows)]
 mod native;
+/// Debounced Windows IP interface change and sleep/resume coordinator (CL-27).
+pub mod net_watch;
+/// Windows IPv4/IPv6 routing table access via IP Helper API (`iphlpapi.dll`).
+pub mod routes;
+/// Administrator-only directory ACL auditing (`WLS-08`).
+pub mod security;
 #[cfg(windows)]
-pub use native::Device;
+pub use native::{Device, MtuController};
 
 /// Maximum DLL size accepted before any native library is loaded.
 pub const MAX_DLL_BYTES: u64 = 16 * 1024 * 1024;

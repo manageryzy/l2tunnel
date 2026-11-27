@@ -21,7 +21,7 @@ mod common_cli_output;
 #[path = "common_proxy_cli.rs"]
 mod common_proxy_cli;
 #[path = "maintained_cli.rs"]
-mod maintained_cli;
+pub(crate) mod maintained_cli;
 #[cfg(all(test, target_os = "linux"))]
 pub(crate) use common_proxy_cli::event as proxy_event_for_test;
 #[cfg(all(test, target_os = "linux"))]

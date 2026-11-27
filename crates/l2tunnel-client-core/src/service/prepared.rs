@@ -145,12 +145,12 @@ pub struct Server {
 pub(super) enum Endpoint {
     SecureClient(crate::secure_udp::credentials::Client),
     SecureServer(Box<SecureServer>),
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     CommonCarrierClient {
         outer: Client,
         inner: crate::secure_udp::credentials::Client,
     },
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     CommonCarrierServer(Box<CommonCarrierServer>),
     #[cfg(unix)]
     CommonRawClient {
@@ -159,19 +159,19 @@ pub(super) enum Endpoint {
     },
     #[cfg(unix)]
     CommonRawServer(Box<CommonRawServer>),
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     CommonMaintainedClient {
         outer: crate::secure_udp::maintained::Client,
         inner: crate::secure_udp::credentials::Client,
     },
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     CommonMaintainedServer(Box<CommonMaintainedServer>),
 }
 pub(super) struct SecureServer {
     pub credentials: crate::secure_udp::credentials::Server,
     pub admission: tokio::sync::Mutex<Option<crate::secure_udp::Server>>,
 }
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub(super) struct CommonCarrierServer {
     pub outer: Server,
     pub inner: crate::secure_udp::credentials::Server,
@@ -189,7 +189,7 @@ pub(super) struct CommonRawServer {
         Option<l2tunnel_runtime::secure_udp::establish::raw_carrier::RawInitialServerAdmission>,
     >,
 }
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub(super) struct CommonMaintainedServer {
     pub outer: crate::secure_udp::maintained::Server,
     pub inner: crate::secure_udp::credentials::Server,
@@ -212,9 +212,9 @@ pub(super) enum Transport {
         opener: crate::raw_packet::common::PacketOpener,
     },
     SecureUdpCommon(Arc<crate::secure_udp::common_transaction_profile::Profile>),
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     SecureUdpCommonMaintained(Arc<crate::secure_udp::common_transaction_profile::Profile>),
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     SecureUdpCommonCarrier {
         profile: Arc<crate::secure_udp::common_transaction_profile::Profile>,
         outer: Arc<l2tunnel_openvpn::wire_carrier::common::Config>,
@@ -246,10 +246,12 @@ impl Prepared {
     pub fn role(&self) -> local::Role {
         match &self.data.endpoint {
             Endpoint::SecureServer(_) => local::Role::Server,
+            #[cfg(any(unix, windows))]
+            Endpoint::CommonCarrierServer(_) | Endpoint::CommonMaintainedServer(_) => {
+                local::Role::Server
+            }
             #[cfg(unix)]
-            Endpoint::CommonCarrierServer(_)
-            | Endpoint::CommonRawServer(_)
-            | Endpoint::CommonMaintainedServer(_) => local::Role::Server,
+            Endpoint::CommonRawServer(_) => local::Role::Server,
             _ => local::Role::Client,
         }
     }
@@ -382,7 +384,7 @@ impl Prepared {
     }
     /// Explicit initial-only OpenVPN outer TLS and common Noise/member client.
     /// Validation defers all socket, handshake and attachment work to the service.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub fn secure_udp_common_carrier_client(
         profile: crate::secure_udp::common_transaction_profile::Profile,
         outer: l2tunnel_openvpn::wire_carrier::common::Config,
@@ -402,7 +404,7 @@ impl Prepared {
         )
     }
     /// Explicit compact Common over original maintained TLS or genuine QUIC.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub fn secure_udp_common_maintained_client(
         profile: crate::secure_udp::common_transaction_profile::Profile,
         outer: crate::secure_udp::maintained::Client,
@@ -417,7 +419,7 @@ impl Prepared {
         )
     }
     /// Matching retained Full/Half acceptor, with no listener opened at preparation.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub fn secure_udp_common_maintained_server(
         profile: crate::secure_udp::common_transaction_profile::Profile,
         outer: crate::secure_udp::maintained::Server,
@@ -470,7 +472,7 @@ impl Prepared {
         )
     }
     /// Explicit fixed-peer OpenVPN acceptor with independent TLS and Noise trust.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub fn secure_udp_common_carrier_server(
         profile: crate::secure_udp::common_transaction_profile::Profile,
         outer: l2tunnel_openvpn::wire_carrier::common::Config,
@@ -593,7 +595,7 @@ impl Prepared {
                 server.credentials.noise(),
                 l2tunnel_security::Role::Responder,
             ),
-            #[cfg(unix)]
+            #[cfg(any(unix, windows))]
             _ => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
@@ -618,6 +620,133 @@ impl Prepared {
         profile.runtime_contract(role)?;
         Ok(())
     }
+    #[cfg(any(unix, windows))]
+    fn validate_maintained(
+        connection: ConnectionConfig,
+        endpoint: &Endpoint,
+        attachment: &Attachment,
+        profile: &crate::secure_udp::common_transaction_profile::Profile,
+        proxy: bool,
+    ) -> io::Result<()> {
+        use crate::secure_udp::maintained::{
+            Client as OuterClient, Server as OuterServer, Transport as OuterTransport,
+        };
+        let selected = profile.maintained_settings().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "maintained policy absent")
+        })?;
+        selected.request(connection)?;
+        if profile.maintained_binding().is_some()
+            || (!proxy && !attachment.readable_kind())
+            || proxy != profile.proxy_config().is_some()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "maintained Common requires its explicit unbound native or proxy plan",
+            ));
+        }
+        let settings = profile.settings();
+        let (noise, role) = match endpoint {
+            Endpoint::CommonMaintainedClient { outer, inner } => {
+                if outer.member().0 != settings.member.0 || inner.member_key() != settings.member {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "maintained member identities differ",
+                    ));
+                }
+                match (selected.transport, outer) {
+                    (OuterTransport::Tls(_), OuterClient::Tls(tls)) => {
+                        Self::client_endpoint(tls)?;
+                        if tls.remote != selected.first.server {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidInput,
+                                "maintained TLS endpoint differs",
+                            ));
+                        }
+                    }
+                    (
+                        OuterTransport::Quic(profiles),
+                        OuterClient::Quic {
+                            roots, server_name, ..
+                        },
+                    ) => {
+                        if server_name.is_empty()
+                            || server_name.len() > 253
+                            || server_name.as_bytes().contains(&0)
+                        {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidInput,
+                                "invalid QUIC verification name",
+                            ));
+                        }
+                        for profile in profiles.into_iter().flatten() {
+                            l2tunnel_quic::ClientConfig::from_der_roots(
+                                roots,
+                                profile,
+                                l2tunnel_quic::EndpointLimits::default(),
+                            )
+                            .map_err(io::Error::other)?;
+                        }
+                    }
+                    _ => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "maintained credential/transport mismatch",
+                        ));
+                    }
+                }
+                (inner.noise(), l2tunnel_security::Role::Initiator)
+            }
+            Endpoint::CommonMaintainedServer(server) => {
+                if !server
+                    .outer
+                    .members()
+                    .contains(l2tunnel_auth::MemberPublicKey(settings.member.0))
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "maintained allowlist excludes member",
+                    ));
+                }
+                match (selected.transport, &server.outer) {
+                    (OuterTransport::Tls(_), OuterServer::Tls(tls))
+                        if tls.listen == selected.first.server => {}
+                    (OuterTransport::Quic(profiles), OuterServer::Quic { certs, key, .. }) => {
+                        for profile in profiles.into_iter().flatten() {
+                            l2tunnel_quic::ServerConfig::from_der(
+                                certs,
+                                key,
+                                profile,
+                                l2tunnel_quic::EndpointLimits::default(),
+                            )
+                            .map_err(io::Error::other)?;
+                        }
+                    }
+                    _ => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "maintained server credential/transport mismatch",
+                        ));
+                    }
+                }
+                (server.inner.noise(), l2tunnel_security::Role::Responder)
+            }
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "maintained credentials absent",
+                ));
+            }
+        };
+        if noise.profile() != settings.profile || noise.peers(role) != profile.peers() {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "maintained Noise pins differ",
+            ));
+        }
+        profile.maintained_session()?;
+        Ok(())
+    }
+
     fn new(
         connection: ConnectionConfig,
         endpoint: Endpoint,
@@ -703,133 +832,15 @@ impl Prepared {
                 }
                 raw.validate(profile, role)?;
             }
-            #[cfg(unix)]
-            Transport::SecureUdpCommonMaintained(profile)
-            | Transport::ProxyCommonMaintained(profile) => {
-                use crate::secure_udp::maintained::{
-                    Client as OuterClient, Server as OuterServer, Transport as OuterTransport,
-                };
-                let selected = profile.maintained_settings().ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::InvalidInput, "maintained policy absent")
-                })?;
-                selected.request(connection)?;
-                let proxy = matches!(&transport, Transport::ProxyCommonMaintained(_));
-                if profile.maintained_binding().is_some()
-                    || (!proxy && !attachment.readable_kind())
-                    || proxy != profile.proxy_config().is_some()
-                {
-                    return Err(io::Error::new(
-                        io::ErrorKind::Unsupported,
-                        "maintained Common requires its explicit unbound native or proxy plan",
-                    ));
-                }
-                let settings = profile.settings();
-                let (noise, role) = match &endpoint {
-                    Endpoint::CommonMaintainedClient { outer, inner } => {
-                        if outer.member().0 != settings.member.0
-                            || inner.member_key() != settings.member
-                        {
-                            return Err(io::Error::new(
-                                io::ErrorKind::PermissionDenied,
-                                "maintained member identities differ",
-                            ));
-                        }
-                        match (selected.transport, outer) {
-                            (OuterTransport::Tls(_), OuterClient::Tls(tls)) => {
-                                Self::client_endpoint(tls)?;
-                                if tls.remote != selected.first.server {
-                                    return Err(io::Error::new(
-                                        io::ErrorKind::InvalidInput,
-                                        "maintained TLS endpoint differs",
-                                    ));
-                                }
-                            }
-                            (
-                                OuterTransport::Quic(profiles),
-                                OuterClient::Quic {
-                                    roots, server_name, ..
-                                },
-                            ) => {
-                                if server_name.is_empty()
-                                    || server_name.len() > 253
-                                    || server_name.as_bytes().contains(&0)
-                                {
-                                    return Err(io::Error::new(
-                                        io::ErrorKind::InvalidInput,
-                                        "invalid QUIC verification name",
-                                    ));
-                                }
-                                for profile in profiles.into_iter().flatten() {
-                                    l2tunnel_quic::ClientConfig::from_der_roots(
-                                        roots,
-                                        profile,
-                                        l2tunnel_quic::EndpointLimits::default(),
-                                    )
-                                    .map_err(io::Error::other)?;
-                                }
-                            }
-                            _ => {
-                                return Err(io::Error::new(
-                                    io::ErrorKind::InvalidInput,
-                                    "maintained credential/transport mismatch",
-                                ));
-                            }
-                        }
-                        (inner.noise(), l2tunnel_security::Role::Initiator)
-                    }
-                    Endpoint::CommonMaintainedServer(server) => {
-                        if !server
-                            .outer
-                            .members()
-                            .contains(l2tunnel_auth::MemberPublicKey(settings.member.0))
-                        {
-                            return Err(io::Error::new(
-                                io::ErrorKind::PermissionDenied,
-                                "maintained allowlist excludes member",
-                            ));
-                        }
-                        match (selected.transport, &server.outer) {
-                            (OuterTransport::Tls(_), OuterServer::Tls(tls))
-                                if tls.listen == selected.first.server => {}
-                            (
-                                OuterTransport::Quic(profiles),
-                                OuterServer::Quic { certs, key, .. },
-                            ) => {
-                                for profile in profiles.into_iter().flatten() {
-                                    l2tunnel_quic::ServerConfig::from_der(
-                                        certs,
-                                        key,
-                                        profile,
-                                        l2tunnel_quic::EndpointLimits::default(),
-                                    )
-                                    .map_err(io::Error::other)?;
-                                }
-                            }
-                            _ => {
-                                return Err(io::Error::new(
-                                    io::ErrorKind::InvalidInput,
-                                    "maintained server credential/transport mismatch",
-                                ));
-                            }
-                        }
-                        (server.inner.noise(), l2tunnel_security::Role::Responder)
-                    }
-                    _ => {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidInput,
-                            "maintained credentials absent",
-                        ));
-                    }
-                };
-                if noise.profile() != settings.profile || noise.peers(role) != profile.peers() {
-                    return Err(io::Error::new(
-                        io::ErrorKind::PermissionDenied,
-                        "maintained Noise pins differ",
-                    ));
-                }
-                profile.maintained_session()?;
+            #[cfg(any(unix, windows))]
+            Transport::SecureUdpCommonMaintained(profile) => {
+                Self::validate_maintained(connection, &endpoint, &attachment, profile, false)?;
             }
             #[cfg(unix)]
+            Transport::ProxyCommonMaintained(profile) => {
+                Self::validate_maintained(connection, &endpoint, &attachment, profile, true)?;
+            }
+            #[cfg(any(unix, windows))]
             Transport::SecureUdpCommonCarrier { profile, outer } => {
                 if profile.proxy_config().is_some() {
                     return Err(io::Error::new(

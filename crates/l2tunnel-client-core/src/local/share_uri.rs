@@ -18,6 +18,10 @@ pub const SHARE_URI_PREFIX: &str = "l2tunnel://v1/connect";
 pub const MAX_SHARE_URI_BYTES: usize = 16_384;
 /// Maximum raw member PKCS#8 DER length accepted inside a share URI.
 pub const MAX_MEMBER_DER_BYTES: usize = 256;
+/// Bundled default Common transaction plan JSON (1500/1500 Swift) used when
+/// materializing imported `l2tunnel://` share URIs on Desktop and CLI clients
+/// (matching the bundled Android `default_common_plan.json`).
+pub const DEFAULT_COMMON_PLAN_JSON: &str = include_str!("../../resources/default_common_plan.json");
 
 /// Explicit parse/encode errors for `l2tunnel://` share URIs.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -511,11 +515,16 @@ impl ShareProfile {
         options.insert("--duplex".into(), "full".into());
         options.insert("--compression".into(), "off".into());
         options.insert("--layer".into(), "tun".into());
+        options.insert("--device".into(), "l2t0".into());
         options.insert("--udp-bind".into(), "0.0.0.0:0".into());
         options.insert("--udp-peer".into(), self.peer.clone());
         options.insert("--noise-profile".into(), self.noise.clone());
         options.insert("--max-packet".into(), self.tun_mtu.to_string());
         options.insert("--max-path-mtu".into(), self.path_mtu.to_string());
+        #[cfg(windows)]
+        if let Some(tun) = &self.tun {
+            options.insert("--tun-address".into(), tun.clone());
+        }
         if let Some(tr) = &self.tune_repair {
             options.insert("--tune-repair".into(), tr.clone());
         }
@@ -528,6 +537,11 @@ impl ShareProfile {
         if let Some(dir) = key_dir {
             std::fs::create_dir_all(dir)
                 .map_err(|e| err(format!("cannot create {}: {e}", dir.display())))?;
+            let plan_path = materialize_common_plan(dir, self.tun_mtu, self.path_mtu)?;
+            options.insert(
+                "--common-transaction-plan".into(),
+                plan_path.display().to_string(),
+            );
             if let Some(peer_pub) = &self.peer_pub {
                 let p = write_key_file(dir, "noise-peer.pub", peer_pub)?;
                 options.insert("--noise-peer-key-file".into(), p.display().to_string());
@@ -566,6 +580,93 @@ fn read_raw_32(path: &Path) -> Result<[u8; 32], ShareUriError> {
     bytes
         .try_into()
         .map_err(|_| err(format!("{} must be exactly 32 bytes", path.display())))
+}
+
+fn materialize_common_plan(
+    dir: &Path,
+    tun_mtu: u16,
+    path_mtu: u16,
+) -> Result<PathBuf, ShareUriError> {
+    let plan_bytes = if tun_mtu == 1500 && path_mtu == 1500 {
+        DEFAULT_COMMON_PLAN_JSON.as_bytes().to_vec()
+    } else {
+        tune_default_plan_json(tun_mtu, path_mtu)?
+    };
+    let path = dir.join("common-plan.json");
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&path)
+        .map_err(|e| err(format!("cannot write {}: {e}", path.display())))?;
+    file.write_all(&plan_bytes)
+        .and_then(|()| file.sync_all())
+        .map_err(|e| err(format!("cannot write {}: {e}", path.display())))?;
+    Ok(path)
+}
+
+fn tune_default_plan_json(tun_mtu: u16, path_mtu: u16) -> Result<Vec<u8>, ShareUriError> {
+    use l2tunnel::live_tuning::{self, Setting};
+    use l2tunnel::record_configuration::{DESCRIPTOR_BYTES, Descriptor};
+
+    let mut doc: serde_json::Value = serde_json::from_str(DEFAULT_COMMON_PLAN_JSON)
+        .map_err(|e| err(format!("invalid bundled default plan: {e}")))?;
+    let initial_idx = doc
+        .get("initial_index")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as usize;
+    let hex_str = doc
+        .get("catalog")
+        .and_then(|v| v.as_array())
+        .and_then(|arr| arr.get(initial_idx))
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| err("bundled default plan missing initial descriptor"))?;
+    let base_bytes = hex_decode_vec(hex_str)?;
+    let base = Descriptor::decode(&base_bytes)
+        .map_err(|e| err(format!("invalid bundled base descriptor: {e}")))?;
+    let base_setting = live_tuning::setting(&base).map_err(|e| err(e.to_string()))?;
+    let tuned = live_tuning::tune(
+        &base,
+        Setting {
+            repair: base_setting.repair,
+            device_mtu: tun_mtu,
+            path_mtu,
+        },
+    )
+    .map_err(|e| {
+        err(format!(
+            "cannot tune plan for mtu={tun_mtu}, pmtu={path_mtu}: {e}"
+        ))
+    })?;
+    let mut tuned_bytes = [0u8; DESCRIPTOR_BYTES];
+    tuned
+        .encode_into(&mut tuned_bytes)
+        .map_err(|e| err(format!("cannot encode tuned descriptor: {e}")))?;
+    doc["catalog"] = serde_json::json!([hex_encode(&tuned_bytes)]);
+    doc["initial_index"] = serde_json::json!(0);
+    if let Some(native) = doc.get_mut("runtime").and_then(|r| r.get_mut("native")) {
+        let min_pending = u64::from(tun_mtu) * 1024;
+        let cur = native
+            .get("pending_bytes")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        if cur < min_pending {
+            native["pending_bytes"] = serde_json::json!(min_pending);
+        }
+    }
+    serde_json::to_vec_pretty(&doc).map_err(|e| err(format!("cannot serialize tuned plan: {e}")))
+}
+
+fn hex_decode_vec(raw: &str) -> Result<Vec<u8>, ShareUriError> {
+    if !raw.len().is_multiple_of(2) {
+        return Err(err("odd-length hex string"));
+    }
+    let bytes = raw.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len() / 2);
+    for chunk in bytes.chunks_exact(2) {
+        out.push((hex_nibble(chunk[0])? << 4) | hex_nibble(chunk[1])?);
+    }
+    Ok(out)
 }
 
 fn write_key_file(dir: &Path, name: &str, bytes: &[u8]) -> Result<PathBuf, ShareUriError> {
@@ -852,6 +953,44 @@ mod tests {
         assert!(with_adm.secrets.admission.is_some());
         assert!(with_adm.secrets.noise_private.is_none());
         std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn to_profile_document_materializes_default_and_jumbo_common_plans()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let base_dir = std::env::temp_dir().join(format!("l2t-share-plan-{}", std::process::id()));
+        let default_dir = base_dir.join("default");
+        let jumbo_dir = base_dir.join("jumbo");
+
+        let default_uri = "l2tunnel://v1/connect?name=demo&peer=192.168.210.108%3A24461&cover=quic-like&noise=ik&tun=192.168.236.2%2F30";
+        let default_doc =
+            ShareProfile::decode(default_uri)?.to_profile_document(Some(&default_dir))?;
+        let default_plan_path = default_doc
+            .options
+            .get("--common-transaction-plan")
+            .ok_or("missing --common-transaction-plan")?;
+        assert!(Path::new(default_plan_path).is_file());
+        assert_eq!(
+            default_doc.options.get("--device").map(String::as_str),
+            Some("l2t0")
+        );
+        let parsed_default =
+            crate::secure_udp::common_cli::Plan::read(Path::new(default_plan_path))?;
+        assert_eq!(parsed_default.initial().path_mtu(), 1500);
+
+        let jumbo_uri = "l2tunnel://v1/connect?name=jumbo&peer=192.168.210.108%3A24461&cover=quic-like&noise=ik&mtu=4096&path_mtu=1300";
+        let jumbo_doc = ShareProfile::decode(jumbo_uri)?.to_profile_document(Some(&jumbo_dir))?;
+        let jumbo_plan_path = jumbo_doc
+            .options
+            .get("--common-transaction-plan")
+            .ok_or("missing jumbo --common-transaction-plan")?;
+        let parsed_jumbo = crate::secure_udp::common_cli::Plan::read(Path::new(jumbo_plan_path))?;
+        let setting = l2tunnel::live_tuning::setting(&parsed_jumbo.initial())?;
+        assert_eq!(setting.device_mtu, 4096);
+        assert_eq!(setting.path_mtu, 1300);
+
+        std::fs::remove_dir_all(&base_dir)?;
         Ok(())
     }
 }
