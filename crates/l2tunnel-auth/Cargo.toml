@@ -10,7 +10,7 @@ l2tunnel-identity = { path = "../l2tunnel-identity" }
 l2tunnel-core = { path = "../l2tunnel-core" }
 l2tunnel-device = { path = "../l2tunnel-device" }
 ring = "=0.17.14"
-rustls = { version = "=0.23.45", default-features = false, features = ["ring", "std"] }
+rustls = { version = "=0.23.46", default-features = false, features = ["ring", "std"] }
 tokio = { version = "=1.53.1", features = ["io-util", "net", "time"] }
 tokio-rustls = { version = "=0.26.5", default-features = false, features = ["ring"] }
 zeroize = "=1.9.0"
