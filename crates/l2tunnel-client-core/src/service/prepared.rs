@@ -26,6 +26,7 @@ enum Open {
     Readable(Arc<dyn Fn() -> io::Result<crate::native::Native> + Send + Sync>),
 }
 impl Attachment {
+    #[cfg_attr(not(unix), allow(dead_code))]
     pub(super) fn open(&self) -> io::Result<Device> {
         match &self.open {
             Open::Packet(open) => open(),
@@ -200,6 +201,7 @@ pub(super) struct CommonMaintainedServer {
 /// Selected setup backend. Each variant names one existing authenticated factory;
 /// this is not a carrier preference list and never falls back to another variant.
 #[derive(Clone)]
+#[cfg_attr(not(unix), allow(clippy::enum_variant_names))]
 pub(super) enum Transport {
     #[cfg(unix)]
     ProxyCommon(Arc<crate::secure_udp::common_transaction_profile::Profile>),
@@ -666,7 +668,10 @@ impl Prepared {
                     (
                         OuterTransport::Quic(profiles),
                         OuterClient::Quic {
-                            roots, server_name, ..
+                            roots,
+                            server_pin,
+                            server_name,
+                            ..
                         },
                     ) => {
                         if server_name.is_empty()
@@ -679,8 +684,9 @@ impl Prepared {
                             ));
                         }
                         for profile in profiles.into_iter().flatten() {
-                            l2tunnel_quic::ClientConfig::from_der_roots(
+                            l2tunnel_quic::ClientConfig::from_der_roots_with_pin(
                                 roots,
+                                *server_pin,
                                 profile,
                                 l2tunnel_quic::EndpointLimits::default(),
                             )
@@ -967,6 +973,7 @@ impl Prepared {
         Ok(device)
     }
 
+    #[cfg_attr(not(unix), allow(dead_code))]
     pub(super) fn open(&self) -> io::Result<Device> {
         let device = self.data.attachment.open()?;
         if device.layer() != self.data.connection.layer {

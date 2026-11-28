@@ -2324,9 +2324,11 @@ dependencies = [
  "ring",
  "runas",
  "rustix 1.1.4",
+ "rustls",
  "serde",
  "serde_json",
  "tokio",
+ "tokio-rustls",
  "zeroize",
 ]
 

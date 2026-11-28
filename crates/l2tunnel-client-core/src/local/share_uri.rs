@@ -18,6 +18,8 @@ pub const SHARE_URI_PREFIX: &str = "l2tunnel://v1/connect";
 pub const MAX_SHARE_URI_BYTES: usize = 16_384;
 /// Maximum raw member PKCS#8 DER length accepted inside a share URI.
 pub const MAX_MEMBER_DER_BYTES: usize = 256;
+/// Maximum raw CA DER certificate length accepted inside a share URI.
+pub const MAX_CA_DER_BYTES: usize = 4_096;
 /// Bundled default Common transaction plan JSON (1500/1500 Swift) used when
 /// materializing imported `l2tunnel://` share URIs on Desktop and CLI clients
 /// (matching the bundled Android `default_common_plan.json`).
@@ -72,12 +74,14 @@ impl fmt::Debug for ShareSecrets {
     }
 }
 
-/// Portable L3 TUN UDP client share payload encoded by `l2tunnel://v1/connect?...`.
+/// Portable client share payload encoded by `l2tunnel://v1/connect?...`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ShareProfile {
     /// Optional suggested profile name (`[a-z0-9._-]`).
     pub name: Option<String>,
-    /// Remote `l2tunneld` UDP endpoint (`host:port`).
+    /// Optional carrier (`None` or `"udp"` for direct UDP covers; `"openvpn-like"`, `"tcp"`, `"quic"`).
+    pub carrier: Option<String>,
+    /// Remote `l2tunneld` endpoint (`host:port`).
     pub peer: String,
     /// UDP cover (`quic-like`, `media-like`, `tls-like`).
     pub cover: String,
@@ -85,6 +89,16 @@ pub struct ShareProfile {
     pub noise: String,
     /// Pinned 32-byte server Noise static public key (`noise-peer.pub`).
     pub peer_pub: Option<[u8; 32]>,
+    /// Optional cover ClientHello SNI DNS name for outer TLS carriers (e.g. `google.com`).
+    pub sni: Option<String>,
+    /// Optional outer TLS certificate verification hostname (`--server-name`).
+    pub server_name: Option<String>,
+    /// Optional 32-byte SHA-256 leaf server certificate pin (`--server-pin`).
+    pub server_pin: Option<[u8; 32]>,
+    /// Optional own-server CA DER certificate (`--ca`, bounded to [`MAX_CA_DER_BYTES`]).
+    pub ca_der: Option<Vec<u8>>,
+    /// Optional local client bind `IP:PORT` (used by maintained `tcp`/`quic` policies).
+    pub client_bind: Option<String>,
     /// TUN MTU (`1280..=65519`).
     pub tun_mtu: u16,
     /// Outer IP path MTU (`1280..=65535`).
@@ -108,10 +122,24 @@ pub struct ShareProfile {
 }
 
 impl ShareProfile {
+    /// Effective carrier name (`"quic-like"`/`"media-like"`/`"tls-like"` for direct UDP,
+    /// or `"openvpn-like"`/`"tcp"`/`"quic"`).
+    pub fn effective_carrier(&self) -> &str {
+        match self.carrier.as_deref() {
+            None | Some("") | Some("udp") => &self.cover,
+            Some(c) => c,
+        }
+    }
+
     /// Validate bounds and field syntax.
     pub fn validate(&self) -> Result<(), ShareUriError> {
         if let Some(name) = &self.name {
             validate_profile_name(name).map_err(err)?;
+        }
+        if let Some(carrier) = &self.carrier
+            && !matches!(carrier.as_str(), "udp" | "openvpn-like" | "tcp" | "quic")
+        {
+            return Err(err(format!("unsupported share URI carrier: {carrier}")));
         }
         if self.peer.trim().is_empty() || self.peer.contains(char::is_whitespace) {
             return Err(err("peer must be a non-empty host:port"));
@@ -121,6 +149,27 @@ impl ShareProfile {
         }
         if !matches!(self.cover.as_str(), "quic-like" | "media-like" | "tls-like") {
             return Err(err(format!("unsupported UDP cover: {}", self.cover)));
+        }
+        if let Some(sni) = &self.sni {
+            l2tunnel_auth::ClientSni::named(sni)
+                .map_err(|_| err(format!("invalid cover SNI DNS name: {sni}")))?;
+        }
+        if let Some(server_name) = &self.server_name
+            && (server_name.is_empty()
+                || server_name.len() > 253
+                || server_name.contains(char::is_whitespace))
+        {
+            return Err(err("invalid server_name"));
+        }
+        if let Some(ca) = &self.ca_der
+            && (ca.is_empty() || ca.len() > MAX_CA_DER_BYTES)
+        {
+            return Err(err("CA DER certificate length out of bounds"));
+        }
+        if let Some(bind) = &self.client_bind
+            && bind.parse::<SocketAddr>().is_err()
+        {
+            return Err(err(format!("invalid client_bind IP:port: {bind}")));
         }
         if !matches!(self.noise.as_str(), "ik" | "ikpsk2") {
             return Err(err(format!("unsupported Noise profile: {}", self.noise)));
@@ -162,11 +211,31 @@ impl ShareProfile {
         if let Some(name) = &self.name {
             pairs.push(("name", percent_encode(name)));
         }
+        if let Some(carrier) = &self.carrier
+            && carrier != "udp"
+        {
+            pairs.push(("carrier", carrier.clone()));
+        }
         pairs.push(("peer", percent_encode(&self.peer)));
         pairs.push(("cover", self.cover.clone()));
         pairs.push(("noise", self.noise.clone()));
         if let Some(pub_key) = &self.peer_pub {
             pairs.push(("peer_pub", hex_encode(pub_key)));
+        }
+        if let Some(sni) = &self.sni {
+            pairs.push(("sni", percent_encode(sni)));
+        }
+        if let Some(server_name) = &self.server_name {
+            pairs.push(("server_name", percent_encode(server_name)));
+        }
+        if let Some(pin) = &self.server_pin {
+            pairs.push(("pin", hex_encode(pin)));
+        }
+        if let Some(ca) = &self.ca_der {
+            pairs.push(("ca", base64url_encode(ca)));
+        }
+        if let Some(bind) = &self.client_bind {
+            pairs.push(("bind", percent_encode(bind)));
         }
         if self.tun_mtu != 1500 {
             pairs.push(("mtu", self.tun_mtu.to_string()));
@@ -275,10 +344,16 @@ impl ShareProfile {
             if !matches!(
                 known_only.as_str(),
                 "name"
+                    | "carrier"
                     | "peer"
                     | "cover"
                     | "noise"
                     | "peer_pub"
+                    | "sni"
+                    | "server_name"
+                    | "pin"
+                    | "ca"
+                    | "bind"
                     | "mtu"
                     | "path_mtu"
                     | "hs"
@@ -306,12 +381,21 @@ impl ShareProfile {
             .cloned()
             .or(fragment)
             .filter(|s| !s.trim().is_empty());
+        let carrier = map
+            .get("carrier")
+            .cloned()
+            .filter(|s| !s.is_empty() && s != "udp");
         let cover = map
             .get("cover")
             .cloned()
             .unwrap_or_else(|| "quic-like".to_owned());
         let noise = map.get("noise").cloned().unwrap_or_else(|| "ik".to_owned());
         let peer_pub = map.get("peer_pub").map(|h| hex_decode_32(h)).transpose()?;
+        let sni = map.get("sni").cloned().filter(|s| !s.is_empty());
+        let server_name = map.get("server_name").cloned().filter(|s| !s.is_empty());
+        let server_pin = map.get("pin").map(|h| hex_decode_32(h)).transpose()?;
+        let ca_der = map.get("ca").map(|b| base64url_decode(b)).transpose()?;
+        let client_bind = map.get("bind").cloned().filter(|s| !s.is_empty());
         let tun_mtu = map
             .get("mtu")
             .map(|s| s.parse::<u16>().map_err(|_| err("invalid mtu")))
@@ -362,10 +446,16 @@ impl ShareProfile {
         };
         let parsed = Self {
             name,
+            carrier,
             peer,
             cover,
             noise,
             peer_pub,
+            sni,
+            server_name,
+            server_pin,
+            ca_der,
+            client_bind,
             tun_mtu,
             path_mtu,
             handshake_seconds,
@@ -403,12 +493,19 @@ impl ShareProfile {
                 "only TUN (L3) profiles can be shared via l2tunnel:// URIs (got --layer {layer})"
             )));
         }
-        let cover = opt("--carrier").unwrap_or("quic-like").to_owned();
-        if !matches!(cover.as_str(), "quic-like" | "media-like" | "tls-like") {
-            return Err(err(format!(
-                "share URIs currently support UDP covers (quic-like/media-like/tls-like), got {cover}"
-            )));
-        }
+        let raw_carrier = opt("--carrier").unwrap_or("quic-like").to_owned();
+        let (carrier, cover) = match raw_carrier.as_str() {
+            "quic-like" | "media-like" | "tls-like" => (None, raw_carrier),
+            "openvpn-like" | "tcp" | "quic" => (
+                Some(raw_carrier),
+                opt("--udp-cover").unwrap_or("tls-like").to_owned(),
+            ),
+            other => {
+                return Err(err(format!(
+                    "share URIs support quic-like/media-like/tls-like/openvpn-like/tcp/quic, got {other}"
+                )));
+            }
+        };
         let noise = opt("--noise-profile").unwrap_or("ik").to_owned();
         let tun_mtu = opt("--max-packet")
             .and_then(|s| s.parse::<u16>().ok())
@@ -422,11 +519,23 @@ impl ShareProfile {
         let tune_repair = opt("--tune-repair").map(str::to_owned);
         let tune_device_mtu = opt("--tune-device-mtu").map(str::to_owned);
         let tune_path_mtu = opt("--tune-path-mtu").map(str::to_owned);
+        let sni = opt("--sni").map(str::to_owned);
+        let server_name = opt("--server-name").map(str::to_owned);
+        let server_pin = opt("--server-pin").map(hex_decode_32).transpose()?;
+        let ca_der = opt("--ca")
+            .or_else(|| {
+                (doc.role == ProfileRole::Serve)
+                    .then(|| opt("--cert"))
+                    .flatten()
+            })
+            .map(|p| std::fs::read(p).map_err(|e| err(format!("cannot read {p}: {e}"))))
+            .transpose()?;
 
         let (peer, peer_pub) = match doc.role {
             ProfileRole::Connect => {
                 let peer = opt("--udp-peer")
-                    .ok_or_else(|| err("profile is missing --udp-peer"))?
+                    .or_else(|| opt("--remote"))
+                    .ok_or_else(|| err("profile is missing --udp-peer / --remote"))?
                     .to_owned();
                 let peer_pub = opt("--noise-peer-key-file")
                     .map(|p| read_raw_32(Path::new(p)))
@@ -434,14 +543,15 @@ impl ShareProfile {
                 (peer, peer_pub)
             }
             ProfileRole::Serve => {
-                let bind =
-                    opt("--udp-bind").ok_or_else(|| err("server profile is missing --udp-bind"))?;
+                let bind = opt("--udp-bind")
+                    .or_else(|| opt("--listen"))
+                    .ok_or_else(|| err("server profile is missing --udp-bind / --listen"))?;
                 let parsed: SocketAddr = bind
                     .parse()
-                    .map_err(|_| err("server --udp-bind must be a valid ip:port"))?;
+                    .map_err(|_| err("server --udp-bind/--listen must be a valid ip:port"))?;
                 if parsed.ip().is_unspecified() {
                     return Err(err(
-                        "server --udp-bind is wildcard (0.0.0.0); specify a concrete server IP before sharing",
+                        "server bind is wildcard (0.0.0.0); specify a concrete server IP before sharing",
                     ));
                 }
                 let srv_pub = opt("--noise-private-key-file")
@@ -483,10 +593,16 @@ impl ShareProfile {
 
         let share = Self {
             name: name.map(str::to_owned),
+            carrier,
             peer,
             cover,
             noise,
             peer_pub,
+            sni,
+            server_name,
+            server_pin,
+            ca_der,
+            client_bind: None,
             tun_mtu,
             path_mtu,
             handshake_seconds,
@@ -503,21 +619,47 @@ impl ShareProfile {
     }
 
     /// Convert an imported [`ShareProfile`] into a desktop/daemon [`ProfileDocument`],
-    /// optionally writing embedded key material into `key_dir` (mode `0600` on Unix).
+    /// optionally writing embedded key material, `ca.der`, `common-plan.json`, and
+    /// `maintained-policy.json` into `key_dir` (mode `0600` on Unix for secrets).
     pub fn to_profile_document(
         &self,
         key_dir: Option<&Path>,
     ) -> Result<ProfileDocument, ShareUriError> {
         self.validate()?;
+        let effective_carrier = self.effective_carrier();
+        let is_maintained = matches!(effective_carrier, "tcp" | "quic");
+        let is_outer_tls = matches!(effective_carrier, "openvpn-like" | "tcp" | "quic");
+
         let mut options = BTreeMap::new();
         options.insert("--record-profile".into(), "common".into());
-        options.insert("--carrier".into(), self.cover.clone());
+        options.insert("--carrier".into(), effective_carrier.to_owned());
         options.insert("--duplex".into(), "full".into());
         options.insert("--compression".into(), "off".into());
         options.insert("--layer".into(), "tun".into());
         options.insert("--device".into(), "l2t0".into());
-        options.insert("--udp-bind".into(), "0.0.0.0:0".into());
-        options.insert("--udp-peer".into(), self.peer.clone());
+        if is_maintained {
+            options.insert("--remote".into(), self.peer.clone());
+            options.insert("--udp-cover".into(), self.cover.clone());
+        } else {
+            options.insert("--udp-bind".into(), "0.0.0.0:0".into());
+            options.insert("--udp-peer".into(), self.peer.clone());
+            if effective_carrier == "openvpn-like" {
+                options.insert("--udp-cover".into(), self.cover.clone());
+            }
+        }
+        if is_outer_tls {
+            if let Some(sn) = &self.server_name {
+                options.insert("--server-name".into(), sn.clone());
+            }
+            if let Some(sni) = &self.sni
+                && effective_carrier != "quic"
+            {
+                options.insert("--sni".into(), sni.clone());
+            }
+            if let Some(pin) = &self.server_pin {
+                options.insert("--server-pin".into(), hex_encode(pin));
+            }
+        }
         options.insert("--noise-profile".into(), self.noise.clone());
         options.insert("--max-packet".into(), self.tun_mtu.to_string());
         options.insert("--max-path-mtu".into(), self.path_mtu.to_string());
@@ -542,6 +684,36 @@ impl ShareProfile {
                 "--common-transaction-plan".into(),
                 plan_path.display().to_string(),
             );
+            if is_maintained {
+                let server_addr: SocketAddr = self.peer.parse().map_err(|_| {
+                    err("maintained tcp/quic share URI requires numeric IP:port peer")
+                })?;
+                let c_bind: SocketAddr = match &self.client_bind {
+                    Some(b) => b
+                        .parse()
+                        .map_err(|_| err("invalid bind= in maintained share URI"))?,
+                    None => {
+                        if server_addr.is_ipv6() {
+                            SocketAddr::new(IpAddr::V6(std::net::Ipv6Addr::LOCALHOST), 43101)
+                        } else {
+                            SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 43101)
+                        }
+                    }
+                };
+                let policy_bytes = crate::local::wizard::build_maintained_policy_json(
+                    effective_carrier,
+                    c_bind,
+                    server_addr,
+                    self.path_mtu,
+                )
+                .map_err(err)?;
+                let mp = write_key_file(dir, "maintained-policy.json", &policy_bytes)?;
+                options.insert("--maintained-policy".into(), mp.display().to_string());
+            }
+            if let Some(ca) = &self.ca_der {
+                let p = write_key_file(dir, "ca.der", ca)?;
+                options.insert("--ca".into(), p.display().to_string());
+            }
             if let Some(peer_pub) = &self.peer_pub {
                 let p = write_key_file(dir, "noise-peer.pub", peer_pub)?;
                 options.insert("--noise-peer-key-file".into(), p.display().to_string());
@@ -605,7 +777,10 @@ fn materialize_common_plan(
     Ok(path)
 }
 
-fn tune_default_plan_json(tun_mtu: u16, path_mtu: u16) -> Result<Vec<u8>, ShareUriError> {
+pub(crate) fn tune_default_plan_json(
+    tun_mtu: u16,
+    path_mtu: u16,
+) -> Result<Vec<u8>, ShareUriError> {
     use l2tunnel::live_tuning::{self, Setting};
     use l2tunnel::record_configuration::{DESCRIPTOR_BYTES, Descriptor};
 
@@ -848,10 +1023,16 @@ mod tests {
     fn canonical_public_and_full_share_uri_round_trip() -> Result<(), ShareUriError> {
         let public = ShareProfile {
             name: Some("office".into()),
+            carrier: None,
             peer: "192.168.210.108:24461".into(),
             cover: "quic-like".into(),
             noise: "ik".into(),
             peer_pub: Some([0x11; 32]),
+            sni: None,
+            server_name: None,
+            server_pin: None,
+            ca_der: None,
+            client_bind: None,
             tun_mtu: 1500,
             path_mtu: 1500,
             handshake_seconds: 30,

@@ -39,8 +39,11 @@ l2tunnel-meters = { path = "../l2tunnel-meters" }
 l2tunnel-datagram = { path = "../l2tunnel-datagram" }
 l2tunnel-udp = { path = "../l2tunnel-udp" }
 l2tunnel-quic = { path = "../l2tunnel-quic" }
+rcgen = { version = "=0.14.10", default-features = false, features = ["ring"] }
 ring = "=0.17.14"
+rustls = { version = "=0.23.45", default-features = false, features = ["ring", "std"] }
 tokio = { version = "=1.53.1", features = ["net", "time", "rt-multi-thread", "io-util", "sync", "macros"] }
+tokio-rustls = { version = "=0.26.5", default-features = false, features = ["ring"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 l2tunnel-platform-linux = { path = "../l2tunnel-platform-linux" }
@@ -60,7 +63,6 @@ tokio = { version = "=1.53.1", features = ["test-util"] }
 l2tunnel-platform-windows = { path = "../l2tunnel-platform-windows" }
 l2tunnel-reliable = { path = "../l2tunnel-reliable" }
 l2tunnel-packet = { path = "../l2tunnel-packet" }
-rcgen = { version = "=0.14.10", default-features = false, features = ["ring"] }
 
 [[example]]
 name = "common_cli_process_probe"

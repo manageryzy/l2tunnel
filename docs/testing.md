@@ -15,6 +15,11 @@ harnesses live alongside it in `tools/`:
   user-namespace TAP self-test), `tools/native_smoke.py`, `tools/kcp_native_reference.py`,
   `tools/native_throughput.py`, `tools/native_perf_profile.py`,
   `tools/path_bundle_netns_lab.py`.
+- **Embedded OpenGFW DPI & survival lab:** `tools/opengfw_lab.py` (dry-run by default;
+  compiles pinned `HyNetworks/OpenGFW` into `target/opengfw-cache/opengfw` and runs
+  OpenGFW inline inside the isolated router namespace `l2t-<id>-wan` via NFQUEUE
+  `FORWARD` with `rst=true` across all carriers and rulesets; see
+  [docs/modules/opengfw-lab.md](modules/opengfw-lab.md)).
 - **Unprivileged local & in-process harnesses:** `tools/local_real_pair.py`
   (real loopback/forwarding daemon pair with `--replace` restart),
   `tools/fake_local_service.py` (API v5 contract harness), `common_cli_process_probe`

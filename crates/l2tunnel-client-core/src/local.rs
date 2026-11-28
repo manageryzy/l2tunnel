@@ -43,5 +43,6 @@ pub mod share_uri;
 #[cfg(any(unix, windows))]
 mod transport;
 pub mod tunnel_test;
+pub mod wizard;
 #[cfg(any(unix, windows))]
 pub use transport::{CONCURRENT_CONNECTIONS, Server, request, request_operation};

@@ -167,6 +167,8 @@ pub struct ProfileState {
     pub keys_of: String,
     /// Key generation form.
     pub generate: Generate,
+    /// Quick Setup Wizard modal state.
+    pub wizard: crate::wizard_panel::WizardState,
 }
 
 /// Local key generation form.
@@ -305,6 +307,9 @@ pub fn section(ui: &mut egui::Ui, model: &mut Model, state: &mut ProfileState) -
         {
             open_new(state);
         }
+        if ui.button("✨ Quick Setup Wizard…").clicked() {
+            state.wizard.open = true;
+        }
         ui.separator();
         ui.label("Import from file");
         ui.add(
@@ -393,8 +398,9 @@ fn import(model: &mut Model, state: &mut ProfileState) {
     }
 }
 
-/// Draw the editor and file chooser windows (any page); returns exchanges.
+/// Draw the editor, wizard, and file chooser windows (any page); returns exchanges.
 pub fn windows(ctx: &egui::Context, model: &mut Model, state: &mut ProfileState) -> Vec<Command> {
+    crate::wizard_panel::show(ctx, model, state);
     let mut commands = Vec::new();
     if let Some((target, path)) = browse::show(ctx, &mut state.browser) {
         let text = path.display().to_string();

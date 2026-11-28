@@ -31,6 +31,8 @@ pub mod test_panel;
 #[cfg(any(unix, windows))]
 mod tuning_panel;
 #[cfg(any(unix, windows))]
+mod wizard_panel;
+#[cfg(any(unix, windows))]
 mod worker;
 
 /// Run the GUI binary `name` with its command-line arguments (without `argv[0]`).

@@ -190,6 +190,7 @@ impl MaintainedPolicy {
 }
 impl MaintainedCarrier {
     /// Compare all requested policy fields, preserving observed-only queue facts.
+    #[cfg_attr(not(unix), allow(dead_code))]
     pub(crate) fn matches_requested_policy(&self) -> bool {
         let Some(effective) = self.effective.as_ref() else {
             return false;

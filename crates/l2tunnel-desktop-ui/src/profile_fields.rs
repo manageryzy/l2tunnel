@@ -356,6 +356,19 @@ pub const FIELDS: &[Field] = &[
         )
     },
     Field {
+        roles: Roles::Client,
+        carriers: Carriers::OuterTls,
+        required: false,
+        hint: "64 hex SHA-256 (optional)",
+        ..field(
+            "--server-pin",
+            "Server cert SHA-256 pin",
+            "Security and keys",
+            Kind::Text,
+            "Optional 64-hex SHA-256 digest of the server leaf DER certificate (verified alongside CA & server name).",
+        )
+    },
+    Field {
         roles: Roles::Server,
         carriers: Carriers::OuterTls,
         ..field(
@@ -394,6 +407,50 @@ pub const FIELDS: &[Field] = &[
         Kind::Choice(&["tun", "tap"]),
         "tun carries IP packets, tap carries Ethernet frames.",
     ),
+    Field {
+        required: false,
+        hint: "02:aa:bb:cc:dd:ee",
+        ..field(
+            "--tap-mac",
+            "TAP MAC address",
+            "Tunnel device",
+            Kind::Text,
+            "Optional unicast Ethernet MAC address for TAP L2 adapters.",
+        )
+    },
+    Field {
+        required: false,
+        hint: "0.0.0.0:4789",
+        ..field(
+            "--vxlan-bind",
+            "VXLAN local UDP bind",
+            "Tunnel device",
+            Kind::Address,
+            "Optional VXLAN L2 UDP bind IP:port (replaces --device; requires --layer tap).",
+        )
+    },
+    Field {
+        required: false,
+        hint: "127.0.0.1:4790",
+        ..field(
+            "--vxlan-peer",
+            "VXLAN peer UDP address",
+            "Tunnel device",
+            Kind::Address,
+            "Optional VXLAN L2 remote VTEP IP:port (requires --layer tap).",
+        )
+    },
+    Field {
+        required: false,
+        hint: "42",
+        ..field(
+            "--vni",
+            "VXLAN VNI",
+            "Tunnel device",
+            Kind::Number,
+            "Optional 24-bit VXLAN Network Identifier (0..=16777215; requires --layer tap).",
+        )
+    },
     Field {
         required: false,
         hint: "1600",
@@ -570,10 +627,13 @@ pub fn validate(
 ) -> Validation {
     let carrier = value("--carrier").unwrap_or_default();
     let mut out = Validation::default();
+    let has_vxlan = ["--vxlan-bind", "--vxlan-peer", "--vni"]
+        .iter()
+        .any(|opt| value(opt).is_some_and(|text| !text.trim().is_empty()));
     for field in FIELDS.iter().filter(|field| field.shown(serve, &carrier)) {
         let label = field.label(serve);
         let Some(text) = value(field.option).filter(|text| !text.trim().is_empty()) else {
-            if field.required {
+            if field.required && !(field.option == "--device" && has_vxlan) {
                 out.errors.push(format!("{label} is required"));
             }
             continue;
@@ -599,8 +659,25 @@ pub fn validate(
                         out.errors
                             .push(format!("{label} must be a nonzero whole number"));
                     }
+                } else if field.option == "--vni" {
+                    if text
+                        .parse::<u32>()
+                        .ok()
+                        .filter(|value| *value <= 0x00ff_ffff)
+                        .is_none()
+                    {
+                        out.errors
+                            .push(format!("{label} must be between 0 and 16777215"));
+                    }
                 } else if text.parse::<u64>().is_err() {
                     out.errors.push(format!("{label} must be a whole number"));
+                }
+            }
+            Kind::Text if field.option == "--server-pin" => {
+                if text.len() != 64 || !text.bytes().all(|b| b.is_ascii_hexdigit()) {
+                    out.errors.push(format!(
+                        "{label} must be 64 hexadecimal characters (SHA-256)"
+                    ));
                 }
             }
             Kind::File if !exists(text) => {
@@ -749,5 +826,34 @@ mod tests {
         );
         raw.insert("--raw-mark", "7");
         assert_eq!(check(false, &raw), Validation::default());
+
+        // Server cert SHA-256 pin validation on outer TLS carriers.
+        let mut pinned = tcp.clone();
+        pinned.insert("--server-pin", "bad-pin");
+        assert!(
+            check(false, &pinned)
+                .errors
+                .iter()
+                .any(|e| e.contains("64 hexadecimal"))
+        );
+        let good_pin = "a".repeat(64);
+        pinned.insert("--server-pin", good_pin.as_str());
+        assert_eq!(check(false, &pinned), Validation::default());
+
+        // VXLAN L2 profile omits --device and validates VNI range.
+        let mut vxlan = tcp;
+        vxlan.remove("--device");
+        vxlan.insert("--layer", "tap");
+        vxlan.insert("--vxlan-bind", "0.0.0.0:4789");
+        vxlan.insert("--vxlan-peer", "127.0.0.1:4790");
+        vxlan.insert("--vni", "16777216");
+        assert!(
+            check(false, &vxlan)
+                .errors
+                .iter()
+                .any(|e| e.contains("16777215"))
+        );
+        vxlan.insert("--vni", "42");
+        assert_eq!(check(false, &vxlan), Validation::default());
     }
 }

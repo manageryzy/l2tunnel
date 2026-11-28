@@ -71,7 +71,7 @@ cp "$ROOT/scripts/windows/Uninstall-L2Tunnel.ps1" "$OUT_DIR/"
 cp "$ROOT/scripts/windows/Verify-L2TunnelWindows.ps1" "$OUT_DIR/"
 
 # Copy default 1500/1500 plan and generate jumbo 4096>1300 plan if host l2tunnelctl exists
-BASE_PLAN="$ROOT/clients/android/app/src/main/res/raw/default_common_plan.json"
+BASE_PLAN="$ROOT/crates/l2tunnel-client-core/resources/default_common_plan.json"
 cp "$BASE_PLAN" "$OUT_DIR/plans/common-1500.json"
 if [[ -x "$ROOT/target/release/l2tunnelctl" ]]; then
     "$ROOT/target/release/l2tunnelctl" plan tune \
@@ -86,7 +86,7 @@ l2tunnel Windows Client Bundle (x86_64)
 
 Contents:
   l2tunnel-windows-gui.exe     Unprivileged Desktop GUI (auto-installs service on first Start)
-  l2tunnel-windows.exe         Windows Service & multi-profile Wintun L3 daemon (0 args opens GUI)
+  l2tunnel-windows.exe         Windows Service & multi-profile Wintun L3 / TAP L2 / VXLAN L2 daemon (0 args opens GUI)
   l2tunnelctl.exe              CLI + offline GeoIP/ASN policy & MTU plan tools
   wintun.dll                   Official signed Wintun 0.14.1 (amd64) driver DLL (SHA-256 verified)
   plans/common-1500.json       Default Common Swift plan (1500/1500)
@@ -96,15 +96,24 @@ Contents:
   Verify-L2TunnelWindows.ps1   Native Windows E2E qualification harness
 
 Quick Start (Zero Manual Setup — same flow as Linux GUI):
-  1. Double-click l2tunnel-windows-gui.exe (runs unprivileged; uses DirectX/Vulkan/WARP
-     wgpu with automatic OpenGL glow fallback).
+  1. Double-click l2tunnel-windows-gui.exe (runs unprivileged; uses hardware OpenGL
+     glow first with automatic clean-process DirectX/Vulkan/WARP wgpu fallback).
   2. Click "Start service..." (or "Install & restart service..." when updating) and
      approve the Windows UAC prompt:
      - Automatically installs l2tunnel-windows.exe and the bundled wintun.dll into
        C:\Program Files\l2tunnel (with WLS-08 admin-only ACLs and pinned SHA-256),
        starts the l2tunnel LocalSystem service, and attaches the GUI.
-  3. On Management, paste a l2tunnel://v1/connect?... Share URI, click Import URI,
+  3. On Management, paste an l2tunnel://v1/connect?... Share URI, click Import URI,
      Save, and Connect.
+
+Windows L2 & Production Hardening Options:
+  - TAP L2 (--layer tap [--device NAME] [--tap-mac AA:BB:CC:DD:EE:FF]):
+    Uses OpenVPN TAP-Windows6 (tap0901) driver when installed; supports unnumbered L2 bridging.
+  - Driverless VXLAN L2 (--layer tap --vxlan-bind IP:PORT --vxlan-peer IP:PORT --vni 0..16777215):
+    Bridges Ethernet frames over UDP VXLAN without needing a TAP kernel driver.
+  - Server Certificate Pinning (--server-pin HEX64):
+    Enforces exact leaf DER SHA-256 verification alongside CA chain and --server-name
+    on TCP/TLS, OpenVPN-like, and QUIC carriers.
 
 Optional Scripted Install / Native E2E Verification (Administrator PowerShell):
   .\Install-L2Tunnel.ps1

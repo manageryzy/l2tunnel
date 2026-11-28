@@ -178,6 +178,7 @@ impl ProxyFrame {
     }
 }
 
+#[cfg_attr(not(unix), allow(dead_code))]
 enum Control {
     Fixed(crate::proxy::Handle),
     Measured(crate::proxy_measured::Handle),
@@ -201,6 +202,7 @@ pub(super) struct Backend {
     #[cfg(unix)]
     meters: Mutex<Option<(Instant, Arc<l2tunnel_meters::Table>)>>,
 }
+#[cfg_attr(not(unix), allow(dead_code))]
 impl Backend {
     pub(super) fn fixed(
         handle: crate::proxy::Handle,

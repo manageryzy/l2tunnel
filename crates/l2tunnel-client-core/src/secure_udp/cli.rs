@@ -427,6 +427,7 @@ fn selection_for(
         "--ca",
         "--server-name",
         "--sni",
+        "--server-pin",
         "--cert",
         "--key",
     ];
@@ -531,7 +532,7 @@ fn selection_for(
                 required(options, "--server-name")?;
             }
             "serve"
-                if !["--ca", "--server-name", "--sni"]
+                if !["--ca", "--server-name", "--sni", "--server-pin"]
                     .iter()
                     .any(|key| options.contains_key(*key)) =>
             {
@@ -1103,6 +1104,7 @@ pub(super) fn prepare(
                             secure_udp::maintained::Transport::Quic(_) => {
                                 secure_udp::maintained::Client::Quic {
                                     roots: vec![bounded_file(required(options, "--ca")?, 65536)?],
+                                    server_pin: tls_frontend::pin(options)?,
                                     server_name: name,
                                     member,
                                 }

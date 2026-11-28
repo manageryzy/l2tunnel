@@ -4,6 +4,7 @@ pub(super) mod maintained;
 pub(super) mod raw;
 use super::super::proxy_backend::Backend;
 use super::*;
+#[cfg(unix)]
 use l2tunnel_runtime::proxy as runtime;
 use std::sync::Arc;
 

@@ -450,6 +450,7 @@ async fn quic_lanes(
             outer:
                 OuterClient::Quic {
                     roots,
+                    server_pin,
                     server_name,
                     member,
                 },
@@ -457,8 +458,13 @@ async fn quic_lanes(
         } => {
             let mut endpoints = Vec::with_capacity(count);
             for (path, profile) in paths.into_iter().flatten().zip(expected) {
-                let config = l2tunnel_quic::ClientConfig::from_der_roots(roots, profile, limits)
-                    .map_err(io::Error::other)?;
+                let config = l2tunnel_quic::ClientConfig::from_der_roots_with_pin(
+                    roots,
+                    *server_pin,
+                    profile,
+                    limits,
+                )
+                .map_err(io::Error::other)?;
                 endpoints.push((
                     l2tunnel_quic::ClientEndpoint::bind(path.client, &config)
                         .map_err(io::Error::other)?,

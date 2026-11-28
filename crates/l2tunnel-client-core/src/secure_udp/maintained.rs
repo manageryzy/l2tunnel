@@ -155,6 +155,8 @@ pub enum Client {
     Quic {
         /// Bounded DER trust anchors consumed by maintained Quinn configuration.
         roots: Vec<Vec<u8>>,
+        /// Optional pinned SHA-256 leaf server certificate digest (`CONN-02`).
+        server_pin: Option<l2tunnel_auth::ServerIdentity>,
         /// Own-server certificate verification identity.
         server_name: String,
         /// Same authenticated member identity required by the inner Common profile.

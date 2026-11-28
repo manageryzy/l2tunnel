@@ -32,6 +32,7 @@ pub(super) const GROUPS: &[&str] = &[
     "tune",
     "policy",
     "plan",
+    "wizard",
 ];
 /// Default and maximum client-side watch bound for submissions, in seconds.
 const DEFAULT_WATCH_SECONDS: u64 = 120;
@@ -114,6 +115,15 @@ pub(super) const HELP: &str =
   policy compile [--preset NAME | --rules FILE | --rule MATCH=ACTION,...] [--default tunnel|direct|reject] [--peer IP] [--db CSV]
       (offline: CIDR, ASN, GeoIP country/region, Continent, and Private/LAN redirect policy
        evaluation and exact minimal TUN route compilation)
+  wizard crawl DOMAIN[:PORT] [--timeout 1..15]
+      (read-only TLS 1.3 + UDP/QUIC appearance probe of a public cover domain, e.g. google.com)
+  wizard init --carrier quic-like|tls-like|media-like|openvpn-like|tcp|quic --server IP:PORT --output DIR
+              [--look-like DOMAIN] [--name NAME] [--noise ik|ikpsk2] [--layer tun|tap]
+              [--device-mtu N] [--path-mtu N] [--tun-server CIDR] [--tun-client CIDR]
+              [--server-bind IP:PORT] [--client-bind IP:PORT] [--offline]
+      (one-step setup: optionally crawls --look-like domain, generates fresh server/client keys
+       + pinned own-server TLS cert/key, writes server/ & client/ bundles + run-server.sh, and
+       prints a ready-to-import l2tunnel://v1/connect?... client share link)
   config switch --configuration HEX [--request-key K] [--watch SECONDS | --detach]
   config catalog --generation G --catalog HEX --offset O --limit 1..4
   profile inspect OPTIONS   (same as inspect-common-transaction-plan)
@@ -209,6 +219,7 @@ enum Command {
     Delegate(&'static str),
     KeyGenerate(local::keys::KeyGeneration),
     LocalTool(policy::LocalToolCommand),
+    Wizard(wizard_cli::WizardCommand),
     Info,
     Sessions,
     Revoke {
@@ -540,6 +551,12 @@ fn parse(args: &[String]) -> Result<Parsed, Usage> {
                 flags.extend(more_flags);
             }
         }
+        ("wizard", _) if wizard_cli::accepted(verb).is_some() => {
+            if let Some((more_values, more_flags)) = wizard_cli::accepted(verb) {
+                values.extend(more_values);
+                flags.extend(more_flags);
+            }
+        }
         _ => return Err(usage(format!("unknown command {group} {verb}"))),
     }
     if group == "service" && matches!(verb, "connect" | "reconnect") {
@@ -553,7 +570,7 @@ fn parse(args: &[String]) -> Result<Parsed, Usage> {
     let flag = |name: &str| set.iter().any(|value| value == name);
     if (!matches!(
         group,
-        "operation" | "device" | "route" | "profile" | "test" | "meters" | "policy"
+        "operation" | "device" | "route" | "profile" | "test" | "meters" | "policy" | "wizard"
     ) || verb == "list")
         && !positional.is_empty()
     {
@@ -717,6 +734,7 @@ fn parse(args: &[String]) -> Result<Parsed, Usage> {
         ("policy" | "plan", _) => {
             Command::LocalTool(policy::parse(group, verb, &positional, &options, flag)?)
         }
+        ("wizard", _) => Command::Wizard(wizard_cli::parse(verb, &positional, &options, flag)?),
         _ => return Err(usage(format!("unknown command {group} {verb}"))),
     };
     Ok(Parsed {
@@ -1602,7 +1620,10 @@ async fn execute(parsed: Parsed) -> Exit {
                 Err((exit, error)) => failed(exit, error),
             }
         }
-        Command::Delegate(_) | Command::KeyGenerate(_) | Command::LocalTool(_) => Exit::Usage,
+        Command::Delegate(_)
+        | Command::KeyGenerate(_)
+        | Command::LocalTool(_)
+        | Command::Wizard(_) => Exit::Usage,
     }
 }
 
@@ -1624,6 +1645,11 @@ pub(super) fn main(args: &[String]) -> ExitCode {
         let mut out = io::stdout().lock();
         let mut err = io::stderr().lock();
         return policy::run(tool, parsed.json, &mut out, &mut err).into();
+    }
+    if let Command::Wizard(cmd) = parsed.command {
+        let mut out = io::stdout().lock();
+        let mut err = io::stderr().lock();
+        return wizard_cli::run(cmd, parsed.json, &mut out, &mut err).into();
     }
     if let Command::KeyGenerate(generation) = &parsed.command {
         return match local::keys::generate(generation) {
@@ -1682,6 +1708,8 @@ mod stats;
 mod test;
 #[path = "cli_groups_tune.rs"]
 mod tune;
+#[path = "cli_groups_wizard.rs"]
+mod wizard_cli;
 
 fn unavailable(exit: Exit, error: io::Error) -> Exit {
     note(format!("service unavailable: {error}"));

@@ -370,6 +370,19 @@ remains open until `Verify-L2TunnelWindows.ps1` runs on a real Windows host):
   - `net_watch::ffi`: `NotifyIpInterfaceChange` + SCM `ServiceControl::PowerEvent`
     (`ResumeAutomatic`/`ResumeSuspend`/`ResumeCritical`) through `TransitionLimiter`
     (`1.5 s` debounce, `6 / 5 min` cap).
+- **Windows L2 TAP & driverless VXLAN (`CL-26`, `VX-09`):** `l2tunnel-platform-windows`
+  adds `TapConfig` and `TapDevice` (OpenVPN TAP-Windows6 `tap0901` via `tun-rs`
+  `Layer::L2`, zero new `unsafe` FFI) with optional adapter alias, optional IPv4/prefix
+  (unnumbered L2 supported for bridging), optional unicast `--tap-mac`, and live
+  `MtuController` resizing. `l2tunnel-client-core::secure_udp::native_client::prepare_profile_document`
+  supports `--layer tap` with either `TapDevice` or driverless cross-platform VXLAN L2
+  (`--vxlan-bind`, `--vxlan-peer`, `--vni` via `l2tunnel-platform-vxlan::VxlanDevice`).
+  Native Windows TAP-Windows6 and VXLAN hardware qualification remains open (`CL-26`, `VX-09`).
+- **TLS / QUIC server certificate SHA-256 pin verification (`CONN-02`, `CL-08`):**
+  `--server-pin HEX64` enforces exact leaf certificate DER SHA-256 matching inside the
+  TLS 1.3 / QUIC handshake verifier alongside CA chain and `server_name` verification
+  for `openvpn-like`, `tcp`, `raw-packet`, and `quic` carriers on both Linux and Windows,
+  and is exposed in the Desktop GUI profile editor.
 - **One-click auto-install & Windows rendering (Linux GUI parity):**
   `l2tunnel-windows-gui.exe` stays unprivileged and attaches to `\\.\pipe\l2tunnel`
   just like `l2tunnel-linux-gui`. When no service answers, clicking **"Start service…"**
@@ -379,10 +392,10 @@ remains open until `Verify-L2TunnelWindows.ps1` runs on a real Windows host):
   creating `%ProgramData%\l2tunnel\state`) whenever the service is missing (`ERROR_SERVICE_DOES_NOT_EXIST`).
   Zero-argument `service install-start` reinstalls from the current binary and restarts
   the service (backing the GUI's **"Install & restart service…"** update banner and
-  `Advanced -> Reinstall`). On Windows the GUI prefers `eframe`'s `wgpu` renderer
-  (DX12 / DX11 / Vulkan / Microsoft WARP software fallback) with automatic clean-process
-  `--renderer glow` fallback, and displays a native Win32 `MessageBoxW` plus
-  `%LOCALAPPDATA%\l2tunnel\gui-startup.log` on startup errors. Launching
+  `Advanced -> Reinstall`). On Windows the GUI prefers hardware OpenGL `glow` first for
+  smooth frame pacing with automatic clean-process `--renderer wgpu` fallback
+  (DX12 / DX11 / Vulkan / Microsoft WARP with `AutoNoVsync`), and displays a native Win32
+  `MessageBoxW` plus `%LOCALAPPDATA%\l2tunnel\gui-startup.log` on startup errors. Launching
   `l2tunnel-windows.exe` with no arguments spawns the sibling `l2tunnel-windows-gui.exe`
   when present.
 - **Packaging & native qualification scripts:** `scripts/build-windows-bundle.sh`

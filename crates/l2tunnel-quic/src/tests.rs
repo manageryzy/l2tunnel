@@ -147,6 +147,76 @@ async fn wrong_server_name_roots_member_layer_digest_lane_and_alpn_fail_closed()
     }
     Ok(())
 }
+
+#[tokio::test]
+async fn server_pin_allows_exact_leaf_and_rejects_mismatched_trusted_cert() -> TestResult {
+    let p = profile();
+    let limits = EndpointLimits {
+        handshake_timeout: Duration::from_secs(2),
+        ..EndpointLimits::default()
+    };
+    let cert_a = rcgen::generate_simple_self_signed(vec!["quic.test".to_owned()])?;
+    let cert_b = rcgen::generate_simple_self_signed(vec!["quic.test".to_owned()])?;
+    let der_a = cert_a.cert.der().to_vec();
+    let der_b = cert_b.cert.der().to_vec();
+    let pin_a = l2tunnel_auth::ServerIdentity(
+        ring::digest::digest(&ring::digest::SHA256, &der_a)
+            .as_ref()
+            .try_into()?,
+    );
+    let pin_b = l2tunnel_auth::ServerIdentity(
+        ring::digest::digest(&ring::digest::SHA256, &der_b)
+            .as_ref()
+            .try_into()?,
+    );
+    let key = MemberKey::from_pkcs8(&MemberKey::generate_pkcs8()?)?;
+    let members = MemberAllowlist::new(&[key.public_key()])?;
+    let server = ServerEndpoint::bind(
+        "127.0.0.1:0".parse()?,
+        &ServerConfig::from_der(
+            std::slice::from_ref(&der_a),
+            cert_a.signing_key.serialize_der().as_slice(),
+            p,
+            limits,
+        )?,
+    )?;
+
+    // Matching pin succeeds.
+    let good_cfg = ClientConfig::from_der_roots_with_pin(
+        &[der_a.clone(), der_b.clone()],
+        Some(pin_a),
+        p,
+        limits,
+    )?;
+    let good_client = ClientEndpoint::bind("127.0.0.1:0".parse()?, &good_cfg)?;
+    let (a, b) = tokio::join!(
+        good_client.connect(
+            server.local_addr()?,
+            "quic.test",
+            &key,
+            base(PacketLayer::Ip)
+        ),
+        server.accept(&members, base(PacketLayer::Ip))
+    );
+    assert!(a.is_ok(), "matching pin must succeed: {:?}", a.err());
+    assert!(b.is_ok(), "server accept must succeed: {:?}", b.err());
+
+    // Mismatched pin fails even though der_a is in the trusted roots.
+    let bad_cfg = ClientConfig::from_der_roots_with_pin(&[der_a, der_b], Some(pin_b), p, limits)?;
+    let bad_client = ClientEndpoint::bind("127.0.0.1:0".parse()?, &bad_cfg)?;
+    let (a, b) = tokio::join!(
+        bad_client.connect(
+            server.local_addr()?,
+            "quic.test",
+            &key,
+            base(PacketLayer::Ip)
+        ),
+        server.accept(&members, base(PacketLayer::Ip))
+    );
+    assert!(a.is_err(), "mismatched QUIC pin must fail closed");
+    assert!(b.is_err(), "server must observe failed handshake");
+    Ok(())
+}
 fn unreachable_case() -> TestResult {
     Err("unreachable test case".into())
 }

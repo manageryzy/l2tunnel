@@ -125,3 +125,36 @@ fn naming_observation_is_requested_only_and_omission_has_no_new_output() -> io::
     }
     Ok(())
 }
+
+#[test]
+fn server_pin_preflight_validates_hex_carrier_and_client_role() -> io::Result<()> {
+    let valid_pin = "a".repeat(64);
+    let mut tcp = BTreeMap::new();
+    tcp.insert("--server-pin".into(), valid_pin.clone());
+    tcp.insert("--server-name".into(), "own-server.test".into());
+    tcp.insert("--ca".into(), "/missing/tls-roots.der".into());
+    preflight("connect", &tcp)?;
+    assert!(preflight("serve", &tcp).is_err());
+
+    // Maintained QUIC accepts --server-pin (unlike --sni).
+    let mut quic = tcp.clone();
+    quic.insert("--carrier".into(), "quic".into());
+    quic.insert("--record-profile".into(), "common".into());
+    quic.insert("--maintained-policy".into(), "/missing/policy.json".into());
+    preflight("connect", &quic)?;
+
+    // Non-TLS UDP covers reject --server-pin.
+    let mut udp = tcp.clone();
+    udp.insert("--carrier".into(), "quic-like".into());
+    udp.insert("--record-profile".into(), "common".into());
+    assert!(preflight("connect", &udp).is_err());
+
+    // Malformed pin is rejected before opening CA file.
+    let mut bad = tcp;
+    bad.insert("--server-pin".into(), "not-64-hex".into());
+    assert_eq!(
+        preflight("connect", &bad).err().map(|e| e.kind()),
+        Some(io::ErrorKind::InvalidInput)
+    );
+    Ok(())
+}

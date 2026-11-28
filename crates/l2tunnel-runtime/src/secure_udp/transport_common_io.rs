@@ -1715,6 +1715,7 @@ impl Driver {
                     pending.fragment,
                 );
                 let generation = confirmation.as_ref().ok().copied().flatten();
+                #[cfg(unix)]
                 let physical_time = sampled.as_ref().ok().copied();
                 let eligibility = (|| {
                     sampled?;

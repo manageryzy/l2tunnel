@@ -180,6 +180,37 @@ pub use l2tunnel_identity::MemberPublicKey;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ServerIdentity(pub [u8; 32]);
 
+impl ServerIdentity {
+    /// Parse a 64-character ASCII hexadecimal SHA-256 server leaf certificate pin.
+    pub fn from_hex(text: &str) -> Result<Self, Error> {
+        let trimmed = text.trim();
+        let bytes = trimmed.as_bytes();
+        if bytes.len() != 64 {
+            return Err(Error::Configuration(
+                "server certificate pin must be exactly 64 hex characters",
+            ));
+        }
+        let mut out = [0_u8; 32];
+        for (dst, pair) in out.iter_mut().zip(bytes.chunks_exact(2)) {
+            let hi = hex_nibble(pair[0])?;
+            let lo = hex_nibble(pair[1])?;
+            *dst = (hi << 4) | lo;
+        }
+        Ok(Self(out))
+    }
+}
+
+fn hex_nibble(byte: u8) -> Result<u8, Error> {
+    match byte {
+        b'0'..=b'9' => Ok(byte - b'0'),
+        b'a'..=b'f' => Ok(byte - b'a' + 10),
+        b'A'..=b'F' => Ok(byte - b'A' + 10),
+        _ => Err(Error::Configuration(
+            "server certificate pin must contain only ASCII hex digits",
+        )),
+    }
+}
+
 /// Expected native packet layer and canonical configuration digest.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SessionConfig {
@@ -249,19 +280,21 @@ impl MemberAllowlist {
 mod sni;
 pub use sni::ClientSni;
 
-/// Private, verified TLS 1.3 client configuration with explicit SNI and no early data.
+/// Private, verified TLS 1.3 client configuration with explicit SNI, optional
+/// leaf SHA-256 pin verification, and no early data.
 #[derive(Clone)]
 pub struct ClientTls(
     Arc<ClientConfig>,
     ClientSni,
     Option<Arc<rustls::client::WebPkiServerVerifier>>,
+    Option<ServerIdentity>,
 );
 
 impl ClientTls {
     /// Build certificate-root and name verification from DER trust anchors.
     /// SNI, resumption and early data are disabled; certificate validation remains enabled.
     pub fn from_der_roots(certificates: &[Vec<u8>]) -> Result<Self, Error> {
-        Self::from_der_roots_with_sni(certificates, ClientSni::Disabled)
+        Self::from_der_roots_with_policy(certificates, ClientSni::Disabled, None)
     }
 
     /// Build verified TLS with an explicit ClientHello SNI policy.
@@ -269,6 +302,20 @@ impl ClientTls {
     pub fn from_der_roots_with_sni(
         certificates: &[Vec<u8>],
         sni: ClientSni,
+    ) -> Result<Self, Error> {
+        Self::from_der_roots_with_policy(certificates, sni, None)
+    }
+
+    /// Build verified TLS 1.3 with explicit ClientHello SNI and optional server
+    /// leaf certificate SHA-256 pin (`CONN-02`).
+    ///
+    /// When `server_pin` is `Some`, the leaf certificate's DER SHA-256 must match
+    /// in addition to full CA chain and `server_name` verification during the TLS
+    /// handshake itself.
+    pub fn from_der_roots_with_policy(
+        certificates: &[Vec<u8>],
+        sni: ClientSni,
+        server_pin: Option<ServerIdentity>,
     ) -> Result<Self, Error> {
         validate_certificates(certificates, 64)?;
         sni::validate(&sni)?;
@@ -280,16 +327,18 @@ impl ClientTls {
         }
         let roots = Arc::new(roots);
         let provider = Arc::new(rustls::crypto::ring::default_provider());
-        let verifier = match &sni {
-            ClientSni::Disabled => None,
-            ClientSni::Named(_) => Some(
+        let needs_wrapper = matches!(&sni, ClientSni::Named(_)) || server_pin.is_some();
+        let verifier = if needs_wrapper {
+            Some(
                 rustls::client::WebPkiServerVerifier::builder_with_provider(
                     roots.clone(),
                     provider.clone(),
                 )
                 .build()
                 .map_err(|_| Error::Configuration("TLS server verifier"))?,
-            ),
+            )
+        } else {
+            None
         };
         let mut config = ClientConfig::builder_with_provider(provider)
             .with_protocol_versions(&[&rustls::version::TLS13])
@@ -299,12 +348,17 @@ impl ClientTls {
         config.enable_sni = matches!(&sni, ClientSni::Named(_));
         config.enable_early_data = false;
         config.resumption = rustls::client::Resumption::disabled();
-        Ok(Self(Arc::new(config), sni, verifier))
+        Ok(Self(Arc::new(config), sni, verifier, server_pin))
     }
 
     /// Requested public SNI policy; server trust remains separately configured.
     pub fn sni(&self) -> &ClientSni {
         &self.1
+    }
+
+    /// Optional pinned server leaf certificate SHA-256 digest.
+    pub fn server_pin(&self) -> Option<ServerIdentity> {
+        self.3
     }
 }
 

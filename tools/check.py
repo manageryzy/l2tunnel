@@ -70,7 +70,7 @@ def main() -> None:
         shutil.rmtree(directory)
     if sys.platform == 'linux':
         run(sys.executable, '-m', 'unittest', 'tools.test_secure_udp_native', 'tools.test_secure_udp_capture_observations', '-v')
-        run(sys.executable, '-m', 'unittest', 'tools.test_netns_lab', 'tools.test_native_smoke', 'tools.test_raw_native_smoke', 'tools.test_raw_packet_native_smoke', 'tools.test_rolling_native_smoke', 'tools.test_udp_burst_probe', 'tools.test_proxy_native_smoke', 'tools.test_proxy_measured_native_smoke', 'tools.test_openvpn_drain_native_smoke', 'tools.test_native_throughput', 'tools.test_native_throughput_analysis', 'tools.test_native_throughput_profiles', 'tools.test_check_simulator', 'tools.test_selftest', 'tools.test_fake_local_service', 'tools.test_profile_daemon', 'tools.test_service_start', 'tools.test_merge_common_plans', 'tools.test_local_real_pair', '-v')
+        run(sys.executable, '-m', 'unittest', 'tools.test_netns_lab', 'tools.test_opengfw_lab', 'tools.test_native_smoke', 'tools.test_raw_native_smoke', 'tools.test_raw_packet_native_smoke', 'tools.test_rolling_native_smoke', 'tools.test_udp_burst_probe', 'tools.test_proxy_native_smoke', 'tools.test_proxy_measured_native_smoke', 'tools.test_openvpn_drain_native_smoke', 'tools.test_native_throughput', 'tools.test_native_throughput_analysis', 'tools.test_native_throughput_profiles', 'tools.test_check_simulator', 'tools.test_selftest', 'tools.test_fake_local_service', 'tools.test_profile_daemon', 'tools.test_service_start', 'tools.test_merge_common_plans', 'tools.test_local_real_pair', '-v')
     else:
         print('Linux namespace harness tests skipped on this host.', flush=True)
     if sys.platform == 'linux':

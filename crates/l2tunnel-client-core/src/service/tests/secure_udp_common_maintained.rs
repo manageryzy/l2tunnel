@@ -212,6 +212,7 @@ pub(super) fn maintained_plans(
     let outer_client = if half {
         maintained::Client::Quic {
             roots: chain.clone(),
+            server_pin: None,
             server_name: "maintained-service.test".into(),
             member: outer_member,
         }

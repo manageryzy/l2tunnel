@@ -257,6 +257,17 @@ impl ClientConfig {
         profile: Profile,
         limits: EndpointLimits,
     ) -> Result<Self, Error> {
+        Self::from_der_roots_with_pin(certificates, None, profile, limits)
+    }
+
+    /// Build TLS 1.3 certificate/name verification from bounded DER trust roots
+    /// plus an optional pinned server leaf certificate SHA-256 digest (`CONN-02`).
+    pub fn from_der_roots_with_pin(
+        certificates: &[Vec<u8>],
+        server_pin: Option<ServerIdentity>,
+        profile: Profile,
+        limits: EndpointLimits,
+    ) -> Result<Self, Error> {
         profile.validate()?;
         limits.validate()?;
         validate_certs(certificates, 64)?;
@@ -266,13 +277,28 @@ impl ClientConfig {
                 .add(CertificateDer::from(certificate.clone()))
                 .map_err(|_| Error::Configuration("invalid root certificate"))?;
         }
-        let mut tls = rustls::ClientConfig::builder_with_provider(Arc::new(
-            rustls::crypto::ring::default_provider(),
-        ))
-        .with_protocol_versions(&[&rustls::version::TLS13])
-        .map_err(|_| Error::Configuration("TLS 1.3 configuration"))?
-        .with_root_certificates(roots)
-        .with_no_client_auth();
+        let roots = Arc::new(roots);
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let mut tls = if let Some(pin) = server_pin {
+            let delegate = rustls::client::WebPkiServerVerifier::builder_with_provider(
+                roots,
+                provider.clone(),
+            )
+            .build()
+            .map_err(|_| Error::Configuration("QUIC TLS server verifier"))?;
+            rustls::ClientConfig::builder_with_provider(provider)
+                .with_protocol_versions(&[&rustls::version::TLS13])
+                .map_err(|_| Error::Configuration("TLS 1.3 configuration"))?
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(PinnedVerifier { delegate, pin }))
+                .with_no_client_auth()
+        } else {
+            rustls::ClientConfig::builder_with_provider(provider)
+                .with_protocol_versions(&[&rustls::version::TLS13])
+                .map_err(|_| Error::Configuration("TLS 1.3 configuration"))?
+                .with_root_certificates(roots)
+                .with_no_client_auth()
+        };
         tls.enable_sni = false;
         tls.enable_early_data = false;
         tls.resumption = rustls::client::Resumption::disabled();
@@ -286,6 +312,83 @@ impl ClientConfig {
             profile,
             limits,
         })
+    }
+}
+
+#[derive(Debug)]
+struct PinnedVerifier {
+    delegate: Arc<rustls::client::WebPkiServerVerifier>,
+    pin: ServerIdentity,
+}
+
+#[derive(Debug)]
+struct QuicPinMismatchError;
+
+impl std::fmt::Display for QuicPinMismatchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("QUIC server leaf certificate SHA-256 pin mismatch")
+    }
+}
+
+impl std::error::Error for QuicPinMismatchError {}
+
+impl rustls::client::danger::ServerCertVerifier for PinnedVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        server_name: &rustls::pki_types::ServerName<'_>,
+        ocsp_response: &[u8],
+        now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        let verified = self.delegate.verify_server_cert(
+            end_entity,
+            intermediates,
+            server_name,
+            ocsp_response,
+            now,
+        )?;
+        let actual = hash(end_entity.as_ref());
+        let diff = actual
+            .iter()
+            .zip(self.pin.0.iter())
+            .fold(0_u8, |acc, (a, b)| acc | (a ^ b));
+        if diff != 0 {
+            return Err(rustls::Error::InvalidCertificate(
+                rustls::CertificateError::Other(rustls::OtherError(Arc::new(QuicPinMismatchError))),
+            ));
+        }
+        Ok(verified)
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        self.delegate.verify_tls12_signature(message, cert, dss)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        self.delegate.verify_tls13_signature(message, cert, dss)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.delegate.supported_verify_schemes()
+    }
+
+    fn requires_raw_public_keys(&self) -> bool {
+        self.delegate.requires_raw_public_keys()
+    }
+
+    fn root_hint_subjects(&self) -> Option<&[rustls::DistinguishedName]> {
+        self.delegate.root_hint_subjects()
     }
 }
 impl ServerConfig {

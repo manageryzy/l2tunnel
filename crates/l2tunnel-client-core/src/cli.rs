@@ -144,7 +144,15 @@ fn run_options(command: &str) -> Vec<&'static str> {
     let mut allowed = if command == "serve" {
         vec!["--listen", "--cert", "--key", "--allow-key"]
     } else {
-        vec!["--remote", "--ca", "--server-name", "--sni", "--identity"]
+        vec![
+            "--remote",
+            "--ca",
+            "--server-name",
+            "--sni",
+            "--server-pin",
+            "--identity",
+            "--tap-mac",
+        ]
     };
     allowed.extend_from_slice(&[
         "--control-socket",
@@ -384,6 +392,7 @@ pub fn main_entry(args: impl IntoIterator<Item = String>) -> ExitCode {
             "--ca",
             "--server-name",
             "--sni",
+            "--server-pin",
             "--cert",
             "--key",
         ],

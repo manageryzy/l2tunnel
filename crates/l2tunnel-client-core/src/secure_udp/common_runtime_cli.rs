@@ -106,6 +106,7 @@ pub(crate) struct RuntimeDto {
     report_interval_micros: RequiredReport,
 }
 impl RuntimeDto {
+    #[cfg_attr(not(unix), allow(dead_code))]
     pub(crate) fn report_interval(self) -> Option<Duration> {
         self.report_interval_micros.0.map(Duration::from_micros)
     }

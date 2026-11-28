@@ -15,17 +15,25 @@ Implemented today:
   diagnostics export, and elevated `pkexec` systemd service install/restart).
 - Shared `egui`/`eframe` desktop GUI (`crates/l2tunnel-desktop-ui`, built as
   `l2tunnel-linux-gui` and `l2tunnel-windows-gui`) implementing Overview,
-  Connection (live tuning, speed budget, catalog switch, tunnel tests), Devices,
-  Routes, Statistics (rolling charts + CSR meters), Management (profiles, keys,
-  service info/update/stop, server sessions), and Events (diagnostics export).
-  SOCKS5 and live carrier switching remain open.
-- Windows Common UDP service host (`apps/l2tunnel-windows`,
-  `crates/l2tunnel-platform-windows`: Wintun L3, named-pipe API v1/v4/v5,
-  `service install|start|install-start|uninstall|run`, `foreground`, GUI),
-  cross-compiled and Wine-tested; native Windows execution remains open.
-- Android `l2tunnel-android-service` binary with abstract-Unix-socket
-  `ScmRights` TUN descriptor handoff and outer-socket `protect` callback;
-  Kotlin application and JNI shell remain open.
+  Connection (live tuning, speed budget, catalog switch, live make-before-break
+  UDP carrier/cover switching, tunnel tests), Devices, Routes (including GeoIP/ASN
+  redirect rules), SOCKS5 (RFC 1928/1929 over TCP-proxy profiles), Statistics
+  (rolling charts + CSR meters), Management (profiles, Share URI import/export,
+  keys, `--server-pin` TLS leaf pinning, service info/update/stop, server sessions),
+  and Events (diagnostics export).
+- Windows multi-profile service host (`apps/l2tunnel-windows`,
+  `crates/l2tunnel-platform-windows`: Wintun L3, OpenVPN TAP-Windows6 `tap0901`
+  L2 via `tun-rs`, driverless VXLAN L2 via `l2tunnel-platform-vxlan`, Windows IP
+  Helper routing, DPAPI sealing, Event Log + rotating log, sleep/interface-change
+  reconnect, named-pipe API v1/v4/v5, one-click UAC auto-install, GUI); real
+  Windows hardware Wintun L3 connect verified against live Linux server, while
+  formal `Verify-L2TunnelWindows.ps1` / Windows TAP & VXLAN hardware receipts
+  remain open.
+- Android `l2tunnel-android-service` binary (`arm64-v8a` & `x86_64`) with
+  abstract-Unix-socket `ScmRights` TUN descriptor handoff and outer-socket
+  `protect` callback, paired with the adaptive Jetpack Compose Material 3
+  `clients/android` `VpnService` app (verified on Android 12 & 15 x86_64
+  emulators; physical Android device qualification remains open).
 
 See [local operations](modules/local-operations.md),
 [desktop GUI](modules/desktop-gui.md), [Windows local service](modules/windows-local-service.md),
@@ -124,8 +132,10 @@ nor the peer management messages are forwarded to a user's TAP bridge or VXLAN.
   cover does not require native QUIC congestion control; minimal RTP does not
   imply full WebRTC. Keep endpoint address, trust/pin, SNI policy and optional
   cover name separate, with a strict no-SNI option. Configurable independent
-  cover SNI (`ClientSni::Named`, `--sni`) is implemented; pin verification
-  remains open.
+  cover SNI (`ClientSni::Named`, `--sni`) and server leaf certificate SHA-256
+  pin verification (`--server-pin`, `ClientTls::from_der_roots_with_policy`,
+  `l2tunnel_quic::ClientConfig::from_der_roots_with_pin`) are implemented and
+  contract-tested across TCP/TLS, OpenVPN-like, raw-packet, and QUIC.
 - [ ] [CL-09] Add TUN/TAP settings and explicit VXLAN attachment settings: local
   device, addresses/routes, MTU, bridge, VNI, endpoints, UDP port, learning/flood
   policy and tenant limits. Advertise supported combinations from the backend;

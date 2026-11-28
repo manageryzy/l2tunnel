@@ -248,6 +248,7 @@ impl Observation {
 /// predicate; it is not a capability flag or a second lifecycle state machine.
 #[derive(Clone)]
 enum ObservedBackend {
+    #[cfg_attr(not(unix), allow(dead_code))]
     Proxy(Arc<proxy_backend::Backend>),
     SecureUdpCommon(Arc<SecureUdpCommonBackend>),
 }

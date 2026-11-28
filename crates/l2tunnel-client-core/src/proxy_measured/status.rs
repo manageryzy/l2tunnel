@@ -1,5 +1,6 @@
 //! Bounded aggregate DTOs; no payloads, keys or per-flow dumps.
 use super::*;
+#[cfg(unix)]
 use l2tunnel_core::Duplex;
 use serde::Serialize;
 

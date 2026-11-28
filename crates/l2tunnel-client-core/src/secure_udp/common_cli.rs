@@ -57,6 +57,7 @@ impl Plan {
     pub(crate) fn initial(&self) -> Descriptor {
         self.catalog.initial()
     }
+    #[cfg_attr(not(unix), allow(dead_code))]
     pub(crate) fn report_interval(&self) -> Option<Duration> {
         self.runtime.report_interval()
     }
@@ -158,6 +159,7 @@ impl Plan {
             None,
         )
     }
+    #[cfg_attr(not(unix), allow(dead_code))]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn build_raw(
         &self,

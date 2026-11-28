@@ -151,3 +151,66 @@ async fn named_sni_cannot_replace_root_or_each_connections_verification_name() -
     .await?;
     Ok(())
 }
+
+#[tokio::test]
+async fn server_pin_enforces_exact_leaf_sha256_alongside_ca_and_sni() -> TestResult {
+    let (a_der, a_server) = certified("alpha.test")?;
+    let (b_der, b_server) = certified("beta.test")?;
+    let key = member()?;
+    let allow = MemberAllowlist::new(&[key.public_key()])?;
+    let pin_a = ServerIdentity(crate::hash(&a_der));
+    let pin_b = ServerIdentity(crate::hash(&b_der));
+
+    // Hex parser validation (valid lower/upper hex vs wrong length / non-hex).
+    let mut hex_a = String::with_capacity(64);
+    for byte in pin_a.0 {
+        use std::fmt::Write as _;
+        let _ = write!(hex_a, "{byte:02x}");
+    }
+    assert_eq!(ServerIdentity::from_hex(&hex_a)?, pin_a);
+    assert_eq!(
+        ServerIdentity::from_hex(&hex_a.to_ascii_uppercase())?,
+        pin_a
+    );
+    assert!(ServerIdentity::from_hex("deadbeef").is_err());
+    assert!(ServerIdentity::from_hex(&"z".repeat(64)).is_err());
+
+    // Trusting both roots, pin_a allows only a_server (both no-SNI and named-SNI).
+    for sni in [
+        ClientSni::Disabled,
+        ClientSni::Named("cover.example".into()),
+    ] {
+        let tls = ClientTls::from_der_roots_with_policy(
+            &[a_der.clone(), b_der.clone()],
+            sni.clone(),
+            Some(pin_a),
+        )?;
+        assert_eq!(tls.server_pin(), Some(pin_a));
+        let expected_sni = match &sni {
+            ClientSni::Disabled => None,
+            ClientSni::Named(name) => Some(name.as_str()),
+        };
+        observe(
+            pair(&tls, &a_server, "alpha.test", &key, &allow).await?,
+            expected_sni,
+        )
+        .await?;
+        // b_server has a valid trusted CA root and matching server_name "beta.test",
+        // yet MUST fail the TLS handshake because its leaf SHA-256 differs from pin_a.
+        assert!(
+            pair(&tls, &b_server, "beta.test", &key, &allow)
+                .await
+                .is_err()
+        );
+    }
+
+    // Wrong pin against a_server fails closed.
+    let wrong_pin =
+        ClientTls::from_der_roots_with_policy(&[a_der], ClientSni::Disabled, Some(pin_b))?;
+    assert!(
+        pair(&wrong_pin, &a_server, "alpha.test", &key, &allow)
+            .await
+            .is_err()
+    );
+    Ok(())
+}

@@ -1,4 +1,7 @@
-use super::{Config, RING_CAPACITY, invalid, validate_dll_path, validate_packet, verify_dll};
+use super::{
+    Config, RING_CAPACITY, TapConfig, invalid, validate_dll_path, validate_ethernet_frame,
+    validate_packet, verify_dll,
+};
 use l2tunnel_device::{PacketDevice, PacketLayer, READ_BUFFER_BYTES};
 use ring::rand::{SecureRandom, SystemRandom};
 use std::fmt::Write as _;
@@ -232,6 +235,151 @@ impl Drop for Device {
         // No blocking reader/thread is created here. Shutdown ends the session;
         // dependency Drop then closes/removes this created adapter and releases
         // its event/library handles even if shutdown itself reports an error.
+        let _ = self.device.shutdown();
+    }
+}
+
+/// Owned Windows TAP L2 (Ethernet) device backed by the OpenVPN TAP-Windows6
+/// (`tap0901`) driver through [`tun_rs`] (`CL-26`).
+///
+/// Requires the OpenVPN TAP-Windows6 driver (`tap0901`) to be installed on the
+/// host and an elevated process. For driverless Windows L2 transport, use
+/// VXLAN (`--vxlan-bind`/`--vxlan-peer`/`--vni`) instead.
+pub struct TapDevice {
+    device: Arc<SyncDevice>,
+    mtu_controller: Option<MtuController>,
+    name: String,
+    if_index: u32,
+    mac: [u8; 6],
+}
+
+impl TapDevice {
+    /// Open or create a Windows TAP-Windows6 (`tap0901`) Ethernet adapter.
+    pub fn open(config: &TapConfig) -> io::Result<Self> {
+        Self::open_with_mtu(config, None)
+    }
+
+    /// Open a Windows TAP L2 adapter and bind an optional live [`MtuController`].
+    pub fn open_with_mtu(
+        config: &TapConfig,
+        mtu_controller: Option<MtuController>,
+    ) -> io::Result<Self> {
+        let name = if let Some(explicit) = config.adapter_name() {
+            explicit.to_owned()
+        } else {
+            let mut nonce = [0_u8; 8];
+            SystemRandom::new()
+                .fill(&mut nonce)
+                .map_err(|_| io::Error::other("cannot obtain random TAP adapter identity"))?;
+            let mut generated = String::from("l2tap-");
+            for byte in nonce {
+                write!(generated, "{byte:02x}").map_err(io::Error::other)?;
+            }
+            generated
+        };
+        let mut builder = DeviceBuilder::new()
+            .name(&name)
+            .layer(Layer::L2)
+            .persist(config.persist())
+            .reuse_dev(config.adapter_name().is_some())
+            .mtu(config.mtu());
+        if let Some((ip, prefix)) = config.address() {
+            builder = builder.ipv4(ip, prefix, None);
+        }
+        if let Some(mac) = config.mac() {
+            builder = builder.mac_addr(mac);
+        }
+        let device = Arc::new(builder.build_sync().map_err(|err| {
+            io::Error::new(
+                err.kind(),
+                format!(
+                    "failed to open Windows TAP L2 adapter '{name}' (requires OpenVPN TAP-Windows6 'tap0901' driver and administrator privileges; or use --vxlan-bind/--vxlan-peer/--vni for driverless L2): {err}"
+                ),
+            )
+        })?);
+        let actual_name = device.name().unwrap_or(name);
+        let if_index = device.if_index()?;
+        let mac = device.mac_address().unwrap_or([0; 6]);
+        if let Some(ctrl) = &mtu_controller {
+            ctrl.bind(device.clone());
+        }
+        Ok(Self {
+            device,
+            mtu_controller,
+            name: actual_name,
+            if_index,
+            mac,
+        })
+    }
+
+    /// Effective Windows adapter name.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Windows interface index (`IF_INDEX`) of this TAP adapter.
+    pub fn if_index(&self) -> u32 {
+        self.if_index
+    }
+
+    /// Ethernet MAC address reported by the TAP adapter.
+    pub fn mac_address(&self) -> [u8; 6] {
+        self.mac
+    }
+}
+
+impl PacketDevice for TapDevice {
+    type Error = io::Error;
+
+    fn layer(&self) -> PacketLayer {
+        PacketLayer::Ethernet
+    }
+
+    fn receive(&mut self, buffer: &mut [u8]) -> io::Result<Option<usize>> {
+        if buffer.len() < READ_BUFFER_BYTES {
+            return Err(invalid(
+                "receive buffer must fit a complete maximum TAP Ethernet frame",
+            ));
+        }
+        for _ in 0..16 {
+            match self.device.try_recv(buffer) {
+                Ok(size) => {
+                    let Some(frame) = buffer.get(..size) else {
+                        continue;
+                    };
+                    if validate_ethernet_frame(frame).is_err() {
+                        continue;
+                    }
+                    return Ok(Some(size));
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(None),
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(None)
+    }
+
+    fn transmit(&mut self, frame: &[u8]) -> io::Result<()> {
+        if validate_ethernet_frame(frame).is_err() {
+            return Ok(());
+        }
+        match self.device.try_send(frame) {
+            Ok(sent) if sent == frame.len() => Ok(()),
+            Ok(_) => Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "partial TAP Ethernet frame write",
+            )),
+            Err(error) if error.kind() == io::ErrorKind::InvalidData => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+}
+
+impl Drop for TapDevice {
+    fn drop(&mut self) {
+        if let Some(ctrl) = &self.mtu_controller {
+            ctrl.clear();
+        }
         let _ = self.device.shutdown();
     }
 }

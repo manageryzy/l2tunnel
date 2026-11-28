@@ -33,12 +33,146 @@ pub mod routes;
 /// Administrator-only directory ACL auditing (`WLS-08`).
 pub mod security;
 #[cfg(windows)]
-pub use native::{Device, MtuController};
+pub use native::{Device, MtuController, TapDevice};
 
+/// Minimum Ethernet II frame length in bytes (6 dst + 6 src + 2 EtherType).
+pub const MIN_ETHERNET_FRAME_BYTES: usize = 14;
+/// Maximum Windows TAP adapter display name length.
+pub const MAX_ADAPTER_NAME_BYTES: usize = 64;
 /// Maximum DLL size accepted before any native library is loaded.
 pub const MAX_DLL_BYTES: u64 = 16 * 1024 * 1024;
 /// Fixed, bounded Wintun receive/send ring capacity (one MiB).
 pub const RING_CAPACITY: u32 = 1024 * 1024;
+
+/// Local, administrator-supplied configuration for a Windows TAP L2 adapter
+/// backed by the OpenVPN TAP-Windows6 (`tap0901`) driver (`CL-26`).
+///
+/// No custom FFI is added: [`tun_rs`] owns the reviewed NDIS 6 TAP driver FFI.
+/// An explicit IPv4 address is optional because L2 TAP adapters are frequently
+/// attached unnumbered to a Windows network bridge or hypervisor switch.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TapConfig {
+    adapter_name: Option<String>,
+    address: Option<(Ipv4Addr, u8)>,
+    mac: Option<[u8; 6]>,
+    mtu: u16,
+    persist: bool,
+}
+
+impl TapConfig {
+    /// Validate Windows TAP L2 settings without opening any OS adapter.
+    pub fn new(
+        adapter_name: Option<String>,
+        address: Option<(Ipv4Addr, u8)>,
+        mac: Option<[u8; 6]>,
+        mtu: u16,
+        persist: bool,
+    ) -> io::Result<Self> {
+        if let Some(name) = &adapter_name {
+            validate_adapter_name(name)?;
+        }
+        if let Some((ip, prefix)) = address {
+            if ip.is_unspecified() || ip.is_multicast() || ip.is_broadcast() || ip.is_loopback() {
+                return Err(invalid(
+                    "TAP IPv4 address must be a non-loopback unicast address",
+                ));
+            }
+            if prefix == 0 || prefix > 32 {
+                return Err(invalid("TAP IPv4 prefix must be in 1..=32"));
+            }
+        }
+        if let Some(bytes) = mac {
+            validate_unicast_mac(bytes)?;
+        }
+        if mtu < 1280 {
+            return Err(invalid("TAP MTU must be in 1280..=65535"));
+        }
+        Ok(Self {
+            adapter_name,
+            address,
+            mac,
+            mtu,
+            persist,
+        })
+    }
+
+    /// Optional explicit adapter alias; when `None`, a unique random `l2tap-*`
+    /// adapter name is generated at open time.
+    pub fn adapter_name(&self) -> Option<&str> {
+        self.adapter_name.as_deref()
+    }
+
+    /// Optional IPv4 address and prefix length configured on the TAP adapter.
+    pub fn address(&self) -> Option<(Ipv4Addr, u8)> {
+        self.address
+    }
+
+    /// Optional unicast MAC address configured on the TAP adapter.
+    pub fn mac(&self) -> Option<[u8; 6]> {
+        self.mac
+    }
+
+    /// Interface MTU (`1280..=65535`).
+    pub fn mtu(&self) -> u16 {
+        self.mtu
+    }
+
+    /// Whether the TAP adapter should persist after the handle closes.
+    pub fn persist(&self) -> bool {
+        self.persist
+    }
+}
+
+/// Parse a unicast Ethernet MAC address (`AA:BB:CC:DD:EE:FF` or `AA-BB-CC-DD-EE-FF`).
+pub fn parse_mac(text: &str) -> io::Result<[u8; 6]> {
+    let trimmed = text.trim();
+    let sep = if trimmed.contains(':') { ':' } else { '-' };
+    let parts: Vec<&str> = trimmed.split(sep).collect();
+    if parts.len() != 6 || parts.iter().any(|p| p.len() != 2) {
+        return Err(invalid(
+            "MAC address must be 6 hex octets (AA:BB:CC:DD:EE:FF)",
+        ));
+    }
+    let mut mac = [0_u8; 6];
+    for (dst, part) in mac.iter_mut().zip(parts) {
+        *dst = u8::from_str_radix(part, 16)
+            .map_err(|_| invalid("MAC address must contain only ASCII hex digits"))?;
+    }
+    validate_unicast_mac(mac)?;
+    Ok(mac)
+}
+
+/// Format a 6-byte MAC address as lowercase colon-separated hex.
+pub fn format_mac(mac: [u8; 6]) -> String {
+    format!(
+        "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+        mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
+    )
+}
+
+fn validate_unicast_mac(mac: [u8; 6]) -> io::Result<()> {
+    if mac == [0; 6] || (mac[0] & 0x01) != 0 {
+        return Err(invalid(
+            "TAP MAC address must be a non-zero unicast Ethernet address",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_adapter_name(name: &str) -> io::Result<()> {
+    if name.is_empty()
+        || name.len() > MAX_ADAPTER_NAME_BYTES
+        || !name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b' '))
+        || name.trim().is_empty()
+    {
+        return Err(invalid(
+            "TAP adapter name must be 1..=64 ASCII alphanumeric/[-_. ] characters",
+        ));
+    }
+    Ok(())
+}
 
 /// Local, administrator-supplied configuration for a newly owned L3 adapter.
 ///
@@ -199,6 +333,16 @@ fn validate_packet(packet: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
+#[cfg(any(windows, test))]
+fn validate_ethernet_frame(frame: &[u8]) -> io::Result<()> {
+    if frame.len() < MIN_ETHERNET_FRAME_BYTES || frame.len() > MAX_PACKET_BYTES {
+        return Err(invalid(
+            "TAP Ethernet frame length must be within 14..=65535 bytes",
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -298,6 +442,48 @@ mod tests {
         assert!(validate_packet(&[]).is_err());
         assert!(validate_packet(&[0; 14]).is_err());
         assert!(validate_packet(&vec![0; MAX_PACKET_BYTES + 1]).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn tap_config_mac_and_ethernet_frame_validation() -> io::Result<()> {
+        let mac = parse_mac("02:aa:bb:cc:dd:ee")?;
+        assert_eq!(format_mac(mac), "02:aa:bb:cc:dd:ee");
+        assert_eq!(parse_mac("02-AA-BB-CC-DD-EE")?, mac);
+        // Multicast / broadcast / all-zero MACs rejected.
+        assert!(parse_mac("01:00:5e:00:00:01").is_err());
+        assert!(parse_mac("ff:ff:ff:ff:ff:ff").is_err());
+        assert!(parse_mac("00:00:00:00:00:00").is_err());
+        assert!(parse_mac("02:aa:bb").is_err());
+
+        let cfg = TapConfig::new(
+            Some("l2tap0".into()),
+            Some((Ipv4Addr::new(10, 99, 0, 2), 24)),
+            Some(mac),
+            1500,
+            false,
+        )?;
+        assert_eq!(cfg.adapter_name(), Some("l2tap0"));
+        assert_eq!(cfg.address(), Some((Ipv4Addr::new(10, 99, 0, 2), 24)));
+        assert_eq!(cfg.mac(), Some(mac));
+        assert_eq!(cfg.mtu(), 1500);
+        assert!(!cfg.persist());
+
+        // Unnumbered TAP L2 (for Windows bridge/VXLAN) is valid.
+        let unnumbered = TapConfig::new(None, None, None, 1500, false)?;
+        assert_eq!(unnumbered.address(), None);
+
+        // Invalid MTU, loopback IP, invalid adapter name rejected.
+        assert!(TapConfig::new(None, None, None, 1279, false).is_err());
+        assert!(TapConfig::new(Some("".into()), None, None, 1500, false).is_err());
+        assert!(TapConfig::new(Some("bad/name".into()), None, None, 1500, false).is_err());
+        assert!(TapConfig::new(None, Some((Ipv4Addr::LOCALHOST, 24)), None, 1500, false).is_err());
+
+        // Ethernet frame validation.
+        assert!(validate_ethernet_frame(&[0; 13]).is_err());
+        validate_ethernet_frame(&[0; 14])?;
+        validate_ethernet_frame(&[0; 1518])?;
+        assert!(validate_ethernet_frame(&vec![0; MAX_PACKET_BYTES + 1]).is_err());
         Ok(())
     }
 }

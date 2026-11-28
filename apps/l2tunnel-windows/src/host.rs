@@ -269,7 +269,9 @@ mod native {
     use l2tunnel_client_core::{
         local::{self, ProfileDocument},
         native::Native,
-        secure_udp::native_client::{UdpClientProfile, prepare_profile_document},
+        secure_udp::native_client::{
+            NativeAttachmentRequest, UdpClientProfile, prepare_profile_document,
+        },
         service::{
             self, Attachment, AutoRecoveryPolicy, Handle, Phase, Prepared, Run,
             device_mtu::WindowsDevice, host::Host, host_windows::WindowsHost,
@@ -278,7 +280,7 @@ mod native {
     };
     use l2tunnel_device::PacketLayer;
     use l2tunnel_platform_windows::{
-        Device, MtuController,
+        Device, MtuController, TapConfig, TapDevice,
         event_log::ServiceLogger,
         net_watch::{HighResTimerGuard, InterfaceWatcher, TransitionLimiter},
         security::require_admin_only_directory,
@@ -402,9 +404,71 @@ mod native {
             })
     }
 
+    fn parse_optional_ipv4_cidr(
+        cidr: &str,
+        peer: std::net::SocketAddr,
+    ) -> io::Result<(std::net::Ipv4Addr, u8)> {
+        let (ip_str, prefix_str) = cidr.split_once('/').ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Windows TAP/TUN address must be IPV4/PREFIX",
+            )
+        })?;
+        let ip: std::net::Ipv4Addr = ip_str
+            .parse()
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid IPv4 address"))?;
+        let prefix: u8 = prefix_str
+            .parse()
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid IPv4 prefix"))?;
+        if let std::net::IpAddr::V4(peer_ip) = peer.ip() {
+            let mask = if prefix == 0 {
+                0
+            } else {
+                !0_u32 << (32 - u32::from(prefix.min(32)))
+            };
+            if (u32::from(ip) & mask) == (u32::from(peer_ip) & mask) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "outer peer IP falls inside the local tunnel interface subnet",
+                ));
+            }
+        }
+        Ok((ip, prefix))
+    }
+
+    fn deferred_tap_attachment(
+        req: NativeAttachmentRequest<'_>,
+        mtu_ctrl: MtuController,
+    ) -> io::Result<Attachment> {
+        let addr = match req.address_override {
+            Some(cidr) => Some(parse_optional_ipv4_cidr(cidr, req.peer)?),
+            None => None,
+        };
+        let config = TapConfig::new(
+            req.device_name.map(str::to_owned),
+            addr,
+            req.tap_mac,
+            req.mtu,
+            false,
+        )?;
+        let mtu_host = Arc::new(WindowsDevice::new(mtu_ctrl.clone()));
+        Ok(Attachment::deferred_native(PacketLayer::Ethernet, move || {
+            let config = config.clone();
+            let ctrl = mtu_ctrl.clone();
+            async move {
+                let mut creating = crate::setup::Setup::spawn(move || {
+                    TapDevice::open_with_mtu(&config, Some(ctrl))
+                })?;
+                creating.finish().await.map(Native::new)
+            }
+        })
+        .with_device_mtu(mtu_host))
+    }
+
     /// Serve the full-parity multi-profile Windows daemon (`--state-dir`) with
-    /// stored profiles, all cross-platform carriers, Wintun live MTU, Windows
-    /// IP Helper routing, Event Log + file logging, and sleep/network reconnect.
+    /// stored profiles, all cross-platform carriers, Wintun L3, TAP-Windows6 L2,
+    /// driverless VXLAN L2, live MTU, Windows IP Helper routing, Event Log and
+    /// file logging, and sleep/network reconnect.
     pub fn serve_daemon(
         options: &DaemonOptions,
         ready: impl FnOnce(),
@@ -428,26 +492,31 @@ mod native {
             let pinned_wintun = pinned_wintun.clone();
             let default_addr = default_addr.clone();
             let ctrl = prep_mtu.clone();
-            prepare_profile_document(doc, move |mtu, peer, addr_override| {
-                let address = addr_override.unwrap_or(&default_addr).to_owned();
-                if let Some((dll, sha256)) = pinned_wintun {
-                    deferred_wintun_attachment(dll, sha256, address, mtu, peer, ctrl)
-                } else {
-                    let mtu_host = Arc::new(WindowsDevice::new(ctrl.clone()));
-                    Ok(Attachment::deferred_native(PacketLayer::Ip, move || {
-                        let address = address.clone();
-                        let ctrl = ctrl.clone();
-                        async move {
-                            let (dll, sha256) = discover_wintun(skip_acl_check)?;
-                            let config =
-                                crate::cli::device_config(&dll, &sha256, &address, mtu, peer)?;
-                            let mut creating = crate::setup::Setup::spawn(move || {
-                                Device::open_with_mtu(&config, Some(ctrl))
-                            })?;
-                            creating.finish().await.map(Native::new)
-                        }
-                    })
-                    .with_device_mtu(mtu_host))
+            prepare_profile_document(doc, move |req| match req.layer {
+                PacketLayer::Ethernet => deferred_tap_attachment(req, ctrl),
+                PacketLayer::Ip => {
+                    let address = req.address_override.unwrap_or(&default_addr).to_owned();
+                    let mtu = req.mtu;
+                    let peer = req.peer;
+                    if let Some((dll, sha256)) = pinned_wintun {
+                        deferred_wintun_attachment(dll, sha256, address, mtu, peer, ctrl)
+                    } else {
+                        let mtu_host = Arc::new(WindowsDevice::new(ctrl.clone()));
+                        Ok(Attachment::deferred_native(PacketLayer::Ip, move || {
+                            let address = address.clone();
+                            let ctrl = ctrl.clone();
+                            async move {
+                                let (dll, sha256) = discover_wintun(skip_acl_check)?;
+                                let config =
+                                    crate::cli::device_config(&dll, &sha256, &address, mtu, peer)?;
+                                let mut creating = crate::setup::Setup::spawn(move || {
+                                    Device::open_with_mtu(&config, Some(ctrl))
+                                })?;
+                                creating.finish().await.map(Native::new)
+                            }
+                        })
+                        .with_device_mtu(mtu_host))
+                    }
                 }
             })
         });

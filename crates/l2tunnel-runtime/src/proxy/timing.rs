@@ -1,4 +1,5 @@
 //! Opt-in bounded proxy custody diagnostics, never scheduling or deadline authority.
+#![cfg_attr(not(unix), allow(dead_code))]
 //!
 //! Physical timestamps retain their existing meaning. Duration populations overlap;
 //! their sums and quantiles must not be added. Publication-to-import is deliberately

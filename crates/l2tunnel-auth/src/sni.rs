@@ -1,8 +1,8 @@
 //! Explicit ClientHello naming with immutable per-connection verification identity.
 
-use super::{ClientTls, Error};
+use super::{ClientTls, Error, ServerIdentity, hash};
 use rustls::{
-    DigitallySignedStruct, DistinguishedName, SignatureScheme,
+    DigitallySignedStruct, DistinguishedName, OtherError, SignatureScheme,
     client::{
         WebPkiServerVerifier,
         danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
@@ -51,32 +51,36 @@ pub(super) fn connection(
     tls: &ClientTls,
     verification_name: ServerName<'static>,
 ) -> Result<(TlsConnector, ServerName<'static>), Error> {
-    match &tls.1 {
-        ClientSni::Disabled => Ok((TlsConnector::from(tls.0.clone()), verification_name)),
-        ClientSni::Named(name) => {
-            let wire_name = dns_name(name)?;
-            let delegate = tls
-                .2
-                .as_ref()
-                .ok_or(Error::Configuration("missing maintained TLS verifier"))?;
-            // A connection owns its verifier name. Reusing ClientTls cannot
-            // mutate another in-flight connection's certificate identity.
-            let mut config = (*tls.0).clone();
-            config
-                .dangerous()
-                .set_certificate_verifier(Arc::new(Verifier {
-                    delegate: delegate.clone(),
-                    verification_name,
-                }));
-            Ok((TlsConnector::from(Arc::new(config)), wire_name))
-        }
+    let wire_name = match &tls.1 {
+        ClientSni::Disabled => verification_name.clone(),
+        ClientSni::Named(name) => dns_name(name)?,
+    };
+    let server_pin = tls.3;
+    if matches!(&tls.1, ClientSni::Disabled) && server_pin.is_none() {
+        return Ok((TlsConnector::from(tls.0.clone()), verification_name));
     }
+    let delegate = tls
+        .2
+        .as_ref()
+        .ok_or(Error::Configuration("missing maintained TLS verifier"))?;
+    // A connection owns its verifier name and optional leaf pin. Reusing
+    // ClientTls cannot mutate another in-flight connection's identity check.
+    let mut config = (*tls.0).clone();
+    config
+        .dangerous()
+        .set_certificate_verifier(Arc::new(Verifier {
+            delegate: delegate.clone(),
+            verification_name,
+            server_pin,
+        }));
+    Ok((TlsConnector::from(Arc::new(config)), wire_name))
 }
 
 #[derive(Debug)]
 struct Verifier {
     delegate: Arc<WebPkiServerVerifier>,
     verification_name: ServerName<'static>,
+    server_pin: Option<ServerIdentity>,
 }
 
 impl ServerCertVerifier for Verifier {
@@ -88,13 +92,26 @@ impl ServerCertVerifier for Verifier {
         ocsp_response: &[u8],
         now: UnixTime,
     ) -> Result<ServerCertVerified, rustls::Error> {
-        self.delegate.verify_server_cert(
+        let verified = self.delegate.verify_server_cert(
             end_entity,
             intermediates,
             &self.verification_name,
             ocsp_response,
             now,
-        )
+        )?;
+        if let Some(expected) = self.server_pin {
+            let actual = hash(end_entity.as_ref());
+            let diff = actual
+                .iter()
+                .zip(expected.0.iter())
+                .fold(0_u8, |acc, (a, b)| acc | (a ^ b));
+            if diff != 0 {
+                return Err(rustls::Error::InvalidCertificate(
+                    rustls::CertificateError::Other(OtherError(Arc::new(PinMismatchError))),
+                ));
+            }
+        }
+        Ok(verified)
     }
 
     fn verify_tls12_signature(
@@ -127,3 +144,14 @@ impl ServerCertVerifier for Verifier {
         self.delegate.root_hint_subjects()
     }
 }
+
+#[derive(Debug)]
+struct PinMismatchError;
+
+impl std::fmt::Display for PinMismatchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("server leaf certificate SHA-256 pin mismatch")
+    }
+}
+
+impl std::error::Error for PinMismatchError {}

@@ -13,6 +13,7 @@ pub(super) struct RawSelection {
     pub(super) outer: Option<AuthenticatedRaw>,
 }
 impl Profile {
+    #[cfg_attr(not(unix), allow(dead_code))]
     pub(crate) fn requested_resources(&self, role: security::Role) -> transport::Config {
         if role == security::Role::Initiator {
             self.initiator

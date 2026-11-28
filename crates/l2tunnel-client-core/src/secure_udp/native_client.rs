@@ -179,24 +179,137 @@ impl UdpClientProfile {
     }
 }
 
+/// Native device attachment details resolved from a [`crate::local::ProfileDocument`]
+/// when opening a platform TUN (L3) or TAP (L2) adapter.
+#[cfg(any(unix, windows))]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NativeAttachmentRequest<'a> {
+    /// Selected packet layer (`PacketLayer::Ip` for TUN or `PacketLayer::Ethernet` for TAP).
+    pub layer: PacketLayer,
+    /// Configured inner device MTU / max packet size.
+    pub mtu: u16,
+    /// Outer tunnel peer socket address (used for route-loop refusal).
+    pub peer: SocketAddr,
+    /// Optional explicit IPv4/prefix override (`--tun-address` or `--address`).
+    pub address_override: Option<&'a str>,
+    /// Optional explicit adapter alias (`--device`).
+    pub device_name: Option<&'a str>,
+    /// Optional explicit unicast Ethernet MAC address (`--tap-mac`, TAP only).
+    pub tap_mac: Option<[u8; 6]>,
+}
+
+#[cfg(any(unix, windows))]
+fn parse_tap_mac(text: &str) -> io::Result<[u8; 6]> {
+    let trimmed = text.trim();
+    let sep = if trimmed.contains(':') { ':' } else { '-' };
+    let parts: Vec<&str> = trimmed.split(sep).collect();
+    if parts.len() != 6 || parts.iter().any(|p| p.len() != 2) {
+        return Err(invalid(
+            "invalid --tap-mac (expected 6 hex octets like 02:aa:bb:cc:dd:ee)",
+        ));
+    }
+    let mut mac = [0_u8; 6];
+    for (dst, part) in mac.iter_mut().zip(parts) {
+        *dst = u8::from_str_radix(part, 16).map_err(|_| invalid("invalid --tap-mac hex digit"))?;
+    }
+    if mac == [0; 6] || (mac[0] & 0x01) != 0 {
+        return Err(invalid(
+            "--tap-mac must be a non-zero unicast Ethernet MAC address",
+        ));
+    }
+    Ok(mac)
+}
+
+#[cfg(any(unix, windows))]
+#[derive(Clone, Copy)]
+struct NativeVxlan {
+    bind: SocketAddr,
+    peer: SocketAddr,
+    vni: l2tunnel_vxlan::Vni,
+    max_frame_bytes: usize,
+}
+
+#[cfg(any(unix, windows))]
+fn parse_native_vxlan(
+    opts: &BTreeMap<String, String>,
+    layer: PacketLayer,
+    max_packet: u16,
+) -> io::Result<Option<NativeVxlan>> {
+    let count = ["--vxlan-bind", "--vxlan-peer", "--vni"]
+        .iter()
+        .filter(|k| opts.get(**k).is_some_and(|v| !v.trim().is_empty()))
+        .count();
+    if count == 0 {
+        return Ok(None);
+    }
+    if count != 3 {
+        return Err(invalid(
+            "VXLAN L2 attachment requires all of --vxlan-bind, --vxlan-peer, and --vni",
+        ));
+    }
+    if layer != PacketLayer::Ethernet {
+        return Err(invalid("VXLAN L2 attachment requires --layer tap"));
+    }
+    if opts.get("--tap-mac").is_some_and(|v| !v.trim().is_empty()) {
+        return Err(invalid(
+            "--tap-mac cannot be combined with VXLAN L2 attachment",
+        ));
+    }
+    let bind: SocketAddr = opts
+        .get("--vxlan-bind")
+        .ok_or_else(|| invalid("missing --vxlan-bind"))?
+        .parse()
+        .map_err(|_| invalid("invalid --vxlan-bind (expected IP:PORT)"))?;
+    let peer: SocketAddr = opts
+        .get("--vxlan-peer")
+        .ok_or_else(|| invalid("missing --vxlan-peer"))?
+        .parse()
+        .map_err(|_| invalid("invalid --vxlan-peer (expected IP:PORT)"))?;
+    if bind.is_ipv4() != peer.is_ipv4()
+        || bind == peer
+        || bind.ip().is_multicast()
+        || peer.port() == 0
+        || peer.ip().is_unspecified()
+        || peer.ip().is_multicast()
+    {
+        return Err(invalid("invalid --vxlan-bind/--vxlan-peer endpoint pair"));
+    }
+    let raw_vni: u32 = opts
+        .get("--vni")
+        .ok_or_else(|| invalid("missing --vni"))?
+        .parse()
+        .map_err(|_| invalid("invalid --vni (expected integer 0..=16777215)"))?;
+    let vni = l2tunnel_vxlan::Vni::new(raw_vni)
+        .map_err(|_| invalid("--vni out of 24-bit VXLAN range (0..=16777215)"))?;
+    Ok(Some(NativeVxlan {
+        bind,
+        peer,
+        vni,
+        max_frame_bytes: usize::from(max_packet),
+    }))
+}
+
 /// Prepare a stored Local API v5 [`crate::local::ProfileDocument`] for a native
-/// L3 TUN client (e.g. Windows Wintun) across all supported cross-platform
-/// Common carriers: UDP covers (`quic-like`, `media-like`, `tls-like`),
-/// `openvpn-like`, maintained `tcp` (TLS 1.3), and genuine `quic` (Quinn).
+/// client (e.g. Windows Wintun L3, Windows TAP-Windows6 L2, or driverless
+/// cross-platform VXLAN L2) across all supported cross-platform Common carriers:
+/// UDP covers (`quic-like`, `media-like`, `tls-like`), `openvpn-like`,
+/// maintained `tcp` (TLS 1.3), and genuine `quic` (Quinn).
 ///
-/// Explicitly refuses `--layer tap` and `--carrier raw-packet` with
-/// [`io::ErrorKind::Unsupported`]. Supports Internal MTU > Capsule MTU
-/// (`--max-packet > --max-path-mtu`) and live-tuning options (`--tune-repair`,
-/// `--tune-device-mtu`, `--tune-path-mtu`). Opens no socket or TUN device.
+/// Explicitly refuses `--carrier raw-packet` with [`io::ErrorKind::Unsupported`].
+/// Supports `--layer tun` (L3), `--layer tap` (L2 TAP or VXLAN), optional
+/// `--server-pin` TLS/QUIC leaf SHA-256 verification (`CONN-02`), Internal MTU >
+/// Capsule MTU (`--max-packet > --max-path-mtu`), and live-tuning options
+/// (`--tune-repair`, `--tune-device-mtu`, `--tune-path-mtu`). Opens no socket
+/// or device.
 #[cfg(any(unix, windows))]
 pub fn prepare_profile_document<F>(
     document: &crate::local::ProfileDocument,
     make_attachment: F,
 ) -> io::Result<service::Prepared>
 where
-    F: FnOnce(u16, SocketAddr, Option<&str>) -> io::Result<service::Attachment>,
+    F: FnOnce(NativeAttachmentRequest<'_>) -> io::Result<service::Attachment>,
 {
-    use l2tunnel_auth::{ClientSni, ClientTls, MemberKey};
+    use l2tunnel_auth::{ClientSni, ClientTls, MemberKey, ServerIdentity};
     use std::io::Read;
 
     document.validate().map_err(|msg| {
@@ -208,7 +321,7 @@ where
     if document.role != crate::local::ProfileRole::Connect {
         return Err(io::Error::new(
             io::ErrorKind::Unsupported,
-            "native L3 client daemon only runs connect profiles",
+            "native client daemon only runs connect profiles",
         ));
     }
     let opts = &document.options;
@@ -226,13 +339,26 @@ where
             "native client requires --record-profile common",
         ));
     }
-    let layer = opts.get("--layer").map(String::as_str).unwrap_or("tun");
-    if !layer.eq_ignore_ascii_case("tun") {
-        return Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "native L3 client only supports --layer tun (TAP/VXLAN L2 is unsupported)",
-        ));
-    }
+    let layer = match opts.get("--layer").map(String::as_str).unwrap_or("tun") {
+        s if s.eq_ignore_ascii_case("tun") => PacketLayer::Ip,
+        s if s.eq_ignore_ascii_case("tap") => PacketLayer::Ethernet,
+        _ => {
+            return Err(invalid("invalid --layer (expected tun or tap)"));
+        }
+    };
+    let tap_mac = match opts
+        .get("--tap-mac")
+        .map(String::as_str)
+        .filter(|s| !s.is_empty())
+    {
+        Some(text) => {
+            if layer != PacketLayer::Ethernet {
+                return Err(invalid("--tap-mac is only supported with --layer tap"));
+            }
+            Some(parse_tap_mac(text)?)
+        }
+        None => None,
+    };
     let carrier = req("--carrier")?;
     if carrier == "raw-packet" {
         return Err(io::Error::new(
@@ -276,8 +402,9 @@ where
     {
         return Err(invalid("invalid MTU or handshake deadline bounds"));
     }
+    let vxlan = parse_native_vxlan(opts, layer, tun_mtu)?;
     let connection = ConnectionConfig {
-        layer: PacketLayer::Ip,
+        layer,
         duplex,
         max_packet: usize::from(tun_mtu),
         compression,
@@ -337,13 +464,77 @@ where
             Some(name) => ClientSni::named(name).map_err(|_| invalid("invalid --sni")),
         }
     };
+    let parse_server_pin = || -> io::Result<Option<ServerIdentity>> {
+        match opts
+            .get("--server-pin")
+            .map(String::as_str)
+            .filter(|s| !s.is_empty())
+        {
+            None => Ok(None),
+            Some(hex) => ServerIdentity::from_hex(hex)
+                .map(Some)
+                .map_err(|_| invalid("invalid --server-pin (expected 64 hex chars)")),
+        }
+    };
     let address_override = opts
         .get("--tun-address")
         .or_else(|| opts.get("--address"))
-        .map(String::as_str);
+        .map(String::as_str)
+        .filter(|s| !s.is_empty());
+    let device_name = opts
+        .get("--device")
+        .map(String::as_str)
+        .filter(|s| !s.is_empty());
+    let build_attachment = |peer: SocketAddr| -> io::Result<service::Attachment> {
+        if let Some(vxlan) = vxlan {
+            let open_vxlan = move || -> io::Result<crate::native::Native> {
+                let device = l2tunnel_platform_vxlan::VxlanDevice::bind(
+                    vxlan.bind,
+                    l2tunnel_platform_vxlan::VxlanConfig {
+                        peer: vxlan.peer,
+                        vni: vxlan.vni,
+                        max_frame_bytes: vxlan.max_frame_bytes,
+                        receive_budget: 64,
+                    },
+                )?;
+                Ok(crate::native::Native::new(device))
+            };
+            #[cfg(unix)]
+            {
+                Ok(service::Attachment::readable(
+                    PacketLayer::Ethernet,
+                    open_vxlan,
+                ))
+            }
+            #[cfg(windows)]
+            {
+                Ok(service::Attachment::deferred_native(
+                    PacketLayer::Ethernet,
+                    move || async move { open_vxlan() },
+                ))
+            }
+        } else {
+            make_attachment(NativeAttachmentRequest {
+                layer,
+                mtu: tun_mtu,
+                peer,
+                address_override,
+                device_name,
+                tap_mac,
+            })
+        }
+    };
 
     match carrier {
         "quic-like" | "media-like" | "tls-like" => {
+            if opts
+                .get("--server-pin")
+                .is_some_and(|s| !s.trim().is_empty())
+            {
+                return Err(invalid(
+                    "--server-pin requires an outer TLS or QUIC carrier (openvpn-like, tcp, or quic)",
+                ));
+            }
             plan.validate_carrier(false)?;
             if plan.initial().path_mtu() > usize::from(path_mtu) {
                 return Err(invalid(
@@ -382,7 +573,7 @@ where
             let profile = plan
                 .build(connection, raw, peers, capacity, overhead)?
                 .with_tuning(tuning);
-            let attachment = make_attachment(tun_mtu, peer, address_override)?;
+            let attachment = build_attachment(peer)?;
             service::Prepared::secure_udp_common_client(profile, inner_creds, attachment)
         }
         "openvpn-like" => {
@@ -423,8 +614,9 @@ where
                 .with_tuning(tuning);
             let outer_cfg = plan.outer_config(&profile)?;
             let ca = read_ca_der(req("--ca")?)?;
-            let tls = ClientTls::from_der_roots_with_sni(&[ca], parse_sni()?)
-                .map_err(io::Error::other)?;
+            let tls =
+                ClientTls::from_der_roots_with_policy(&[ca], parse_sni()?, parse_server_pin()?)
+                    .map_err(io::Error::other)?;
             let member =
                 std::sync::Arc::new(MemberKey::from_pkcs8(&member_der).map_err(io::Error::other)?);
             let outer_creds = service::Client {
@@ -433,7 +625,7 @@ where
                 server_name: req("--server-name")?.to_owned(),
                 member,
             };
-            let attachment = make_attachment(tun_mtu, peer, address_override)?;
+            let attachment = build_attachment(peer)?;
             service::Prepared::secure_udp_common_carrier_client(
                 profile,
                 outer_cfg,
@@ -476,12 +668,14 @@ where
                 .with_tuning(tuning);
             let ca = read_ca_der(req("--ca")?)?;
             let server_name = req("--server-name")?.to_owned();
+            let server_pin = parse_server_pin()?;
             let member =
                 std::sync::Arc::new(MemberKey::from_pkcs8(&member_der).map_err(io::Error::other)?);
             let outer = match settings.transport {
                 super::maintained::Transport::Tls(_) => {
-                    let tls = ClientTls::from_der_roots_with_sni(&[ca], parse_sni()?)
-                        .map_err(io::Error::other)?;
+                    let tls =
+                        ClientTls::from_der_roots_with_policy(&[ca], parse_sni()?, server_pin)
+                            .map_err(io::Error::other)?;
                     super::maintained::Client::Tls(service::Client {
                         remote: settings.first.server,
                         tls,
@@ -491,11 +685,12 @@ where
                 }
                 super::maintained::Transport::Quic(_) => super::maintained::Client::Quic {
                     roots: vec![ca],
+                    server_pin,
                     server_name,
                     member,
                 },
             };
-            let attachment = make_attachment(tun_mtu, settings.first.server, address_override)?;
+            let attachment = build_attachment(settings.first.server)?;
             service::Prepared::secure_udp_common_maintained_client(
                 profile,
                 outer,
@@ -558,5 +753,38 @@ mod tests {
             Some(io::ErrorKind::Unsupported),
             "TAP layer must be explicitly refused on native L3 client"
         );
+    }
+
+    #[test]
+    fn native_vxlan_and_tap_mac_validation() {
+        let mut opts = BTreeMap::new();
+        assert!(parse_native_vxlan(&opts, PacketLayer::Ip, 1500).is_ok());
+
+        // Partial VXLAN options fail.
+        opts.insert("--vxlan-bind".into(), "127.0.0.1:4789".into());
+        assert!(parse_native_vxlan(&opts, PacketLayer::Ethernet, 1500).is_err());
+
+        opts.insert("--vxlan-peer".into(), "127.0.0.1:4790".into());
+        opts.insert("--vni".into(), "42".into());
+        // VXLAN on TUN layer fails.
+        assert!(parse_native_vxlan(&opts, PacketLayer::Ip, 1500).is_err());
+        // VXLAN on TAP layer succeeds.
+        let vxlan = parse_native_vxlan(&opts, PacketLayer::Ethernet, 1500)
+            .ok()
+            .flatten();
+        assert!(vxlan.is_some());
+
+        // Out-of-range VNI fails.
+        opts.insert("--vni".into(), "16777216".into());
+        assert!(parse_native_vxlan(&opts, PacketLayer::Ethernet, 1500).is_err());
+
+        // Valid and invalid TAP MAC addresses.
+        assert_eq!(
+            parse_tap_mac("02:aa:bb:cc:dd:ee").ok(),
+            Some([0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0xee])
+        );
+        assert!(parse_tap_mac("01:00:5e:00:00:01").is_err());
+        assert!(parse_tap_mac("00:00:00:00:00:00").is_err());
+        assert!(parse_tap_mac("not-a-mac").is_err());
     }
 }
